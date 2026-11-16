@@ -1,0 +1,15 @@
+.tools/
+artifacts/
+**/.dart_tool/
+**/build/
+**/.gradle/
+**/target/
+**/local.properties
+**/key.properties
+**/*.jks
+**/*.keystore
+**/*.p12
+**/*.mobileprovision
+**/pubspec_overrides.yaml
+**/.flutter-plugins*
+**/*.log
