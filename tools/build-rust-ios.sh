@@ -112,7 +112,7 @@ fi
 
 if command -v rustup >/dev/null 2>&1; then
     if ! rustup target list --installed | grep -qx "$TRIPLE"; then
-        echo "缺少 Rust 目标 $TRIPLE。" >&2
+        echo "缺少 Rust 目标 ${TRIPLE}。" >&2
         echo "请先运行：rustup target add $TRIPLE" >&2
         exit 1
     fi
@@ -136,12 +136,12 @@ if [[ "$MAKE_IPA" == "1" ]]; then
     BUILD_ARGS+=(--locked)
 fi
 
-echo "目标：$TRIPLE（$PROFILE）"
+echo "目标：${TRIPLE}（${PROFILE}）"
 cargo "${BUILD_ARGS[@]}" -- --print "native-static-libs=$LINK_FLAGS"
 
 LIB_SOURCE="$RUST_PRODUCT_DIR/lib$LIB_NAME.a"
 if [[ ! -f "$LIB_SOURCE" ]]; then
-    echo "没有生成 $LIB_SOURCE。" >&2
+    echo "没有生成 ${LIB_SOURCE}。" >&2
     echo "请确认包的 [lib] name 为 $LIB_NAME 且 crate-type 包含 staticlib。" >&2
     exit 1
 fi
