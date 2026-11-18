@@ -11,6 +11,10 @@ use serde::{Deserialize, Serialize};
 use yejian_core::ChapterMetadata;
 use yejian_sources::*;
 
+/// The Aidoku community catalogue, kept as an explicit one-tap choice rather
+/// than a silently preinstalled repository.
+const COMMUNITY_INDEX:&str="https://aidoku-community.github.io/sources/index.min.json";
+
 enum Task { List, Fetch(String), Install(RepositorySource), Search{source:String,query:String,page:i32}, Chapters(String,Manga) }
 enum Reply { Installed(Vec<InstalledSource>), Repository(RepositoryIndex), Results{source:String,query:String,page:i32,entries:Vec<Manga>,has_next:bool}, Chapters(String,Manga,Vec<Chapter>), Error(Option<i32>,String) }
 
@@ -1219,8 +1223,12 @@ impl Sources {
                 ui.horizontal(|ui|{
                     let row=ui.available_width();
                     ui.set_max_width(row);
-                    ui.add_enabled(!self.busy,TextEdit::singleline(&mut self.url).hint_text("仓库列表 URL").desired_width((row-92.).max(120.)));
-                    if ui.add_enabled(!self.busy,Button::new("读取").min_size(vec2(72.,28.))).clicked(){self.submit(Task::Fetch(self.url.trim().into()));}
+                    ui.add_enabled(!self.busy,TextEdit::singleline(&mut self.url).hint_text("仓库列表 URL").desired_width((row-176.).max(120.)));
+                    if ui.add_enabled(!self.busy,Button::new("读取").min_size(vec2(64.,28.))).clicked(){self.submit(Task::Fetch(self.url.trim().into()));}
+                    if ui.add_enabled(!self.busy,Button::new("社区源").min_size(vec2(72.,28.))).clicked(){
+                        self.url=COMMUNITY_INDEX.into();
+                        self.submit(Task::Fetch(COMMUNITY_INDEX.into()));
+                    }
                 });
                 if let Some(repo)=self.repository.clone(){
                     ui.add_space(10.);
