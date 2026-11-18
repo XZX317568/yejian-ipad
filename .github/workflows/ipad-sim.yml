@@ -56,18 +56,29 @@ jobs:
             xcrun simctl io "$DEVICE" screenshot "artifacts/rust/ipad-sim/$name.png"
           }
           shoot shelf 120 --seed-demo --ui-snapshot shelf
+          timeout 25 xcrun simctl launch --console-pty --terminate-running-process "$DEVICE" \
+            app.yejian.reader.rust --ui-snapshot shelf 2>&1 | tee artifacts/rust/ipad-sim/launch-console.txt || true
+          sleep 3
+          xcrun simctl io "$DEVICE" screenshot "artifacts/rust/ipad-sim/shelf-early.png"
           shoot detail 20 --ui-snapshot detail
           shoot reader 20 --ui-snapshot reader
           shoot history 10 --ui-snapshot history
           shoot sources 10 --ui-snapshot sources
           shoot settings 10 --ui-snapshot settings
+          xcrun simctl spawn "$DEVICE" log show --style compact --last 15m \
+            --predicate 'process == "Yejian" OR eventMessage CONTAINS "yejian"' \
+            > artifacts/rust/ipad-sim/yejian-log.txt || true
+          cp ~/Library/Logs/DiagnosticReports/*.ips artifacts/rust/ipad-sim/ 2>/dev/null || true
           xcrun simctl shutdown "$DEVICE"
 
       - name: 保存截图
         uses: actions/upload-artifact@v7
         with:
           name: Yejian-iPad-Sim
-          path: artifacts/rust/ipad-sim/*.png
+          path: |
+            artifacts/rust/ipad-sim/*.png
+            artifacts/rust/ipad-sim/*.txt
+            artifacts/rust/ipad-sim/*.ips
           if-no-files-found: error
           retention-days: 3
           compression-level: 0
