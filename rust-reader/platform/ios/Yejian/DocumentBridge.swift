@@ -83,9 +83,10 @@ private final class YejianDocumentBridge: NSObject, UIApplicationDelegate, UIDoc
             // by the first import request.
         }
 
-        // Winit intentionally registers no application delegate, so replacing
-        // the nil delegate is safe and lets warm "open in" events reach us.
-        if UIApplication.shared.delegate !== self {
+        // winit owns the application delegate (UIApplicationMain installs it).
+        // Replacing it kills window/scene delivery, so only fill a genuinely
+        // empty slot. Open-in events then rely on Documents/Inbox scanning.
+        if UIApplication.shared.delegate == nil {
             UIApplication.shared.delegate = self
         }
         // Moving large files must not block the first frame; the batch is
