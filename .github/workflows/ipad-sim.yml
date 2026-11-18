@@ -31,6 +31,7 @@ jobs:
             -configuration Debug -sdk iphonesimulator \
             -destination 'generic/platform=iOS Simulator' \
             ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
+            ENABLE_DEBUG_DYLIB=NO \
             -derivedDataPath "$RUNNER_TEMP/sim-build" build CODE_SIGNING_ALLOWED=NO
 
       - name: 启动 iPad 模拟器并截图
@@ -56,8 +57,12 @@ jobs:
             xcrun simctl io "$DEVICE" screenshot "artifacts/rust/ipad-sim/$name.png"
           }
           shoot shelf 120 --seed-demo --ui-snapshot shelf
-          timeout 25 xcrun simctl launch --console-pty --terminate-running-process "$DEVICE" \
-            app.yejian.reader.rust --ui-snapshot shelf 2>&1 | tee artifacts/rust/ipad-sim/launch-console.txt || true
+          xcrun simctl launch --console-pty --terminate-running-process "$DEVICE" \
+            app.yejian.reader.rust --ui-snapshot shelf \
+            > artifacts/rust/ipad-sim/launch-console.txt 2>&1 &
+          LAUNCH_PID=$!
+          sleep 12
+          kill "$LAUNCH_PID" 2>/dev/null || true
           sleep 3
           xcrun simctl io "$DEVICE" screenshot "artifacts/rust/ipad-sim/shelf-early.png"
           shoot detail 20 --ui-snapshot detail
