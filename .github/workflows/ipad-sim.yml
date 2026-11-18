@@ -1,0 +1,72 @@
+name: 页间 iPad 模拟器截图
+
+on: workflow_dispatch
+
+permissions:
+  contents: read
+
+jobs:
+  sim:
+    runs-on: macos-15
+    timeout-minutes: 50
+    env:
+      CARGO_BUILD_JOBS: "3"
+      CARGO_INCREMENTAL: "0"
+      RUSTUP_TOOLCHAIN: "1.97.0"
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: 准备模拟器工具链
+        run: |
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --target aarch64-apple-ios-sim
+          xcodebuild -version
+
+      - name: 编译模拟器版本
+        run: |
+          bash tools/build-rust-ios.sh --sim
+          xcodebuild -project rust-reader/platform/ios/Yejian.xcodeproj -scheme Yejian \
+            -configuration Debug -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$RUNNER_TEMP/sim-build" build CODE_SIGNING_ALLOWED=NO
+
+      - name: 启动 iPad 模拟器并截图
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/sim-build/Build/Products/Debug-iphonesimulator/Yejian.app"
+          DEVICE=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          devices = [d for runtimes in json.load(sys.stdin)["devices"].values() for d in runtimes]
+          ipads = [d for d in devices if "iPad" in d["name"]]
+          print(ipads[0]["udid"])')
+          echo "simulator: $DEVICE"
+          xcrun simctl boot "$DEVICE"
+          xcrun simctl bootstatus "$DEVICE" -b
+          xcrun simctl status_bar "$DEVICE" override --time 9:41 --batteryState charged --batteryLevel 100
+          xcrun simctl install "$DEVICE" "$APP"
+          mkdir -p artifacts/rust/ipad-sim
+          shoot() {
+            local name=$1 delay=$2
+            shift 2
+            xcrun simctl launch --terminate-running-process "$DEVICE" app.yejian.reader.rust "$@"
+            sleep "$delay"
+            xcrun simctl io "$DEVICE" screenshot "artifacts/rust/ipad-sim/$name.png"
+          }
+          shoot shelf 120 --seed-demo --ui-snapshot shelf
+          shoot detail 20 --ui-snapshot detail
+          shoot reader 20 --ui-snapshot reader
+          shoot history 10 --ui-snapshot history
+          shoot sources 10 --ui-snapshot sources
+          shoot settings 10 --ui-snapshot settings
+          xcrun simctl shutdown "$DEVICE"
+
+      - name: 保存截图
+        uses: actions/upload-artifact@v7
+        with:
+          name: Yejian-iPad-Sim
+          path: artifacts/rust/ipad-sim/*.png
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0

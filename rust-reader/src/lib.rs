@@ -41,6 +41,15 @@ pub fn run() -> eframe::Result {
     let root = args.iter().position(|x|x=="--data-dir").and_then(|i|args.get(i+1)).map(PathBuf::from)
         .unwrap_or_else(default_data_dir);
     let imports: Vec<PathBuf> = args.iter().position(|x|x=="--import").map(|i|args[i+1..].iter().map(PathBuf::from).collect()).unwrap_or_default();
+    // Simulator-only UI snapshots. Release builds never see these flags.
+    #[cfg(debug_assertions)]
+    let seed_demo = args.iter().any(|x| x == "--seed-demo");
+    #[cfg(debug_assertions)]
+    let snapshot = args
+        .iter()
+        .position(|x| x == "--ui-snapshot")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_title("页间").with_inner_size([1024.,768.]).with_min_inner_size([320.,480.]).with_app_id("app.yejian.reader.rust"),
         run_and_return: !cfg!(target_os="ios"),
@@ -50,10 +59,74 @@ pub fn run() -> eframe::Result {
         configure_fonts(&cc.egui_ctx);
         let wake=cc.egui_ctx.clone();
         yejian_platform::set_event_waker(move||wake.request_repaint());
+        #[cfg(debug_assertions)]
+        let demo_root = root.join("demo");
         let mut app = ReaderApp::new(root,cc.egui_ctx.clone());
         app.import_files(imports);
+        #[cfg(debug_assertions)]
+        {
+            if seed_demo
+                && let Ok(paths) = demo_archives(&demo_root)
+            {
+                app.import_files(paths);
+            }
+            if let Some(name) = snapshot {
+                app.request_snapshot(name);
+            }
+        }
         Ok(Box::new(app))
     }))
+}
+
+/// Five small original archives for simulator screenshots.
+#[cfg(debug_assertions)]
+fn demo_archives(root: &std::path::Path) -> anyhow::Result<Vec<PathBuf>> {
+    use std::io::Write;
+    std::fs::create_dir_all(root)?;
+    let titles = ["山海之间", "深蓝来信", "雨后列车", "小镇回声", "月光旅人"];
+    let colors = [
+        [52u8, 87, 83],
+        [40, 75, 108],
+        [152, 118, 77],
+        [104, 88, 121],
+        [182, 95, 74],
+    ];
+    let mut paths = Vec::new();
+    for (index, title) in titles.iter().enumerate() {
+        let path = root.join(format!("{title}.cbz"));
+        if path.is_file() {
+            paths.push(path);
+            continue;
+        }
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&path)?);
+        for page in 0..6 {
+            let mut image = image::RgbImage::new(640, 960);
+            for (y, row) in image.enumerate_rows_mut() {
+                for (x, _, pixel) in row {
+                    let base = colors[index];
+                    let sun = (x as i32 - 380).pow(2) + (y as i32 - 225).pow(2) < 155 * 155;
+                    let wave = y as f32 > 400. + (x as f32 / 110.).sin() * 65. + page as f32 * 12.;
+                    *pixel = image::Rgb(if sun {
+                        [223, 224, 207]
+                    } else if wave {
+                        [base[0] / 2, base[1] / 2, base[2] / 2]
+                    } else {
+                        base
+                    });
+                }
+            }
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            image.write_to(&mut bytes, image::ImageFormat::Png)?;
+            zip.start_file(
+                format!("{:03}.png", page + 1),
+                zip::write::SimpleFileOptions::default(),
+            )?;
+            zip.write_all(&bytes.into_inner())?;
+        }
+        zip.finish()?;
+        paths.push(path);
+    }
+    Ok(paths)
 }
 
 pub fn default_data_dir() -> PathBuf {

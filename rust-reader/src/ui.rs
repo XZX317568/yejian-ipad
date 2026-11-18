@@ -75,6 +75,8 @@ pub struct ReaderApp {
     screen: Screen,
     reader_from_shelf: bool,
     motion: ShelfMotion,
+    #[cfg(debug_assertions)]
+    snapshot_request: Option<String>,
     first_frame: Option<f64>,
     shelf_viewport: Rect,
     shelf_shift: f32,
@@ -144,6 +146,8 @@ impl ReaderApp {
             screen: Screen::Library,
             reader_from_shelf: false,
             motion: ShelfMotion::default(),
+            #[cfg(debug_assertions)]
+            snapshot_request: None,
             first_frame: None,
             shelf_viewport: Rect::NOTHING,
             shelf_shift: 0.,
@@ -191,6 +195,40 @@ impl ReaderApp {
     pub fn import_files(&mut self, paths: Vec<PathBuf>) {
         if !paths.is_empty() {
             self.send(Command::Import(paths));
+        }
+    }
+    /// Simulator snapshots: jump to a screen once the library is readable.
+    #[cfg(debug_assertions)]
+    pub fn request_snapshot(&mut self, name: String) {
+        self.snapshot_request = Some(name);
+    }
+    #[cfg(debug_assertions)]
+    fn apply_snapshot(&mut self, name: &str) {
+        match name {
+            "detail" => {
+                if let Some(book) = self.books.first() {
+                    self.screen = Screen::Detail(book.id.clone());
+                }
+            }
+            "reader" => {
+                if let Some(book) = self.books.first().cloned() {
+                    self.flight = None;
+                    self.open_reader(&book);
+                }
+            }
+            "sources" => {
+                self.tab = Tab::Sources;
+                self.screen = Screen::Library;
+            }
+            "settings" => {
+                self.tab = Tab::Settings;
+                self.screen = Screen::Library;
+            }
+            "history" => {
+                self.tab = Tab::History;
+                self.screen = Screen::Library;
+            }
+            _ => {}
         }
     }
     fn send(&mut self, command: Command) {
@@ -909,6 +947,11 @@ impl ReaderApp {
     pub fn draw(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
         self.receive(&ctx);
+        #[cfg(debug_assertions)]
+        if self.snapshot_request.is_some() && self.ready && !self.books.is_empty() {
+            let name = self.snapshot_request.take().unwrap_or_default();
+            self.apply_snapshot(&name);
+        }
         #[cfg(any(target_os = "android", target_os = "ios"))]
         {
             loop {
