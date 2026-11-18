@@ -1,0 +1,2257 @@
+use std::{
+    collections::{HashSet, VecDeque},
+    io::{Read, Write},
+    path::{Path, PathBuf},
+    sync::{mpsc, Arc, atomic::{AtomicU8, Ordering}},
+    thread,
+};
+use egui::*;
+use anyhow::Context as _;
+use serde::{Deserialize, Serialize};
+use yejian_core::ChapterMetadata;
+use yejian_sources::*;
+
+enum Task { List, Fetch(String), Install(RepositorySource), Search{source:String,query:String,page:i32}, Chapters(String,Manga) }
+enum Reply { Installed(Vec<InstalledSource>), Repository(RepositoryIndex), Results{source:String,query:String,page:i32,entries:Vec<Manga>,has_next:bool}, Chapters(String,Manga,Vec<Chapter>), Error(Option<i32>,String) }
+
+/// One finished chapter ready for `Command::ImportChapter`.
+///
+/// `id` is the queue task id: after `import` and `link_chapter` both succeed
+/// the caller acknowledges it with [`Sources::ack_downloaded`].
+pub struct DownloadedChapter {
+    pub id:String,
+    pub path:PathBuf,
+    pub metadata:ChapterMetadata,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum DownloadStatus { Queued, Running, Paused, Failed, Done }
+impl DownloadStatus {
+    fn label(self)->&'static str {
+        match self { Self::Queued=>"排队中", Self::Running=>"下载中", Self::Paused=>"已暂停", Self::Failed=>"失败", Self::Done=>"已完成" }
+    }
+}
+
+/// One persisted download job. It is self-contained: the source engine can be
+/// reopened on any thread and `pages_with` is fed the reconstructed
+/// Manga/Chapter, so an app restart never needs the original search session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DownloadTask {
+    id:String,
+    source_id:String,
+    manga_id:String,
+    manga_title:String,
+    #[serde(default)] manga_url:Option<String>,
+    #[serde(default)] manga_cover:Option<String>,
+    chapter_id:String,
+    chapter_title:String,
+    #[serde(default)] chapter_number:Option<f64>,
+    #[serde(default)] volume_number:Option<f64>,
+    #[serde(default)] chapter_url:Option<String>,
+    #[serde(default)] chapter_language:Option<String>,
+    /// Id of the stored snapshot of the complete `Manga` object passed to
+    /// `get_page_list`. The bytes live once per manga under
+    /// `download-work/snapshots`, so many chapter tasks of the same work never
+    /// duplicate its chapter list in this JSON.
+    #[serde(default)] manga_snapshot:Option<String>,
+    /// Postcard bytes of the exact `Chapter` object the source is asked for
+    /// pages, keeping scanlators/date/thumbnail/locked etc. across restarts.
+    #[serde(default)] chapter_snapshot:Option<Vec<u8>>,
+    status:DownloadStatus,
+    #[serde(default)] error:Option<String>,
+    #[serde(default)] pages_done:usize,
+    #[serde(default)] pages_total:usize,
+    /// Page-list fingerprint the cached page files belong to. A different list
+    /// clears this chapter's own cache before refetching.
+    #[serde(default)] pages_signature:Option<String>,
+    #[serde(default)] cbz:Option<PathBuf>,
+    /// True once the library import + chapter link succeeded. Unlinked
+    /// finished files are offered again on the next start instead of being
+    /// downloaded again.
+    #[serde(default)] linked:bool,
+}
+impl DownloadTask {
+    fn from_chapter(source:&str,manga:&Manga,chapter:&Chapter)->Self {
+        let chapter_title=chapter.title.clone().unwrap_or_else(||chapter.chapter_number.map(|n|format!("第 {n} 话")).unwrap_or_else(||chapter.key.clone()));
+        Self {
+            id:identity_id(source,&manga.key,&chapter.key),
+            source_id:source.to_string(),
+            manga_id:manga.key.clone(),
+            manga_title:manga.title.clone(),
+            manga_url:manga.url.clone(),
+            manga_cover:manga.cover.clone(),
+            chapter_id:chapter.key.clone(),
+            chapter_title,
+            chapter_number:chapter.chapter_number.map(f64::from),
+            volume_number:chapter.volume_number.map(f64::from),
+            chapter_url:chapter.url.clone(),
+            chapter_language:chapter.language.clone(),
+            manga_snapshot:None,
+            chapter_snapshot:Some(chapter.to_postcard_bytes()),
+            status:DownloadStatus::Queued,
+            error:None,
+            pages_done:0,
+            pages_total:0,
+            pages_signature:None,
+            cbz:None,
+            linked:false,
+        }
+    }
+    fn manga(&self)->Manga {
+        Manga {
+            source_key:self.source_id.clone(),
+            key:self.manga_id.clone(),
+            title:self.manga_title.clone(),
+            cover:self.manga_cover.clone(),
+            url:self.manga_url.clone(),
+            ..Default::default()
+        }
+    }
+    fn chapter(&self)->Chapter {
+        Chapter {
+            key:self.chapter_id.clone(),
+            title:Some(self.chapter_title.clone()),
+            chapter_number:self.chapter_number.map(|n|n as f32),
+            volume_number:self.volume_number.map(|n|n as f32),
+            url:self.chapter_url.clone(),
+            language:self.chapter_language.clone(),
+            ..Default::default()
+        }
+    }
+    /// The original `Manga` for this task. Only queues written before
+    /// snapshots existed fall back to the reduced legacy fields; a task that
+    /// *has* a snapshot must restore it exactly, otherwise it fails visibly
+    /// instead of sending a half-empty object to the source.
+    fn manga_for(&self,root:&Path)->anyhow::Result<Manga> {
+        let Some(key)=self.manga_snapshot.as_deref() else{return Ok(self.manga());};
+        let path=manga_snapshot_path(root,key)?;
+        let bytes=std::fs::read(&path).map_err(|error|anyhow::anyhow!(
+            "漫画快照不可用（{key}）：{error}；请回到作品详情重新加入该章节以重建快照"
+        ))?;
+        let mut manga=Manga::from_postcard_bytes(&bytes).map_err(|error|anyhow::anyhow!(
+            "漫画快照已损坏（{key}）：{error}；请回到作品详情重新加入该章节以重建快照"
+        ))?;
+        anyhow::ensure!(manga.key==self.manga_id,
+            "漫画快照与任务不匹配（{key}）；请回到作品详情重新加入该章节以重建快照");
+        manga.source_key=self.source_id.clone();
+        Ok(manga)
+    }
+    /// The original `Chapter` for this task. Legacy queues without a snapshot
+    /// keep working; a broken snapshot fails instead of silently degrading.
+    fn chapter_for(&self)->anyhow::Result<Chapter> {
+        let Some(bytes)=self.chapter_snapshot.as_deref() else{return Ok(self.chapter());};
+        let chapter=Chapter::from_postcard_bytes(bytes).map_err(|error|anyhow::anyhow!(
+            "章节快照已损坏：{error}；请回到作品详情重新加入该章节以重建快照"
+        ))?;
+        anyhow::ensure!(chapter.key==self.chapter_id,
+            "章节快照与任务不匹配；请回到作品详情重新加入该章节以重建快照");
+        Ok(chapter)
+    }
+    fn metadata(&self)->ChapterMetadata {
+        ChapterMetadata {
+            source_id:self.source_id.clone(),
+            manga_id:self.manga_id.clone(),
+            manga_title:self.manga_title.clone(),
+            chapter_id:self.chapter_id.clone(),
+            chapter_title:self.chapter_title.clone(),
+            chapter_number:self.chapter_number,
+            volume_number:self.volume_number,
+        }
+    }
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct TaskStore {
+    #[serde(default)] tasks:Vec<DownloadTask>,
+}
+
+enum DlCmd { Run(DownloadTask) }
+enum DlEvent {
+    Progress{id:String,done:usize,total:usize,signature:Option<String>},
+    Finished{id:String,path:PathBuf},
+    Failed{id:String,error:String},
+    Aborted{id:String,how:u8},
+    LockUnavailable{id:String,error:String},
+}
+
+const STOP_NONE:u8=0;
+const STOP_PAUSE:u8=1;
+const STOP_CANCEL:u8=2;
+
+/// The result list plus the exact search that produced it.
+///
+/// Every entry keeps its own `source_key`, and results are only accepted for
+/// the source/query/page that is still current, so a late reply from an
+/// abandoned search can never be shown under another source.
+#[derive(Default)]
+struct ResultsState {
+    source:String,
+    query:String,
+    page:i32,
+    has_more:bool,
+    entries:Vec<Manga>,
+}
+impl ResultsState {
+    fn clear(&mut self){*self=Self::default();}
+    fn begin(&mut self,source:&str,query:&str){
+        self.entries.clear();
+        self.source=source.to_string();
+        self.query=query.to_string();
+        self.page=0;
+        self.has_more=false;
+    }
+    /// Source, query and page for the next request, or `None` at the end.
+    fn next_page(&self)->Option<(String,String,i32)>{
+        if !self.has_more||self.source.is_empty(){None}else{Some((self.source.clone(),self.query.clone(),self.page+1))}
+    }
+    /// Accepts exactly the reply we asked for. Returns `false` for stale,
+    /// foreign-source or duplicate replies, leaving state untouched so the
+    /// page counter only moves on real success and a failed page stays
+    /// retryable.
+    fn accept(&mut self,source:&str,query:&str,page:i32,entries:Vec<Manga>,has_next:bool)->bool{
+        if source!=self.source.as_str()||query!=self.query.as_str()||page!=self.page+1{return false;}
+        let mut seen:HashSet<(String,String)>=self.entries.iter().map(|m|(m.source_key.clone(),m.key.clone())).collect();
+        for mut manga in entries {
+            if manga.source_key.is_empty(){manga.source_key=source.to_string();}
+            if seen.insert((manga.source_key.clone(),manga.key.clone())){self.entries.push(manga);}
+        }
+        self.page=page;
+        self.has_more=has_next;
+        true
+    }
+}
+
+/// Applies a source selection: returns `true` when the source actually changed.
+/// Any old result list, detail and chapter state belongs to the previous
+/// source and is dropped, so the next tap can never load a foreign manga key.
+fn apply_source_change(selected:&mut String,results:&mut ResultsState,selected_manga:&mut Option<Manga>,chapters:&mut Vec<Chapter>,id:&str)->bool{
+    if selected.as_str()==id{return false;}
+    *selected=id.to_string();
+    *selected_manga=None;
+    chapters.clear();
+    results.clear();
+    true
+}
+
+// ---------------------------------------------------------------------------
+// Persisted task identity and per-chapter page staging
+// ---------------------------------------------------------------------------
+
+/// Stable 64-bit FNV-1a over source/manga/chapter, so the same chapter always
+/// maps to one task id across restarts and concurrent enqueues.
+fn identity_id(source:&str,manga:&str,chapter:&str)->String {
+    let mut hash:u64=0xcbf2_9ce4_8422_2325;
+    for part in [source,manga,chapter] {
+        for byte in part.as_bytes().iter().chain(std::iter::once(&0xffu8)) {
+            hash^=u64::from(*byte);
+            hash=hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    format!("{hash:016x}")
+}
+
+fn work_root(root:&Path)->PathBuf{root.join("download-work")}
+
+/// Task ids are always the 16 lowercase hex digits produced by `identity_id`.
+/// Anything else is treated as a corrupt queue entry, never as a path.
+fn valid_task_id(id:&str)->bool {
+    id.len()==16&&id.bytes().all(|byte|byte.is_ascii_digit()||(b'a'..=b'f').contains(&byte))
+}
+
+/// Resolves one task's staging directory and proves it stays inside
+/// `download-work`, including the target of an existing symlink/junction.
+fn task_dir(root:&Path,id:&str)->anyhow::Result<PathBuf> {
+    anyhow::ensure!(valid_task_id(id),"非法的下载任务 id：{id:?}");
+    let work=work_root(root);
+    let dir=work.join(format!("task-{id}"));
+    anyhow::ensure!(dir.parent()==Some(work.as_path()),"下载任务路径越界：{}",dir.display());
+    match std::fs::symlink_metadata(&dir) {
+        Ok(_)=>{
+            std::fs::create_dir_all(&work)?;
+            let work_real=std::fs::canonicalize(&work)?;
+            let dir_real=std::fs::canonicalize(&dir)?;
+            anyhow::ensure!(dir_real.starts_with(&work_real),"下载任务路径指向 download-work 之外：{}",dir.display());
+        }
+        Err(error) if error.kind()==std::io::ErrorKind::NotFound=>{}
+        Err(error)=>return Err(anyhow::anyhow!("检查下载任务路径失败：{error}")),
+    }
+    Ok(dir)
+}
+
+/// Deletes only one validated task's staging directory. A malformed id or a
+/// link that resolves outside `download-work` is reported instead of followed.
+fn remove_task_cache(root:&Path,id:&str)->anyhow::Result<()> {
+    let dir=task_dir(root,id)?;
+    match std::fs::symlink_metadata(&dir) {
+        Ok(_)=>std::fs::remove_dir_all(&dir).map_err(|error|anyhow::anyhow!("清理缓存 {} 失败：{error}",dir.display())),
+        Err(error) if error.kind()==std::io::ErrorKind::NotFound=>Ok(()),
+        Err(error)=>Err(anyhow::anyhow!("检查缓存 {} 失败：{error}",dir.display())),
+    }
+}
+
+fn snapshot_root(root:&Path)->PathBuf{work_root(root).join("snapshots")}
+
+fn manga_snapshot_key(source:&str,manga:&str)->String{identity_id(source,manga,"manga-snapshot")}
+
+fn manga_snapshot_path(root:&Path,key:&str)->anyhow::Result<PathBuf> {
+    anyhow::ensure!(valid_task_id(key),"非法的漫画快照 id：{key:?}");
+    Ok(snapshot_root(root).join(format!("{key}.manga")))
+}
+
+/// Stores the complete `Manga` from the search result once per work. The exact
+/// postcard bytes the interpreter would send to `get_page_list` are written, so
+/// a restored task passes authors/tags/viewer/description unchanged and never
+/// needs a new details request. Existing identical bytes are reused.
+fn save_manga_snapshot(root:&Path,manga:&Manga)->anyhow::Result<String> {
+    let key=manga_snapshot_key(&manga.source_key,&manga.key);
+    let path=manga_snapshot_path(root,&key)?;
+    let bytes=manga.to_postcard_bytes();
+    if std::fs::read(&path).ok().as_deref()==Some(bytes.as_slice()){return Ok(key);}
+    let directory=snapshot_root(root);
+    std::fs::create_dir_all(&directory)
+        .map_err(|error|anyhow::anyhow!("创建漫画快照目录失败：{error}"))?;
+    let nonce=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|elapsed|elapsed.as_nanos()).unwrap_or(0);
+    let part=directory.join(format!("{key}-{}-{nonce}.part",std::process::id()));
+    let mut file=std::fs::OpenOptions::new().write(true).create_new(true).open(&part)
+        .map_err(|error|anyhow::anyhow!("写入漫画快照失败：{error}"))?;
+    let cleanup=PartCleanup::new(&part);
+    file.write_all(&bytes).and_then(|_|file.sync_all())
+        .map_err(|error|anyhow::anyhow!("写入漫画快照失败：{error}"))?;
+    drop(file);
+    std::fs::rename(&part,&path)
+        .map_err(|error|anyhow::anyhow!("保存漫画快照 {} 失败：{error}",path.display()))?;
+    cleanup.keep();
+    Ok(key)
+}
+
+/// One OS-level exclusive lock per data root. It is held only while a task is
+/// actually running and is released automatically when the guard is dropped.
+fn acquire_download_lock(root:&Path)->anyhow::Result<std::fs::File> {
+    let work=work_root(root);
+    std::fs::create_dir_all(&work)?;
+    let path=work.join(".download.lock");
+    let file=std::fs::OpenOptions::new().create(true).read(true).write(true).open(&path)?;
+    file.try_lock().map_err(|error|anyhow::anyhow!("上一次下载仍在退出，请稍后重试（{error}）"))?;
+    Ok(file)
+}
+
+fn stored_page(dir: &Path, number: usize) -> Option<PathBuf> {
+    ["jpg", "png", "webp"].into_iter()
+        .map(|extension| dir.join(format!("page-{number:04}.{extension}")))
+        .find(|path| path.is_file())
+}
+
+fn existing_pages(dir:&Path)->HashSet<usize> {
+    let mut found=HashSet::new();
+    let Ok(entries)=std::fs::read_dir(dir) else{return found;};
+    for entry in entries.flatten() {
+        let name=entry.file_name();
+        let name=name.to_string_lossy();
+        if !name.starts_with("page-")||name.ends_with(".part"){continue;}
+        let number=&name["page-".len()..];
+        let Some((digits, extension)) = number.split_once('.') else { continue; };
+        if matches!(extension, "jpg" | "png" | "webp")
+            && let Ok(value) = digits.parse::<usize>()
+            && value > 0
+            && entry.file_type().is_ok_and(|kind| kind.is_file())
+        {
+            found.insert(value);
+        }
+    }
+    found
+}
+
+/// Fingerprint of the chapter's page list. URL pages, zip entries, embedded
+/// images and text pages all contribute; a changed list means cached page
+/// files cannot be trusted and are cleared for this task only.
+fn page_signature(pages:&[Page])->String {
+    use std::fmt::Write as _;
+    let mut text=String::with_capacity(pages.len()*48);
+    for page in pages {
+        match &page.content {
+            PageContent::Url{url,context}=>{
+                let _=write!(text,"u|{url}|");
+                if let Some(context)=context {
+                    for (name,value) in context {let _=write!(text,"{name}={value};");}
+                }
+                text.push('\n');
+            }
+            PageContent::ZipFile{url,file_path}=>{let _=writeln!(text,"z|{url}|{file_path}");}
+            PageContent::Text(body)=>{let _=writeln!(text,"t|{}",body.len());}
+            PageContent::Image{image_ref,image_data}=>{let _=writeln!(text,"i|{image_ref}|{}",image_data.as_ref().map_or(0,|bytes|bytes.len()));}
+        }
+    }
+    text
+}
+
+fn reset_page_cache(dir:&Path)->anyhow::Result<()> {
+    if !dir.exists(){return Ok(());}
+    for entry in std::fs::read_dir(dir)? {
+        let entry=entry?;
+        let name=entry.file_name();
+        let name=name.to_string_lossy();
+        if name.starts_with("page-"){std::fs::remove_file(entry.path())?;}
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct FetchSummary { done:usize, aborted:bool }
+
+/// The page-list signature is only a fingerprint, and inline images can reuse
+/// the same `image_ref` while two different 4x4 PNGs still have exactly the
+/// same byte length. For an inline page that already has a cached file, compare
+/// the actual bytes; a mismatch invalidates only that one page.
+fn cached_inline_page_matches(dir:&Path,number:usize,page:&Page)->anyhow::Result<bool> {
+    let PageContent::Image{image_data,..}=&page.content else{return Ok(true);};
+    let Some(expected)=image_data else{return Ok(false);};
+    let Some(path)=stored_page(dir,number) else{return Ok(false);};
+    Ok(std::fs::read(path)?==*expected)
+}
+
+/// Downloads only the pages that are not yet stored. Each page is validated by
+/// its real image header, written to `page-NNNN.part`, synced and renamed, so
+/// a page file existing means it was fully written. A stop request between
+/// pages leaves every completed page reusable.
+fn fetch_missing_pages(
+    dir:&Path,
+    pages:&[Page],
+    mut fetch:impl FnMut(&Page)->anyhow::Result<Vec<u8>>,
+    mut progress:impl FnMut(usize,usize),
+    stop:&AtomicU8,
+)->anyhow::Result<FetchSummary> {
+    std::fs::create_dir_all(dir)?;
+    let mut stored=existing_pages(dir);
+    let total=pages.len();
+    let mut done=stored.iter().filter(|number|**number<=total).count();
+    for (index,page) in pages.iter().enumerate() {
+        let number=index+1;
+        if stop.load(Ordering::SeqCst)!=STOP_NONE {return Ok(FetchSummary{done,aborted:true});}
+        if stored.contains(&number) {
+            if cached_inline_page_matches(dir,number,page)? {continue;}
+            if let Some(path)=stored_page(dir,number){std::fs::remove_file(path)?;}
+            stored.remove(&number);
+            done=done.saturating_sub(1);
+        }
+        let bytes = fetch(page)?;
+        let reader = crate::worker::image_reader(&bytes)?;
+        let extension = match reader.format() {
+            Some(image::ImageFormat::Jpeg) => "jpg",
+            Some(image::ImageFormat::Png) => "png",
+            Some(image::ImageFormat::WebP) => "webp",
+            _ => anyhow::bail!("第 {number} 页图像格式暂不支持"),
+        };
+        // A server can return a truncated image with a valid signature.
+        // Decode one page with the reader's limits before marking it complete.
+        drop(reader.decode().with_context(|| format!("第 {number} 页图片不完整或无法解码"))?);
+        let part=dir.join(format!("page-{number:04}.part"));
+        let target=dir.join(format!("page-{number:04}.{extension}"));
+        let mut file=std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&part)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&part,&target)?;
+        stored.insert(number);
+        done+=1;
+        progress(done,total);
+    }
+    Ok(FetchSummary{done,aborted:false})
+}
+
+fn safe_name(title:&str)->String {
+    let mut safe = String::new();
+    for ch in title.chars().take(80) {
+        let ch = if ch.is_control() || "<>:\"/\\|?*".contains(ch) { '_' } else { ch };
+        if safe.len() + ch.len_utf8() > 180 { break; }
+        safe.push(ch);
+    }
+    if safe.trim().is_empty(){"chapter".into()}else{safe}
+}
+
+/// Builds the final CBZ from the validated page files. The archive is written
+/// to a fresh `.part` and renamed only after `finish + sync_all`; any failure
+/// removes just that file, and an existing `.cbz` is never touched.
+fn chapter_archive(root: &Path, task: &DownloadTask) -> PathBuf {
+    let title = safe_name(&format!("{} - {}", task.manga_title, task.chapter_title));
+    root.join("downloads").join(format!("{title}-{}.cbz", task.id))
+}
+
+fn build_cbz(root:&Path,task:&DownloadTask,dir:&Path,total:usize)->anyhow::Result<PathBuf> {
+    let directory=root.join("downloads");
+    std::fs::create_dir_all(&directory)?;
+    let path = chapter_archive(root, task);
+    if path.is_file() { return Ok(path); }
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+    let part = path.with_extension(format!("{nonce}.part"));
+    let file=std::fs::OpenOptions::new().write(true).create_new(true).open(&part)?;
+    let cleanup=PartCleanup::new(&part);
+    let mut zip=zip::ZipWriter::new(file);
+    let options=zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for number in 1..=total {
+        let page=stored_page(dir,number).ok_or_else(||anyhow::anyhow!("第 {number} 页缓存缺失"))?;
+        let bytes=std::fs::read(&page)?;
+        let extension=page.extension().and_then(|ext|ext.to_str()).unwrap_or("jpg");
+        zip.start_file(format!("{number:05}.{extension}"),options)?;
+        zip.write_all(&bytes)?;
+    }
+    zip.finish()?.sync_all()?;
+    cleanup.keep();
+    std::fs::rename(&part,&path)?;
+    Ok(path)
+}
+
+#[derive(Debug)]
+struct LoadedTasks {
+    tasks:Vec<DownloadTask>,
+    /// Present when part of the file was unreadable. The original file is
+    /// never overwritten just because startup could not parse all of it.
+    warning:Option<String>,
+}
+
+fn load_tasks(root:&Path)->anyhow::Result<LoadedTasks> {
+    let path=root.join("download-tasks.json");
+    let bytes=match std::fs::read(&path) {
+        Ok(bytes)=>bytes,
+        Err(error) if error.kind()==std::io::ErrorKind::NotFound=>return Ok(LoadedTasks{tasks:Vec::new(),warning:None}),
+        Err(error)=>return Err(anyhow::anyhow!("读取 {} 失败：{error}",path.display())),
+    };
+    let value=serde_json::from_slice::<serde_json::Value>(&bytes)
+        .map_err(|error|anyhow::anyhow!("下载队列 JSON 损坏：{error}"))?;
+    let Some(items)=value.get("tasks").and_then(|tasks|tasks.as_array()) else {
+        return Err(anyhow::anyhow!("下载队列 JSON 缺少 tasks 数组"));
+    };
+    // Parse task by task: one damaged entry must not discard the rest of the
+    // queue, but tell the user that something was skipped.
+    let mut tasks=Vec::new();
+    let mut skipped=0usize;
+    for item in items {
+        match serde_json::from_value::<DownloadTask>(item.clone()) {
+            Ok(task) if valid_task_id(&task.id)=>tasks.push(task),
+            Err(_)=>skipped+=1,
+            Ok(_)=>skipped+=1,
+        }
+    }
+    let warning=(skipped>0).then(||format!("下载队列有 {skipped} 条损坏记录已跳过，原文件已保留"));
+    Ok(LoadedTasks{tasks,warning})
+}
+
+/// Loads and normalizes the persisted queue. A whole-file failure is surfaced
+/// as a warning and leaves the file untouched; it never turns into a silent
+/// empty queue.
+fn load_queue(root:&Path)->(Vec<DownloadTask>,Option<String>) {
+    match load_tasks(root) {
+        Ok(loaded)=>{
+            let mut tasks=loaded.tasks;
+            normalize_loaded(root, &mut tasks);
+            (tasks,loaded.warning)
+        }
+        Err(error)=>(Vec::new(),Some(format!("下载队列读取失败：{error:#}；原文件已保留，未开始任何下载"))),
+    }
+}
+
+/// Applies the restart policy to tasks loaded from disk: an interrupted
+/// download waits for an explicit "继续"; a finished task whose file vanished
+/// becomes retryable instead of pretending success.
+fn recover_completed_archive(root: &Path, task: &DownloadTask) -> Option<PathBuf> {
+    let archive = chapter_archive(root, task);
+    archive.is_file().then_some(archive)
+}
+
+fn normalize_loaded(root: &Path, tasks: &mut [DownloadTask]) {
+    for task in tasks {
+        if task.status != DownloadStatus::Done
+            && let Some(path) = recover_completed_archive(root, task)
+        {
+            task.status = DownloadStatus::Done;
+            task.cbz = Some(path);
+            task.error = None;
+            task.linked = false;
+            task.pages_done = task.pages_total;
+        } else if task.status==DownloadStatus::Running {
+            task.status=DownloadStatus::Paused;
+            task.error=Some("上次下载中断，点“继续”恢复".into());
+        } else if task.status==DownloadStatus::Done&&!task.cbz.as_ref().is_some_and(|path|path.exists()) {
+            task.status=DownloadStatus::Failed;
+            task.error=Some("下载文件已丢失，可重试".into());
+            task.cbz=None;
+        }
+    }
+}
+
+/// Finished files that still need a library import, in queue order. Used on
+/// start so an import that failed before the last shutdown is retried without
+/// downloading anything again.
+fn pending_imports(tasks:&[DownloadTask])->Vec<String> {
+    tasks.iter()
+        .filter(|task|task.status==DownloadStatus::Done&&!task.linked&&task.cbz.as_ref().is_some_and(|path|path.exists()))
+        .map(|task|task.id.clone())
+        .collect()
+}
+
+enum EnqueueOutcome { Added, Duplicate, AlreadyDownloaded }
+
+/// Adds one task, or explains why not. A finished task whose CBZ still exists
+/// is protected; a finished task whose file disappeared goes back to the queue
+/// and keeps its page cache (the page signature check decides whether that
+/// cache is still valid).
+fn enqueue_task(tasks:&mut Vec<DownloadTask>,task:DownloadTask)->EnqueueOutcome {
+    if let Some(existing)=tasks.iter_mut().find(|existing|existing.id==task.id) {
+        if existing.status==DownloadStatus::Done {
+            if existing.cbz.as_ref().is_some_and(|path|path.exists()){return EnqueueOutcome::AlreadyDownloaded;}
+            existing.status=DownloadStatus::Queued;
+            existing.error=None;
+            existing.cbz=None;
+        }
+        // Re-adding from the manga detail page carries freshly saved complete
+        // objects. Replace the references so a task whose snapshot file was
+        // lost or corrupted can be retried without losing its cached pages.
+        existing.manga_snapshot=task.manga_snapshot;
+        existing.chapter_snapshot=task.chapter_snapshot;
+        if existing.status==DownloadStatus::Failed {
+            existing.status=DownloadStatus::Queued;
+            existing.error=None;
+        }
+        return EnqueueOutcome::Duplicate;
+    }
+    tasks.push(task);
+    EnqueueOutcome::Added
+}
+
+fn next_queued(tasks:&[DownloadTask])->Option<usize> {
+    tasks.iter().position(|task|task.status==DownloadStatus::Queued)
+}
+
+pub struct Sources {
+    root:PathBuf,
+    tx:mpsc::Sender<Task>,
+    rx:mpsc::Receiver<Reply>,
+    installed:Vec<InstalledSource>,
+    repository:Option<RepositoryIndex>,
+    results:ResultsState,
+    chapters:Vec<Chapter>,
+    selected_source:String,
+    selected_manga:Option<Manga>,
+    url:String,
+    query:String,
+    busy:bool,
+    status:String,
+    tasks:Vec<DownloadTask>,
+    running:Option<String>,
+    ready:VecDeque<String>,
+    /// Import attempts that are really in flight, kept only in memory.
+    /// `ack_downloaded` or `import_failed` clears the entry; while it is
+    /// present the UI never offers a duplicate retry for the same file.
+    import_attempts:HashSet<String>,
+    dl_tx:mpsc::Sender<DlCmd>,
+    dl_rx:mpsc::Receiver<DlEvent>,
+    dl_stop:Arc<AtomicU8>,
+}
+impl Sources {
+    pub fn new(root:PathBuf,ctx:Context)->Self {
+        let(tx,rx_task)=mpsc::channel();
+        let(tx_reply,rx)=mpsc::channel();
+        let meta_root=root.clone();
+        let meta_ctx=ctx.clone();
+        thread::Builder::new().name("yejian-sources".into()).spawn(move||{
+            let catalog=SourceCatalog::new(meta_root.join("sources"));
+            let mut engines=std::collections::HashMap::<String,SourceEngine>::new();
+            let send=|reply|{let _=tx_reply.send(reply);meta_ctx.request_repaint();};
+            while let Ok(task)=rx_task.recv() {
+                let page=match &task{Task::Search{page,..}=>Some(*page),_=>None};
+                let result=(||->anyhow::Result<()> {
+                    match task {
+                        Task::List=>send(Reply::Installed(catalog.list()?)),
+                        Task::Fetch(url)=> {
+                            let installer=SourceInstaller::new(SourceCatalog::new(catalog.root()))?;
+                            send(Reply::Repository(installer.fetch_index(&url)?));
+                        }
+                        Task::Install(entry)=>{
+                            let installer=SourceInstaller::new(SourceCatalog::new(catalog.root()))?;
+                            installer.install_entry(&entry)?;
+                            engines.remove(&entry.id);
+                            send(Reply::Installed(catalog.list()?));
+                        }
+                        Task::Search{source,query,page}=>{
+                            if !engines.contains_key(&source){engines.insert(source.clone(),SourceEngine::load(&catalog,&source)?);}
+                            let result=pollster::block_on(engines[&source].search_page(&query,page,Vec::new()))?;
+                            send(Reply::Results{source,query,page,entries:result.entries,has_next:result.has_next_page});
+                        }
+                        Task::Chapters(source,manga)=>{
+                            if !engines.contains_key(&source){engines.insert(source.clone(),SourceEngine::load(&catalog,&source)?);}
+                            let engine=&engines[&source];
+                            let detail=pollster::block_on(engine.manga_details(&manga.key))?;
+                            let chapters=pollster::block_on(engine.chapters(&manga.key))?;
+                            send(Reply::Chapters(source,detail,chapters));
+                        }
+                    } Ok(())
+                })();
+                if let Err(error)=result {send(Reply::Error(page,format!("{error:#}")));}
+            }
+        }).expect("Unable to start source worker");
+
+        // Downloads live on their own thread and run one task at a time, so a
+        // slow image server never blocks search, chapter loading or the UI.
+        let(dl_tx,dl_cmd_rx)=mpsc::channel::<DlCmd>();
+        let(dl_ev_tx,dl_rx)=mpsc::channel::<DlEvent>();
+        let dl_stop=Arc::new(AtomicU8::new(STOP_NONE));
+        {
+            let root=root.clone();
+            let ctx=ctx.clone();
+            let stop=dl_stop.clone();
+            thread::Builder::new().name("yejian-downloads".into()).spawn(move||{
+                let catalog=SourceCatalog::new(root.join("sources"));
+                let mut engines=std::collections::HashMap::<String,SourceEngine>::new();
+                let send=|event|{let _=dl_ev_tx.send(event);ctx.request_repaint();};
+                while let Ok(DlCmd::Run(task))=dl_cmd_rx.recv() {
+                    let id=task.id.clone();
+                    let lock=match acquire_download_lock(&root) {
+                        Ok(lock)=>lock,
+                        Err(error)=>{
+                            let _=send(DlEvent::LockUnavailable{id,error:format!("{error:#}")});
+                            continue;
+                        }
+                    };
+                    let outcome=(||->anyhow::Result<Outcome> {
+                        if stop.load(Ordering::SeqCst)!=STOP_NONE {
+                            return Ok(Outcome::Aborted{how:stop.load(Ordering::SeqCst)});
+                        }
+                        if let Some(path) = recover_completed_archive(&root, &task) {
+                            return Ok(Outcome::Done { path });
+                        }
+                        if !engines.contains_key(&task.source_id){engines.insert(task.source_id.clone(),SourceEngine::load(&catalog,&task.source_id)?);}
+                        let engine=&engines[&task.source_id];
+                        let pages=pollster::block_on(engine.pages_with(task.manga_for(&root)?,task.chapter_for()?))?;
+                        execute_task(&root,&task,pages,&stop,|page|page_bytes(engine,page),|done,total,signature|{
+                            send(DlEvent::Progress{id:id.clone(),done,total,signature});
+                        })
+                    })();
+                    drop(lock);
+                    match outcome {
+                        Ok(Outcome::Done{path})=>{
+                            let _=send(DlEvent::Finished{id,path});
+                        }
+                        Ok(Outcome::Aborted{how})=>{let _=send(DlEvent::Aborted{id,how});}
+                        Err(error)=>{let _=send(DlEvent::Failed{id,error:format!("{error:#}")});}
+                    }
+                }
+            }).expect("Unable to start download worker");
+        }
+
+        let(tasks,load_warning)=load_queue(&root);
+        let ready:VecDeque<String>=pending_imports(&tasks).into();
+        let sources=Self {
+            root,
+            tx,
+            rx,
+            installed:Vec::new(),
+            repository:None,
+            results:ResultsState::default(),
+            chapters:Vec::new(),
+            selected_source:String::new(),
+            selected_manga:None,
+            url:String::new(),
+            query:String::new(),
+            busy:false,
+            status:load_warning.clone().unwrap_or_default(),
+            tasks,
+            running:None,
+            ready,
+            import_attempts:HashSet::new(),
+            dl_tx,
+            dl_rx,
+            dl_stop,
+        };
+        // Never overwrite a file that startup could not fully parse.
+        if load_warning.is_none() {
+            let mut sources=sources;
+            if let Err(error)=sources.persist() {
+                sources.status=format!("初始化下载队列失败：{error:#}；原有存档未被覆盖");
+            }
+            let _=sources.tx.send(Task::List);
+            return sources;
+        }
+        let _=sources.tx.send(Task::List);
+        sources
+    }
+
+    /// Pops one finished chapter for the library importer. Call in a loop:
+    /// several downloads can finish between two frames, and every id is kept
+    /// until taken.
+    pub fn take_downloaded(&mut self)->Option<DownloadedChapter>{
+        while let Some(id)=self.ready.pop_front() {
+            let Some(task)=self.tasks.iter().find(|task|task.id==id) else{continue;};
+            if task.status!=DownloadStatus::Done||task.linked{continue;}
+            let Some(path)=task.cbz.clone() else{continue;};
+            if !path.exists(){continue;}
+            self.import_attempts.insert(task.id.clone());
+            return Some(DownloadedChapter{id:task.id.clone(),path,metadata:task.metadata()});
+        }
+        None
+    }
+
+    /// Marks one finished chapter as imported and linked. Call only after both
+    /// `import` and `link_chapter` succeeded; otherwise the file stays pending
+    /// and is offered again on the next start without re-downloading it.
+    pub fn ack_downloaded(&mut self,id:&str) {
+        self.import_attempts.remove(id);
+        let mut changed=false;
+        if let Some(task)=self.tasks.iter_mut().find(|task|task.id==id) {
+            task.linked=true;
+            changed=true;
+        }
+        if changed {
+            if let Err(error)=self.persist() {
+                self.status=format!("已加入书架，但队列状态保存失败：{error:#}；重启后可能重复导入此文件");
+            }
+        }
+    }
+
+    /// Puts a chapter back at the front of the import queue, for a same-session
+    /// retry after a failed import. The CBZ is never re-downloaded.
+    pub fn requeue_import(&mut self,id:&str) {
+        self.import_attempts.remove(id);
+        if self.tasks.iter().any(|task|task.id==id&&task.status==DownloadStatus::Done&&!task.linked&&task.cbz.as_ref().is_some_and(|path|path.exists()))
+            && !self.ready.iter().any(|queued|queued==id) {
+            self.ready.push_front(id.to_string());
+        }
+    }
+
+    /// Reports a failed library import/link for a downloaded file. The CBZ is
+    /// kept and the task stays `Done`/unlinked; the UI shows an immediate
+    /// manual retry instead of silently re-offering or re-downloading it.
+    pub fn import_failed(&mut self,id:&str,error:&str) {
+        self.import_attempts.remove(id);
+        self.status=format!("加入书架失败：{error}；文件已保留，可点“重试导入”");
+    }
+
+    fn persist(&self)->anyhow::Result<()> {
+        let store=TaskStore{tasks:self.tasks.clone()};
+        let bytes=serde_json::to_vec(&store)
+            .map_err(|error|anyhow::anyhow!("序列化下载队列失败：{error}"))?;
+        std::fs::create_dir_all(&self.root)
+            .map_err(|error|anyhow::anyhow!("创建数据目录失败：{error}"))?;
+        let path=self.root.join("download-tasks.json");
+        let tmp=self.root.join("download-tasks.json.tmp");
+        let result:std::io::Result<()>=(||{
+            std::fs::write(&tmp,&bytes)?;
+            std::fs::rename(&tmp,&path)?;
+            Ok(())
+        })();
+        if let Err(error)=result {
+            let _=std::fs::remove_file(&tmp);
+            return Err(anyhow::anyhow!("写入 {} 失败：{error}",path.display()));
+        }
+        Ok(())
+    }
+
+    fn submit(&mut self,task:Task) {
+        if self.tx.send(task).is_err(){self.status="书源线程已停止，请重新打开应用".into();}
+        else {self.busy=true;self.status="正在加载…".into();}
+    }
+    fn select_source(&mut self,id:&str) {
+        if apply_source_change(&mut self.selected_source,&mut self.results,&mut self.selected_manga,&mut self.chapters,id){self.status.clear();}
+    }
+    /// New search from the text field: page one of this source and query.
+    fn start_search(&mut self) {
+        let source=self.selected_source.clone();
+        if source.is_empty(){return;}
+        let query=self.query.trim().to_string();
+        self.query=query.clone();
+        self.results.begin(&source,&query);
+        self.selected_manga=None;
+        self.chapters.clear();
+        self.submit(Task::Search{source,query,page:1});
+    }
+    fn load_next_page(&mut self) {
+        if let Some((source,query,page))=self.results.next_page(){self.submit(Task::Search{source,query,page});}
+    }
+    fn open_manga(&mut self,manga:Manga) {
+        let source=if manga.source_key.is_empty(){self.results.source.clone()}else{manga.source_key.clone()};
+        if source.is_empty(){self.status="请先选择并搜索一个书源".into();return;}
+        self.selected_manga=None;
+        self.chapters.clear();
+        self.submit(Task::Chapters(source,manga));
+    }
+
+    // -- download queue ----------------------------------------------------
+
+    fn source_for(&self,manga:&Manga)->String {
+        if manga.source_key.is_empty(){self.selected_source.clone()}else{manga.source_key.clone()}
+    }
+    fn chapter_state(&self,source:&str,manga:&str,chapter:&str)->Option<String> {
+        let id=identity_id(source,manga,chapter);
+        self.tasks.iter().find(|task|task.id==id).map(|task|task.status.label().to_string())
+    }
+    /// A failed chapter may be joined again from its manga detail page; that
+    /// path also rewrites the saved Manga/Chapter snapshots.
+    fn chapter_failed(&self,source:&str,manga:&str,chapter:&str)->bool {
+        let id=identity_id(source,manga,chapter);
+        self.tasks.iter().any(|task|task.id==id&&task.status==DownloadStatus::Failed)
+    }
+    fn enqueue_chapter(&mut self,manga:&Manga,chapter:&Chapter) {
+        let source=self.source_for(manga);
+        if source.is_empty(){self.status="请先选择并搜索一个书源".into();return;}
+        let mut snapshot_manga=manga.clone();
+        snapshot_manga.source_key=source.clone();
+        let snapshot_key=match save_manga_snapshot(&self.root,&snapshot_manga) {
+            Ok(key)=>key,
+            Err(error)=>{self.status=format!("无法保存漫画快照，未开始下载：{error:#}");return;}
+        };
+        let mut task=DownloadTask::from_chapter(&source,manga,chapter);
+        task.manga_snapshot=Some(snapshot_key);
+        let id=task.id.clone();
+        let title=task.chapter_title.clone();
+        let was_failed=self.tasks.iter().any(|task|task.id==id&&task.status==DownloadStatus::Failed);
+        match enqueue_task(&mut self.tasks,task) {
+            EnqueueOutcome::Added=>{
+                if let Err(error)=self.persist() {
+                    self.tasks.retain(|task|task.id!=id);
+                    self.status=format!("无法保存下载队列，未开始下载：{error:#}");
+                    return;
+                }
+                self.status=format!("已加入下载队列：{title}");
+                self.pump();
+            }
+            EnqueueOutcome::Duplicate=>{
+                if let Err(error)=self.persist() {
+                    self.status=format!("无法保存下载队列，未开始下载：{error:#}");
+                    return;
+                }
+                self.status=if was_failed{format!("已用完整快照重新加入：{title}")}else{format!("{title} 已在下载队列中")};
+                self.pump();
+            }
+            EnqueueOutcome::AlreadyDownloaded=>self.status=format!("{title} 已下载完成"),
+        }
+    }
+    fn enqueue_missing(&mut self,manga:&Manga) {
+        let source=self.source_for(manga);
+        if source.is_empty(){return;}
+        let mut snapshot_manga=manga.clone();
+        snapshot_manga.source_key=source.clone();
+        let snapshot_key=match save_manga_snapshot(&self.root,&snapshot_manga) {
+            Ok(key)=>key,
+            Err(error)=>{self.status=format!("无法保存漫画快照，未开始下载：{error:#}");return;}
+        };
+        let mut added=0usize;
+        let mut added_ids=Vec::new();
+        for chapter in self.chapters.clone() {
+            if chapter.locked{continue;}
+            let mut task=DownloadTask::from_chapter(&source,manga,&chapter);
+            task.manga_snapshot=Some(snapshot_key.clone());
+            let id=task.id.clone();
+            if matches!(enqueue_task(&mut self.tasks,task),EnqueueOutcome::Added){added+=1;added_ids.push(id);}
+        }
+        if let Err(error)=self.persist() {
+            self.tasks.retain(|task|!added_ids.contains(&task.id));
+            self.status=format!("无法保存下载队列，未开始下载：{error:#}");
+            return;
+        }
+        self.status=if added==0{"没有需要加入的章节".into()}else{format!("已加入 {added} 个章节")};
+        self.pump();
+    }
+    /// Dispatches the next queued task when the single download slot is free.
+    fn pump(&mut self) {
+        if self.running.is_some(){return;}
+        let Some(index)=next_queued(&self.tasks) else{return;};
+        let previous=self.tasks[index].status;
+        self.tasks[index].status=DownloadStatus::Running;
+        self.tasks[index].error=None;
+        let id=self.tasks[index].id.clone();
+        let task=self.tasks[index].clone();
+        if let Err(error)=self.persist() {
+            self.tasks[index].status=previous;
+            self.status=format!("无法保存下载队列，暂不开始下载：{error:#}");
+            return;
+        }
+        self.dl_stop.store(STOP_NONE,Ordering::SeqCst);
+        self.running=Some(id.clone());
+        if self.dl_tx.send(DlCmd::Run(task)).is_err() {
+            self.running=None;
+            if let Some(task)=self.tasks.iter_mut().find(|task|task.id==id) {
+                task.status=DownloadStatus::Failed;
+                task.error=Some("下载线程已停止，请重新打开应用".into());
+            }
+            if let Err(error)=self.persist() {
+                self.status=format!("下载线程已停止，且队列状态保存失败：{error:#}");
+            } else {
+                self.status="下载线程已停止，请重新打开应用".into();
+            }
+        }
+    }
+    fn set_task_queued(&mut self,id:&str) {
+        let Some(position)=self.tasks.iter().position(|task|task.id==id) else{return;};
+        let mut task=self.tasks.remove(position);
+        let previous=task.clone();
+        task.status=DownloadStatus::Queued;
+        task.error=None;
+        // Explicit continue/retry runs this task next, even if older
+        // queued tasks are still waiting.
+        self.tasks.insert(0,task);
+        if let Err(error)=self.persist() {
+            let _=self.tasks.remove(0);
+            self.tasks.insert(position.min(self.tasks.len()),previous);
+            self.status=format!("无法保存下载队列，未开始下载：{error:#}");
+            return;
+        }
+        self.pump();
+    }
+    fn request_pause(&mut self) {
+        self.dl_stop.store(STOP_PAUSE,Ordering::SeqCst);
+        self.status="已请求暂停，当前图片请求结束后生效".into();
+    }
+    /// Retry a failed task. In a manga detail view the fresh complete
+    /// Manga/Chapter are on hand, so rebuild the snapshots through the normal
+    /// enqueue path instead of retrying a broken one; elsewhere just requeue.
+    fn retry_task(&mut self,task:&DownloadTask) {
+        if let Some(manga)=self.selected_manga.clone() {
+            if let Some(chapter)=self.chapters.iter().find(|chapter|chapter.key==task.chapter_id).cloned() {
+                self.enqueue_chapter(&manga,&chapter);
+                return;
+            }
+        }
+        self.set_task_queued(&task.id);
+    }
+    fn request_cancel(&mut self,id:&str) {
+        if self.running.as_deref()==Some(id) {
+            self.dl_stop.store(STOP_CANCEL,Ordering::SeqCst);
+            self.status="已请求取消，当前图片请求结束后生效".into();
+        } else {
+            if self.remove_task_now(id,"已从下载队列移除"){self.pump();}
+        }
+    }
+    /// Removes a task and only that task's staging directory. Downloaded CBZ
+    /// files, other tasks and the library are never touched.
+    fn remove_task_now(&mut self,id:&str,success:&str)->bool {
+        self.import_attempts.remove(id);
+        let Some(position)=self.tasks.iter().position(|task|task.id==id) else{return true;};
+        let removed=self.tasks.remove(position);
+        if let Err(error)=self.persist() {
+            self.tasks.insert(position.min(self.tasks.len()),removed);
+            self.status=format!("无法保存下载队列，任务未移除：{error:#}");
+            return false;
+        }
+        let cleanup=remove_task_cache(&self.root,id);
+        self.status=match cleanup {
+            Ok(())=>success.to_string(),
+            Err(error)=>format!("{success}，但缓存未清理：{error:#}"),
+        };
+        true
+    }
+    fn handle_download_event(&mut self,event:DlEvent) {
+        match event {
+            DlEvent::Progress{id,done,total,signature}=>{
+                if let Some(task)=self.tasks.iter_mut().find(|task|task.id==id) {
+                    task.pages_done=done;
+                    task.pages_total=total;
+                    if signature.is_some(){task.pages_signature=signature;}
+                }
+                if let Err(error)=self.persist() {
+                    self.status=format!("下载队列保存失败：{error:#}；下载继续进行");
+                }
+            }
+            DlEvent::Finished{id,path}=>{
+                if let Some(task)=self.tasks.iter_mut().find(|task|task.id==id) {
+                    task.status=DownloadStatus::Done;
+                    task.error=None;
+                    task.cbz=Some(path.clone());
+                    task.pages_done=task.pages_total;
+                    task.linked=false;
+                }
+                if !self.ready.iter().any(|queued|queued==&id){self.ready.push_back(id.clone());}
+                self.running=None;
+                self.status="章节下载完成，正在加入书架".into();
+                if let Err(error)=self.persist() {
+                    self.status=format!("章节已下载，但队列状态保存失败：{error:#}；文件已保留");
+                    return;
+                }
+                self.pump();
+            }
+            DlEvent::Failed{id,error}=>{
+                if let Some(task)=self.tasks.iter_mut().find(|task|task.id==id) {
+                    task.status=DownloadStatus::Failed;
+                    task.error=Some(error.clone());
+                }
+                self.running=None;
+                self.status=format!("章节下载失败：{error}");
+                if let Err(error)=self.persist() {
+                    self.status=format!("章节下载失败，且队列状态保存失败：{error:#}");
+                    return;
+                }
+                // A failed chapter must not block the rest of the queue.
+                self.pump();
+            }
+            DlEvent::Aborted{id,how}=>{
+                self.running=None;
+                if how==STOP_CANCEL {
+                    if self.remove_task_now(&id,"已取消下载"){self.pump();}
+                } else {
+                    if let Some(task)=self.tasks.iter_mut().find(|task|task.id==id) {
+                        task.status=DownloadStatus::Paused;
+                        task.error=None;
+                    }
+                    self.status="下载已暂停，可稍后继续".into();
+                    if let Err(error)=self.persist() {
+                        self.status=format!("下载已暂停，但队列状态保存失败：{error:#}");
+                        return;
+                    }
+                    self.pump();
+                }
+            }
+            DlEvent::LockUnavailable{id,error}=>{
+                self.running=None;
+                if let Some(task)=self.tasks.iter_mut().find(|task|task.id==id) {
+                    task.status=DownloadStatus::Paused;
+                    task.error=Some(error.clone());
+                }
+                self.status=format!("{error}；未改动任何缓存");
+                if let Err(persist_error)=self.persist() {
+                    self.status=format!("{error}；且队列状态保存失败：{persist_error:#}");
+                }
+                // Another instance still owns the lock. Do not immediately
+                // retry the next queued task or hammer the same lock.
+            }
+        }
+    }
+
+    pub fn poll(&mut self) {
+        while let Ok(reply)=self.rx.try_recv(){
+            self.busy=false;
+            match reply {
+                Reply::Installed(list)=>{self.installed=list;self.status="书源列表已更新".into();}
+                Reply::Repository(index)=>{self.status=format!("找到 {} 个书源",index.sources.len());self.repository=Some(index);}
+                Reply::Results{source,query,page,entries,has_next}=>{
+                    if self.results.accept(&source,&query,page,entries,has_next){
+                        self.selected_source=source;
+                        self.status=if has_next{format!("已加载第 {page} 页，可继续加载下一页")}
+                            else if page>1{format!("已加载到第 {page} 页，没有更多结果")}
+                            else{"搜索完成".into()};
+                    }
+                }
+                Reply::Chapters(source,manga,list)=>{
+                    if source==self.selected_source{self.selected_manga=Some(manga);self.chapters=list;self.status.clear();}
+                }
+                Reply::Error(page,text)=>self.status=match page {
+                    Some(page) if page>1=>format!("第 {page} 页加载失败，可点“加载下一页”重试：{text}"),
+                    Some(_)=>format!("搜索失败，可重试：{text}"),
+                    None=>format!("未完成：{text}"),
+                },
+            }
+        }
+        while let Ok(event)=self.dl_rx.try_recv(){self.handle_download_event(event);}
+    }
+
+    fn download_row(&mut self,ui:&mut Ui,task:&DownloadTask) {
+        // A long failure message used to share one horizontal row with the
+        // title and the action buttons. That pushed the buttons past the right
+        // edge on a 390px screen and also widened the whole page, which in turn
+        // stretched the repository URL input. Keep the row inside the page
+        // width and stack title / state / reason / actions.
+        let width=ui.available_width().max(160.);
+        ui.allocate_ui_with_layout(vec2(width,0.),Layout::top_down(Align::Min),|ui|{
+            ui.set_max_width(width);
+            let title=if self.selected_manga.is_none(){
+                format!("{} · {}",task.manga_title,task.chapter_title)
+            } else {
+                task.chapter_title.clone()
+            };
+            ui.add(Label::new(RichText::new(title).strong()).truncate());
+            let state=match task.status {
+                DownloadStatus::Running if task.pages_total>0=>format!("{} {}/{}",task.status.label(),task.pages_done,task.pages_total),
+                DownloadStatus::Done if task.cbz.is_some()&&task.linked=>"已完成".to_string(),
+                DownloadStatus::Done if task.cbz.is_some()=>"已完成，待加入书架".to_string(),
+                status=>status.label().to_string(),
+            };
+            ui.add(Label::new(state).truncate());
+            if let Some(error)=&task.error{
+                ui.add(Label::new(error).wrap());
+            }
+            ui.add_space(4.);
+            ui.horizontal_wrapped(|ui|{
+                match task.status {
+                    DownloadStatus::Queued=>{
+                        if ui.button("开始").clicked(){self.set_task_queued(&task.id);}
+                        if ui.button("取消").clicked(){self.request_cancel(&task.id);}
+                    }
+                    DownloadStatus::Running=>{
+                        if ui.button("暂停").clicked(){self.request_pause();}
+                        if ui.button("取消").clicked(){self.request_cancel(&task.id);}
+                    }
+                    DownloadStatus::Paused=>{
+                        if ui.button("继续").clicked(){self.set_task_queued(&task.id);}
+                        if ui.button("取消").clicked(){self.request_cancel(&task.id);}
+                    }
+                    DownloadStatus::Failed=>{
+                        if ui.button("重试").clicked(){self.retry_task(task);}
+                        if ui.button("取消").clicked(){self.request_cancel(&task.id);}
+                    }
+                    DownloadStatus::Done=>{
+                        if !task.linked {
+                            if self.import_attempts.contains(&task.id) {
+                                ui.add(Label::new("正在加入书架…"));
+                            } else if ui.button("加入书架 / 重试导入").clicked(){
+                                self.requeue_import(&task.id);
+                            }
+                        }
+                    }
+                }
+            });
+        });
+        ui.add_space(10.);
+    }
+
+    pub fn ui(&mut self,ui:&mut Ui) {
+        self.poll();
+        ScrollArea::vertical().show(ui,|ui|{
+            // Never let one long row stretch the page beyond the viewport; rows
+            // truncate or wrap inside this width instead.
+            ui.set_max_width(ui.available_width());
+            if self.selected_manga.is_none() {
+                let unfinished:Vec<DownloadTask>=self.tasks.iter().filter(|task|task.status!=DownloadStatus::Done).cloned().collect();
+                if !unfinished.is_empty() {
+                    CollapsingHeader::new(format!("下载队列（{}）",unfinished.len())).default_open(true).show(ui,|ui|{
+                        for task in &unfinished{self.download_row(ui,task);}
+                    });
+                    ui.add_space(8.);
+                }
+                ui.label("添加 Aidoku 书源仓库");
+                ui.horizontal(|ui|{
+                    let row=ui.available_width();
+                    ui.set_max_width(row);
+                    ui.add_enabled(!self.busy,TextEdit::singleline(&mut self.url).hint_text("仓库列表 URL").desired_width((row-92.).max(120.)));
+                    if ui.add_enabled(!self.busy,Button::new("读取")).clicked(){self.submit(Task::Fetch(self.url.trim().into()));}
+                });
+                if let Some(repo)=self.repository.clone(){
+                    ui.add_space(10.);
+                    CollapsingHeader::new(repo.name.unwrap_or_else(||"可安装书源".into())).default_open(true).show(ui,|ui|{
+                        for source in repo.sources.iter().take(400) {
+                            ui.horizontal(|ui|{
+                                // Place the button first from the right so a long
+                                // repository name can only truncate, never push
+                                // the button off screen.
+                                ui.with_layout(Layout::right_to_left(Align::Center),|ui|{
+                                    let label=if self.installed.iter().any(|s|s.manifest.id==source.id){"更新"}else{"安装"};
+                                    if ui.add_enabled(!self.busy,Button::new(label)).clicked(){self.submit(Task::Install(source.clone()));}
+                                    ui.with_layout(Layout::left_to_right(Align::Center),|ui|{
+                                        let mut text=source.name.clone();
+                                        if !source.languages.is_empty(){text.push_str("  ");text.push_str(&source.languages.join(" / "));}
+                                        ui.add(Label::new(text).truncate());
+                                    });
+                                });
+                            });
+                        }
+                    });
+                }
+                ui.add_space(20.);ui.heading("已安装");
+                if self.installed.is_empty(){ui.label("添加仓库并安装一个书源后，即可在这里搜索漫画。");}
+                for source in self.installed.clone(){
+                    if ui.selectable_label(self.selected_source==source.manifest.id,&source.manifest.name).clicked(){self.select_source(&source.manifest.id);}
+                }
+                if !self.selected_source.is_empty(){
+                    ui.horizontal(|ui|{
+                        let row=ui.available_width();
+                        ui.set_max_width(row);
+                        ui.add_enabled(!self.busy,TextEdit::singleline(&mut self.query).hint_text("漫画名称").desired_width((row-92.).max(120.)));
+                        if ui.add_enabled(!self.busy,Button::new("搜索")).clicked(){self.start_search();}
+                    });
+                }
+                ui.add_space(12.);
+                for manga in self.results.entries.clone(){
+                    if ui.add_enabled(!self.busy,Button::new(&manga.title).min_size(vec2(ui.available_width(),42.))).clicked(){self.open_manga(manga);}
+                }
+                if self.results.has_more {
+                    let next=self.results.page+1;
+                    ui.add_space(8.);
+                    if ui.add_enabled(!self.busy,Button::new(format!("加载下一页（第 {next} 页）")).min_size(vec2(ui.available_width(),40.))).clicked(){self.load_next_page();}
+                }
+            } else {
+                if ui.button("返回搜索结果").clicked(){self.selected_manga=None;self.chapters.clear();return;}
+                let manga=self.selected_manga.clone().unwrap();
+                let source=if manga.source_key.is_empty(){self.selected_source.clone()}else{manga.source_key.clone()};
+                ui.heading(&manga.title);
+                if let Some(description)=&manga.description {ui.label(description);}
+                ui.add_space(12.);
+                let missing=self.chapters.iter().filter(|chapter|!chapter.locked&&self.chapter_state(&source,&manga.key,&chapter.key).is_none()).count();
+                if ui.add_enabled(missing>0&&!self.busy,Button::new(format!("加入未下载章节（{missing}）"))).clicked(){self.enqueue_missing(&manga);}
+                let queue:Vec<DownloadTask>=self.tasks.iter().filter(|task|task.source_id==source&&task.manga_id==manga.key).cloned().collect();
+                if !queue.is_empty(){
+                    ui.add_space(8.);
+                    ui.label("下载队列");
+                    for task in &queue{self.download_row(ui,task);}
+                }
+                ui.add_space(12.);
+                for chapter in self.chapters.clone(){
+                    let name=chapter.title.clone().unwrap_or_else(||chapter.chapter_number.map(|n|format!("第 {n} 话")).unwrap_or_else(||chapter.key.clone()));
+                    let state=self.chapter_state(&source,&manga.key,&chapter.key);
+                    let failed=self.chapter_failed(&source,&manga.key,&chapter.key);
+                    let enabled=!self.busy&&!chapter.locked&&(state.is_none()||failed);
+                    let label=if failed{format!("{name}    ↻ 重新加入")}else{format!("{name}    ↓ 下载")};
+                    ui.horizontal(|ui|{
+                        if ui.add_enabled(enabled,Button::new(label).min_size(vec2((ui.available_width()*0.7).max(160.),42.))).clicked(){
+                            self.enqueue_chapter(&manga,&chapter);
+                        }
+                        if let Some(state)=state{ui.small(state);}
+                    });
+                }
+            }
+            if self.selected_manga.is_none() {
+                let pending:Vec<(String,String,String)>=self.tasks.iter()
+                    .filter(|task|task.status==DownloadStatus::Done&&!task.linked&&task.cbz.as_ref().is_some_and(|path|path.exists()))
+                    .map(|task|(task.id.clone(),task.manga_title.clone(),task.chapter_title.clone()))
+                    .collect();
+                if !pending.is_empty() {
+                    ui.add_space(12.);
+                    ui.heading("待加入书架");
+                    for (id,manga,chapter) in pending {
+                        ui.horizontal(|ui|{
+                            ui.with_layout(Layout::right_to_left(Align::Center),|ui|{
+                                if self.import_attempts.contains(&id) {
+                                    ui.add(Label::new("正在加入书架…"));
+                                } else if ui.button("加入书架 / 重试导入").clicked(){
+                                    self.requeue_import(&id);
+                                }
+                                ui.with_layout(Layout::left_to_right(Align::Center),|ui|{
+                                    ui.add(Label::new(format!("{manga} - {chapter}")).truncate());
+                                });
+                            });
+                        });
+                    }
+                }
+            }
+            if !self.status.is_empty(){ui.add_space(12.);ui.label(&self.status);}
+        });
+    }
+}
+
+impl Drop for Sources {
+    fn drop(&mut self) {
+        // Do not block window/Activity teardown. The worker notices this after
+        // the current HTTP request finishes, then exits and releases its lock.
+        self.dl_stop.store(STOP_PAUSE,Ordering::SeqCst);
+    }
+}
+
+#[derive(Debug)]
+enum Outcome { Done{path:PathBuf}, Aborted{how:u8} }
+
+fn request(engine:&SourceEngine,url:String,headers:Vec<(String,String)>,body:Option<Vec<u8>>)->anyhow::Result<Vec<u8>>{
+    let response=pollster::block_on(engine.http_request(NetRequestData{method:if body.is_some(){"POST"}else{"GET"}.into(),url,headers,body,timeout_ms:60000}))?;
+    if let Some(error)=response.error{anyhow::bail!("{error}");}
+    anyhow::ensure!((200..300).contains(&response.status_code),"图片服务器返回 HTTP {}",response.status_code);
+    anyhow::ensure!(response.body.len()<=64*1024*1024,"单页图片超过 64 MB");
+    Ok(response.body)
+}
+fn page_bytes(engine:&SourceEngine,page:&Page)->anyhow::Result<Vec<u8>>{
+    match &page.content {
+        PageContent::Url{url,context}=>{
+            let modified=pollster::block_on(engine.image_request(url,context.clone()))?;
+            if let Some(req)=modified {request(engine,req.url,req.headers,req.body)}
+            else{request(engine,url.clone(),vec![],None)}
+        }
+        PageContent::Image{image_data:Some(bytes),..}=>Ok(bytes.clone()),
+        PageContent::ZipFile{url,file_path}=>{
+            let bytes=request(engine,url.clone(),vec![],None)?;
+            let mut zip=zip::ZipArchive::new(std::io::Cursor::new(bytes))?;
+            let mut entry=zip.by_name(file_path)?;
+            anyhow::ensure!(entry.size()<=64*1024*1024,"单页图片超过 64 MB");
+            let mut data=Vec::new();entry.read_to_end(&mut data)?;Ok(data)
+        }
+        PageContent::Text(_)=>anyhow::bail!("此章节包含文字页，当前漫画阅读模式无法显示"),
+        _=>anyhow::bail!("书源未返回有效图像数据"),
+    }
+}
+
+/// Runs one download job to completion (or a pause/cancel checkpoint).
+///
+/// Kept separate from the worker thread so tests can execute the real page
+/// staging, cache reuse and CBZ build paths with local pages instead of only
+/// flipping task statuses.
+fn execute_task(
+    root:&Path,
+    task:&DownloadTask,
+    pages:Vec<Page>,
+    stop:&AtomicU8,
+    mut fetch:impl FnMut(&Page)->anyhow::Result<Vec<u8>>,
+    mut report:impl FnMut(usize,usize,Option<String>),
+)->anyhow::Result<Outcome> {
+    anyhow::ensure!(!pages.is_empty(),"这一章没有可读页面");
+    let dir=task_dir(root,&task.id)?;
+    let signature=page_signature(&pages);
+    let signature_file = dir.join("page-list.v2");
+    let recorded = match std::fs::read_to_string(&signature_file) {
+        Ok(previous) => Some(previous),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if recorded.as_deref() != Some(signature.as_str()) {
+        if recorded.is_none() && task.pages_signature.as_deref() == Some(signature.as_str()) {
+            // Old queues kept only the signature and accepted image headers.
+            // Keep every legacy page the current reader can actually display.
+            for number in existing_pages(&dir) {
+                if let Some(path) = stored_page(&dir, number) {
+                    let bytes = std::fs::read(&path)?;
+                    if crate::worker::image_reader(&bytes).and_then(|r| Ok(r.decode()?)).is_err() {
+                        std::fs::remove_file(path)?;
+                    }
+                }
+            }
+        } else {
+            reset_page_cache(&dir)?;
+        }
+        std::fs::create_dir_all(&dir)?;
+        let part = dir.join("page-list.part");
+        let mut file = std::fs::File::create(&part)?;
+        file.write_all(signature.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&part, &signature_file)?;
+    }
+    if task.pages_signature.as_deref() != Some(signature.as_str()) {
+        report(0, pages.len(), Some(signature));
+    }
+    let summary=fetch_missing_pages(&dir,&pages,&mut fetch,|done,total|report(done,total,None),stop)?;
+    let how=stop.load(Ordering::SeqCst);
+    if summary.aborted||how!=STOP_NONE {
+        return Ok(Outcome::Aborted{how:if how==STOP_NONE{STOP_PAUSE}else{how}});
+    }
+    anyhow::ensure!(summary.done == pages.len(), "章节存在未完成的图片");
+    let path=build_cbz(root,task,&dir,pages.len())?;
+    // The CBZ is already complete; a cleanup problem must not turn a real
+    // download into a failed task or delete anything outside this cache.
+    let _=remove_task_cache(root,&task.id);
+    Ok(Outcome::Done{path})
+}
+
+/// Removes the `.part` file created by one CBZ build when writing fails before
+/// the archive is complete. Final `.cbz` files are never touched.
+struct PartCleanup { path:PathBuf, armed:bool }
+impl PartCleanup {
+    fn new(path:&Path)->Self{Self{path:path.to_path_buf(),armed:true}}
+    fn keep(mut self){self.armed=false;}
+}
+impl Drop for PartCleanup {
+    fn drop(&mut self){if self.armed{let _=std::fs::remove_file(&self.path);}}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn manga(source:&str,key:&str)->Manga{Manga{source_key:source.into(),key:key.into(),title:key.into(),..Default::default()}}
+    fn url_page(url:&str)->Page{Page{content:PageContent::Url{url:url.into(),context:None},thumbnail:None,has_description:false,description:None}}
+    fn png() -> Vec<u8> { colored_png([36, 82, 94, 255]) }
+    fn colored_png(pixel:[u8;4])->Vec<u8> {
+        let image=image::RgbaImage::from_pixel(4,4,image::Rgba(pixel));
+        let mut out=std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image).write_to(&mut out,image::ImageFormat::Png).unwrap();
+        out.into_inner()
+    }
+    fn source_manifest()->SourceManifest {
+        SourceManifest {
+            id:"test.source".into(),
+            name:"Test Source".into(),
+            version:1,
+            alt_names:Vec::new(),
+            languages:vec!["en".into()],
+            urls:vec!["http://127.0.0.1".into()],
+            content_rating:0,
+            listings:Vec::new(),
+            allows_base_url_select:false,
+            hides_filters_while_searching:false,
+        }
+    }
+    fn leb_u32(mut value:u32,out:&mut Vec<u8>) {
+        loop {
+            let mut byte=(value&0x7f) as u8;
+            value>>=7;
+            if value!=0{byte|=0x80;}
+            out.push(byte);
+            if value==0{break;}
+        }
+    }
+    fn wasm_section(id:u8,payload:&[u8],out:&mut Vec<u8>) {
+        out.push(id);
+        leb_u32(payload.len() as u32,out);
+        out.extend_from_slice(payload);
+    }
+    /// Minimal self-contained WASM module exporting `get_page_list` that
+    /// returns the same postcard `Vec<Page>` the real Aidoku source ABI uses.
+    fn pages_wasm(urls:&[String])->Vec<u8> {
+        let mut payload=Vec::new();
+        leb_u32(urls.len() as u32,&mut payload);
+        for url in urls {
+            payload.push(0);
+            leb_u32(url.len() as u32,&mut payload);
+            payload.extend_from_slice(url.as_bytes());
+            payload.push(0);
+            payload.push(0);
+            payload.push(0);
+            payload.push(0);
+        }
+        let mut data=Vec::with_capacity(payload.len()+8);
+        data.extend_from_slice(&((payload.len()+8) as u32).to_le_bytes());
+        data.extend_from_slice(&[0u8;4]);
+        data.extend_from_slice(&payload);
+
+        let mut module=b"\0asm\x01\0\0\0".to_vec();
+        wasm_section(1,&[0x01,0x60,0x02,0x7f,0x7f,0x01,0x7f],&mut module);
+        wasm_section(3,&[0x01,0x00],&mut module);
+        wasm_section(5,&[0x01,0x00,0x01],&mut module);
+        let mut exports=Vec::new();
+        leb_u32(2,&mut exports);
+        leb_u32(6,&mut exports);exports.extend_from_slice(b"memory");exports.push(0x02);leb_u32(0,&mut exports);
+        leb_u32(13,&mut exports);exports.extend_from_slice(b"get_page_list");exports.push(0x00);leb_u32(0,&mut exports);
+        wasm_section(7,&exports,&mut module);
+        let body=[0x00,0x41,0x80,0x08,0x0b];
+        let mut code=Vec::new();
+        leb_u32(1,&mut code);
+        leb_u32(body.len() as u32,&mut code);
+        code.extend_from_slice(&body);
+        wasm_section(10,&code,&mut module);
+        let mut segment=Vec::new();
+        leb_u32(1,&mut segment);
+        segment.push(0x00);
+        segment.push(0x41);
+        leb_u32(1024,&mut segment);
+        segment.push(0x0b);
+        leb_u32(data.len() as u32,&mut segment);
+        segment.extend_from_slice(&data);
+        wasm_section(11,&segment,&mut module);
+        module
+    }
+    fn serve_png(count:usize)->(String,thread::JoinHandle<()>) {
+        let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address=listener.local_addr().unwrap();
+        let handle=thread::spawn(move||{
+            for _ in 0..count {
+                let Ok((mut stream,_))=listener.accept() else{break;};
+                let mut request=[0u8;1024];
+                let _=stream.read(&mut request);
+                let body=png();
+                let header=format!("HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len());
+                let _=stream.write_all(header.as_bytes());
+                let _=stream.write_all(&body);
+            }
+        });
+        (format!("http://{address}"),handle)
+    }
+    fn task(source:&str,manga_id:&str,chapter:&str)->DownloadTask{
+        DownloadTask::from_chapter(source,&manga(source,manga_id),&Chapter{key:chapter.into(),title:Some(chapter.into()),..Default::default()})
+    }
+    fn test_sources(root:&Path)->Sources{
+        let(dl_tx,dl_cmd_rx)=mpsc::channel();
+        // Keep the command receiver alive so `pump()` can actually dispatch the
+        // next task in tests. The task itself is exercised directly.
+        std::mem::forget(dl_cmd_rx);
+        Sources{
+            root:root.to_path_buf(),
+            tx:mpsc::channel().0,
+            rx:mpsc::channel().1,
+            installed:Vec::new(),
+            repository:None,
+            results:ResultsState::default(),
+            chapters:Vec::new(),
+            selected_source:String::new(),
+            selected_manga:None,
+            url:String::new(),
+            query:String::new(),
+            busy:false,
+            status:String::new(),
+            tasks:Vec::new(),
+            running:None,
+            ready:VecDeque::new(),
+            import_attempts:HashSet::new(),
+            dl_tx,
+            dl_rx:mpsc::channel().1,
+            dl_stop:Arc::new(AtomicU8::new(STOP_NONE)),
+        }
+    }
+
+    #[test]
+    fn replies_from_another_source_are_rejected() {
+        let mut results=ResultsState::default();
+        results.begin("source.a","dragon");
+        assert!(results.accept("source.a","dragon",1,vec![manga("","1")],true));
+        assert_eq!(results.entries[0].source_key,"source.a");
+        assert!(!results.accept("source.b","dragon",1,vec![manga("source.b","9")],true));
+        assert_eq!(results.entries.len(),1);
+        assert_eq!(results.entries[0].key,"1");
+    }
+
+    #[test]
+    fn switching_source_drops_results_detail_and_chapters() {
+        let mut results=ResultsState::default();
+        results.begin("source.a","dragon");
+        assert!(results.accept("source.a","dragon",1,vec![manga("source.a","1")],true));
+        let mut selected=String::from("source.a");
+        let mut detail=Some(manga("source.a","1"));
+        let mut chapters=vec![Chapter{key:"chapter-1".into(),..Default::default()}];
+        assert!(apply_source_change(&mut selected,&mut results,&mut detail,&mut chapters,"source.b"));
+        assert_eq!(selected,"source.b");
+        assert!(results.entries.is_empty());
+        assert!(results.next_page().is_none());
+        assert!(detail.is_none());
+        assert!(chapters.is_empty());
+        results.begin("source.b","one piece");
+        assert!(results.accept("source.b","one piece",1,vec![manga("source.b","7")],false));
+        assert!(!apply_source_change(&mut selected,&mut results,&mut detail,&mut chapters,"source.b"));
+        assert_eq!(results.entries.len(),1);
+    }
+
+    #[test]
+    fn failed_page_is_retried_without_advancing() {
+        let mut results=ResultsState::default();
+        results.begin("source.a","dragon");
+        assert!(results.accept("source.a","dragon",1,vec![manga("source.a","1")],true));
+        assert_eq!(results.next_page().map(|(_,_,page)|page),Some(2));
+        assert_eq!(results.page,1);
+        assert_eq!(results.next_page().map(|(_,_,page)|page),Some(2));
+        assert!(results.accept("source.a","dragon",2,vec![],false));
+        assert_eq!(results.page,2);
+        assert!(results.next_page().is_none());
+    }
+
+    #[test]
+    fn duplicate_keys_across_pages_are_merged_once() {
+        let mut results=ResultsState::default();
+        results.begin("source.a","dragon");
+        assert!(results.accept("source.a","dragon",1,vec![manga("source.a","1"),manga("source.a","2")],true));
+        assert!(results.accept("source.a","dragon",2,vec![manga("source.a","2"),manga("source.a","3")],false));
+        let keys:Vec<_>=results.entries.iter().map(|m|m.key.as_str()).collect();
+        assert_eq!(keys,vec!["1","2","3"]);
+        assert!(!results.accept("source.a","dragon",2,vec![manga("source.a","4")],true));
+        assert_eq!(results.page,2);
+    }
+
+    #[test]
+    fn resume_fetches_only_missing_pages() {
+        let dir=tempfile::tempdir().unwrap();
+        let work=dir.path().join("task");
+        let pages=vec![url_page("p1"),url_page("p2")];
+        let stop=AtomicU8::new(STOP_NONE);
+        let error=fetch_missing_pages(&work,&pages,|page|match &page.content {
+            PageContent::Url{url,..} if url=="p1"=>Ok(png()),
+            _=>anyhow::bail!("第 2 页上游返回 500"),
+        },|_,_|{},&stop).unwrap_err();
+        assert!(error.to_string().contains("500"));
+        assert!(stored_page(&work,1).is_some());
+        assert!(stored_page(&work,2).is_none());
+        let mut fetched=Vec::new();
+        let summary=fetch_missing_pages(&work,&pages,|page|{
+            if let PageContent::Url{url,..}=&page.content{fetched.push(url.clone());}
+            Ok(png())
+        },|_,_|{},&stop).unwrap();
+        assert_eq!(fetched,vec!["p2"]);
+        assert_eq!(summary.done,2);
+        assert!(stored_page(&work,2).is_some());
+    }
+
+    #[test]
+    fn a_truncated_image_cannot_finish_and_retry_reuses_pages_before_the_ui_saves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let task = task("fixture", "m", "chapter");
+        let pages = vec![url_page("1"), url_page("2")];
+        let stop = AtomicU8::new(STOP_NONE);
+        let failure = execute_task(root, &task, pages.clone(), &stop, |page| {
+            if matches!(&page.content, PageContent::Url { url, .. } if url == "2") {
+                return Ok(b"\x89PNG\r\n\x1a\n".to_vec());
+            }
+            Ok(png())
+        }, |_, _, _| {},).unwrap_err();
+        assert!(format!("{failure:#}").contains("第 2 页"));
+        let dir = task_dir(root, &task.id).unwrap();
+        assert!(stored_page(&dir, 1).is_some());
+        assert!(stored_page(&dir, 2).is_none());
+        assert!(!chapter_archive(root, &task).exists());
+
+        // Simulate the app closing before either progress or completion is
+        // drained by its UI. Both stages recover using the worker's files.
+        let recovered = execute_task(root, &task, pages, &stop, |page| {
+            assert!(matches!(&page.content, PageContent::Url { url, .. } if url == "2"));
+            Ok(png())
+        }, |_, _, _| {}).unwrap();
+        let Outcome::Done { path } = recovered else { panic!("retry did not complete") };
+        let mut on_disk = task;
+        on_disk.status = DownloadStatus::Running;
+        let mut tasks = [on_disk];
+        normalize_loaded(root, &mut tasks);
+        assert_eq!(tasks[0].status, DownloadStatus::Done);
+        assert_eq!(tasks[0].cbz.as_ref(), Some(&path));
+        assert_eq!(pending_imports(&tasks), vec![tasks[0].id.clone()]);
+    }
+
+    #[test]
+    fn inline_pages_with_equal_length_but_different_bytes_are_rewritten() {
+        let dir=tempfile::tempdir().unwrap();
+        let work=dir.path().join("task");
+        std::fs::create_dir_all(&work).unwrap();
+        let old=colored_png([255,0,0,255]);
+        let new=colored_png([0,0,255,255]);
+        assert_eq!(old.len(),new.len(),"fixture must have different bytes but equal length");
+        assert_ne!(old,new);
+        std::fs::write(work.join("page-0001.png"),&old).unwrap();
+        let page=Page{content:PageContent::Image{image_ref:7,image_data:Some(new.clone())},thumbnail:None,has_description:false,description:None};
+        let stop=AtomicU8::new(STOP_NONE);
+        let mut fetched=0;
+        let summary=fetch_missing_pages(&work,&[page],|_|{fetched+=1;Ok(new.clone())},|_,_|{},&stop).unwrap();
+        assert_eq!(fetched,1,"equal-length inline bytes must not be trusted from the signature");
+        assert_eq!(summary.done,1);
+        assert_eq!(std::fs::read(work.join("page-0001.png")).unwrap(),new);
+    }
+
+    #[test]
+    fn paused_download_stops_before_fetching() {
+        let dir=tempfile::tempdir().unwrap();
+        let pages=vec![url_page("p1"),url_page("p2")];
+        let stop=AtomicU8::new(STOP_PAUSE);
+        let summary=fetch_missing_pages(&dir.path().join("task"),&pages,|_|panic!("must not fetch while paused"),|_,_|{},&stop).unwrap();
+        assert!(summary.aborted);
+        assert_eq!(summary.done,0);
+        assert!(existing_pages(&dir.path().join("task")).is_empty());
+    }
+
+    #[test]
+    fn page_list_change_clears_only_this_task_pages() {
+        let dir=tempfile::tempdir().unwrap();
+        let work=dir.path().join("task");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(work.join("page-0001.png"),png()).unwrap();
+        std::fs::write(work.join("notes.txt"),b"keep").unwrap();
+        reset_page_cache(&work).unwrap();
+        assert!(existing_pages(&work).is_empty());
+        assert_eq!(std::fs::read(work.join("notes.txt")).unwrap(),b"keep");
+    }
+
+    #[test]
+    fn enqueue_dedupes_task_and_protects_existing_cbz() {
+        let dir=tempfile::tempdir().unwrap();
+        let mut tasks=Vec::new();
+        assert!(matches!(enqueue_task(&mut tasks,task("source.a","m","c")),EnqueueOutcome::Added));
+        assert!(matches!(enqueue_task(&mut tasks,task("source.a","m","c")),EnqueueOutcome::Duplicate));
+        assert_eq!(tasks.len(),1);
+        let cbz=dir.path().join("chapter.cbz");
+        std::fs::write(&cbz,b"done").unwrap();
+        tasks[0].status=DownloadStatus::Done;
+        tasks[0].cbz=Some(cbz);
+        assert!(matches!(enqueue_task(&mut tasks,task("source.a","m","c")),EnqueueOutcome::AlreadyDownloaded));
+        assert_eq!(tasks.len(),1);
+        assert_eq!(tasks[0].status,DownloadStatus::Done);
+    }
+
+    #[test]
+    fn reopened_download_fetches_only_missing_pages() {
+        let root=tempfile::tempdir().unwrap();
+        let mut item=task("source.a","m","c");
+        let pages=vec![url_page("p1"),url_page("p2")];
+        let stop=AtomicU8::new(STOP_NONE);
+        let mut signature=None;
+        let first=execute_task(root.path(),&item,pages.clone(),&stop,|page|match &page.content {
+            PageContent::Url{url,..} if url=="p2"=>anyhow::bail!("第 2 页上游返回 500"),
+            _=>Ok(png()),
+        },|_,_,value|{if value.is_some(){signature=value;}});
+        assert!(first.is_err());
+        let work=task_dir(root.path(),&item.id).unwrap();
+        assert!(stored_page(&work,1).is_some());
+        assert!(stored_page(&work,2).is_none());
+
+        // Persist the page fingerprint the UI received before the failure and
+        // reload, as after an app restart.
+        item.pages_signature=signature;
+        item.status=DownloadStatus::Failed;
+        let store=TaskStore{tasks:vec![item]};
+        std::fs::write(root.path().join("download-tasks.json"),serde_json::to_vec(&store).unwrap()).unwrap();
+        let loaded=load_tasks(root.path()).unwrap();
+        assert_eq!(loaded.tasks.len(),1);
+        let reopened=loaded.tasks[0].clone();
+        assert!(reopened.pages_signature.is_some());
+
+        let mut fetched=Vec::new();
+        let outcome=execute_task(root.path(),&reopened,pages,&stop,|page|{
+            if let PageContent::Url{url,..}=&page.content{fetched.push(url.clone());}
+            Ok(png())
+        },|_,_,_|{}).unwrap();
+        assert_eq!(fetched,vec!["p2"],"the complete first page must not be fetched again");
+        assert!(matches!(outcome,Outcome::Done{..}));
+    }
+
+    #[test]
+    fn failed_download_does_not_block_the_next_task() {
+        let root=tempfile::tempdir().unwrap();
+        let mut sources=test_sources(root.path());
+        let first=task("source.a","m","c1");
+        let second=task("source.a","m","c2");
+        sources.tasks=vec![first.clone(),second.clone()];
+        sources.tasks[0].status=DownloadStatus::Running;
+        sources.running=Some(first.id.clone());
+        let stop=AtomicU8::new(STOP_NONE);
+        let error=execute_task(root.path(),&first,vec![url_page("a1"),url_page("a2")],&stop,|page|match &page.content {
+            PageContent::Url{url,..} if url=="a2"=>anyhow::bail!("a2 上游返回 500"),
+            _=>Ok(png()),
+        },|_,_,_|{}).unwrap_err();
+        sources.handle_download_event(DlEvent::Failed{id:first.id.clone(),error:error.to_string()});
+        assert_eq!(sources.tasks[0].status,DownloadStatus::Failed);
+        assert_eq!(sources.running.as_deref(),Some(second.id.as_str()));
+
+        let outcome=execute_task(root.path(),&second,vec![url_page("b1")],&stop,|_|Ok(png()),|_,_,_|{}).unwrap();
+        let Outcome::Done{path}=outcome else{panic!("second task did not finish")};
+        sources.handle_download_event(DlEvent::Finished{id:second.id.clone(),path:path.clone()});
+        assert_eq!(sources.tasks[1].status,DownloadStatus::Done);
+        assert!(sources.ready.contains(&second.id));
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn finished_downloads_survive_import_failure_and_drain_in_order() {
+        let root=tempfile::tempdir().unwrap();
+        let mut sources=test_sources(root.path());
+        let mut items=Vec::new();
+        for chapter in ["c1","c2","c3"] {
+            let mut item=task("source.a","m",chapter);
+            let path=root.path().join(format!("{chapter}.cbz"));
+            std::fs::write(&path,b"cbz").unwrap();
+            item.status=DownloadStatus::Done;
+            item.cbz=Some(path);
+            items.push(item);
+        }
+        sources.tasks=items.clone();
+        for item in &items { sources.ready.push_back(item.id.clone()); }
+
+        let first=sources.take_downloaded().unwrap();
+        let second=sources.take_downloaded().unwrap();
+        let third=sources.take_downloaded().unwrap();
+        assert_eq!(first.id,items[0].id);
+        assert_eq!(second.id,items[1].id);
+        assert_eq!(third.id,items[2].id);
+        sources.ack_downloaded(&first.id);
+
+        // The second import failed: put only that file back and retry it
+        // without touching the third file or re-downloading anything.
+        sources.requeue_import(&second.id);
+        let retried=sources.take_downloaded().unwrap();
+        assert_eq!(retried.id,second.id);
+        assert!(retried.path.exists());
+        sources.ack_downloaded(&third.id);
+        sources.ack_downloaded(&retried.id);
+        assert!(sources.take_downloaded().is_none());
+        assert!(sources.tasks.iter().all(|item|item.linked));
+        assert!(sources.tasks.iter().all(|item|item.status==DownloadStatus::Done));
+    }
+
+    #[test]
+    fn import_failure_keeps_the_file_and_allows_manual_retry_only() {
+        let root=tempfile::tempdir().unwrap();
+        let mut sources=test_sources(root.path());
+        let mut item=task("source.a","m","c");
+        let path=root.path().join("chapter.cbz");
+        std::fs::write(&path,b"cbz").unwrap();
+        item.status=DownloadStatus::Done;
+        item.cbz=Some(path.clone());
+        sources.tasks=vec![item.clone()];
+        sources.ready.push_back(item.id.clone());
+
+        let offered=sources.take_downloaded().unwrap();
+        assert!(sources.take_downloaded().is_none(),"an in-flight import must not be offered twice");
+        sources.import_failed(&offered.id,"cbz 解压失败");
+        assert!(sources.status.contains("加入书架失败"));
+        assert_eq!(sources.tasks[0].status,DownloadStatus::Done);
+        assert!(!sources.tasks[0].linked);
+        assert!(path.exists());
+        assert!(sources.take_downloaded().is_none(),"failure must wait for the explicit retry entry");
+
+        sources.requeue_import(&offered.id);
+        let retried=sources.take_downloaded().unwrap();
+        assert_eq!(retried.id,item.id);
+        sources.ack_downloaded(&retried.id);
+        assert!(sources.tasks[0].linked);
+    }
+
+    #[test]
+    fn wasm_source_pages_flow_through_download_and_import_handoff() {
+        let root=tempfile::tempdir().unwrap();
+        let(base,server)=serve_png(2);
+        let urls=vec![format!("{base}/page-1.png"),format!("{base}/page-2.png")];
+        let engine=SourceEngine::load_wasm(source_manifest(),pages_wasm(&urls),EngineOptions::default()).unwrap();
+        let item=task("test.source","m1","c1");
+        let pages=pollster::block_on(engine.pages_with(item.manga(),item.chapter())).unwrap();
+        assert_eq!(pages.len(),2);
+        assert!(matches!(&pages[0].content,PageContent::Url{url,..} if url==&urls[0]));
+
+        let stop=AtomicU8::new(STOP_NONE);
+        let mut fetched=0;
+        let outcome=execute_task(root.path(),&item,pages,&stop,|page|{
+            fetched+=1;
+            page_bytes(&engine,page)
+        },|_,_,_|{}).unwrap();
+        let Outcome::Done{path}=outcome else{panic!("download did not finish")};
+        assert_eq!(fetched,2);
+
+        let mut sources=test_sources(root.path());
+        sources.tasks=vec![item.clone()];
+        sources.running=Some(item.id.clone());
+        sources.handle_download_event(DlEvent::Finished{id:item.id.clone(),path:path.clone()});
+        let downloaded=sources.take_downloaded().expect("finished chapter offered to the importer");
+        assert_eq!(downloaded.id,item.id);
+        assert_eq!(downloaded.metadata.source_id,"test.source");
+        assert_eq!(downloaded.metadata.manga_id,"m1");
+        assert_eq!(downloaded.metadata.chapter_id,"c1");
+        assert!(downloaded.path.exists());
+        let library = yejian_core::Library::open(&root.path().join("library")).unwrap();
+        let book = library.import(&downloaded.path).unwrap();
+        library.link_chapter(&book.id, &downloaded.metadata).unwrap();
+        assert_eq!(book.page_count, 2);
+        for page in 0..book.page_count {
+            let bytes = library.page_bytes(&book.id, page).unwrap();
+            assert_eq!(crate::worker::decode(&bytes, false).unwrap().size, [4, 4]);
+        }
+        sources.ack_downloaded(&downloaded.id);
+        assert!(sources.take_downloaded().is_none());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn restart_pauses_running_downloads_and_detects_missing_cbz() {
+        let dir=tempfile::tempdir().unwrap();
+        let existing=dir.path().join("ok.cbz");
+        std::fs::write(&existing,b"done").unwrap();
+        let mut running=task("source.a","m","c1");
+        running.status=DownloadStatus::Running;
+        let mut done_ok=task("source.a","m","c2");
+        done_ok.status=DownloadStatus::Done;
+        done_ok.cbz=Some(existing);
+        let mut done_missing=task("source.a","m","c3");
+        done_missing.status=DownloadStatus::Done;
+        done_missing.cbz=Some(dir.path().join("gone.cbz"));
+        let mut tasks=vec![running,done_ok,done_missing];
+        normalize_loaded(dir.path(), &mut tasks);
+        assert_eq!(tasks[0].status,DownloadStatus::Paused);
+        assert!(tasks[0].error.is_some());
+        assert_eq!(tasks[1].status,DownloadStatus::Done);
+        assert_eq!(tasks[2].status,DownloadStatus::Failed);
+        assert!(tasks[2].cbz.is_none());
+    }
+
+    #[test]
+    fn corrupt_queue_entry_does_not_discard_the_rest() {
+        let dir=tempfile::tempdir().unwrap();
+        let valid=task("source.a","m","c");
+        let mut bad_id=task("source.a","m","other");
+        bad_id.id="../escape".into();
+        let value=serde_json::json!({"tasks":[serde_json::to_value(&valid).unwrap(),{"id":5},serde_json::to_value(&bad_id).unwrap()]});
+        std::fs::write(dir.path().join("download-tasks.json"),serde_json::to_vec(&value).unwrap()).unwrap();
+        let loaded=load_tasks(dir.path()).unwrap();
+        assert_eq!(loaded.tasks.len(),1);
+        assert_eq!(loaded.tasks[0].id,valid.id);
+        assert!(loaded.warning.unwrap().contains("2 条损坏记录"));
+    }
+
+    #[test]
+    fn corrupt_queue_file_is_reported_and_preserved() {
+        let dir=tempfile::tempdir().unwrap();
+        let path=dir.path().join("download-tasks.json");
+        let original=b"{ this is not json";
+        std::fs::write(&path,original).unwrap();
+        let error=load_tasks(dir.path()).unwrap_err();
+        assert!(error.to_string().contains("损坏"));
+        assert_eq!(std::fs::read(&path).unwrap(),original);
+
+        let(tasks,warning)=load_queue(dir.path());
+        assert!(tasks.is_empty());
+        assert!(warning.unwrap().contains("读取失败"));
+        assert_eq!(std::fs::read(&path).unwrap(),original);
+    }
+
+    #[test]
+    fn persist_failure_is_reported_and_never_starts_an_unrecorded_task() {
+        let dir=tempfile::tempdir().unwrap();
+        let root=dir.path().join("not-a-directory");
+        std::fs::write(&root,b"keep").unwrap();
+        let sources=test_sources(&root);
+        let error=sources.persist().unwrap_err();
+        assert!(!error.to_string().is_empty());
+        assert_eq!(std::fs::read(&root).unwrap(),b"keep");
+
+        // Allow the new metadata snapshot to be written, then fail the queue
+        // file's atomic replacement rather than the earlier snapshot stage.
+        let queue_root=dir.path().join("queue-write-failure");
+        let blocked=queue_root.join("download-tasks.json");
+        std::fs::create_dir_all(&blocked).unwrap();
+        std::fs::write(blocked.join("keep.txt"),b"keep").unwrap();
+        let mut sources=test_sources(&queue_root);
+        sources.selected_source="source.a".into();
+        let book=manga("source.a","m");
+        let chapter=Chapter{key:"c".into(),title:Some("c".into()),..Default::default()};
+        sources.enqueue_chapter(&book,&chapter);
+        assert!(sources.tasks.is_empty(),"an unpersisted task must be rolled back");
+        assert!(sources.running.is_none(),"an unpersisted task must not start");
+        assert!(sources.status.contains("无法保存下载队列"));
+        assert_eq!(std::fs::read(blocked.join("keep.txt")).unwrap(),b"keep");
+    }
+
+    #[test]
+    fn invalid_or_linked_task_paths_never_delete_neighbour_files() {
+        let root=tempfile::tempdir().unwrap();
+        let work=work_root(root.path());
+        std::fs::create_dir_all(&work).unwrap();
+        let outside=root.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("keep.txt"),b"keep").unwrap();
+
+        let error=remove_task_cache(root.path(),"x/../../outside").unwrap_err();
+        assert!(error.to_string().contains("非法"));
+        assert_eq!(std::fs::read(outside.join("keep.txt")).unwrap(),b"keep");
+
+        let id="0123456789abcdef";
+        let link=work.join(format!("task-{id}"));
+        #[cfg(windows)]
+        let linked=std::os::windows::fs::symlink_dir(&outside,&link).is_ok();
+        #[cfg(unix)]
+        let linked=std::os::unix::fs::symlink(&outside,&link).is_ok();
+        #[cfg(not(any(windows,unix)))]
+        let linked=false;
+        if linked {
+            let error=remove_task_cache(root.path(),id).unwrap_err();
+            assert!(error.to_string().contains("download-work 之外"));
+            assert_eq!(std::fs::read(outside.join("keep.txt")).unwrap(),b"keep");
+            let _=std::fs::remove_dir(&link);
+        }
+    }
+
+    #[test]
+    fn pending_imports_skip_linked_and_missing_files() {
+        let dir=tempfile::tempdir().unwrap();
+        let file=dir.path().join("chapter.cbz");
+        std::fs::write(&file,b"cbz").unwrap();
+        let mut waiting=task("source.a","m","c1");
+        waiting.status=DownloadStatus::Done;
+        waiting.cbz=Some(file.clone());
+        let mut linked=task("source.a","m","c2");
+        linked.status=DownloadStatus::Done;
+        linked.cbz=Some(file.clone());
+        linked.linked=true;
+        let mut missing=task("source.a","m","c3");
+        missing.status=DownloadStatus::Done;
+        missing.cbz=Some(dir.path().join("gone.cbz"));
+        let ids=pending_imports(&[waiting.clone(),linked,missing]);
+        assert_eq!(ids,vec![waiting.id]);
+    }
+
+    #[test]
+    fn import_ack_keeps_finished_file_without_downloading_again() {
+        let dir=tempfile::tempdir().unwrap();
+        let file=dir.path().join("chapter.cbz");
+        std::fs::write(&file,b"cbz").unwrap();
+        let mut done=task("source.a","m","c");
+        done.status=DownloadStatus::Done;
+        done.cbz=Some(file);
+        let mut sources=test_sources(dir.path());
+        sources.ready.push_back(done.id.clone());
+        sources.tasks=vec![done.clone()];
+        let item=sources.take_downloaded().unwrap();
+        assert_eq!(item.id,done.id);
+        assert!(item.path.exists());
+        // A failed import can put it back; the file is not downloaded again.
+        sources.requeue_import(&done.id);
+        assert!(sources.take_downloaded().is_some());
+        sources.ack_downloaded(&done.id);
+        assert!(sources.tasks[0].linked);
+        assert!(sources.take_downloaded().is_none());
+    }
+
+    #[test]
+    fn cancel_removes_only_its_own_work_dir() {
+        let root=tempfile::tempdir().unwrap();
+        let id=identity_id("source.a","m","c");
+        let own=task_dir(root.path(),&id).unwrap();
+        let other=task_dir(root.path(),"0000000000000000").unwrap();
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(own.join("page-0001.png"),png()).unwrap();
+        std::fs::write(other.join("page-0001.png"),png()).unwrap();
+        let downloads=root.path().join("downloads");
+        std::fs::create_dir_all(&downloads).unwrap();
+        std::fs::write(downloads.join("keep.cbz"),b"keep").unwrap();
+        let mut sources=test_sources(root.path());
+        sources.tasks=vec![task("source.a","m","c")];
+        assert!(sources.remove_task_now(&id,"已从下载队列移除"));
+        assert!(sources.tasks.is_empty());
+        assert!(!own.exists());
+        assert!(other.exists());
+        assert_eq!(std::fs::read(downloads.join("keep.cbz")).unwrap(),b"keep");
+    }
+
+    #[test]
+    fn dropping_sources_requests_pause_without_blocking() {
+        let root=tempfile::tempdir().unwrap();
+        let sources=test_sources(root.path());
+        let stop=sources.dl_stop.clone();
+        assert_eq!(stop.load(Ordering::SeqCst),STOP_NONE);
+        drop(sources);
+        assert_eq!(stop.load(Ordering::SeqCst),STOP_PAUSE);
+    }
+
+    #[test]
+    fn download_lock_is_exclusive_between_instances() {
+        let root=tempfile::tempdir().unwrap();
+        let first=acquire_download_lock(root.path()).unwrap();
+        let error=acquire_download_lock(root.path()).unwrap_err();
+        assert!(error.to_string().contains("上一次下载仍在退出"));
+        drop(first);
+        let _second=acquire_download_lock(root.path()).unwrap();
+    }
+
+    #[test]
+    fn incomplete_cbz_build_removes_its_part_and_keeps_existing_files() {
+        let root=tempfile::tempdir().unwrap();
+        let downloads=root.path().join("downloads");
+        std::fs::create_dir_all(&downloads).unwrap();
+        let existing=downloads.join("previous.cbz");
+        std::fs::write(&existing,b"previous download").unwrap();
+        let work=root.path().join("download-work").join("task");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(work.join("page-0001.png"),png()).unwrap();
+        let task=task("source.a","m","c");
+        let error=build_cbz(root.path(),&task,&work,2).unwrap_err();
+        assert!(error.to_string().contains("缓存缺失"));
+        assert_eq!(std::fs::read(&existing).unwrap(),b"previous download");
+        let parts:Vec<_>=std::fs::read_dir(&downloads).unwrap().flatten().filter(|entry|entry.path().extension().is_some_and(|ext|ext.to_string_lossy()=="part")).collect();
+        assert!(parts.is_empty(),"failed CBZ build must not leave a .part file");
+    }
+
+    #[test]
+    fn full_manga_and_chapter_snapshots_survive_restart_and_page_requests() {
+        let root=tempfile::tempdir().unwrap();
+        let mut book=manga("test.source","m42");
+        book.title="Full Work".into();
+        book.cover=Some("cover.png".into());
+        book.artists=Some(vec!["Artist A".into(),"Artist B".into()]);
+        book.authors=Some(vec!["Author A".into()]);
+        book.description=Some("简介".into());
+        book.url=Some("https://example.test/m42".into());
+        book.tags=Some(vec!["action".into(),"drama".into()]);
+        book.status=PublishingStatus::Ongoing;
+        book.content_rating=ContentRating::Safe;
+        book.viewer=Viewer::Vertical;
+        book.update_strategy=UpdateStrategy::Never;
+        book.next_update_time=Some(1_700_000_000);
+        book.chapters=Some(vec![Chapter{key:"c0".into(),title:Some("Chapter 0".into()),..Default::default()}]);
+        let chapter=Chapter{
+            key:"c42".into(),
+            title:Some("Chapter 42".into()),
+            chapter_number:Some(42.5),
+            volume_number:Some(4.),
+            date_uploaded:Some(1_690_000_000),
+            scanlators:Some(vec!["Group X".into()]),
+            url:Some("https://example.test/c42".into()),
+            language:Some("zh".into()),
+            thumbnail:Some("thumb.png".into()),
+            locked:true,
+        };
+
+        // Real enqueue path: writes the shared manga snapshot and the queue.
+        let mut sources=test_sources(root.path());
+        sources.enqueue_chapter(&book,&chapter);
+        let id=identity_id("test.source","m42","c42");
+        assert!(sources.tasks.iter().any(|task|task.id==id),"task queued");
+        sources.enqueue_chapter(&book,&Chapter{key:"c43".into(),title:Some("Chapter 43".into()),..Default::default()});
+
+        // One snapshot per work, not one per chapter task.
+        let snapshots:Vec<_>=std::fs::read_dir(snapshot_root(root.path())).unwrap().flatten()
+            .filter(|entry|entry.path().extension().is_some_and(|ext|ext.to_string_lossy()=="manga"))
+            .collect();
+        assert_eq!(snapshots.len(),1,"same manga must be stored once");
+        let json=std::fs::read_to_string(root.path().join("download-tasks.json")).unwrap();
+        assert!(!json.contains("\"c0\""),"the manga chapter list must not be duplicated into task JSON");
+        assert!(json.contains("\"manga_snapshot\""),"task references the shared snapshot");
+
+        // Restart: reload the queue from disk and restore both objects.
+        let(tasks,warning)=load_queue(root.path());
+        assert!(warning.is_none());
+        let restored=tasks.into_iter().find(|task|task.id==id).expect("task survives restart");
+        assert_eq!(restored.manga_title,"Full Work","legacy fields stay readable");
+        let manga=restored.manga_for(root.path()).unwrap();
+        let restored_chapter=restored.chapter_for().unwrap();
+        assert_eq!(manga.authors,book.authors);
+        assert_eq!(manga.artists,book.artists);
+        assert_eq!(manga.tags,book.tags);
+        assert_eq!(manga.description,book.description);
+        assert_eq!(manga.viewer,Viewer::Vertical);
+        assert_eq!(manga.status,PublishingStatus::Ongoing);
+        assert_eq!(manga.chapters.as_ref().map(Vec::len),Some(1));
+        assert_eq!(restored_chapter.scanlators,chapter.scanlators);
+        assert_eq!(restored_chapter.date_uploaded,chapter.date_uploaded);
+        assert_eq!(restored_chapter.thumbnail,chapter.thumbnail);
+        assert!(restored_chapter.locked);
+        // These are exactly the bytes the interpreter sends to get_page_list.
+        assert_eq!(manga.to_postcard_bytes(),book.to_postcard_bytes(),"source receives the identical manga bytes");
+        assert_eq!(restored_chapter.to_postcard_bytes(),chapter.to_postcard_bytes(),"source receives the identical chapter bytes");
+
+        // A real WASM engine still accepts the restored objects for page listing.
+        let urls=vec!["https://example.test/page-1.png".to_string()];
+        let engine=SourceEngine::load_wasm(source_manifest(),pages_wasm(&urls),EngineOptions::default()).unwrap();
+        let pages=pollster::block_on(engine.pages_with(restored.manga_for(root.path()).unwrap(),restored.chapter_for().unwrap())).unwrap();
+        assert_eq!(pages.len(),1);
+    }
+
+    #[test]
+    fn broken_recorded_snapshot_fails_while_legacy_tasks_keep_the_fallback() {
+        let root=tempfile::tempdir().unwrap();
+        let mut book=manga("test.source","m7");
+        book.authors=Some(vec!["Author A".into()]);
+        book.tags=Some(vec!["drama".into()]);
+        book.viewer=Viewer::RightToLeft;
+        let chapter=Chapter{key:"c7".into(),title:Some("Chapter 7".into()),scanlators:Some(vec!["Group".into()]),..Default::default()};
+        let task=DownloadTask::from_chapter("test.source",&book,&chapter);
+        assert!(task.chapter_snapshot.is_some(),"new tasks record snapshots");
+
+        // Old queues have no snapshot at all and keep the reduced DTO fallback.
+        let mut legacy=task.clone();
+        legacy.manga_snapshot=None;
+        legacy.chapter_snapshot=None;
+        assert_eq!(legacy.manga_for(root.path()).unwrap().title,"m7");
+        assert_eq!(legacy.chapter_for().unwrap().key,"c7");
+
+        // A task that recorded a snapshot never degrades to that fallback.
+        let key=manga_snapshot_key("test.source","m7");
+        let mut recorded=task.clone();
+        recorded.manga_snapshot=Some(key.clone());
+        let error=recorded.manga_for(root.path()).unwrap_err().to_string();
+        assert!(error.contains("漫画快照不可用")&&error.contains("请回到作品详情"),"missing snapshot is explicit: {error}");
+
+        recorded.manga_snapshot=Some("../escape".into());
+        assert!(recorded.manga_for(root.path()).unwrap_err().to_string().contains("非法"));
+
+        std::fs::create_dir_all(snapshot_root(root.path())).unwrap();
+        let path=manga_snapshot_path(root.path(),&key).unwrap();
+        std::fs::write(&path,b"not a postcard").unwrap();
+        recorded.manga_snapshot=Some(key.clone());
+        let error=recorded.manga_for(root.path()).unwrap_err().to_string();
+        assert!(error.contains("已损坏"),"corrupt snapshot is explicit: {error}");
+
+        let mut other=book.clone();
+        other.key="another".into();
+        std::fs::write(&path,other.to_postcard_bytes()).unwrap();
+        let error=recorded.manga_for(root.path()).unwrap_err().to_string();
+        assert!(error.contains("不匹配"),"snapshot of another manga is rejected: {error}");
+
+        let mut bad_chapter=task.clone();
+        bad_chapter.manga_snapshot=None;
+        bad_chapter.chapter_snapshot=Some(vec![0,1,2]);
+        assert!(bad_chapter.chapter_for().unwrap_err().to_string().contains("章节快照已损坏"));
+
+        // Re-adding the chapter from the manga detail page rebuilds the
+        // snapshot from the new complete object and requeues the task.
+        let mut updated=book.clone();
+        updated.authors=Some(vec!["New Author".into()]);
+        let mut sources=test_sources(root.path());
+        let mut failed=DownloadTask::from_chapter("test.source",&book,&chapter);
+        failed.status=DownloadStatus::Failed;
+        failed.manga_snapshot=Some("0000000000000000".into());
+        failed.chapter_snapshot=None;
+        sources.tasks=vec![failed];
+        sources.enqueue_chapter(&updated,&chapter);
+        let task_id=identity_id("test.source","m7","c7");
+        let retried=sources.tasks.iter().find(|item|item.id==task_id).unwrap();
+        assert_ne!(retried.status,DownloadStatus::Failed,"failed chapter is requeued");
+        let rebuilt=retried.manga_for(root.path()).expect("re-join writes a readable snapshot");
+        assert_eq!(rebuilt.authors,Some(vec!["New Author".into()]));
+    }
+}

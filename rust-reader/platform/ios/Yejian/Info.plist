@@ -1,0 +1,177 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>$(DEVELOPMENT_LANGUAGE)</string>
+    <key>CFBundleDisplayName</key>
+    <string>页间</string>
+    <key>CFBundleExecutable</key>
+    <string>$(EXECUTABLE_NAME)</string>
+    <key>CFBundleIdentifier</key>
+    <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+    <!-- 图标来自 Assets.xcassets/AppIcon.appiconset（与 Android 矢量同一套书本线条）。 -->
+    <key>CFBundleIconName</key>
+    <string>AppIcon</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>$(PRODUCT_NAME)</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>$(MARKETING_VERSION)</string>
+    <key>CFBundleVersion</key>
+    <string>$(CURRENT_PROJECT_VERSION)</string>
+    <key>LSRequiresIPhoneOS</key>
+    <true/>
+    <!-- 用户导入的书源可能指向 http:// 站点，与 Android 的
+         usesCleartextTraffic 保持一致；只影响用户主动添加的源。 -->
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsArbitraryLoads</key>
+        <true/>
+    </dict>
+    <!-- 局域网阅读进度同步：iOS 14+ 访问本地网络会弹授权，必须说明用途。 -->
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>页间需要访问局域网，以便在你同意后与同一网络内的设备同步阅读进度。</string>
+    <key>LSSupportsOpeningDocumentsInPlace</key>
+    <true/>
+    <key>UIFileSharingEnabled</key>
+    <true/>
+    <key>UIApplicationSupportsIndirectInputEvents</key>
+    <true/>
+    <key>UILaunchScreen</key>
+    <dict/>
+    <key>UIRequiresFullScreen</key>
+    <false/>
+    <key>UISupportedInterfaceOrientations</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+        <string>UIInterfaceOrientationPortraitUpsideDown</string>
+        <string>UIInterfaceOrientationLandscapeLeft</string>
+        <string>UIInterfaceOrientationLandscapeRight</string>
+    </array>
+    <key>UISupportedInterfaceOrientations~ipad</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+        <string>UIInterfaceOrientationPortraitUpsideDown</string>
+        <string>UIInterfaceOrientationLandscapeLeft</string>
+        <string>UIInterfaceOrientationLandscapeRight</string>
+    </array>
+
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>Comic Archive</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>org.yejian.cbz</string>
+                <string>org.yejian.cbr</string>
+                <string>org.yejian.cbt</string>
+                <string>org.yejian.rar</string>
+                <string>public.zip-archive</string>
+                <string>public.tar-archive</string>
+            </array>
+        </dict>
+    </array>
+
+    <!-- These identifiers are declared by this app, so they are exported
+         types (imported types are for formats another app owns). -->
+    <key>UTExportedTypeDeclarations</key>
+    <array>
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>org.yejian.cbz</string>
+            <key>UTTypeDescription</key>
+            <string>Comic Book ZIP Archive</string>
+            <key>UTTypeConformsTo</key>
+            <array>
+                <string>public.zip-archive</string>
+            </array>
+            <key>UTTypeTagSpecification</key>
+            <dict>
+                <key>public.filename-extension</key>
+                <array>
+                    <string>cbz</string>
+                </array>
+                <key>public.mime-type</key>
+                <array>
+                    <string>application/vnd.comicbook+zip</string>
+                    <string>application/x-cbz</string>
+                </array>
+            </dict>
+        </dict>
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>org.yejian.cbr</string>
+            <key>UTTypeDescription</key>
+            <string>Comic Book RAR Archive</string>
+            <key>UTTypeConformsTo</key>
+            <array>
+                <string>public.data</string>
+            </array>
+            <key>UTTypeTagSpecification</key>
+            <dict>
+                <key>public.filename-extension</key>
+                <array>
+                    <string>cbr</string>
+                </array>
+                <key>public.mime-type</key>
+                <array>
+                    <string>application/vnd.comicbook-rar</string>
+                    <string>application/x-cbr</string>
+                </array>
+            </dict>
+        </dict>
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>org.yejian.cbt</string>
+            <key>UTTypeDescription</key>
+            <string>Comic Book TAR Archive</string>
+            <key>UTTypeConformsTo</key>
+            <array>
+                <string>public.tar-archive</string>
+            </array>
+            <key>UTTypeTagSpecification</key>
+            <dict>
+                <key>public.filename-extension</key>
+                <array>
+                    <string>cbt</string>
+                </array>
+                <key>public.mime-type</key>
+                <array>
+                    <string>application/x-cbt</string>
+                </array>
+            </dict>
+        </dict>
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>org.yejian.rar</string>
+            <key>UTTypeDescription</key>
+            <string>RAR Archive</string>
+            <key>UTTypeConformsTo</key>
+            <array>
+                <string>public.data</string>
+            </array>
+            <key>UTTypeTagSpecification</key>
+            <dict>
+                <key>public.filename-extension</key>
+                <array>
+                    <string>rar</string>
+                </array>
+                <key>public.mime-type</key>
+                <array>
+                    <string>application/vnd.rar</string>
+                    <string>application/x-rar-compressed</string>
+                </array>
+            </dict>
+        </dict>
+    </array>
+</dict>
+</plist>

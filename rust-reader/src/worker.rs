@@ -1,0 +1,626 @@
+use egui::{ColorImage, Context};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
+    thread,
+};
+use yejian_core::{Book, ChapterLink, ChapterMetadata, Library};
+
+pub enum Command {
+    Refresh,
+    Import(Vec<PathBuf>),
+    ImportChapter {
+        task_id: String,
+        path: PathBuf,
+        metadata: ChapterMetadata,
+    },
+    Image {
+        id: String,
+        page: usize,
+        cover: bool,
+        generation: u64,
+    },
+    Progress {
+        id: String,
+        page: usize,
+        fraction: f32,
+        private: bool,
+    },
+    Setting(String, String),
+    Category(Vec<String>, String),
+    Remove(Vec<String>),
+    Backup(PathBuf),
+    Restore(PathBuf),
+    Flush(mpsc::Sender<Result<(), String>>),
+}
+pub enum Event {
+    Ready(Vec<Book>, Vec<(String, String)>, Vec<ChapterLink>),
+    Library(Vec<Book>, Vec<ChapterLink>),
+    Image {
+        id: String,
+        page: usize,
+        cover: bool,
+        generation: u64,
+        result: Result<DecodedPage, String>,
+    },
+    Notice(String),
+    Error(String),
+    StartupError(String),
+    BackupReady(PathBuf),
+    ChapterImported(String),
+    ChapterImportFailed {
+        id: String,
+        error: String,
+    },
+    ProgressSaved {
+        id: String,
+        page: usize,
+        fraction: f32,
+    },
+    ProgressSaveFailed {
+        id: String,
+        page: usize,
+        fraction: f32,
+        private: bool,
+        error: String,
+    },
+}
+enum PositionCommand {
+    Save {
+        id: String,
+        page: usize,
+        fraction: f32,
+        private: bool,
+    },
+    Flush(mpsc::Sender<Result<(), String>>),
+}
+pub struct DecodedPage {
+    pub tiles: Vec<ColorImage>,
+    pub size: [usize; 2],
+}
+pub struct Worker {
+    pub tx: mpsc::Sender<Command>,
+    pub rx: mpsc::Receiver<Event>,
+    pub generation: Arc<AtomicU64>,
+    position_tx: mpsc::Sender<PositionCommand>,
+}
+impl Worker {
+    pub fn start(root: PathBuf, ctx: Context) -> Self {
+        let (tx, command_rx) = mpsc::channel();
+        let (event_tx, rx) = mpsc::channel();
+        let (position_tx, position_rx) = mpsc::channel();
+        let position_queue = position_tx.clone();
+        let generation = Arc::new(AtomicU64::new(0));
+        let latest = generation.clone();
+        thread::Builder::new()
+            .name("yejian-library".into())
+            .spawn(move || {
+                let notify = |event| {
+                    let _ = event_tx.send(event);
+                    ctx.request_repaint();
+                };
+                let library = match Library::open(&root) {
+                    Ok(library) => library,
+                    Err(e) => {
+                        notify(Event::StartupError(format!("无法打开书库：{e:#}")));
+                        return;
+                    }
+                };
+                // Reading writes use their own connection and FIFO lane.
+                // Archive copies and speculative decoding cannot delay them.
+                let position_library=match Library::open(&root) {
+                    Ok(library)=>library,
+                    Err(e)=>{notify(Event::StartupError(format!("无法打开阅读位置存储：{e:#}")));return;}
+                };
+                let position_events=event_tx.clone();let position_ctx=ctx.clone();
+                thread::Builder::new().name("yejian-progress".into()).spawn(move||{
+                    let mut last_error:Option<String>=None;
+                    while let Ok(command)=position_rx.recv() {
+                        match command {
+                            PositionCommand::Save{id,page,fraction,private}=>{
+                                match position_library.save_position(&id,page,fraction,private) {
+                                    Ok(())=>{last_error=None;let _=position_events.send(Event::ProgressSaved{id,page,fraction:fraction.clamp(0.,1.)});}
+                                    Err(error)=>{let error=format!("阅读位置保存失败：{error:#}");last_error=Some(error.clone());let _=position_events.send(Event::ProgressSaveFailed{id,page,fraction,private,error});}
+                                }
+                                position_ctx.request_repaint();
+                            }
+                            PositionCommand::Flush(reply)=>{let _=reply.send(last_error.clone().map_or(Ok(()),Err));}
+                        }
+                    }
+                }).expect("Unable to start reading-position worker");
+                // A refresh or backup requested after a position change must
+                // see the committed row, even with two SQLite connections.
+                let wait_for_positions = || -> anyhow::Result<()> {
+                    let (reply, committed) = mpsc::channel();
+                    position_queue.send(PositionCommand::Flush(reply))
+                        .map_err(|_| anyhow::anyhow!("阅读位置线程已停止"))?;
+                    // Individual save failures already reach the UI with a retry
+                    // action. Its last readable snapshot can still be backed up.
+                    let _last_save = committed.recv()
+                        .map_err(|_| anyhow::anyhow!("无法确认阅读位置写入顺序"))?;
+                    Ok(())
+                };
+                let settings = match read_settings(&library) {
+                    Ok(settings) => settings,
+                    Err(e) => {
+                        notify(Event::StartupError(format!("无法读取阅读设置：{e:#}")));
+                        return;
+                    }
+                };
+                match library
+                    .list_books("")
+                    .and_then(|books| Ok((books, library.list_chapter_links()?)))
+                {
+                    Ok((books, links)) => notify(Event::Ready(books, settings, links)),
+                    Err(e) => {
+                        notify(Event::StartupError(format!("无法读取书库：{e:#}")));
+                        return;
+                    }
+                }
+                while let Ok(command) = command_rx.recv() {
+                    let result: anyhow::Result<()> = (|| {
+                        match command {
+                            Command::Refresh => {
+                                wait_for_positions()?;
+                                notify(Event::Library(library.list_books("")?, library.list_chapter_links()?));
+                            }
+                            Command::ImportChapter {
+                                task_id,
+                                path,
+                                metadata,
+                            } => {
+                                let result=(||->anyhow::Result<()> {
+                                    let book=library.import(&path)?;
+                                    library.link_chapter(&book.id,&metadata)?;
+                                    Ok(())
+                                })();
+                                if let Err(error)=result {
+                                    notify(Event::ChapterImportFailed{id:task_id,error:format!("{error:#}")});
+                                    return Ok(());
+                                }
+                                notify(Event::ChapterImported(task_id));
+                                notify(Event::Library(
+                                    library.list_books("")?,
+                                    library.list_chapter_links()?,
+                                ));
+                                notify(Event::Notice(format!(
+                                    "已加入书架：{} · {}",
+                                    metadata.manga_title, metadata.chapter_title
+                                )));
+                            }
+                            Command::Import(paths) => {
+                                let mut imported = 0;
+                                let mut errors = Vec::new();
+                                for path in paths {
+                                    match library.import(&path) {
+                                        Ok(_) => imported += 1,
+                                        Err(e) => errors.push(format!(
+                                            "{}：{e:#}",
+                                            path.file_name().unwrap_or_default().to_string_lossy()
+                                        )),
+                                    }
+                                }
+                                notify(Event::Library(
+                                    library.list_books("")?,
+                                    library.list_chapter_links()?,
+                                ));
+                                if errors.is_empty() {
+                                    notify(Event::Notice(format!(
+                                        "已导入 {imported} 本，书库已保存"
+                                    )));
+                                } else {
+                                    notify(Event::Error(format!(
+                                        "已导入 {imported} 本；以下文件未导入：\n{}",
+                                        errors.join("\n")
+                                    )));
+                                }
+                            }
+                            Command::Image {
+                                id,
+                                page,
+                                cover,
+                                generation,
+                            } => {
+                                if !cover && generation != latest.load(Ordering::Relaxed) {
+                                    return Ok(());
+                                }
+                                let result = (|| -> anyhow::Result<DecodedPage> {
+                                    let bytes = if cover {
+                                        let book = library
+                                            .list_books("")?
+                                            .into_iter()
+                                            .find(|b| b.id == id)
+                                            .ok_or_else(|| anyhow::anyhow!("这本书已不在书库"))?;
+                                        if let Some(path) = book.cover_path {
+                                            std::fs::read(path)?
+                                        } else {
+                                            library.page_bytes(&id, 0)?
+                                        }
+                                    } else {
+                                        library.page_bytes(&id, page)?
+                                    };
+                                    decode(&bytes, cover)
+                                })()
+                                .map_err(|e| format!("{e:#}"));
+                                notify(Event::Image {
+                                    id,
+                                    page,
+                                    cover,
+                                    generation,
+                                    result,
+                                });
+                            }
+                            Command::Progress {
+                                id,
+                                page,
+                                fraction,
+                                private,
+                            } => {
+                                position_queue.send(PositionCommand::Save{id,page,fraction,private})
+                                    .map_err(|_|anyhow::anyhow!("阅读位置线程已停止"))?;
+                            }
+                            Command::Flush(reply)=>{
+                                let _=position_queue.send(PositionCommand::Flush(reply));
+                            }
+                            Command::Setting(key, value) => {
+                                library.set_setting(&key, &value)?;
+                            }
+                            Command::Category(ids, category) => {
+                                for id in ids {
+                                    library.set_category(&id, &category)?;
+                                }
+                                notify(Event::Library(
+                                    library.list_books("")?,
+                                    library.list_chapter_links()?,
+                                ));
+                            }
+                            Command::Remove(ids) => {
+                                for id in ids {
+                                    library.remove_from_library(&id)?;
+                                }
+                                notify(Event::Library(
+                                    library.list_books("")?,
+                                    library.list_chapter_links()?,
+                                ));
+                            }
+                            Command::Backup(path) => {
+                                wait_for_positions()?;
+                                let report = library.export_backup(&path)?;
+                                if report.is_complete() {
+                                    notify(Event::Notice(format!(
+                                        "{} 本书已备份到 {}",
+                                        report.books_exported,
+                                        path.display()
+                                    )));
+                                } else {
+                                    notify(Event::Error(format!(
+                                        "已备份 {} 本；以下内容未备份：\n{}",
+                                        report.books_exported,
+                                        report
+                                            .skipped
+                                            .iter()
+                                            .map(|s| format!("{}：{}", s.title, s.reason))
+                                            .collect::<Vec<_>>()
+                                            .join("\n")
+                                    )));
+                                }
+                                notify(Event::BackupReady(path));
+                            }
+                            Command::Restore(path) => {
+                                wait_for_positions()?;
+                                let report = library.restore(&path)?;
+                                notify(Event::Ready(
+                                    library.list_books("")?,
+                                    read_settings(&library)?,
+                                    library.list_chapter_links()?,
+                                ));
+                                let message = format!(
+                                    "恢复完成：新增 {} 本，更新 {} 本，跳过 {} 本，失败 {} 本；章节关联未恢复 {} 条",
+                                    report.imported_count(),
+                                    report.updated_count(),
+                                    report.skipped_count(),
+                                    report.failed_count(),
+                                    report.link_failures.len()
+                                );
+                                if report.is_fully_restored() {
+                                    notify(Event::Notice(message));
+                                } else {
+                                    notify(Event::Error(format!(
+                                        "{message}\n{}",
+                                        report
+                                            .skipped
+                                            .iter()
+                                            .chain(report.failures.iter())
+                                            .chain(report.link_failures.iter())
+                                            .map(|r| format!(
+                                                "{}：{}",
+                                                r.title,
+                                                r.reason.as_deref().unwrap_or("未恢复")
+                                            ))
+                                            .collect::<Vec<_>>()
+                                            .join("\n")
+                                    )));
+                                }
+                            }
+                        }
+                        Ok(())
+                    })();
+                    if let Err(e) = result {
+                        notify(Event::Error(format!("{e:#}")));
+                    }
+                }
+            })
+            .expect("Unable to start library worker");
+        Self {
+            tx,
+            rx,
+            generation,
+            position_tx,
+        }
+    }
+    pub fn send(&self, command: Command) -> Result<(), String> {
+        if let Command::Progress {
+            id,
+            page,
+            fraction,
+            private,
+        } = command
+        {
+            return self
+                .position_tx
+                .send(PositionCommand::Save {
+                    id,
+                    page,
+                    fraction,
+                    private,
+                })
+                .map_err(|_| "阅读位置线程已停止，请重新打开应用".into());
+        }
+        self.tx
+            .send(command)
+            .map_err(|_| "书库线程已停止，请退出后重新打开应用".into())
+    }
+    pub fn flush(&self, timeout: std::time::Duration) -> Result<(), String> {
+        let (tx, rx) = mpsc::channel();
+        self.send(Command::Flush(tx))?;
+        rx.recv_timeout(timeout)
+            .map_err(|_| "等待书库和阅读位置保存超时".to_string())?
+    }
+}
+
+fn read_settings(library: &Library) -> anyhow::Result<Vec<(String, String)>> {
+    let mut settings = Vec::new();
+    for key in [
+        "theme",
+        "reduce-motion",
+        "reading-direction",
+        "private",
+        "reading-mode",
+        "font-scale",
+    ] {
+        if let Some(value) = library.get_setting(key)? {
+            settings.push((key.to_string(), value));
+        }
+    }
+    Ok(settings)
+}
+
+pub(super) fn image_reader(bytes: &[u8]) -> anyhow::Result<image::ImageReader<std::io::Cursor<&[u8]>>> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()?;
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(128 * 1024 * 1024);
+    limits.max_image_width = Some(32000);
+    limits.max_image_height = Some(64000);
+    reader.limits(limits);
+    Ok(reader)
+}
+
+pub fn decode(bytes: &[u8], cover: bool) -> anyhow::Result<DecodedPage> {
+    let mut image = image_reader(bytes)?.decode()?;
+    if cover {
+        image = image.thumbnail(512, 768);
+    } else if image.width() > 3072 {
+        let height = (image.height() as f64 * 3072. / image.width() as f64)
+            .round()
+            .max(1.) as u32;
+        image = image.resize_exact(3072, height, image::imageops::FilterType::Triangle);
+    }
+    let image = image.to_rgba8();
+    let size = [image.width() as usize, image.height() as usize];
+    let mut tiles = Vec::new();
+    for top in (0..image.height()).step_by(2048) {
+        let height = (image.height() - top).min(2048);
+        let tile = image::imageops::crop_imm(&image, 0, top, image.width(), height).to_image();
+        tiles.push(ColorImage::from_rgba_unmultiplied(
+            [image.width() as usize, height as usize],
+            tile.as_raw(),
+        ));
+    }
+    Ok(DecodedPage { tiles, size })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn position_flush_reports_failures_and_waits_for_a_corrected_save() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("library");
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbImage::from_pixel(4, 4, image::Rgb([55, 75, 95]))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let archive = tmp.path().join("comic.cbz");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        writer
+            .start_file("1.png", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(png.get_ref()).unwrap();
+        writer.finish().unwrap();
+        let library = yejian_core::Library::open(&root).unwrap();
+        let book = library.import(&archive).unwrap();
+        let worker = super::Worker::start(root, egui::Context::default());
+        let timeout = std::time::Duration::from_secs(5);
+        assert!(matches!(
+            worker.rx.recv_timeout(timeout).unwrap(),
+            super::Event::Ready(_, _, _)
+        ));
+        worker
+            .send(super::Command::Progress {
+                id: book.id.clone(),
+                page: 99,
+                fraction: 0.5,
+                private: false,
+            })
+            .unwrap();
+        assert!(worker.flush(timeout).unwrap_err().contains("保存失败"));
+        assert!(matches!(
+            worker.rx.recv_timeout(timeout).unwrap(),
+            super::Event::ProgressSaveFailed { page: 99, .. }
+        ));
+        // The original public command sender is also preserved: the normal
+        // flush forwards its barrier behind any reading writes it dispatches.
+        worker
+            .tx
+            .send(super::Command::Progress {
+                id: book.id.clone(),
+                page: 0,
+                fraction: 0.35,
+                private: false,
+            })
+            .unwrap();
+        worker.flush(timeout).unwrap();
+        assert!((library.get_book(&book.id).unwrap().page_fraction - 0.35).abs() < 0.0001);
+
+        // Back requests a refresh immediately after a save. Backup likewise
+        // has to include every earlier write without waiting in the UI.
+        worker.send(super::Command::Progress {
+            id: book.id.clone(), page: 0, fraction: 0.65, private: false,
+        }).unwrap();
+        worker.send(super::Command::Refresh).unwrap();
+        let backup = tmp.path().join("reading-position.zip");
+        worker.tx.send(super::Command::Progress {
+            id: book.id.clone(), page: 0, fraction: 0.85, private: false,
+        }).unwrap();
+        worker.send(super::Command::Backup(backup.clone())).unwrap();
+        let mut saw_refresh = false;
+        loop {
+            match worker.rx.recv_timeout(timeout).unwrap() {
+                super::Event::Library(books, _) => {
+                    assert!((books[0].page_fraction - 0.65).abs() < 0.0001);
+                    saw_refresh = true;
+                }
+                super::Event::BackupReady(_) => break,
+                super::Event::Error(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        assert!(saw_refresh);
+        let copy = yejian_core::Library::open(&tmp.path().join("restored")).unwrap();
+        copy.import_backup(&backup).unwrap();
+        assert!((copy.get_book(&book.id).unwrap().page_fraction - 0.85).abs() < 0.0001);
+    }
+    #[test]
+    fn downloaded_chapter_is_acknowledged_only_after_import_and_link() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = tmp.path().join("chapter.cbz");
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbImage::from_pixel(4, 4, image::Rgb([35, 65, 95]))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        writer
+            .start_file("1.png", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(png.get_ref()).unwrap();
+        writer.finish().unwrap();
+        let worker = super::Worker::start(tmp.path().join("library"), egui::Context::default());
+        let timeout = std::time::Duration::from_secs(5);
+        assert!(matches!(
+            worker.rx.recv_timeout(timeout).unwrap(),
+            super::Event::Ready(_, _, _)
+        ));
+        let metadata = yejian_core::ChapterMetadata {
+            source_id: "fixture".into(),
+            manga_id: "story".into(),
+            manga_title: "作品".into(),
+            chapter_id: "chapter-1".into(),
+            chapter_title: "第1话".into(),
+            chapter_number: Some(1.),
+            volume_number: None,
+        };
+        worker
+            .send(super::Command::ImportChapter {
+                task_id: "failed".into(),
+                path: tmp.path().join("missing.cbz"),
+                metadata: metadata.clone(),
+            })
+            .unwrap();
+        assert!(
+            matches!(worker.rx.recv_timeout(timeout).unwrap(),super::Event::ChapterImportFailed{id,..} if id=="failed")
+        );
+        worker
+            .send(super::Command::ImportChapter {
+                task_id: "finished".into(),
+                path: archive.clone(),
+                metadata,
+            })
+            .unwrap();
+        assert!(
+            matches!(worker.rx.recv_timeout(timeout).unwrap(),super::Event::ChapterImported(id) if id=="finished")
+        );
+        match worker.rx.recv_timeout(timeout).unwrap() {
+            super::Event::Library(books, links) => {
+                assert_eq!(books.len(), 1);
+                assert_eq!(links.len(), 1);
+                assert_eq!(books[0].id, links[0].book_id);
+            }
+            _ => panic!("successful import must update books and chapter links together"),
+        }
+        assert!(
+            archive.exists(),
+            "import must retain the completed download for recovery"
+        );
+    }
+    #[test]
+    fn restored_settings_are_delivered_to_the_running_ui() {
+        let tmp = tempfile::tempdir().unwrap();
+        let original = yejian_core::Library::open(&tmp.path().join("original")).unwrap();
+        original.set_setting("theme", "dark").unwrap();
+        original.set_setting("reading-direction", "rtl").unwrap();
+        let backup = tmp.path().join("settings.zip");
+        original.export_backup(&backup).unwrap();
+        let worker = super::Worker::start(tmp.path().join("destination"), egui::Context::default());
+        let deadline = std::time::Duration::from_secs(5);
+        assert!(matches!(
+            worker.rx.recv_timeout(deadline).unwrap(),
+            super::Event::Ready(_, _, _)
+        ));
+        worker.send(super::Command::Restore(backup)).unwrap();
+        match worker.rx.recv_timeout(deadline).unwrap() {
+            super::Event::Ready(_, settings, _) => {
+                assert!(settings.contains(&("theme".into(), "dark".into())));
+                assert!(settings.contains(&("reading-direction".into(), "rtl".into())));
+            }
+            _ => panic!("restore must refresh settings together with the library"),
+        }
+    }
+    #[test]
+    fn long_comic_keeps_its_width_and_tiles_below_gpu_limits() {
+        let image = image::RgbImage::from_pixel(320, 9000, image::Rgb([21, 32, 43]));
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+        let decoded = super::decode(encoded.get_ref(), false).unwrap();
+        assert_eq!(decoded.size, [320, 9000]);
+        assert_eq!(decoded.tiles.len(), 5);
+        assert!(decoded.tiles.iter().all(|t| t.size[1] <= 2048));
+        assert_eq!(decoded.tiles.iter().map(|t| t.size[1]).sum::<usize>(), 9000);
+    }
+}

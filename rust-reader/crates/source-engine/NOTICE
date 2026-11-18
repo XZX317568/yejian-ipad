@@ -1,0 +1,23 @@
+Yejian source engine (crate `yejian-sources`)
+==============================================
+
+This crate is extracted from the Rust Aidoku WebAssembly host that ships with
+Mangayomi v0.9.96, originally located at:
+
+    app/rust/src/aidoku_wasm/   (source snapshot commit 39381ba)
+
+The extracted modules keep their original structure and behaviour where the
+host ABI requires it (HTML/CSS host functions, postcard codec, WASM models and
+the interpreter loop). Changes made for this crate: Flutter Rust Bridge macros
+and Dart callbacks were removed, HTTP is executed natively with `reqwest`
+instead of being delegated to Dart, and each source runs on its own background
+thread behind a plain Rust async API. Safety additions on top of the original
+host: a per-call WASM fuel budget (runaway loops return an explicit error) and
+a 64 MiB response-body cap.
+
+Upstream project: Mangayomi (https://github.com/kodjodevf/mangayomi)
+License: Apache License 2.0 — see LICENSE in this directory.
+
+The engine executes third-party Aidoku source packages supplied by the user.
+No source package, source list, or third-party site content is bundled with
+this crate.
