@@ -819,6 +819,30 @@ impl ReaderApp {
                 vec2((area.width() * 0.55 - 32.).min(520.), height),
             );
         }
+        if Self::shelf_two_column(area) {
+            // iPad landscape: a large stage on the left, the reading column on
+            // the right. Both share the same visual centre instead of hugging
+            // the top edge of a tall screen.
+            let height = (area.height() - 300.).clamp(320., 640.);
+            let width = (area.width() - 380.).clamp(320., 820.);
+            let top = 96. + (area.height() - 96. - 40. - height).max(0.) * 0.42;
+            return Rect::from_min_size(
+                pos2(area.left() + 24., area.top() + top),
+                vec2(width, height),
+            );
+        }
+        if area.width() >= 700. {
+            // iPad portrait and Split View: keep the shelf generous, then put
+            // the title and actions underneath it.
+            let height = (area.height() - 420.).clamp(416., 560.);
+            let width = (area.width() - 48.).clamp(1., 640.);
+            let block = height + 190.;
+            let top = 96. + (area.height() - 96. - 40. - block).max(0.) * 0.42;
+            return Rect::from_min_size(
+                pos2(area.left() + 24., area.top() + top),
+                vec2(width, height),
+            );
+        }
         Rect::from_min_size(
             pos2(area.left() + 24., area.top() + 114.),
             vec2((area.width() - 48.).clamp(1., 520.), 416.),
@@ -832,7 +856,31 @@ impl ReaderApp {
                 vec2(height * 118. / 166., height),
             );
         }
-        let width = if area.width() > 700. { 224. } else { 164. };
+        if Self::detail_wide(area) {
+            // iPad landscape: a large cover on the left, the reading column
+            // beside it, both centred in the page.
+            let height = (area.height() * 0.62).clamp(320., 620.);
+            let width = height * 118. / 166.;
+            let top = area.top() + (area.height() - height).max(0.) * 0.46;
+            let left = area.center().x - (width + 432.) / 2.;
+            return Rect::from_min_size(
+                pos2(left, top),
+                vec2(width, height),
+            );
+        }
+        if area.width() >= 700. {
+            // iPad portrait and Split View: a generous centred cover with the
+            // title block underneath.
+            let width = 320.;
+            let height = width * 166. / 118.;
+            let block = height + 220.;
+            let top = 84. + (area.height() - 84. - 24. - block).max(0.) * 0.40;
+            return Rect::from_min_size(
+                pos2(area.center().x - width / 2., area.top() + top),
+                vec2(width, height),
+            );
+        }
+        let width = 164.;
         let top = if area.height() < 640. { 66. } else { 105. };
         Rect::from_min_size(
             pos2(area.center().x - width / 2., area.top() + top),
@@ -841,6 +889,22 @@ impl ReaderApp {
     }
     fn detail_side_by_side(area: Rect) -> bool {
         area.height() < 600. && area.width() >= 480. && area.width() > area.height()
+    }
+    /// Enough room for the shelf and a separate reading column.
+    fn shelf_two_column(area: Rect) -> bool {
+        area.width() >= 1100. && area.height() >= 620.
+    }
+    /// iPad-sized detail page with a separate column beside the cover.
+    fn detail_wide(area: Rect) -> bool {
+        area.width() >= 1100. && area.height() >= 620.
+    }
+    /// A readable column: full width on phones, centred and capped on iPad.
+    fn page_column(area: Rect, top: f32, bottom: f32) -> Rect {
+        let width = (area.width() - 48.).min(760.);
+        Rect::from_min_max(
+            pos2(area.center().x - width / 2., area.top() + top),
+            pos2(area.center().x + width / 2., area.bottom() - bottom),
+        )
     }
     pub fn draw(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
@@ -1375,6 +1439,32 @@ impl ReaderApp {
                 );
             }
         }
+        // The row is an endless shelf, so spines must dissolve into the page
+        // instead of ending on a hard clip line.
+        {
+            let (background, _, _) = self.colors();
+            let clear = Color32::from_rgba_unmultiplied(
+                background.r(),
+                background.g(),
+                background.b(),
+                0,
+            );
+            let fade = 30.;
+            let mut mesh = egui::Mesh::default();
+            mesh.colored_vertex(pos2(shelf_area.left(), shelf_area.top()), background);
+            mesh.colored_vertex(pos2(shelf_area.left() + fade, shelf_area.top()), clear);
+            mesh.colored_vertex(pos2(shelf_area.left() + fade, shelf_area.bottom()), clear);
+            mesh.colored_vertex(pos2(shelf_area.left(), shelf_area.bottom()), background);
+            mesh.add_triangle(0, 1, 2);
+            mesh.add_triangle(0, 2, 3);
+            mesh.colored_vertex(pos2(shelf_area.right() - fade, shelf_area.top()), clear);
+            mesh.colored_vertex(pos2(shelf_area.right(), shelf_area.top()), background);
+            mesh.colored_vertex(pos2(shelf_area.right(), shelf_area.bottom()), background);
+            mesh.colored_vertex(pos2(shelf_area.right() - fade, shelf_area.bottom()), clear);
+            mesh.add_triangle(4, 5, 6);
+            mesh.add_triangle(4, 6, 7);
+            ui.painter().add(Shape::mesh(mesh));
+        }
         let gesture = ui.interact(
             shelf_area,
             Id::unique("shelf-gesture"),
@@ -1426,27 +1516,31 @@ impl ReaderApp {
         let index = (self.motion.focus.round() as i32).rem_euclid(books.len() as i32) as usize;
         let book = &books[index];
         let short_landscape = Self::detail_side_by_side(area);
-        let wide = short_landscape || (area.width() >= 880. && self.font_scale < 1.5);
+        let wide = Self::shelf_two_column(area) && self.font_scale < 1.5;
         let info = if short_landscape {
             pos2(shelf_area.right() + 24., area.top() + (area.height() * 0.34).max(112.))
         } else if wide {
-            pos2(shelf_area.right() + 48., area.top() + 300.)
+            pos2(shelf_area.right() + 48., shelf_area.center().y - 70.)
         } else {
-            pos2(area.left() + 24., area.top() + 522.)
+            pos2(area.left() + 24., shelf_area.bottom() + 34.)
         };
-        let title_width = (area.right() - 70. - info.x).max(80.);
+        let title_width = (area.right() - 126. - info.x).max(80.);
+        let title_size = if wide {
+            30.
+        } else if area.width() >= 700. {
+            26.
+        } else {
+            22.
+        } * self.font_scale;
         let mut title = egui::text::LayoutJob::simple(
             book.title.clone(),
-            FontId::proportional(if wide {
-                26. * self.font_scale
-            } else {
-                20. * self.font_scale
-            }),
+            FontId::proportional(title_size),
             ink,
             title_width,
         );
         title.wrap.max_rows = 1;
         let title = ui.painter().layout_job(title);
+        let title_width_px = title.size().x;
         let progress_pos = info + vec2(0., title.size().y + 6.);
         ui.painter().galley(info, title, ink);
         let has_progress = book.last_read_at.is_some();
@@ -1470,7 +1564,12 @@ impl ReaderApp {
         let progress = ui.painter().layout_job(progress);
         let action_y = progress_pos.y + progress.size().y + 16.;
         ui.painter().galley(progress_pos, progress, muted);
-        let open_rect = Rect::from_min_size(pos2(area.right() - 68., info.y - 5.), vec2(44., 44.));
+        let open_x = if short_landscape {
+            area.right() - 68.
+        } else {
+            (info.x + title_width_px + 16.).min(area.right() - 68.)
+        };
+        let open_rect = Rect::from_min_size(pos2(open_x, info.y - 5.), vec2(44., 44.));
         if self.selected.is_empty() && self.icon(ui, "open-book", open_rect, "open", "查看漫画详情") {
             if let Some(volume) = volumes
                 .iter()
@@ -1493,7 +1592,7 @@ impl ReaderApp {
         let y = if short_landscape {
             shelf_area.bottom() - 28.
         } else if wide {
-            shelf_area.bottom() + 12.
+            shelf_area.bottom() + 8.
         } else if action.right() + 8. > pager_left {
             action.bottom() + 4.
         } else {
@@ -1618,48 +1717,84 @@ impl ReaderApp {
         };
         let details_start = if Self::detail_side_by_side(area) {
             pos2(area.center().x, area.top() + 68.)
+        } else if Self::detail_wide(area) {
+            pos2(cover.right() + 72., cover.top() + cover.height() * 0.15)
         } else {
             pos2(area.left() + 24., cover.bottom() + 30.)
         };
+        if Self::detail_wide(area) {
+            let body = Rect::from_min_size(
+                details_start,
+                vec2(360., (area.bottom() - 24. - details_start.y).max(160.)),
+            );
+            ui.scope_builder(UiBuilder::new().max_rect(body), |ui| {
+                ScrollArea::vertical().id_salt(("detail-body", id)).show(ui, |ui| {
+                    ui.add(
+                        Label::new(RichText::new(title).size(36. * self.font_scale).color(ink)).wrap(),
+                    );
+                    ui.add_space(8.);
+                    ui.add(
+                        Label::new(RichText::new(text).size(15. * self.font_scale).color(muted)).wrap(),
+                    );
+                    ui.add_space(28.);
+                    self.detail_actions(ui, &book, id, 280., 52.);
+                });
+            });
+            return;
+        }
         let body = Rect::from_min_max(details_start, area.max - vec2(24., 12.));
-        let can_restart = book.current_page > 0 || book.page_fraction > 0.;
         ui.scope_builder(UiBuilder::new().max_rect(body), |ui| {
             ScrollArea::vertical().id_salt(("detail-body", id)).show(ui, |ui| {
                 ui.vertical_centered(|ui| {
-                    ui.add(Label::new(RichText::new(title).size(24. * self.font_scale).color(ink)).wrap());
+                    let title_size = if area.width() >= 700. { 30. } else { 24. };
+                    ui.add(
+                        Label::new(RichText::new(title).size(title_size * self.font_scale).color(ink)).wrap(),
+                    );
                     ui.add_space(6.);
                     ui.add(Label::new(RichText::new(text).size(13. * self.font_scale).color(muted)).wrap());
                     ui.add_space(18.);
                     let width = (218. * self.font_scale.sqrt()).min(ui.available_width());
-                    let (rect, _) = ui.allocate_exact_size(vec2(width, 48.), Sense::hover());
-                    let action = if book.last_read_at.is_some() {
-                        format!("继续阅读 · 第 {} 页", book.current_page + 1)
-                    } else {
-                        "开始阅读".to_string()
-                    };
-                    if self.button(ui, "read", rect, &action, true) {
-                        self.flight = None;
-                        self.open_reader(&book);
-                    }
-                    if can_restart {
-                        let (rect, _) = ui.allocate_exact_size(vec2(width, 44.), Sense::hover());
-                        if self.button(ui, "read-start", rect, "从第一页开始", false) {
-                            let mut first = book.clone();
-                            first.current_page = 0;
-                            first.page_fraction = 0.;
-                            self.flight = None;
-                            self.open_reader(&first);
-                        }
-                    }
-                    if self.chapter(id).is_some() {
-                        let (rect, _) = ui.allocate_exact_size(vec2(width, 44.), Sense::hover());
-                        if self.button(ui, "detail-chapters", rect, "已下载章节", false) {
-                            self.chapter_dialog = Some(id.to_string());
-                        }
-                    }
+                    self.detail_actions(ui, &book, id, width, 48.);
                 });
             });
         });
+    }
+    fn detail_actions(
+        &mut self,
+        ui: &mut Ui,
+        book: &yejian_core::Book,
+        id: &str,
+        width: f32,
+        primary_height: f32,
+    ) {
+        let can_restart = book.current_page > 0 || book.page_fraction > 0.;
+        let width = width.min(ui.available_width());
+        let (rect, _) = ui.allocate_exact_size(vec2(width, primary_height), Sense::hover());
+        let action = if book.last_read_at.is_some() {
+            format!("继续阅读 · 第 {} 页", book.current_page + 1)
+        } else {
+            "开始阅读".to_string()
+        };
+        if self.button(ui, "read", rect, &action, true) {
+            self.flight = None;
+            self.open_reader(book);
+        }
+        if can_restart {
+            let (rect, _) = ui.allocate_exact_size(vec2(width, 46.), Sense::hover());
+            if self.button(ui, "read-start", rect, "从第一页开始", false) {
+                let mut first = book.clone();
+                first.current_page = 0;
+                first.page_fraction = 0.;
+                self.flight = None;
+                self.open_reader(&first);
+            }
+        }
+        if self.chapter(id).is_some() {
+            let (rect, _) = ui.allocate_exact_size(vec2(width, 46.), Sense::hover());
+            if self.button(ui, "detail-chapters", rect, "已下载章节", false) {
+                self.chapter_dialog = Some(id.to_string());
+            }
+        }
     }
     fn reader_ui(&mut self, ui: &mut Ui, area: Rect, id: &str, now: f64) {
         let Some(book) = self.books.iter().find(|b| b.id == id).cloned() else {
@@ -2084,9 +2219,10 @@ impl ReaderApp {
     }
     fn history_ui(&mut self, ui: &mut Ui, area: Rect) {
         let (_, ink, muted) = self.colors();
+        let column = Self::page_column(area, 128., 88.);
         self.label(
             ui.painter(),
-            area.min + vec2(24., 80.),
+            pos2(column.left(), area.top() + 80.),
             "阅读历史",
             23.,
             ink,
@@ -2098,8 +2234,7 @@ impl ReaderApp {
             .cloned()
             .collect();
         books.sort_by_key(|b| std::cmp::Reverse(b.last_read_at));
-        let rect = Rect::from_min_max(area.min + vec2(24., 128.), area.max - vec2(24., 88.));
-        ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
+        ui.scope_builder(UiBuilder::new().max_rect(column), |ui| {
             ScrollArea::vertical().show(ui, |ui| {
                 if books.is_empty() {
                     ui.label("还没有阅读记录。");
@@ -2144,9 +2279,15 @@ impl ReaderApp {
     }
     fn settings_ui(&mut self, ui: &mut Ui, area: Rect) {
         let (_, ink, _) = self.colors();
-        self.label(ui.painter(), area.min + vec2(24., 80.), "设置", 23., ink);
-        let rect = Rect::from_min_max(area.min + vec2(24., 130.), area.max - vec2(24., 88.));
-        ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
+        let column = Self::page_column(area, 130., 88.);
+        self.label(
+            ui.painter(),
+            pos2(column.left(), area.top() + 80.),
+            "设置",
+            23.,
+            ink,
+        );
+        ui.scope_builder(UiBuilder::new().max_rect(column), |ui| {
             ScrollArea::vertical().show(ui, |ui| {
                 ui.heading("外观与阅读");
                 ui.horizontal(|ui| {
@@ -2250,9 +2391,15 @@ impl ReaderApp {
     }
     fn sources_ui(&mut self, ui: &mut Ui, area: Rect) {
         let (_, ink, _) = self.colors();
-        self.label(ui.painter(), area.min + vec2(24., 80.), "书源", 23., ink);
-        let rect = Rect::from_min_max(area.min + vec2(24., 132.), area.max - vec2(24., 88.));
-        ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
+        let column = Self::page_column(area, 132., 88.);
+        self.label(
+            ui.painter(),
+            pos2(column.left(), area.top() + 80.),
+            "书源",
+            23.,
+            ink,
+        );
+        ui.scope_builder(UiBuilder::new().max_rect(column), |ui| {
             self.sources.ui(ui);
         });
     }

@@ -1213,12 +1213,14 @@ impl Sources {
                     });
                     ui.add_space(8.);
                 }
-                ui.label("添加 Aidoku 书源仓库");
+                ui.add_space(2.);
+                ui.label(RichText::new("添加 Aidoku 书源仓库").size(15.).strong());
+                ui.add_space(6.);
                 ui.horizontal(|ui|{
                     let row=ui.available_width();
                     ui.set_max_width(row);
                     ui.add_enabled(!self.busy,TextEdit::singleline(&mut self.url).hint_text("仓库列表 URL").desired_width((row-92.).max(120.)));
-                    if ui.add_enabled(!self.busy,Button::new("读取")).clicked(){self.submit(Task::Fetch(self.url.trim().into()));}
+                    if ui.add_enabled(!self.busy,Button::new("读取").min_size(vec2(72.,28.))).clicked(){self.submit(Task::Fetch(self.url.trim().into()));}
                 });
                 if let Some(repo)=self.repository.clone(){
                     ui.add_space(10.);
@@ -1241,7 +1243,9 @@ impl Sources {
                         }
                     });
                 }
-                ui.add_space(20.);ui.heading("已安装");
+                ui.add_space(24.);
+                ui.label(RichText::new("已安装").size(19.).strong());
+                ui.add_space(4.);
                 if self.installed.is_empty(){ui.label("添加仓库并安装一个书源后，即可在这里搜索漫画。");}
                 for source in self.installed.clone(){
                     if ui.selectable_label(self.selected_source==source.manifest.id,&source.manifest.name).clicked(){self.select_source(&source.manifest.id);}

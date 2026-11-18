@@ -1,6 +1,9 @@
 //! Android bridge. Calls the static methods on
 //! `app.yejian.reader.RustActivity` through the `ndk-context` JVM handle that
 //! `android-activity` (and therefore winit) initialises before `android_main`.
+//!
+//! `ndk-context` holds the **Application** object, not the activity, so the
+//! bridge resolves the activity class through the application's class loader.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
@@ -42,6 +45,10 @@ static BACK_PENDING: AtomicBool = AtomicBool::new(false);
 /// happen while the UI is drawing anyway, so this never creates a tick.
 static LAST_POLL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+/// `app.yejian.reader.RustActivity`, resolved once through the app's own class
+/// loader. `FindClass` on a native thread would only see system classes.
+static ACTIVITY_CLASS: std::sync::OnceLock<GlobalRef> = std::sync::OnceLock::new();
+const ACTIVITY_CLASS_NAME: &str = "app.yejian.reader.RustActivity";
 
 fn now_ms() -> u64 {
     START.get_or_init(Instant::now).elapsed().as_millis() as u64
@@ -126,19 +133,44 @@ fn with_activity<T>(
         .map_err(|error| PlatformError::Jni(format!("attach_current_thread: {error}")))?;
 
     env.with_local_frame(32, |env| {
-        // SAFETY: `ndk-context` owns this global reference. `forget` below
-        // keeps `JObject::drop` from deleting a reference we do not own.
-        let activity = unsafe { JObject::from_raw(context.context().cast()) };
-        // `FindClass` on a native thread uses the system class loader, which
-        // cannot see app classes. Ask the activity for its class instead and
-        // keep a global reference for the static-method call.
-        let class = env.get_object_class(&activity);
-        std::mem::forget(activity);
+        if let Some(class) = ACTIVITY_CLASS.get() {
+            return f(env, class);
+        }
 
-        let class = class?;
-        let class_object: &JObject<'_> = class.as_ref();
-        let class = env.new_global_ref(class_object)?;
-        f(env, &class)
+        // SAFETY: `ndk-context` owns this global reference of the Application.
+        // `forget` below keeps `JObject::drop` from deleting a reference we do
+        // not own.
+        let application = unsafe { JObject::from_raw(context.context().cast()) };
+        let resolved = (|| -> Result<GlobalRef> {
+            let loader = env
+                .call_method(
+                    &application,
+                    "getClassLoader",
+                    "()Ljava/lang/ClassLoader;",
+                    &[],
+                )
+                .and_then(|value| value.l())
+                .map_err(|error| PlatformError::Jni(format!("getClassLoader: {error}")))?;
+            let name = env
+                .new_string(ACTIVITY_CLASS_NAME)
+                .map_err(|error| PlatformError::Jni(format!("class name: {error}")))?;
+            let name = JObject::from(name);
+            let class = env
+                .call_method(
+                    &loader,
+                    "loadClass",
+                    "(Ljava/lang/String;)Ljava/lang/Class;",
+                    &[JValue::Object(&name)],
+                )
+                .and_then(|value| value.l())
+                .map_err(|error| PlatformError::Jni(format!("loadClass: {error}")))?;
+            Ok(env.new_global_ref(&class)?)
+        })();
+        std::mem::forget(application);
+
+        let class = resolved?;
+        let _ = ACTIVITY_CLASS.set(class);
+        f(env, ACTIVITY_CLASS.get().expect("activity class was just stored"))
     })
 }
 

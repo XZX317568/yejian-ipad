@@ -58,7 +58,7 @@ pub fn foreground(volumes: &[Volume], lane: i32, cover: Plane) -> Vec<Volume> {
 }
 
 fn shelf_scale(area: Rect) -> f32 {
-    (area.height() / 416.).clamp(0.2, 1.)
+    (area.height() / 416.).clamp(0.2, 1.55)
 }
 
 pub fn lane_pitch(area: Rect) -> f32 {

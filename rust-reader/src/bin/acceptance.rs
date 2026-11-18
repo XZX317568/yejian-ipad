@@ -470,12 +470,55 @@ fn main() -> Result<()> {
     h.size = [1024, 768];
     h.frames(5)?;
     h.frame(vec![], Some("tablet-shelf"))?;
+    // iPad window sizes: 11" landscape and portrait, plus a narrow Split View.
+    for (width, height, name) in [
+        (1366, 1024, "ipad-landscape-shelf"),
+        (1024, 1366, "ipad-portrait-shelf"),
+        (507, 1024, "ipad-split-shelf"),
+    ] {
+        h.size = [width, height];
+        h.frames(6)?;
+        h.frame(vec![], Some(name))?;
+    }
+    h.size = [1366, 1024];
+    h.frames(6)?;
+    h.click("open-book")?;
+    h.frames(65)?;
+    eprintln!("ipad landscape after open-book: {}", h.app.screen_name());
+    h.frame(vec![], Some("ipad-landscape-detail"))?;
+    h.click("back")?;
+    h.frames(90)?;
+    h.size = [1024, 1366];
+    h.frames(6)?;
+    h.click("open-book")?;
+    h.frames(65)?;
+    eprintln!("ipad portrait after open-book: {}", h.app.screen_name());
+    h.frame(vec![], Some("ipad-portrait-detail"))?;
+    h.click("back")?;
+    h.frames(90)?;
+    h.size = [1024, 768];
+    h.frames(4)?;
     h.click("nav-history")?;
     h.frames(3)?;
     h.frame(vec![], Some("history"))?;
     h.click("nav-settings")?;
     h.frames(3)?;
     h.frame(vec![], Some("settings"))?;
+    h.size = [1366, 1024];
+    h.frames(6)?;
+    h.click("nav-search")?;
+    h.frames(4)?;
+    h.frame(vec![], Some("ipad-landscape-sources"))?;
+    h.click("nav-history")?;
+    h.frames(4)?;
+    h.frame(vec![], Some("ipad-landscape-history"))?;
+    h.click("nav-settings")?;
+    h.frames(4)?;
+    h.frame(vec![], Some("ipad-landscape-settings"))?;
+    h.click("nav-library")?;
+    h.frames(4)?;
+    h.size = [1024, 768];
+    h.frames(4)?;
     // Reopen the real database from disk; in-memory state is insufficient.
     let reopened = yejian_core::Library::open(&data.join("library"))?;
     anyhow::ensure!(

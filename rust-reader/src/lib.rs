@@ -16,6 +16,23 @@ pub fn configure_fonts(ctx: &egui::Context) {
         fonts.families.entry(family).or_default().push("yejian-cjk".into());
     }
     ctx.set_fonts(fonts);
+    // Touch-sized controls and comfortable line spacing. The default egui
+    // metrics are desktop-mouse sized and read as a debug panel on iPad.
+    for theme in [egui::Theme::Light, egui::Theme::Dark] {
+        ctx.style_mut_of(theme, |style| {
+            style.spacing.item_spacing = egui::vec2(10., 9.);
+            style.spacing.button_padding = egui::vec2(12., 8.);
+            style.spacing.interact_size = egui::vec2(30., 30.);
+            style.spacing.icon_width = 22.;
+            style.spacing.icon_width_inner = 12.;
+            style.spacing.icon_spacing = 8.;
+            style.spacing.slider_width = 180.;
+            style.text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(15.));
+            style.text_styles.insert(egui::TextStyle::Button, egui::FontId::proportional(15.));
+            style.text_styles.insert(egui::TextStyle::Heading, egui::FontId::proportional(22.));
+            style.text_styles.insert(egui::TextStyle::Small, egui::FontId::proportional(12.5));
+        });
+    }
 }
 
 pub fn run() -> eframe::Result {
