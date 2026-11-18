@@ -157,5 +157,28 @@ fn android_main(app: winit::platform::android::activity::AndroidApp) {
 #[cfg(target_os="ios")]
 #[unsafe(no_mangle)]
 pub extern "C" fn yejian_start_app() {
-    if let Err(error)=run(){log::error!("页间启动失败：{error}");}
+    startup_note("yejian_start_app: enter");
+    match run() {
+        Ok(()) => startup_note("yejian_start_app: run returned Ok"),
+        Err(error) => startup_note(&format!("yejian_start_app: run failed: {error}")),
+    }
+}
+
+/// Minimal file trace for iOS startup problems; the system log drops Rust
+/// output before a logger exists.
+#[cfg(target_os = "ios")]
+fn startup_note(message: &str) {
+    use std::io::Write;
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let documents = PathBuf::from(home).join("Documents");
+    let _ = std::fs::create_dir_all(&documents);
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(documents.join("yejian-startup.log"))
+    {
+        let _ = writeln!(file, "{message}");
+    }
 }

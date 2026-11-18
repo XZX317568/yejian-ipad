@@ -63,6 +63,10 @@ jobs:
           LAUNCH_PID=$!
           sleep 12
           kill "$LAUNCH_PID" 2>/dev/null || true
+          CONTAINER=$(xcrun simctl get_app_container "$DEVICE" app.yejian.reader.rust data || true)
+          if [ -n "${CONTAINER:-}" ]; then
+            cp "$CONTAINER/Documents/yejian-startup.log" artifacts/rust/ipad-sim/ 2>/dev/null || true
+          fi
           sleep 3
           xcrun simctl io "$DEVICE" screenshot "artifacts/rust/ipad-sim/shelf-early.png"
           shoot detail 20 --ui-snapshot detail

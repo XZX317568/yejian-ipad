@@ -11,4 +11,6 @@ import Foundation
 @_silgen_name("yejian_start_app")
 func yejian_start_app()
 
+NSLog("Yejian main: calling Rust")
 yejian_start_app()
+NSLog("Yejian main: Rust returned")
