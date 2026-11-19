@@ -99,6 +99,12 @@ RUNNER_CONTAINER=$(xcrun simctl get_app_container "$DEVICE" app.yejian.reader.ui
 for screen in shelf detail reader; do
   marker="$CONTAINER/Documents/Yejian/ui-snapshots/$screen.json"
   cp "$RUNNER_CONTAINER/Documents/$screen-landscape.png" "$OUT/$screen-landscape.png"
+  if [ ! -f "$marker" ]; then
+    # XCTest installs a fresh app container; fall back to the simctl container
+    # listing if the cached path no longer holds the readiness marker.
+    ALT=$(xcrun simctl get_app_container "$DEVICE" "$BUNDLE" data)
+    marker="$ALT/Documents/Yejian/ui-snapshots/$screen.json"
+  fi
   python3 - "$marker" <<'PY'
 import json, sys
 with open(sys.argv[1]) as stream:
