@@ -157,11 +157,17 @@ fn android_main(app: winit::platform::android::activity::AndroidApp) {
 #[cfg(target_os="ios")]
 #[unsafe(no_mangle)]
 pub extern "C" fn yejian_start_app() {
+    // stderr write reaches `simctl launch --console-pty` and the unified log
+    // even when HOME/Documents is unavailable, so we can tell whether this
+    // Rust entry point is actually invoked.
+    use std::io::Write as _;
+    let _ = std::io::stderr().write_all(b"YEJIAN_RUST_ENTER\n");
     startup_note("yejian_start_app: enter");
     match run() {
         Ok(()) => startup_note("yejian_start_app: run returned Ok"),
         Err(error) => startup_note(&format!("yejian_start_app: run failed: {error}")),
     }
+    let _ = std::io::stderr().write_all(b"YEJIAN_RUST_EXIT\n");
 }
 
 /// Minimal file trace for iOS startup problems; the system log drops Rust
