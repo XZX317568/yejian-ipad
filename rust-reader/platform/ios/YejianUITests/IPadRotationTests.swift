@@ -13,7 +13,12 @@ final class IPadRotationTests: XCTestCase {
 
     private func capture(_ screen: String) throws {
         let app = XCUIApplication(bundleIdentifier: "app.yejian.reader.rust")
-        app.launchArguments = ["--ui-snapshot", screen, "--ui-landscape"]
+        let runID = UUID().uuidString
+        // Reuse the library imported before XCTest installed this app. Seeding
+        // here would conceal broken stored paths after the container moves.
+        app.launchArguments = [
+            "--ui-snapshot", screen, "--ui-landscape", "--ui-snapshot-run", runID
+        ]
         XCUIDevice.shared.orientation = .portrait
         app.launch()
         defer {
@@ -30,11 +35,33 @@ final class IPadRotationTests: XCTestCase {
         )
         XCTAssertEqual(XCTWaiter.wait(for: [rotated], timeout: 30), .completed)
 
-        // Allow the production UI to finish loading its page and to write the
-        // readiness marker that the shell checks separately after these tests.
-        let settled = expectation(description: "landscape compositor settled")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { settled.fulfill() }
-        wait(for: [settled], timeout: 10)
+        let marker = app.descendants(matching: .any)
+            .matching(identifier: "yejian.snapshot.ready").firstMatch
+        XCTAssertTrue(
+            marker.waitForExistence(timeout: 90),
+            "The landscape renderer never acknowledged loaded content for \(screen)"
+        )
+        let json = try XCTUnwrap(marker.value as? String)
+        let data = try XCTUnwrap(json.data(using: .utf8))
+        let report = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+        XCTAssertEqual(report["run_id"] as? String, runID, "Stale readiness report")
+        XCTAssertEqual(report["screen"] as? String, screen)
+        let width = try XCTUnwrap(report["width"] as? Double)
+        let height = try XCTUnwrap(report["height"] as? Double)
+        XCTAssertGreaterThan(width, height)
+        let books = try XCTUnwrap(report["books"] as? Int)
+        XCTAssertEqual(books, 5, "The original imported library must survive reinstallation")
+        XCTAssertEqual(report["archives_available"] as? Int, books)
+        XCTAssertEqual(report["cover_files_available"] as? Int, books)
+        XCTAssertEqual(report["covers_pending"] as? Int, 0)
+        XCTAssertEqual(report["covers_failed"] as? Int, 0)
+        if screen == "reader" {
+            XCTAssertEqual(report["page_loaded"] as? Bool, true)
+        } else {
+            XCTAssertGreaterThan(try XCTUnwrap(report["covers_loaded"] as? Int), 0)
+        }
         XCTAssertEqual(app.state, .runningForeground)
         let screenshot = XCUIScreen.main.screenshot()
         let attachment = XCTAttachment(screenshot: screenshot)
@@ -44,6 +71,10 @@ final class IPadRotationTests: XCTestCase {
         let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         try screenshot.pngRepresentation.write(
             to: documents.appendingPathComponent("\(screen)-landscape.png")
+        )
+        try data.write(
+            to: documents.appendingPathComponent("\(screen)-landscape.json"),
+            options: .atomic
         )
     }
 }

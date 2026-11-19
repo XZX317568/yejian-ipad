@@ -530,7 +530,7 @@ impl Library {
     pub fn page_bytes(&self, book_id: &str, page: usize) -> Result<Vec<u8>> {
         let stored = {
             let connection = self.lock_db()?;
-            db::require_book(&connection, book_id, false)?
+            db::require_book(&connection, &self.root, book_id, false)?
         };
         if page >= stored.book.page_count {
             bail!(

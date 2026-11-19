@@ -55,7 +55,7 @@ impl Library {
     pub fn link_chapter(&self, book_id: &str, metadata: &ChapterMetadata) -> Result<()> {
         let metadata = sanitized_metadata(metadata)?;
         let mut connection = self.lock_db()?;
-        db::require_book(&connection, book_id, false)?;
+        db::require_book(&connection, &self.root, book_id, false)?;
 
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)

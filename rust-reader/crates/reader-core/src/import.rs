@@ -202,13 +202,19 @@ impl Library {
             return;
         };
         for path in created {
-            let text = path.to_string_lossy();
+            // New rows store managed files relative to the library root; a
+            // row written by an older build may still hold the absolute form.
+            let text = crate::book::managed_relative(&path, &self.archives_dir())
+                .or_else(|| crate::book::managed_relative(&path, &self.covers_dir()))
+                .unwrap_or_else(|| path.to_string_lossy().into_owned());
+            let absolute = path.to_string_lossy().into_owned();
             let referenced: i64 = connection
                 .query_row(
                     "SELECT EXISTS(
-                         SELECT 1 FROM books WHERE archive_path = ?1 OR cover_path = ?1
+                         SELECT 1 FROM books
+                         WHERE archive_path IN (?1, ?2) OR cover_path IN (?1, ?2)
                      )",
-                    params![&*text],
+                    params![text, absolute],
                     |row| row.get(0),
                 )
                 .unwrap_or(1);
@@ -220,7 +226,7 @@ impl Library {
 
     fn find_by_hash(&self, content_hash: &str) -> Result<Option<StoredBook>> {
         let connection = self.lock_db()?;
-        db::find_by_hash(&connection, content_hash)
+        db::find_by_hash(&connection, &self.root, content_hash)
     }
 
     fn finish_existing(
@@ -252,7 +258,7 @@ impl Library {
 
         let _ = self.ensure_cover(&stored);
         let connection = self.lock_db()?;
-        let current = db::require_book(&connection, &stored.book.id, false)?;
+        let current = db::require_book(&connection, &self.root, &stored.book.id, false)?;
         Ok((current.book, ImportStatus::Existing))
     }
 
@@ -325,7 +331,6 @@ impl Library {
         }
         Ok(())
     }
-
     fn ensure_cover(&self, stored: &StoredBook) -> Result<()> {
         let cover_missing = stored
             .book
@@ -340,7 +345,8 @@ impl Library {
         let cover = build_cover(kind, &stored.book.archive_path, &pages)?;
         let cover_path = self.covers_dir().join(format!("{}.jpg", stored.book.id));
         atomic_write(&cover_path, &cover)?;
-        let cover_path = cover_path.to_string_lossy().into_owned();
+        let cover_path = crate::book::managed_relative(&cover_path, &self.covers_dir())
+            .unwrap_or_else(|| cover_path.to_string_lossy().into_owned());
         let connection = self.lock_db()?;
         connection
             .execute(
@@ -356,16 +362,19 @@ impl Library {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("start book import")?;
-        if let Some(existing) = db::find_by_hash(&transaction, &prepared.content_hash)? {
+        if let Some(existing) = db::find_by_hash(&transaction, &self.root, &prepared.content_hash)?
+        {
             transaction.commit().context("finish duplicate import")?;
             return Ok((existing.book, ImportStatus::Existing));
         }
 
-        let cover = prepared
-            .cover_path
-            .as_ref()
-            .map(|path| path.to_string_lossy().into_owned());
-        let archive_path = prepared.archive_path.to_string_lossy().into_owned();
+        let cover = prepared.cover_path.as_ref().map(|path| {
+            crate::book::managed_relative(path, &self.covers_dir())
+                .unwrap_or_else(|| path.to_string_lossy().into_owned())
+        });
+        let archive_path =
+            crate::book::managed_relative(&prepared.archive_path, &self.archives_dir())
+                .unwrap_or_else(|| prepared.archive_path.to_string_lossy().into_owned());
         transaction
             .execute(
                 "INSERT INTO books(

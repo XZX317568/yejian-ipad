@@ -90,6 +90,14 @@ impl Library {
             .context("configure library database")?;
         db::migrate(&connection)?;
 
+        // Rows written before managed paths were stored relative to the
+        // library root hold absolute paths from the container that imported
+        // them (or working-directory-relative `data\archives\...` values).
+        // Rewrite those rows once so a library moved to a new root keeps
+        // resolving its own archives/ and covers/ copies; the rewrite touches
+        // no other column, in particular not the reading timestamps.
+        relocate_managed_paths(&connection)?;
+
         Ok(Self {
             root: root.to_path_buf(),
             conn: Mutex::new(connection),
@@ -115,4 +123,111 @@ impl Library {
             .lock()
             .map_err(|_| anyhow::anyhow!("library database lock poisoned"))
     }
+}
+
+/// Rewrites `archive_path`/`cover_path` values that name a managed copy
+/// (`archives/<id>[.ext]`, `covers/<id>.jpg`) into the canonical
+/// root-relative form. Values pointing elsewhere — a legacy external path,
+/// an unrelated folder name, or a file that does not follow the
+/// content-addressed convention — are left untouched.
+fn relocate_managed_paths(connection: &Connection) -> Result<()> {
+    let mut statement = connection
+        .prepare("SELECT id, archive_path, cover_path FROM books")
+        .context("prepare managed-path relocation")?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .context("query managed paths")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("read managed paths")?;
+    drop(statement);
+
+    let transaction = connection
+        .unchecked_transaction()
+        .context("start managed-path relocation")?;
+    for (id, archive_path, cover_path) in rows {
+        let new_archive = relocate_value(&archive_path, "archives", &id);
+        let new_cover = cover_path
+            .as_deref()
+            .and_then(|value| relocate_value(value, "covers", &id));
+        // Only a recognised managed value is rewritten; an unrecognised row
+        // keeps its stored text untouched and is not even updated.
+        let archive_update = new_archive.filter(|value| *value != archive_path);
+        let cover_update = new_cover.filter(|value| Some(value.as_str()) != cover_path.as_deref());
+        if archive_update.is_none() && cover_update.is_none() {
+            continue;
+        }
+        transaction
+            .execute(
+                "UPDATE books SET archive_path = ?1, cover_path = ?2 WHERE id = ?3",
+                rusqlite::params![
+                    archive_update.unwrap_or(archive_path),
+                    cover_update.or(cover_path),
+                    id
+                ],
+            )
+            .context("relocate managed path")?;
+    }
+    transaction
+        .commit()
+        .context("commit managed-path relocation")
+}
+
+/// Returns the canonical `<dirname>/<file>` stored value when `stored` names
+/// a managed copy of `book_id`, else `None`.
+///
+/// A managed row is recognised by shape alone, never by probing the
+/// filesystem: the last path component is the content-addressed file name
+/// (`<id>[.ext]` for archives, `<id>.jpg` for covers) and the component
+/// before it is the managed directory name (`archives`/`covers`). Anything
+/// else — an external file, an unrelated folder, a `data/archives/...`
+/// nesting that still ends in the managed pair — is either rewritten to that
+/// same pair (the managed pair is what matters) or left untouched when the
+/// file name does not match the book id.
+fn relocate_value(stored: &str, directory: &str, book_id: &str) -> Option<String> {
+    let normalized = stored.replace('\\', "/");
+    let mut parts = normalized.split('/');
+    let file_name = parts.next_back()?;
+    let parent = parts.next_back()?;
+    if parent != directory {
+        return None;
+    }
+    // The stored stem must be this row's content-addressed id, not just any
+    // 64-hex name and never a foreign basename.
+    if !is_content_id(book_id) {
+        return None;
+    }
+    let stem = file_name.split('.').next()?;
+    if stem != book_id {
+        return None;
+    }
+    // Archive copies keep the extension the importer recorded (`<id>` for an
+    // image folder, `<id>.<ext>` for an archive file); covers are the
+    // generated JPEG thumbnail `<id>.jpg`. Any other suffix is not a managed
+    // name we may claim.
+    let suffix = file_name.strip_prefix(book_id)?;
+    let allowed = match directory {
+        "archives" => {
+            suffix.is_empty()
+                || matches!(suffix, ".cbz" | ".zip" | ".cbt" | ".tar" | ".cbr" | ".rar")
+        }
+        "covers" => suffix == ".jpg",
+        _ => false,
+    };
+    if !allowed {
+        return None;
+    }
+    Some(format!("{directory}/{stem}{suffix}"))
+}
+
+fn is_content_id(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }

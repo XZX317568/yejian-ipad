@@ -563,14 +563,17 @@ fn recover_completed_archive(root: &Path, task: &DownloadTask) -> Option<PathBuf
 
 fn normalize_loaded(root: &Path, tasks: &mut [DownloadTask]) {
     for task in tasks {
-        if task.status != DownloadStatus::Done
-            && let Some(path) = recover_completed_archive(root, task)
-        {
-            task.status = DownloadStatus::Done;
+        if let Some(path) = recover_completed_archive(root, task) {
+            // iOS can relocate the data container during an update. A done
+            // task still records the old absolute CBZ path; prefer this
+            // library's own complete archive and keep its import state.
+            if task.status != DownloadStatus::Done {
+                task.status = DownloadStatus::Done;
+                task.error = None;
+                task.linked = false;
+                task.pages_done = task.pages_total;
+            }
             task.cbz = Some(path);
-            task.error = None;
-            task.linked = false;
-            task.pages_done = task.pages_total;
         } else if task.status==DownloadStatus::Running {
             task.status=DownloadStatus::Paused;
             task.error=Some("上次下载中断，点“继续”恢复".into());
@@ -1699,6 +1702,46 @@ mod tests {
         assert_eq!(tasks[0].status, DownloadStatus::Done);
         assert_eq!(tasks[0].cbz.as_ref(), Some(&path));
         assert_eq!(pending_imports(&tasks), vec![tasks[0].id.clone()]);
+    }
+
+    #[test]
+    fn completed_downloads_follow_a_moved_container_without_reimporting_linked_chapters() {
+        let temp = tempfile::tempdir().unwrap();
+        let old_root = temp.path().join("old");
+        let new_root = temp.path().join("new");
+        let mut tasks = Vec::new();
+        let stop = AtomicU8::new(STOP_NONE);
+        for linked in [false, true] {
+            let mut item = task("fixture", "m", if linked { "linked" } else { "pending" });
+            let Outcome::Done { path } = execute_task(
+                &old_root, &item, vec![url_page("1")], &stop, |_| Ok(png()), |_, _, _| {}
+            ).unwrap() else { panic!("fixture did not complete") };
+            item.status = DownloadStatus::Done;
+            item.cbz = Some(path);
+            item.linked = linked;
+            tasks.push(item);
+        }
+        std::fs::write(
+            old_root.join("download-tasks.json"),
+            serde_json::to_vec(&TaskStore { tasks: tasks.clone() }).unwrap()
+        ).unwrap();
+        std::fs::rename(&old_root, &new_root).unwrap();
+        // A leftover old container must never take precedence over the
+        // complete archive inside the library we actually opened.
+        let stale = tasks[0].cbz.as_ref().unwrap();
+        std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        std::fs::write(stale, b"stale").unwrap();
+        let (loaded, warning) = load_queue(&new_root);
+        assert!(warning.is_none());
+        for item in &loaded {
+            assert_eq!(item.status, DownloadStatus::Done);
+            assert_eq!(item.cbz.as_ref(), Some(&chapter_archive(&new_root, item)));
+            let archive = std::fs::File::open(item.cbz.as_ref().unwrap()).unwrap();
+            assert_eq!(zip::ZipArchive::new(archive).unwrap().len(), 1);
+        }
+        assert!(!loaded[0].linked);
+        assert!(loaded[1].linked);
+        assert_eq!(pending_imports(&loaded), vec![loaded[0].id.clone()]);
     }
 
     #[test]

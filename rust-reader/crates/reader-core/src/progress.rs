@@ -130,7 +130,7 @@ impl Library {
         };
 
         for record in records {
-            apply_one(&transaction, record, &mut report)?;
+            apply_one(&transaction, &self.root, record, &mut report)?;
         }
 
         transaction
@@ -142,6 +142,7 @@ impl Library {
 
 fn apply_one(
     connection: &rusqlite::Connection,
+    root: &std::path::Path,
     record: &ProgressRecord,
     report: &mut ProgressApplyReport,
 ) -> Result<()> {
@@ -168,7 +169,7 @@ fn apply_one(
     }
 
     let Some(stored) =
-        db::find_by_id(connection, &record.book_id).context("look up progress book")?
+        db::find_by_id(connection, root, &record.book_id).context("look up progress book")?
     else {
         report.skipped.push(ProgressSkip {
             book_id: record.book_id.clone(),

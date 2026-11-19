@@ -30,7 +30,9 @@ impl Library {
             ))
             .context("prepare library list")?;
         let books = statement
-            .query_map(params![trimmed, pattern], db::stored_from_row)
+            .query_map(params![trimmed, pattern], |row| {
+                db::stored_from_row(&self.root, row)
+            })
             .context("query library")?
             .collect::<rusqlite::Result<Vec<_>>>()
             .context("read library rows")?
@@ -50,7 +52,7 @@ impl Library {
                     columns = db::BOOK_COLUMNS
                 ),
                 params![book_id],
-                db::stored_from_row,
+                |row| db::stored_from_row(&self.root, row),
             )
             .optional()
             .context("read book")?
@@ -89,7 +91,7 @@ impl Library {
         }
         let page_fraction = sanitize_fraction(page_fraction);
         let connection = self.lock_db()?;
-        let stored = db::require_book(&connection, book_id, false)?;
+        let stored = db::require_book(&connection, &self.root, book_id, false)?;
         if page >= stored.book.page_count {
             bail!(
                 "page {page} is out of range for a {}-page book",

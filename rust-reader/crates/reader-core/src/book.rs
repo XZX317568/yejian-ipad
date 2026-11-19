@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -37,4 +37,61 @@ pub(crate) fn sanitize_fraction(value: f32) -> f32 {
     } else {
         0.0
     }
+}
+
+/// Resolves a stored `archive_path`/`cover_path` value against the library
+/// root that owns it.
+///
+/// New rows store managed files as canonical forward-slash values
+/// (`archives/<name>`, `covers/<name>`), so a library directory moved to a
+/// new data container keeps working when it is reopened at the new root.
+/// Absolute rows written by older builds and any other relative value keep
+/// their original contract: they are returned literally and resolve against
+/// the process working directory, exactly as the reader that wrote them did.
+pub(crate) fn resolve_stored_path(root: &Path, stored: &str) -> PathBuf {
+    if is_canonical_managed(stored) {
+        let mut resolved = root.to_path_buf();
+        for part in stored.split('/') {
+            resolved.push(part);
+        }
+        return resolved;
+    }
+    PathBuf::from(stored)
+}
+
+/// True when `stored` is exactly `<dirname>/<file>` with a managed directory
+/// name (`archives` or `covers`) and a single plain file component — the only
+/// relative form this library joins to its root.
+pub(crate) fn is_canonical_managed(stored: &str) -> bool {
+    if stored.contains('\\') {
+        return false;
+    }
+    let mut parts = stored.split('/');
+    match parts.next() {
+        Some("archives") | Some("covers") => {}
+        _ => return false,
+    }
+    match parts.next() {
+        Some(file) if !file.is_empty() && file != "." && file != ".." => {}
+        _ => return false,
+    }
+    parts.next().is_none()
+}
+
+/// The stored form of a managed path: `<dirname>/<name>` joined with forward
+/// slashes, where `dirname` is the managed directory's own name (`archives`
+/// or `covers`). Returns `None` when `path` is not a plain file path directly
+/// inside `directory`, so nested folders or unrelated roots are never
+/// claimed.
+pub(crate) fn managed_relative(path: &Path, directory: &Path) -> Option<String> {
+    let parent = path.parent()?;
+    if parent != directory {
+        return None;
+    }
+    let file_name = path.file_name()?.to_string_lossy();
+    if file_name.is_empty() {
+        return None;
+    }
+    let directory_name = directory.file_name()?.to_string_lossy();
+    Some(format!("{directory_name}/{file_name}"))
 }

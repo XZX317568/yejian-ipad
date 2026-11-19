@@ -332,8 +332,8 @@ impl Library {
         let Some(progress_at) = progress_at else {
             return Ok(false);
         };
-        let local_progress_at =
-            crate::db::find_by_id(&connection, &book.id)?.and_then(|stored| stored.progress_at);
+        let local_progress_at = crate::db::find_by_id(&connection, &self.root, &book.id)?
+            .and_then(|stored| stored.progress_at);
         if local_progress_at.is_some_and(|local| progress_at <= local) {
             return Ok(false);
         }

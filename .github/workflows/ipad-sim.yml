@@ -6,6 +6,7 @@ on:
     branches: [main]
     paths:
       - "rust-reader/src/**"
+      - "rust-reader/crates/reader-core/**"
       - "rust-reader/vendor/**"
       - "rust-reader/platform/**"
       - "rust-reader/Cargo*"
@@ -15,6 +16,12 @@ on:
 
 permissions:
   contents: read
+
+defaults:
+  run:
+    # The unspecified shell does not enable pipefail. A failed capture must
+    # fail the job even when tee successfully saves its diagnostics.
+    shell: bash
 
 jobs:
   sim:
@@ -29,6 +36,9 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+
+      - name: 检查验收关卡
+        run: python3 tools/test-ipad-snapshots.py
 
       - name: 准备模拟器工具链
         run: |
@@ -52,6 +62,9 @@ jobs:
             "$RUNNER_TEMP/sim-build/Build/Products/Debug-iphonesimulator/Yejian.app" \
             artifacts/rust/ipad-sim "$RUNNER_TEMP/sim-build" \
             2>&1 | tee artifacts/rust/ipad-sim/capture.log
+
+      - name: 核对全部画面证据
+        run: python3 tools/verify-ipad-snapshots.py artifacts/rust/ipad-sim
 
       - name: 保存截图
         if: always()

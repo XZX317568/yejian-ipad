@@ -250,6 +250,7 @@ impl ReaderApp {
             && self.error.is_none()
             && self.cover_pending.is_empty()
             && self.cover_failed.is_empty()
+            && (!matches!(name.as_str(), "shelf" | "detail") || !self.covers.is_empty())
             && (name != "community" || self.sources.repository_size() > 0)
             && (!std::env::args().any(|arg| arg == "--ui-landscape")
                 || ctx.content_rect().width() > ctx.content_rect().height())
@@ -268,9 +269,20 @@ impl ReaderApp {
             return;
         }
         let name = name.clone();
+        let args: Vec<String> = std::env::args().collect();
+        let run_id = args.iter().position(|arg| arg == "--ui-snapshot-run")
+            .and_then(|index| args.get(index + 1)).cloned().unwrap_or_default();
         let report = serde_json::json!({
             "screen": name,
+            "run_id": run_id,
+            "pid": std::process::id(),
             "books": self.books.len(),
+            "book_ids": self.books.iter().map(|book| &book.id).collect::<Vec<_>>(),
+            "covers_loaded": self.covers.len(),
+            "covers_pending": self.cover_pending.len(),
+            "covers_failed": self.cover_failed.len(),
+            "archives_available": self.books.iter().filter(|book| book.archive_path.exists()).count(),
+            "cover_files_available": self.books.iter().filter(|book| book.cover_path.as_ref().is_some_and(|path| path.is_file())).count(),
             "page_loaded": self.page_loaded(),
             "repository_sources": self.sources.repository_size(),
             "width": ctx.content_rect().width(),
@@ -281,10 +293,21 @@ impl ReaderApp {
                 .collect::<BTreeMap<_, _>>(),
         });
         let dir = self.root.join("ui-snapshots");
+        let json = report.to_string();
         let result = std::fs::create_dir_all(&dir)
-            .and_then(|()| std::fs::write(dir.join(format!("{name}.json")), report.to_string()));
+            .and_then(|()| std::fs::write(dir.join(format!("{name}.tmp")), &json))
+            .and_then(|()| std::fs::rename(dir.join(format!("{name}.tmp")), dir.join(format!("{name}.json"))));
         match result {
             Ok(()) => {
+                // XCTest receives the same report from this running app,
+                // rather than guessing which data container holds its files.
+                #[cfg(target_os = "ios")]
+                if let Ok(json) = std::ffi::CString::new(json) {
+                    unsafe extern "C" {
+                        fn yejian_ios_snapshot_ready(json: *const std::ffi::c_char);
+                    }
+                    unsafe { yejian_ios_snapshot_ready(json.as_ptr()); }
+                }
                 log::info!("snapshot ready: {name}");
                 self.snapshot_pending = None;
             }
@@ -473,7 +496,8 @@ impl ReaderApp {
                                     );
                                 }
                             }
-                            Err(_) => {
+                            Err(error) => {
+                                log::warn!("cannot load cover {id}: {error}");
                                 self.cover_failed.insert(id);
                             }
                         }
@@ -512,6 +536,7 @@ impl ReaderApp {
                                 }
                             }
                             Err(e) => {
+                                log::warn!("cannot load page {id}/{page}: {e}");
                                 self.page_errors.insert((id, page), e);
                             }
                         }

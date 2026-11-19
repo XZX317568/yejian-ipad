@@ -26,6 +26,9 @@ private final class YejianDocumentBridge: NSObject, UIApplicationDelegate, UIDoc
     )
     private var prepared = false
     private var scheduled = false
+    #if DEBUG
+    private var snapshotMarker: UIView?
+    #endif
 
     private override init() {
         super.init()
@@ -478,6 +481,31 @@ private final class YejianDocumentBridge: NSObject, UIApplicationDelegate, UIDoc
 
     // MARK: - UIKit helpers
 
+    #if DEBUG
+    /// Test-only acknowledgement from the Rust renderer. This transparent
+    /// accessibility element carries its actual readiness report to XCTest.
+    /// Release builds contain neither this element nor the exported callback.
+    func snapshotReady(_ json: String) {
+        onMain {
+            guard let window = self.keyWindow() else { return }
+            let marker = self.snapshotMarker ?? UIView()
+            marker.frame = CGRect(
+                x: window.safeAreaInsets.left + 1,
+                y: window.safeAreaInsets.top + 1,
+                width: 2,
+                height: 2
+            )
+            marker.isUserInteractionEnabled = false
+            marker.isAccessibilityElement = true
+            marker.accessibilityIdentifier = "yejian.snapshot.ready"
+            marker.accessibilityLabel = "Rendered screen ready"
+            marker.accessibilityValue = json
+            if marker.superview == nil { window.addSubview(marker) }
+            self.snapshotMarker = marker
+        }
+    }
+    #endif
+
     private func keyWindow() -> UIWindow? {
         for scene in UIApplication.shared.connectedScenes {
             guard let windowScene = scene as? UIWindowScene else { continue }
@@ -509,6 +537,14 @@ private final class YejianDocumentBridge: NSObject, UIApplicationDelegate, UIDoc
 }
 
 // MARK: - Rust ABI
+
+#if DEBUG
+@_cdecl("yejian_ios_snapshot_ready")
+public func yejian_ios_snapshot_ready(_ json: UnsafePointer<CChar>?) {
+    guard let json else { return }
+    YejianDocumentBridge.shared.snapshotReady(String(cString: json))
+}
+#endif
 
 @_cdecl("yejian_ios_init")
 public func yejian_ios_init() {

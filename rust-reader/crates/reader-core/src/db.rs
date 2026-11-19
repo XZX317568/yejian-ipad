@@ -1,11 +1,16 @@
-use std::path::PathBuf;
+use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, Row};
 
 use crate::book::Book;
 
-const SCHEMA_VERSION: i64 = 3;
+// Version 4 marks the managed-path storage change: archive_path/cover_path
+// now hold `archives/<id>[.ext]` and `covers/<id>.jpg` values relative to the
+// library root. A v3 reader would resolve them against the process working
+// directory instead of the library root, so the schema is bumped to refuse
+// old clients rather than let them read the wrong files.
+const SCHEMA_VERSION: i64 = 4;
 
 pub(crate) const BOOK_COLUMNS: &str = "id, title, author, archive_path, cover_path, page_count, \
      current_page, page_fraction, updated_at, last_read_at, category, content_hash, kind, removed, \
@@ -128,18 +133,19 @@ pub(crate) fn migrate(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn stored_from_row(row: &Row<'_>) -> rusqlite::Result<StoredBook> {
+pub(crate) fn stored_from_row(root: &Path, row: &Row<'_>) -> rusqlite::Result<StoredBook> {
     let cover_path: Option<String> = row.get(4)?;
     let page_count: i64 = row.get(5)?;
     let current_page: i64 = row.get(6)?;
     let removed: i64 = row.get(13)?;
+    let archive_path: String = row.get(3)?;
     Ok(StoredBook {
         book: Book {
             id: row.get(0)?,
             title: row.get(1)?,
             author: row.get(2)?,
-            archive_path: PathBuf::from(row.get::<_, String>(3)?),
-            cover_path: cover_path.map(PathBuf::from),
+            archive_path: crate::book::resolve_stored_path(root, &archive_path),
+            cover_path: cover_path.map(|value| crate::book::resolve_stored_path(root, &value)),
             page_count: page_count.max(0) as usize,
             current_page: current_page.max(0) as usize,
             page_fraction: crate::book::sanitize_fraction(row.get::<_, f64>(7)? as f32),
@@ -170,6 +176,7 @@ fn column_exists(connection: &Connection, table: &str, column: &str) -> Result<b
 
 pub(crate) fn find_by_hash(
     connection: &Connection,
+    root: &Path,
     content_hash: &str,
 ) -> Result<Option<StoredBook>> {
     let mut statement = connection
@@ -178,27 +185,34 @@ pub(crate) fn find_by_hash(
         ))
         .context("prepare book lookup by content hash")?;
     statement
-        .query_row(rusqlite::params![content_hash], stored_from_row)
+        .query_row(rusqlite::params![content_hash], |row| {
+            stored_from_row(root, row)
+        })
         .optional()
         .context("look up book by content hash")
 }
 
-pub(crate) fn find_by_id(connection: &Connection, book_id: &str) -> Result<Option<StoredBook>> {
+pub(crate) fn find_by_id(
+    connection: &Connection,
+    root: &Path,
+    book_id: &str,
+) -> Result<Option<StoredBook>> {
     let mut statement = connection
         .prepare(&format!("SELECT {BOOK_COLUMNS} FROM books WHERE id = ?1"))
         .context("prepare book lookup by id")?;
     statement
-        .query_row(rusqlite::params![book_id], stored_from_row)
+        .query_row(rusqlite::params![book_id], |row| stored_from_row(root, row))
         .optional()
         .context("look up book by id")
 }
 
 pub(crate) fn require_book(
     connection: &Connection,
+    root: &Path,
     book_id: &str,
     include_removed: bool,
 ) -> Result<StoredBook> {
-    let stored = find_by_id(connection, book_id)?
+    let stored = find_by_id(connection, root, book_id)?
         .ok_or_else(|| anyhow::anyhow!("book not found: {book_id}"))?;
     if stored.removed && !include_removed {
         bail!("book is not in the library: {book_id}");

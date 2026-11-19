@@ -167,7 +167,7 @@ impl Library {
                 ))
                 .context("prepare backup book list")?;
             let books = statement
-                .query_map([], db::stored_from_row)
+                .query_map([], |row| db::stored_from_row(&self.root, row))
                 .context("query backup books")?
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .context("read backup books")?;
@@ -587,7 +587,8 @@ impl Library {
             let _ = self.restore_cover(archive, entry, &book);
             let local_progress_at = {
                 let connection = self.lock_db()?;
-                db::find_by_id(&connection, &book.id)?.and_then(|stored| stored.progress_at)
+                db::find_by_id(&connection, &self.root, &book.id)?
+                    .and_then(|stored| stored.progress_at)
             };
             let backup_progress_at = entry.last_read_at.or_else(|| {
                 if entry.current_page > 0 {
@@ -660,7 +661,8 @@ impl Library {
         let thumbnail = thumbnail_jpeg(&bytes)?;
         let cover_path = self.covers_dir().join(format!("{}.jpg", book.id));
         atomic_write(&cover_path, &thumbnail)?;
-        let cover_path = cover_path.to_string_lossy().into_owned();
+        let cover_path = crate::book::managed_relative(&cover_path, &self.covers_dir())
+            .unwrap_or_else(|| cover_path.to_string_lossy().into_owned());
         let connection = self.lock_db()?;
         connection
             .execute(
