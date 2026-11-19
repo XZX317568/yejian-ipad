@@ -205,6 +205,8 @@
 				OTHER_LDFLAGS = (
 					"$(inherited)",
 					"-lyejian",
+						"-u",
+						"_yejian_start_app",
 					"@$(SRCROOT)/Libs/$(PLATFORM_NAME)/native-static-libs.rsp",
 					"-framework",
 					"Metal",
@@ -252,6 +254,8 @@
 				OTHER_LDFLAGS = (
 					"$(inherited)",
 					"-lyejian",
+						"-u",
+						"_yejian_start_app",
 					"@$(SRCROOT)/Libs/$(PLATFORM_NAME)/native-static-libs.rsp",
 					"-framework",
 					"Metal",
