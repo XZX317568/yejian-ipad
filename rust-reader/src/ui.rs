@@ -1069,10 +1069,7 @@ impl ReaderApp {
             Visuals::light()
         });
         if self.widget_font_scale != self.font_scale {
-            let mut fonts = Style::default().text_styles;
-            for font in fonts.values_mut() {
-                font.size *= self.font_scale;
-            }
+            let fonts = crate::text_styles(self.font_scale);
             for theme in [Theme::Light, Theme::Dark] {
                 ctx.style_mut_of(theme, |style| style.text_styles = fonts.clone());
             }
@@ -1380,7 +1377,7 @@ impl ReaderApp {
             if self.button(
                 ui,
                 "categories",
-                Rect::from_min_size(pos2(area.right() - 130., area.top() + 88.), vec2(106., 32.)),
+                Rect::from_min_size(pos2(area.right() - 130., area.top() + 82.), vec2(106., 44.)),
                 &if self.category.is_empty() {
                     "全部分类".into()
                 } else {
@@ -2366,7 +2363,7 @@ impl ReaderApp {
                         &format!("history-{}", book.id),
                         Rect::from_min_size(
                             pos2(rect.right() - 80., rect.top() + 12.),
-                            vec2(76., 40.),
+                            vec2(76., 44.),
                         ),
                         "继续",
                         false,
@@ -2389,9 +2386,11 @@ impl ReaderApp {
         );
         ui.scope_builder(UiBuilder::new().max_rect(column), |ui| {
             ScrollArea::vertical().show(ui, |ui| {
+                ui.style_mut().wrap_mode = Some(TextWrapMode::Wrap);
+                ui.spacing_mut().slider_width = (ui.available_width() - 100.).clamp(80., 280.);
                 ui.heading("外观与阅读");
-                ui.horizontal(|ui| {
-                    ui.label("主题");
+                ui.label("主题");
+                ui.horizontal_wrapped(|ui| {
                     for (key, name) in [("system", "跟随系统"), ("light", "浅色"), ("dark", "深色")]
                     {
                         if ui
@@ -2424,8 +2423,8 @@ impl ReaderApp {
                 } else {
                     "paged"
                 };
-                ui.horizontal(|ui| {
-                    ui.label("阅读方式");
+                ui.label("阅读方式");
+                ui.horizontal_wrapped(|ui| {
                     ui.selectable_value(&mut mode, "paged", "单页");
                     ui.selectable_value(&mut mode, "spread", "平板双页");
                     ui.selectable_value(&mut mode, "vertical", "上下滚动");
@@ -2435,10 +2434,10 @@ impl ReaderApp {
                     self.spread = mode == "spread";
                     self.setting("reading-mode", mode.into());
                 }
-                if ui
-                    .add(Slider::new(&mut self.font_scale, 1. ..=2.).text("文字大小"))
-                    .changed()
-                {
+                ui.label("文字大小");
+                let mut percent = (self.font_scale * 100.).round();
+                if ui.add(Slider::new(&mut percent, 100. ..=200.).suffix(" %").step_by(5.)).changed() {
+                    self.font_scale = percent / 100.;
                     self.setting("font-scale", self.font_scale.to_string());
                 }
                 ui.add_space(24.);
@@ -2447,21 +2446,25 @@ impl ReaderApp {
                 if ui.button("选择漫画文件").clicked() {
                     self.pick_import();
                 }
-                #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                if ui.button("选择图片文件夹").clicked() {
-                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                        self.import_files(vec![path]);
+                #[cfg(not(any(target_os = "android", target_os = "ios")))] {
+                    if ui.button("选择图片文件夹").clicked() {
+                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                            self.import_files(vec![path]);
+                        }
+                    }
+                    ui.add_space(8.);
+                    ui.add(TextEdit::singleline(&mut self.import_text)
+                        .desired_width(ui.available_width()).hint_text("漫画文件或文件夹路径"));
+                    if ui.button("导入上述路径").clicked() {
+                        self.import_files(vec![PathBuf::from(self.import_text.trim())]);
                     }
                 }
-                ui.add_space(8.);
-                ui.text_edit_singleline(&mut self.import_text);
-                if ui.button("导入上述路径").clicked() {
-                    self.import_files(vec![PathBuf::from(self.import_text.trim())]);
-                }
                 ui.add_space(16.);
-                ui.label("备份文件");
-                ui.text_edit_singleline(&mut self.backup_path);
-                ui.horizontal(|ui| {
+                #[cfg(not(any(target_os = "android", target_os = "ios")))] {
+                    ui.label("备份文件");
+                    ui.add(TextEdit::singleline(&mut self.backup_path).desired_width(ui.available_width()));
+                }
+                ui.horizontal_wrapped(|ui| {
                     if ui.button("创建完整备份").clicked() {
                         self.send(Command::Backup(self.backup_path.clone().into()));
                     }

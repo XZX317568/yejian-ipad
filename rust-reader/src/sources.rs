@@ -1218,14 +1218,13 @@ impl Sources {
                     ui.add_space(8.);
                 }
                 ui.add_space(2.);
-                ui.label(RichText::new("添加 Aidoku 书源仓库").size(15.).strong());
+                ui.label(RichText::new("添加 Aidoku 书源仓库").strong());
                 ui.add_space(6.);
-                ui.horizontal(|ui|{
-                    let row=ui.available_width();
-                    ui.set_max_width(row);
-                    ui.add_enabled(!self.busy,TextEdit::singleline(&mut self.url).hint_text("仓库列表 URL").desired_width((row-176.).max(120.)));
-                    if ui.add_enabled(!self.busy,Button::new("读取").min_size(vec2(64.,28.))).clicked(){self.submit(Task::Fetch(self.url.trim().into()));}
-                    if ui.add_enabled(!self.busy,Button::new("社区源").min_size(vec2(72.,28.))).clicked(){
+                ui.add_enabled(!self.busy,TextEdit::singleline(&mut self.url)
+                    .hint_text("粘贴书源仓库地址").desired_width(ui.available_width()));
+                ui.horizontal_wrapped(|ui|{
+                    if ui.add_enabled(!self.busy,Button::new("读取")).clicked(){self.submit(Task::Fetch(self.url.trim().into()));}
+                    if ui.add_enabled(!self.busy,Button::new("社区源")).clicked(){
                         self.url=COMMUNITY_INDEX.into();
                         self.submit(Task::Fetch(COMMUNITY_INDEX.into()));
                     }
@@ -1259,10 +1258,9 @@ impl Sources {
                     if ui.selectable_label(self.selected_source==source.manifest.id,&source.manifest.name).clicked(){self.select_source(&source.manifest.id);}
                 }
                 if !self.selected_source.is_empty(){
-                    ui.horizontal(|ui|{
-                        let row=ui.available_width();
-                        ui.set_max_width(row);
-                        ui.add_enabled(!self.busy,TextEdit::singleline(&mut self.query).hint_text("漫画名称").desired_width((row-92.).max(120.)));
+                    ui.add_enabled(!self.busy,TextEdit::singleline(&mut self.query)
+                        .hint_text("漫画名称").desired_width(ui.available_width()));
+                    ui.horizontal_wrapped(|ui|{
                         if ui.add_enabled(!self.busy,Button::new("搜索")).clicked(){self.start_search();}
                     });
                 }
@@ -1297,8 +1295,9 @@ impl Sources {
                     let failed=self.chapter_failed(&source,&manga.key,&chapter.key);
                     let enabled=!self.busy&&!chapter.locked&&(state.is_none()||failed);
                     let label=if failed{format!("{name}    ↻ 重新加入")}else{format!("{name}    ↓ 下载")};
-                    ui.horizontal(|ui|{
-                        if ui.add_enabled(enabled,Button::new(label).min_size(vec2((ui.available_width()*0.7).max(160.),42.))).clicked(){
+                    ui.vertical(|ui|{
+                        if ui.add_enabled(enabled,Button::new(label).wrap()
+                            .min_size(vec2(ui.available_width(),44.))).clicked(){
                             self.enqueue_chapter(&manga,&chapter);
                         }
                         if let Some(state)=state{ui.small(state);}

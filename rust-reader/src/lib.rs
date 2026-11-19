@@ -24,17 +24,29 @@ pub fn configure_fonts(ctx: &egui::Context) {
         ctx.style_mut_of(theme, |style| {
             style.spacing.item_spacing = egui::vec2(10., 9.);
             style.spacing.button_padding = egui::vec2(12., 8.);
-            style.spacing.interact_size = egui::vec2(30., 30.);
+            style.spacing.interact_size = egui::vec2(44., 44.);
             style.spacing.icon_width = 22.;
             style.spacing.icon_width_inner = 12.;
             style.spacing.icon_spacing = 8.;
             style.spacing.slider_width = 180.;
-            style.text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(15.));
-            style.text_styles.insert(egui::TextStyle::Button, egui::FontId::proportional(15.));
-            style.text_styles.insert(egui::TextStyle::Heading, egui::FontId::proportional(22.));
-            style.text_styles.insert(egui::TextStyle::Small, egui::FontId::proportional(12.5));
+            style.text_styles = text_styles(1.);
         });
     }
+}
+
+fn text_styles(scale: f32) -> std::collections::BTreeMap<egui::TextStyle, egui::FontId> {
+    let mut fonts = egui::Style::default().text_styles;
+    for (style, size) in [
+        (egui::TextStyle::Body, 17.),
+        (egui::TextStyle::Button, 16.),
+        (egui::TextStyle::Heading, 23.),
+        (egui::TextStyle::Small, 13.),
+        (egui::TextStyle::Monospace, 15.),
+    ] {
+        let font = fonts.get_mut(&style).expect("standard text style");
+        font.size = size * scale;
+    }
+    fonts
 }
 
 pub fn run() -> eframe::Result {
@@ -56,6 +68,8 @@ pub fn run() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_title("页间").with_inner_size([1024.,768.]).with_min_inner_size([320.,480.]).with_app_id("app.yejian.reader.rust"),
         run_and_return: !cfg!(target_os="ios"),
+        #[cfg(target_os = "ios")]
+        wgpu_options: ios_renderer_configuration(),
         ..Default::default()
     };
     log::info!("starting native renderer");
@@ -81,6 +95,45 @@ pub fn run() -> eframe::Result {
         }
         Ok(Box::new(app))
     }))
+}
+
+#[cfg(target_os = "ios")]
+fn ios_renderer_configuration() -> eframe::WgpuConfiguration {
+    let mut config = eframe::WgpuConfiguration::default();
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut config.wgpu_setup {
+        setup.device_descriptor = std::sync::Arc::new(|adapter| eframe::wgpu::DeviceDescriptor {
+            label: Some("Yejian iPad renderer"),
+            required_limits: ios_render_limits(&adapter.limits()),
+            ..Default::default()
+        });
+    }
+    config
+}
+
+#[cfg(any(target_os = "ios", test))]
+fn ios_render_limits(supported: &eframe::wgpu::Limits) -> eframe::wgpu::Limits {
+    // Metal on the iPad simulator supports 15 inter-stage variables, while
+    // WebGPU's default asks for 16. egui's shader only uses two. The native
+    // downlevel baseline covers our 2D renderer without demanding unused
+    // WebGPU features, and preserves the adapter's actual display resolution.
+    eframe::wgpu::Limits::downlevel_defaults()
+        .using_resolution(supported.clone())
+        .using_alignment(supported.clone())
+}
+
+#[cfg(test)]
+mod renderer_tests {
+    #[test]
+    fn ipad_limits_accept_metal_downlevel_and_retina_surfaces() {
+        let supported = eframe::wgpu::Limits {
+            max_texture_dimension_2d: 8192,
+            ..eframe::wgpu::Limits::downlevel_defaults()
+        };
+        let requested = super::ios_render_limits(&supported);
+        assert!(requested.check_limits(&supported));
+        assert_eq!(requested.max_inter_stage_shader_variables, 15);
+        assert_eq!(requested.max_texture_dimension_2d, 8192);
+    }
 }
 
 /// Five small original archives for simulator screenshots.

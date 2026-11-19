@@ -450,13 +450,24 @@ fn ipad_pass(h: &mut Harness) -> Result<()> {
                 )
             })
             .collect();
-        if !small.is_empty() {
-            println!("  {name}: {} controls under 44 pt: {}", small.len(), small.join(", "));
-        }
+        anyhow::ensure!(small.is_empty(), "{name}: undersized controls: {}", small.join(", "));
         println!(
             "ipad {name}: {}x{} pt, insets top {top} bottom {bottom}",
             size[0], size[1]
         );
+        for (tab, label) in [("search", "sources"), ("settings", "settings"), ("history", "history")] {
+            h.click(&format!("nav-{tab}"))?;
+            h.frames(4)?;
+            h.frame(vec![], Some(&format!("{name}-{label}")))?;
+            if tab == "search" {
+                for control in ["读取", "社区源"] {
+                    anyhow::ensure!(h.texts.iter().any(|(text, _)| text == control),
+                        "{name}: source control {control} is clipped");
+                }
+            }
+        }
+        h.click("nav-library")?;
+        h.frames(4)?;
     }
     set_insets_override(Some(Insets {
         left: 0,
