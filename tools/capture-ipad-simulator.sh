@@ -96,6 +96,9 @@ shoot history
 shoot sources
 shoot settings
 shoot community
+shoot browse
+shoot filters
+shoot filtered
 # Reproduce the format written by build 3, then let XCTest reinstall the app.
 # The five books must survive using the real production Library::open path.
 python3 - "$CONTAINER/Documents/Yejian" "$OUT/legacy-library.json" <<'PY'
@@ -124,7 +127,7 @@ xcodebuild -project rust-reader/platform/ios/Yejian.xcodeproj -scheme Yejian \
   -maximum-concurrent-test-simulator-destinations 1 \
   test-without-building CODE_SIGN_IDENTITY=- 2>&1 | tee "$OUT/rotation-tests.log"
 RUNNER_CONTAINER=$(xcrun simctl get_app_container "$DEVICE" app.yejian.reader.uitests.xctrunner data)
-for screen in shelf detail reader; do
+for screen in shelf detail reader filters; do
   # XCTest captures the live app's acknowledgement and its screenshot
   # together. Both belong to the runner, independent of app-container UUIDs.
   cp "$RUNNER_CONTAINER/Documents/$screen-landscape.png" "$OUT/$screen-landscape.png"

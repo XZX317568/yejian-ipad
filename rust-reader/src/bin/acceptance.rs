@@ -378,6 +378,103 @@ fn fixtures(root: &Path) -> Result<Vec<PathBuf>> {
 ///
 /// The GPU path is identical to the one the shells use, so layout can be
 /// checked on a desktop machine without a Mac, a simulator, or CI minutes.
+fn filters_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
+    use yejian_platform::{Insets, set_insets_override};
+    set_insets_override(Some(Insets{left:0,top:24,right:0,bottom:20}));
+    h.size=[1366,1024];
+    h.app.prepare_source_acceptance("browse")?;
+    h.wait(ReaderApp::source_browser_ready)?;
+    h.frames(4)?;
+    h.frame(vec![],Some("source-browse-landscape"))?;
+    anyhow::ensure!(h.texts.iter().any(|(text,_)|text=="热门-第1页"),"default listing was not executed");
+    h.click_text("加载下一页（第 2 页）")?;
+    h.wait(|app|app.source_browser_report()["results"].as_array()
+        .is_some_and(|entries|entries.iter().any(|value|value=="热门-第2页")))?;
+    h.click_text("最新")?;
+    h.wait(|app|app.source_browser_report()["results"].as_array()
+        .is_some_and(|entries|entries.len()==1&&entries[0]=="最新-第1页"))?;
+    h.click_text("筛选与排序")?;
+    h.frames(4)?;
+    h.frame(vec![],Some("source-filters-landscape"))?;
+    h.click_text("冒险")?;
+    h.click_text("应用筛选")?;
+    h.wait(|app|app.source_browser_report()["results"].as_array()
+        .is_some_and(|entries|entries.len()==1&&entries[0]=="筛选:冒险题材"))?;
+    h.frames(4)?;
+    h.frame(vec![],Some("source-filtered-result"))?;
+    // Cancelling a changed draft preserves the submitted filter.
+    h.click_text("筛选（1）")?;
+    h.frames(3)?;
+    h.click_text("恋爱")?;
+    h.click_text("取消")?;
+    h.frames(3)?;
+    anyhow::ensure!(h.app.source_browser_report()["results"][0]=="筛选:冒险题材","cancel changed results");
+    // Reset must return to the source defaults, not submit all visible defaults.
+    h.click_text("筛选（1）")?;
+    h.frames(3)?;
+    h.click_text("重置")?;
+    h.click_text("应用筛选")?;
+    h.wait(|app|app.source_browser_report()["results"][0]=="未筛选结果")?;
+    // Check and sort widgets must preserve numeric meanings and direction.
+    h.frames(3)?;
+    h.click_text("筛选与排序")?;h.frames(3)?;
+    h.click_text("包含")?;h.click_text("应用筛选")?;
+    h.wait(|app|app.source_browser_report()["results"][0]=="筛选:已完结(含)")?;
+    h.frames(3)?;h.click_text("筛选（1）")?;h.frames(3)?;
+    h.click_text("重置")?;h.frames(2)?;
+    h.click_text("最新")?;h.click_text("升序")?;h.click_text("应用筛选")?;
+    h.wait(|app|app.source_browser_report()["results"][0]=="筛选:最新升序")?;
+    h.frames(3)?;h.click_text("筛选（1）")?;h.frames(3)?;
+    h.click_text("重置")?;h.frames(2)?;
+    // Default 热血 is removed by cycling include -> exclude -> neutral.
+    h.click_text("✓ 热血")?;h.frames(2)?;h.click_text("− 热血")?;h.frames(2)?;h.click_text("治愈")?;
+    h.click_text("应用筛选")?;
+    h.wait(|app|app.source_browser_report()["results"][0]=="筛选:含治愈")?;
+    h.frames(3)?;h.click_text("筛选（1）")?;h.frames(3)?;
+    h.click_text("重置")?;h.click_text("应用筛选")?;
+    h.wait(|app|app.source_browser_report()["results"][0]=="未筛选结果")?;
+    h.frames(3)?;
+    h.click_text("筛选与排序")?;
+    h.frames(3)?;
+    for (size,label) in [
+        ([834,1194],"portrait"),([1194,834],"landscape-11"),
+        ([507,1024],"split-half"),([320,1024],"split-third"),
+    ] {
+        h.size=size;h.frames(5)?;
+        h.frame(vec![],Some(&format!("source-filters-{label}")))?;
+        for control in ["应用筛选","重置","取消"] {
+            anyhow::ensure!(h.texts.iter().any(|(text,rect)|text==control&&rect.left()>=0.&&rect.right()<=size[0] as f32),
+                "{label}: {control} offscreen");
+        }
+    }
+    // A tall form must really scroll and its range input must reject bad data.
+    h.size=[507,1024];h.frames(4)?;
+    for _ in 0..8 {
+        h.frame(vec![Event::PointerMoved(pos2(350.,700.)),Event::MouseWheel{
+            unit:MouseWheelUnit::Point,delta:vec2(0.,-380.),source:MouseWheelSource::Wheel,modifiers:Modifiers::NONE,phase:TouchPhase::Move,
+        }],None)?;
+        h.frames(5)?;
+    }
+    h.frame(vec![],Some("source-filters-range"))?;
+    anyhow::ensure!(h.texts.iter().any(|(text,_)|text=="最大值"),"range filter cannot be reached");
+    // Recreate at 200 percent font size, then inspect the actual draft UI.
+    let library=yejian_core::Library::open(library_root)?;
+    library.set_setting("font-scale","2")?;
+    h.app=ReaderApp::new(library_root.into(),h.ctx.clone());h.wait(ReaderApp::ready)?;
+    h.app.prepare_source_acceptance("filters")?;h.wait(ReaderApp::source_browser_ready)?;
+    for (size,label) in [([507,1024],"half"),([320,1024],"third")]{
+        h.size=size;h.frames(5)?;
+        h.frame(vec![],Some(&format!("source-filters-large-{label}")))?;
+        for control in ["应用筛选","重置","取消"]{
+            anyhow::ensure!(h.texts.iter().any(|(text,_)|text==control),"200 percent {label}: {control} missing");
+        }
+    }
+    library.set_setting("font-scale","1")?;
+    set_insets_override(None);
+    println!("PASS: source listing + pagination + real WASM filtered result + cancel/reset + iPad/200 percent filters");
+    Ok(())
+}
+
 fn ipad_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
     use yejian_platform::{Insets, set_insets_override};
     // iPad window sizes in points (one harness pixel per point), plus the
@@ -526,6 +623,14 @@ fn main() -> Result<()> {
         .duration_since(std::time::UNIX_EPOCH)?
         .as_millis();
     let data = output.join(format!("acceptance-{run}"));
+    let real_source=std::env::var_os("YEJIAN_REAL_FILTERS").map(PathBuf::from);
+    if let Some(source)=&real_source {
+        let target=data.join("library/sources").join(source.file_name().context("source name")?);
+        std::fs::create_dir_all(&target)?;
+        for entry in std::fs::read_dir(source)?{
+            let entry=entry?;if entry.file_type()?.is_file(){std::fs::copy(entry.path(),target.join(entry.file_name()))?;}
+        }
+    }
     let paths = fixtures(&data.join("fixtures"))?;
     let mut h = Harness::new(data.join("library"), output.clone())?;
     h.wait(ReaderApp::ready)?;
@@ -536,6 +641,24 @@ fn main() -> Result<()> {
     h.wait(ReaderApp::covers_loaded)?;
     h.now += 6.;
     h.frames(3)?;
+    if let Some(source)=real_source {
+        h.size=[1366,1024];
+        h.app.prepare_installed_source_acceptance(source.file_name().and_then(|s|s.to_str()).context("source id")?)?;
+        h.wait(|app|app.source_browser_report()["loaded"]==true&&!app.source_browser_report()["busy"].as_bool().unwrap_or(true))?;
+        h.frames(5)?;
+        // A blocked remote search must not hide the successfully loaded filters.
+        if h.app.source_browser_report()["filter_editor"]!=true{
+            h.click_text("筛选与排序")?;h.frames(3)?;
+        }
+        h.frame(vec![],Some("real-source-filters-landscape"))?;
+        h.size=[834,1194];h.frames(4)?;
+        h.frame(vec![],Some("real-source-filters-portrait"))?;
+        println!("REAL SOURCE: {}",h.app.source_browser_report());
+        return Ok(());
+    }
+    if std::env::var_os("YEJIAN_FILTERS_ONLY").is_some() {
+        return filters_pass(&mut h,&data.join("library"));
+    }
     if std::env::var_os("YEJIAN_IPAD_ONLY").is_some() {
         return ipad_pass(&mut h, &data.join("library"));
     }

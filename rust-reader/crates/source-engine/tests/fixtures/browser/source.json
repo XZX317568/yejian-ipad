@@ -1,0 +1,13 @@
+{
+    "info": {
+        "id": "local.filter-acceptance",
+        "name": "筛选验收源",
+        "version": 1,
+        "languages": ["zh"],
+        "urls": ["https://fixture.invalid"]
+    },
+    "listings": [
+        {"id": "popular", "name": "热门", "kind": 0},
+        {"id": "latest", "name": "最新", "kind": 0}
+    ]
+}

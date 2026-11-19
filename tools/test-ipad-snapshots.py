@@ -45,6 +45,11 @@ class IpadGateTests(unittest.TestCase):
                 "archives_available": 5, "cover_files_available": 5,
                 "covers_pending": 0, "covers_failed": 0, "covers_loaded": 5,
                 "page_loaded": screen == "reader", "repository_sources": 176,
+                "source_browser": {
+                    "source": "local.filter-acceptance", "loaded": True, "busy": False,
+                    "filter_count": 7, "listing_count": 2, "filter_editor": screen == "filters",
+                    "results": ["筛选:冒险题材" if screen == "filtered" else "热门-第1页"],
+                },
                 "width": width, "height": height,
                 "safe_area": [0, 0, width, height],
                 "navigation": {
@@ -69,6 +74,15 @@ class IpadGateTests(unittest.TestCase):
 
     def test_complete_evidence_is_accepted(self):
         self.assertEqual(gate.verify(self.root)["result"], "passed")
+
+    def test_filtered_result_must_come_from_wasm(self):
+        self.change("filtered", source_browser={
+            "source": "local.filter-acceptance", "loaded": True, "busy": False,
+            "filter_count": 7, "listing_count": 2, "filter_editor": False,
+            "results": ["未筛选结果"],
+        })
+        with self.assertRaisesRegex(ValueError, "WASM"):
+            gate.verify(self.root)
 
     def test_missing_landscape_report_blocks_delivery(self):
         # Reproduces the old green run: screenshots/XCTest pass but no JSON.

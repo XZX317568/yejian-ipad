@@ -10,6 +10,7 @@ final class IPadRotationTests: XCTestCase {
     func test01ShelfLandscape() throws { try capture("shelf") }
     func test02DetailLandscape() throws { try capture("detail") }
     func test03ReaderLandscape() throws { try capture("reader") }
+    func test04FiltersLandscape() throws { try capture("filters") }
 
     private func capture(_ screen: String) throws {
         let app = XCUIApplication(bundleIdentifier: "app.yejian.reader.rust")
@@ -59,8 +60,15 @@ final class IPadRotationTests: XCTestCase {
         XCTAssertEqual(report["covers_failed"] as? Int, 0)
         if screen == "reader" {
             XCTAssertEqual(report["page_loaded"] as? Bool, true)
-        } else {
+        } else if screen != "filters" {
             XCTAssertGreaterThan(try XCTUnwrap(report["covers_loaded"] as? Int), 0)
+        }
+        if screen == "filters" {
+            let browser = try XCTUnwrap(report["source_browser"] as? [String: Any])
+            XCTAssertEqual(browser["source"] as? String, "local.filter-acceptance")
+            XCTAssertEqual(browser["filter_count"] as? Int, 7)
+            XCTAssertEqual(browser["filter_editor"] as? Bool, true)
+            XCTAssertEqual(browser["busy"] as? Bool, false)
         }
         XCTAssertEqual(app.state, .runningForeground)
         let screenshot = XCUIScreen.main.screenshot()

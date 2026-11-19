@@ -22,6 +22,7 @@
 mod catalog;
 mod engine;
 mod error;
+mod filters;
 mod http;
 pub mod repo;
 mod wasm;
@@ -29,6 +30,7 @@ mod wasm;
 pub use catalog::{CatalogError, InstallError, InstalledSource, SourceCatalog, SourceManifest};
 pub use engine::{BoxFuture, DEFAULT_FUEL_PER_CALL, EngineOptions, RequestHandler, SourceEngine};
 pub use error::SourceError;
+pub use filters::{default_filter_values, parse_filters_json};
 pub use http::{MAX_RESPONSE_BODY_BYTES, NativeHttp, NetRequestData, NetResponseData};
 pub use repo::{RepoError, RepositoryIndex, RepositorySource, SourceInstaller};
 pub use wasm::models::{

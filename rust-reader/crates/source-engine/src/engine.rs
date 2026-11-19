@@ -115,7 +115,28 @@ impl SourceEngine {
             .wasm_bytes()
             .map_err(|e| SourceError::Load(e.to_string()))?;
         let settings = source.settings_json();
-        Self::spawn(source.manifest.clone(), wasm, options, settings)
+        // A malformed or unreadable `filters.json` does NOT fail the source —
+        // AidokuRunner fails init, but the reader keeps the source usable and
+        // surfaces the error only when `filters()` is asked for the schema.
+        // Read the advertised path directly so an unreadable (but present)
+        // file is reported, not mistaken for "no filters".
+        let static_filters = match &source.filters_path {
+            Some(path) => Some(match std::fs::read_to_string(path) {
+                Ok(text) => crate::filters::parse_filters_json(&text),
+                Err(e) => Err(SourceError::Deserialize(format!(
+                    "filters.json could not be read ({}): {e}",
+                    path.display()
+                ))),
+            }),
+            None => None,
+        };
+        Self::spawn(
+            source.manifest.clone(),
+            wasm,
+            options,
+            settings,
+            static_filters,
+        )
     }
 
     /// Loads raw module bytes with explicit metadata. Useful for previews and
@@ -125,7 +146,7 @@ impl SourceEngine {
         wasm: Vec<u8>,
         options: EngineOptions,
     ) -> Result<Self, SourceError> {
-        Self::spawn(manifest, wasm, options, None)
+        Self::spawn(manifest, wasm, options, None, None)
     }
 
     fn spawn(
@@ -133,6 +154,7 @@ impl SourceEngine {
         wasm: Vec<u8>,
         options: EngineOptions,
         settings_json: Option<String>,
+        static_filters: Option<Result<Vec<crate::wasm::models::Filter>, SourceError>>,
     ) -> Result<Self, SourceError> {
         if wasm.len() < 4 || !wasm.starts_with(b"\0asm") {
             return Err(SourceError::Load(
@@ -196,6 +218,7 @@ impl SourceEngine {
                     worker_manifest,
                     features,
                     worker_poisoned.clone(),
+                    static_filters,
                 );
                 while let Ok(job) = rx.recv() {
                     job(&mut state);
@@ -300,6 +323,14 @@ impl SourceEngine {
     ) -> BoxFuture<Result<MangaPageResult, SourceError>> {
         let query = query.to_string();
         self.submit(move |state| {
+            // AidokuRunner clears the caller's filters when the source
+            // declares `hidesFiltersWhileSearching` and a non-empty query is
+            // being run, so a text search is not narrowed by stale filters.
+            let filters = if state.manifest.hides_filters_while_searching && !query.is_empty() {
+                Vec::new()
+            } else {
+                filters
+            };
             let mut result =
                 state
                     .interpreter
@@ -373,9 +404,11 @@ impl SourceEngine {
         self.submit(|state| state.listings())
     }
 
-    /// Dynamic filters only. Static `filters.json` is not parsed by this crate
-    /// yet (documented boundary); sources with static filters still search
-    /// correctly through [`Self::search`].
+    /// The source's full filter list: static `filters.json` entries followed
+    /// by the dynamic `get_filters` result when the module exports it, with no
+    /// deduplication (matching AidokuRunner's `getSearchFilters`). A source
+    /// whose `filters.json` is missing, malformed or unreadable still loads
+    /// and searches; the parse/read error is returned by this call only.
     pub fn filters(&self) -> BoxFuture<Result<Vec<Filter>, SourceError>> {
         self.submit(|state| state.filters())
     }
@@ -482,6 +515,9 @@ struct WorkerState {
     source_id: String,
     manifest: SourceManifest,
     features: SourceFeatures,
+    /// `None` = no `filters.json`; `Some(Err)` = file present but failed to
+    /// read/parse (reported when `filters()` is asked for the schema).
+    static_filters: Option<Result<Vec<Filter>, SourceError>>,
     mangas: HashMap<String, Manga>,
     manga_order: VecDeque<String>,
     chapters: HashMap<String, Chapter>,
@@ -496,12 +532,14 @@ impl WorkerState {
         manifest: SourceManifest,
         features: SourceFeatures,
         poisoned: Arc<AtomicBool>,
+        static_filters: Option<Result<Vec<Filter>, SourceError>>,
     ) -> Self {
         Self {
             source_id: manifest.id.clone(),
             manifest,
             interpreter,
             features,
+            static_filters,
             mangas: HashMap::new(),
             manga_order: VecDeque::new(),
             chapters: HashMap::new(),
@@ -565,18 +603,14 @@ impl WorkerState {
     }
 
     fn find_listing(&mut self, listing_id: &str) -> Result<Listing, SourceError> {
-        if let Some(listing) = self
-            .manifest
-            .listings
-            .iter()
-            .find(|listing| listing.id == listing_id)
-        {
+        // A known static listing does not depend on fetching dynamic lists.
+        // Keep it usable when that optional upstream request is unavailable.
+        if let Some(listing)=self.manifest.listings.iter().find(|listing|listing.id==listing_id) {
             return Ok(listing.clone());
         }
-        if self.features.dynamic_listings {
-            let dynamic = self.interpreter.get_listings()?;
-            if let Some(listing) = dynamic.iter().find(|listing| listing.id == listing_id) {
-                return Ok(listing.clone());
+        for listing in self.listings()? {
+            if listing.id == listing_id {
+                return Ok(listing);
             }
         }
         Err(SourceError::Message(format!(
@@ -585,24 +619,29 @@ impl WorkerState {
     }
 
     fn listings(&mut self) -> Result<Vec<Listing>, SourceError> {
+        // Upstream `Source.getListings` concatenates without deduplication:
+        // `staticListings + dynamicListings`, static first.
         let mut listings = self.manifest.listings.clone();
         if self.features.dynamic_listings {
-            let dynamic = self.interpreter.get_listings()?;
-            for listing in dynamic {
-                if !listings.iter().any(|existing| existing.id == listing.id) {
-                    listings.push(listing);
-                }
-            }
+            listings.extend(self.interpreter.get_listings()?);
         }
         Ok(listings)
     }
 
     fn filters(&mut self) -> Result<Vec<Filter>, SourceError> {
+        // Upstream `Source.getSearchFilters` concatenates without
+        // deduplication: `staticFilters + dynamicFilters`, static first.
+        // A filters.json that failed to parse surfaces here (and only here);
+        // the source can still load and search.
+        let mut filters = match &self.static_filters {
+            Some(Ok(static_filters)) => static_filters.clone(),
+            Some(Err(error)) => return Err(error.clone()),
+            None => Vec::new(),
+        };
         if self.features.dynamic_filters {
-            self.interpreter.get_filters()
-        } else {
-            Ok(Vec::new())
+            filters.extend(self.interpreter.get_filters()?);
         }
+        Ok(filters)
     }
 
     fn manga_details(&mut self, manga_id: &str) -> Result<Manga, SourceError> {
@@ -794,9 +833,10 @@ fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::default_filter_values;
     use crate::wasm::interpreter::AidokuInterpreter;
     use crate::wasm::models::MangaPageResult;
-    use crate::wasm::models::{ListingKind, PublishingStatus};
+    use crate::wasm::models::{FilterTypeConfig, ListingKind, PublishingStatus};
     use crate::wasm::postcard::PostcardWriter;
     use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
@@ -978,5 +1018,356 @@ mod tests {
             matches!(error, SourceError::FuelExhausted { .. }),
             "{error}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Static filters / listings / hidesFiltersWhileSearching
+    // -----------------------------------------------------------------
+
+    /// A result block (`len+8` prefix, 4-byte pad, postcard payload) embedded
+    /// in WASM memory, in the shape `handle_result` expects.
+    fn result_block(payload: Vec<u8>) -> Vec<u8> {
+        let mut buffer = Vec::with_capacity(payload.len() + 8);
+        buffer.extend_from_slice(&((payload.len() + 8) as u32).to_le_bytes());
+        buffer.extend_from_slice(&[0u8; 4]);
+        buffer.extend_from_slice(&payload);
+        buffer
+    }
+
+    fn page_result(key: &str) -> Vec<u8> {
+        let manga = Manga {
+            key: key.into(),
+            title: key.into(),
+            ..Default::default()
+        };
+        let mut payload = PostcardWriter::new();
+        payload.write_list(&[manga], |w, manga| manga.to_postcard(w));
+        payload.write_bool(false);
+        result_block(payload.into_bytes())
+    }
+
+    /// Postcard-encoded `[Filter]` / `[Listing]` results for the dynamic
+    /// exports.
+    fn filters_result(filters: &[Filter]) -> Vec<u8> {
+        let mut payload = PostcardWriter::new();
+        payload.write_list(filters, |w, f| f.to_postcard(w));
+        result_block(payload.into_bytes())
+    }
+
+    fn listings_result(listings: &[Listing]) -> Vec<u8> {
+        let mut payload = PostcardWriter::new();
+        payload.write_list(listings, |w, l| l.to_postcard(w));
+        result_block(payload.into_bytes())
+    }
+
+    /// A source that:
+    /// - returns `no-filters` / `with-filters` manga keys depending on whether
+    ///   the `filters` descriptor it received encodes more than an empty list;
+    /// - exports a dynamic `get_filters` and `get_listings`.
+    fn filter_aware_module() -> Vec<u8> {
+        let dynamic_filters = filters_result(&[Filter {
+            id: "dyn-check".into(),
+            title: Some("Dynamic".into()),
+            hide_from_header: None,
+            config: FilterTypeConfig::Check {
+                name: None,
+                can_exclude: false,
+                default_value: Some(true),
+            },
+        }]);
+        let dynamic_listings = listings_result(&[Listing {
+            id: "popular".into(), // same id as the static listing: must append
+            name: "Dynamic Popular".into(),
+            kind: ListingKind::Default,
+        }]);
+        let no_filters = page_result("no-filters");
+        let with_filters = page_result("with-filters");
+
+        // memory layout
+        let base = 1024usize;
+        let off_filters = base;
+        let off_listings = off_filters + dynamic_filters.len();
+        let off_no = off_listings + dynamic_listings.len();
+        let off_with = off_no + no_filters.len();
+
+        let source = format!(
+            r#"(module
+                (import "std" "buffer_len" (func $len (param i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const {off_filters}) "{}")
+                (data (i32.const {off_listings}) "{}")
+                (data (i32.const {off_no}) "{}")
+                (data (i32.const {off_with}) "{}")
+                ;; get_search_manga_list(query_desc, page, filters_desc)
+                (func (export "get_search_manga_list")
+                    (param $q i32) (param $page i32) (param $f i32) (result i32)
+                    ;; empty filter list encodes as a single varint byte; real
+                    ;; filters always exceed 4 bytes
+                    (if (result i32)
+                        (i32.gt_s (call $len (local.get $f)) (i32.const 4))
+                        (then (i32.const {off_with}))
+                        (else (i32.const {off_no}))))
+                (func (export "get_filters") (result i32)
+                    i32.const {off_filters})
+                (func (export "get_listings") (result i32)
+                    i32.const {off_listings}))"#,
+            wat_escape(&dynamic_filters),
+            wat_escape(&dynamic_listings),
+            wat_escape(&no_filters),
+            wat_escape(&with_filters),
+        );
+        wat::parse_str(source).unwrap()
+    }
+
+    fn manifest_with(
+        listings: Vec<Listing>,
+        hides_filters_while_searching: bool,
+    ) -> SourceManifest {
+        SourceManifest {
+            id: "test.source".into(),
+            name: "Test Source".into(),
+            version: 1,
+            alt_names: Vec::new(),
+            languages: vec!["en".into()],
+            urls: vec!["https://example.test".into()],
+            content_rating: 0,
+            listings,
+            allows_base_url_select: false,
+            hides_filters_while_searching,
+        }
+    }
+
+    /// Builds an installed source directory on disk and loads it through the
+    /// catalogue, so the `filters.json` path is exercised end to end.
+    fn install_source(
+        root: &std::path::Path,
+        manifest: &SourceManifest,
+        wasm: &[u8],
+        filters_json: Option<&str>,
+    ) -> InstalledSource {
+        let dir = root.join(&manifest.id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let source_json = format!(
+            r#"{{"info":{{"id":"{}","name":"{}","version":1,"languages":["en"],
+                "urls":["https://example.test"]}},
+             "listings":[{}],
+             "config":{{"hidesFiltersWhileSearching":{}}}}}"#,
+            manifest.id,
+            manifest.name,
+            manifest
+                .listings
+                .iter()
+                .map(|l| format!(
+                    r#"{{"id":"{}","name":"{}","kind":{}}}"#,
+                    l.id, l.name, l.kind as u8
+                ))
+                .collect::<Vec<_>>()
+                .join(","),
+            manifest.hides_filters_while_searching
+        );
+        std::fs::write(dir.join("source.json"), source_json).unwrap();
+        std::fs::write(dir.join("main.wasm"), wasm).unwrap();
+        if let Some(json) = filters_json {
+            std::fs::write(dir.join("filters.json"), json).unwrap();
+        }
+        let catalog = SourceCatalog::new(root);
+        catalog.get(&manifest.id).unwrap()
+    }
+
+    #[test]
+    fn static_filters_load_and_merge_with_dynamic() {
+        let temp = tempfile::tempdir().unwrap();
+        let installed = install_source(
+            temp.path(),
+            &manifest(),
+            &filter_aware_module(),
+            Some(
+                r#"[
+                    {"id":"status","type":"select","title":"Status",
+                     "options":["any","ongoing"],"ids":["","1"],"default":"1"},
+                    {"id":"note","type":"note","text":"hi"}
+                ]"#,
+            ),
+        );
+        let engine = SourceEngine::load_installed(&installed).unwrap();
+        let filters = pollster::block_on(engine.filters()).unwrap();
+        // static first, then dynamic, no dedup
+        assert_eq!(filters.len(), 3);
+        assert_eq!(filters[0].id, "status");
+        assert_eq!(filters[1].id, "note");
+        assert_eq!(filters[2].id, "dyn-check");
+        // the parsed defaults feed `default_filter_values`
+        let values = default_filter_values(&filters);
+        assert_eq!(
+            values,
+            vec![
+                FilterValue::Select {
+                    id: "status".into(),
+                    value: "1".into()
+                },
+                FilterValue::Check {
+                    id: "dyn-check".into(),
+                    value: 1
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn corrupt_filters_json_reports_on_filters_but_still_loads() {
+        let temp = tempfile::tempdir().unwrap();
+        let installed = install_source(
+            temp.path(),
+            &manifest(),
+            &filter_aware_module(),
+            Some("[{\"type\":\"bogus\"}]"),
+        );
+        // The source still loads and searches; only filters() reports it.
+        let engine = SourceEngine::load_installed(&installed).unwrap();
+        let error = pollster::block_on(engine.filters()).unwrap_err();
+        assert!(matches!(error, SourceError::Deserialize(_)), "{error}");
+        let page = pollster::block_on(engine.search("x")).unwrap();
+        assert_eq!(page.entries[0].key, "no-filters");
+
+        // A valid filters.json still parses and merges.
+        let temp2 = tempfile::tempdir().unwrap();
+        let ok = install_source(
+            temp2.path(),
+            &manifest(),
+            &filter_aware_module(),
+            Some(r#"[{"id":"a","type":"text","placeholder":"x"}]"#),
+        );
+        let engine2 = SourceEngine::load_installed(&ok).unwrap();
+        let filters = pollster::block_on(engine2.filters()).unwrap();
+        assert_eq!(filters[0].id, "a");
+    }
+
+    #[test]
+    fn advertised_but_missing_filters_file_reports_on_filters() {
+        // filters_path points at a file that isn't there — reported, not
+        // mistaken for "no filters", while the source still loads/searches.
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("test.source");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("source.json"),
+            r#"{"info":{"id":"test.source","name":"Test","version":1,
+                "languages":["en"],"urls":["https://example.test"]}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("main.wasm"), &filter_aware_module()).unwrap();
+        let manifest = manifest();
+        let installed = InstalledSource {
+            manifest,
+            directory: dir.clone(),
+            wasm_path: dir.join("main.wasm"),
+            settings_path: None,
+            filters_path: Some(dir.join("filters.json")), // does not exist
+            icon_path: None,
+        };
+        let engine = SourceEngine::load_installed(&installed).unwrap();
+        let error = pollster::block_on(engine.filters()).unwrap_err();
+        assert!(matches!(error, SourceError::Deserialize(_)), "{error}");
+        assert!(pollster::block_on(engine.search("x")).is_ok());
+    }
+
+    #[test]
+    fn search_forwards_filters_and_hides_them_while_searching() {
+        // hidesFiltersWhileSearching = false: filters reach the module.
+        let temp = tempfile::tempdir().unwrap();
+        let installed = install_source(
+            temp.path(),
+            &manifest_with(Vec::new(), false),
+            &filter_aware_module(),
+            None,
+        );
+        let engine = SourceEngine::load_installed(&installed).unwrap();
+        let page = pollster::block_on(engine.search_page(
+            "one piece",
+            1,
+            vec![FilterValue::Text {
+                id: "author".into(),
+                value: "oda".into(),
+            }],
+        ))
+        .unwrap();
+        assert_eq!(page.entries[0].key, "with-filters");
+        let page = pollster::block_on(engine.search_page("one piece", 1, Vec::new())).unwrap();
+        assert_eq!(page.entries[0].key, "no-filters");
+
+        // hidesFiltersWhileSearching = true + non-empty query: cleared.
+        let temp2 = tempfile::tempdir().unwrap();
+        let installed2 = install_source(
+            temp2.path(),
+            &manifest_with(Vec::new(), true),
+            &filter_aware_module(),
+            None,
+        );
+        let engine2 = SourceEngine::load_installed(&installed2).unwrap();
+        let page = pollster::block_on(engine2.search_page(
+            "one piece",
+            1,
+            vec![FilterValue::Text {
+                id: "author".into(),
+                value: "oda".into(),
+            }],
+        ))
+        .unwrap();
+        assert_eq!(page.entries[0].key, "no-filters");
+        // empty query keeps the filters even when the flag is set.
+        let page = pollster::block_on(engine2.search_page(
+            "",
+            1,
+            vec![FilterValue::Text {
+                id: "author".into(),
+                value: "oda".into(),
+            }],
+        ))
+        .unwrap();
+        assert_eq!(page.entries[0].key, "with-filters");
+    }
+
+    #[test]
+    fn listings_append_static_then_dynamic_without_dedup() {
+        let temp = tempfile::tempdir().unwrap();
+        let installed = install_source(
+            temp.path(),
+            &manifest_with(
+                vec![Listing {
+                    id: "popular".into(),
+                    name: "Static Popular".into(),
+                    kind: ListingKind::Default,
+                }],
+                false,
+            ),
+            &filter_aware_module(),
+            None,
+        );
+        let engine = SourceEngine::load_installed(&installed).unwrap();
+        let listings = pollster::block_on(engine.listings()).unwrap();
+        // upstream `staticListings + dynamicListings` keeps both, same id ok
+        assert_eq!(listings.len(), 2);
+        assert_eq!(listings[0].name, "Static Popular");
+        assert_eq!(listings[1].name, "Dynamic Popular");
+        // browse resolves the first match (the static one)
+        let listing = listings[0].clone();
+        assert_eq!(listing.id, "popular");
+    }
+
+    #[test]
+    fn static_listing_still_browses_when_dynamic_listing_export_fails() {
+        let payload=wat_escape(&page_result("static-still-works"));
+        let wasm=wat::parse_str(format!(r#"(module
+            (memory (export "memory") 1)
+            (data (i32.const 1024) "{payload}")
+            (func (export "get_listings") (result i32) i32.const -1)
+            (func (export "get_manga_list") (param i32 i32) (result i32) i32.const 1024)
+        )"#)).unwrap();
+        let engine=SourceEngine::load_wasm(manifest_with(vec![Listing{
+            id:"static".into(),name:"Static".into(),kind:ListingKind::Default,
+        }],false),wasm,EngineOptions::default()).unwrap();
+        assert!(pollster::block_on(engine.listings()).is_err());
+        let page=pollster::block_on(engine.browse("static",1)).unwrap();
+        assert_eq!(page.entries[0].key,"static-still-works");
     }
 }

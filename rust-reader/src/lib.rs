@@ -3,6 +3,7 @@ mod shelf;
 mod worker;
 mod ui;
 mod sources;
+mod source_filters;
 mod sync;
 mod vertical;
 #[cfg(target_os = "ios")]

@@ -35,9 +35,20 @@ Remove-Item Env:YEJIAN_IPAD_ONLY
 
 2026-11-19 发现旧流程可把已退出应用的 iPad 桌面截图记为成功，因此旧绿色记录不能作为启动证据。修复后的真实模拟器截图在 `artifacts/rust/ipad-startup-audit/`。本地离屏测试不替代 UIKit、Metal 和设备运行；实机触控、文件选择、LiveContainer 启动及功耗另行验证。
 
-验收还要求 XCTest 从正在运行的 Rust UI 获取本次启动的就绪报告，确认封面、阅读图片和原有书本身份。脚本先将模拟器书库改成 build 3 的绝对路径格式，再由新程序升级，验证重新安装后的旧库仍能读取。最终 `verify-ipad-snapshots.py` 核对七个竖屏和三个横屏的 JSON/PNG、导航安全区、旧库升级和社区索引，成功才生成 `verification.json`。workflow 显式启用 Bash 的 `pipefail`；日志写入成功不能掩盖测试失败。`test-ipad-snapshots.py` 覆盖缺证据、空白阅读、旧报告、错误方向等拒绝场景。
+验收还要求 XCTest 从正在运行的 Rust UI 获取本次启动的就绪报告，确认封面、阅读图片和原有书本身份。脚本先将模拟器书库改成 build 3 的绝对路径格式，再由新程序升级，验证重新安装后的旧库仍能读取。最终 `verify-ipad-snapshots.py` 核对十个竖屏和四个横屏的 JSON/PNG、导航安全区、旧库升级、社区索引和实际 WASM 筛选结果，成功才生成 `verification.json`。workflow 显式启用 Bash 的 `pipefail`；日志写入成功不能掩盖测试失败。`test-ipad-snapshots.py` 覆盖缺证据、空白阅读、旧报告、错误方向、筛选结果未生效等拒绝场景。
 
-当前 iPad 源码版本为 **0.1.1 / build 4**。直接运行 `ipad.yml` 只编译打包，不表示模拟器已经通过。build 3 的 run `44532550519` 与 `44538203121` 曾因缺少 `pipefail` 出现绿色误报，横屏结果作废。正式交付状态与产物路径以 `IMPLEMENTATION.md` 为准。
+当前 iPad 源码版本为 **0.1.1 / build 5**。直接运行 `ipad.yml` 只编译打包，不表示模拟器已经通过。build 3 的 run `44532550519` 与 `44538203121` 曾因缺少 `pipefail` 出现绿色误报，横屏结果作废。正式交付状态与产物路径以 `IMPLEMENTATION.md` 为准。
+
+书源筛选交互可独立在后台验证。测试书源只在显式 Debug 验收中安装，不进入 Release 包或用户书源目录：
+
+```powershell
+cd D:\Documents\aidoku\rust-reader
+$env:YEJIAN_FILTERS_ONLY='1'
+cargo run --locked -j 1 --features acceptance --bin acceptance -- ..\artifacts\rust\source-filters-build5
+Remove-Item Env:YEJIAN_FILTERS_ONLY
+```
+
+该流程实际点击热门/最新、加载下一页、题材、应用、取消与重置，验证 WASM 收到条件后的结果；另检查横竖屏、分屏和 200% 字体。`examples/source_probe.rs` 可对指定的独立书源目录运行真实联网检查，分别报告筛选、列表、搜索的结果或失败原因。
 
 `rust-reader/vendor/` 的 eframe / egui-wgpu 0.37.0 覆盖修正了 iOS Metal 画布与输入坐标尺寸不一致的问题：iOS 创建和调整画布均使用完整窗口尺寸，应用布局另外遵守安全区。升级这两项依赖时，应检查 `vendor/README.md` 列出的三个表达式；只在上游已解决尺寸不一致时移除 Cargo patch。
 

@@ -99,8 +99,8 @@ for page in pages {
 | `pages(chapter_id)` | `get_page_list` | 依赖 `chapters()` 缓存 |
 | `pages_for(manga_id, chapter_id)` | `get_page_list` | 只有 key 时的兜底 |
 | `pages_with(manga, chapter)` | `get_page_list` | 下载恢复推荐 |
-| `listings()` | `get_listings` + 静态 `source.json` | 去重 |
-| `filters()` | `get_filters` | 仅动态筛选（见边界） |
+| `listings()` | `get_listings` + 静态 `source.json` | 静态在前，不追加去重 |
+| `filters()` | `get_filters` + 静态 `filters.json` | 静态在前，不追加去重 |
 | `base_url()` | `get_base_url` | 可选 |
 | `image_request(url, ctx)` | `get_image_request` | 可选；无实现返回 `None` |
 | `http_request(request)` | 原生网络 | 用源自己的 Cookie/请求头下载 |
@@ -150,7 +150,7 @@ HTTP 4xx/5xx **不是** `Network` 错误：`http_request` 返回 `Ok(NetResponse
   source.json    # 必需，Aidoku 元数据（支持 info 包裹和扁平两种写法）
   main.wasm      # 必需，必须有 \0asm 魔数
   settings.json  # 可选，静态设置默认值会注入 defaults
-  filters.json   # 可选，当前仅保留
+  filters.json   # 可选，静态筛选条件
   icon.png       # 可选
 ```
 
@@ -161,7 +161,7 @@ HTTP 4xx/5xx **不是** `Network` 错误：`http_request` 返回 `Ok(NetResponse
 
 ## 四、可靠性设计与未迁移边界
 
-已迁移并可用：浏览、搜索、详情、章节、页面、动态书单/筛选、图片请求、
+已迁移并可用：浏览、搜索、详情、章节、页面、书单、静态+动态筛选、图片请求、
 基础登录/网页 Cookie 注入、深链、key 迁移（只要源导出对应函数）。
 
 明确边界：
@@ -169,7 +169,15 @@ HTTP 4xx/5xx **不是** `Network` 错误：`http_request` 返回 `Ok(NetResponse
 - **不执行 JavaScript/WebView**。`js.context_eval` 等返回失败并升级成
   `WebVerificationRequired`；Cloudflare 等 403/429/503 验证页也会被识别。
 - `get_home`、动态 `get_settings`、`process_page_image` 仍是未接线状态（与旧原生引擎一致）。
-- 静态 `filters.json` 尚未解析成 UI 模型；`filters()` 只返回动态筛选。
+- `canvas` host 按 AidokuRunner 真实 ABI 接线（坐标 `f32`，`get_image_width/height`
+  返回 `f32`）：`new_context`/`new_image`/`draw_image`/`copy_image`/`get_image`/
+  `get_image_data` 真实实现，供页面去混淆；`fill`/`stroke`/`draw_text`/字体加载为
+  返回成功的 stub（真实源基本只用位图合成路径）。
+- 筛选：`filters()` 返回 `filters.json` 静态筛选 + 动态 `get_filters`
+  （静态在前、不追加去重，同 AidokuRunner `getSearchFilters`）。
+  `filters.json` 缺失/畸形/不可读不影响加载与搜索——只在 `filters()` 调用
+  时报 `Deserialize`。`default_filter_values(&[Filter])` 返回各筛选的
+  resolved 默认基准值（UI 未改动项应省略提交，语义同 Aidoku `FilterListSheetView`）。
 - 每个源严格串行执行。每次调用有 WASM fuel 预算，默认 10 亿（约数秒），
   `SourceEngine::set_fuel_per_call(n)` 可调整、`0` 关闭；超限返回 `FuelExhausted`，
   只影响该源，不会让死循环永久占用 CPU。宿主网络时间不计入 fuel，仍受超时约束。

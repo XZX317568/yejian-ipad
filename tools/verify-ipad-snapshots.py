@@ -5,8 +5,9 @@ from pathlib import Path
 import struct
 import sys
 
-PORTRAIT = ("shelf", "detail", "reader", "history", "sources", "settings", "community")
-LANDSCAPE = ("shelf-landscape", "detail-landscape", "reader-landscape")
+PORTRAIT = ("shelf", "detail", "reader", "history", "sources", "settings", "community",
+            "browse", "filters", "filtered")
+LANDSCAPE = ("shelf-landscape", "detail-landscape", "reader-landscape", "filters-landscape")
 
 
 def require(condition, message):
@@ -85,6 +86,14 @@ def verify(directory):
             require(report["page_loaded"] is True, f"{name}: comic image not loaded")
         if screen == "community":
             require(report["repository_sources"] > 0, f"{name}: empty community repository")
+        if screen in ("browse", "filters", "filtered"):
+            browser = report["source_browser"]
+            require(browser["source"] == "local.filter-acceptance" and browser["loaded"]
+                    and not browser["busy"] and browser["filter_count"] == 7
+                    and browser["listing_count"] == 2, f"{name}: incomplete source metadata")
+            expected = "筛选:冒险题材" if screen == "filtered" else "热门-第1页"
+            require(browser["results"] == [expected], f"{name}: WASM filter/listing result not loaded")
+            require(browser["filter_editor"] == (screen == "filters"), f"{name}: wrong filter view")
         left, top, right, bottom = report["safe_area"]
         require(all(isinstance(n, (int, float)) and math.isfinite(n)
                     for n in (left, top, right, bottom)),
@@ -92,7 +101,7 @@ def verify(directory):
         require(abs(right - left - width) < 1 and abs(bottom - top - height) < 1,
                 f"{name}: inconsistent safe area")
         navigation = report["navigation"]
-        if screen in ("shelf", "history", "sources", "settings", "community"):
+        if screen in ("shelf", "history", "sources", "settings", "community","browse","filters","filtered"):
             require(set(navigation) == {"nav-library", "nav-search", "nav-history", "nav-settings"},
                     f"{name}: incomplete navigation")
         for control, rect in navigation.items():
@@ -114,6 +123,7 @@ def verify(directory):
         "screens": list(reports),
         "landscape_reader_loaded": reports["reader-landscape"]["page_loaded"],
         "community_sources": reports["community"]["repository_sources"],
+        "source_filters_and_listings": True,
         "legacy_library_upgraded": True,
         "data_container_changed": legacy["root"] != relocated["root"],
     }

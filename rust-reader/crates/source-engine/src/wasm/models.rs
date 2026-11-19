@@ -434,7 +434,7 @@ impl Page {
 // Filter / FilterValue
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SortDefault {
     pub index: i64,
     pub ascending: bool,
@@ -451,7 +451,7 @@ impl SortDefault {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SelectFilterCfg {
     pub is_genre: bool,
     pub uses_tag_style: bool,
@@ -483,7 +483,7 @@ impl SelectFilterCfg {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MultiSelectFilterCfg {
     pub is_genre: bool,
     pub can_exclude: bool,
@@ -527,7 +527,7 @@ impl MultiSelectFilterCfg {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum FilterTypeConfig {
     Text {
         placeholder: Option<String>,
@@ -601,7 +601,7 @@ impl FilterTypeConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Filter {
     pub id: String,
     pub title: Option<String>,
@@ -669,14 +669,14 @@ impl Filter {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SortFilterValue {
     pub id: String,
     pub index: i32,
     pub ascending: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum FilterValue {
     Text {
         id: String,
@@ -742,6 +742,207 @@ impl FilterValue {
                 w.write_string(id);
                 w.write_option(from, |w, v| w.write_f32(*v));
                 w.write_option(to, |w, v| w.write_f32(*v));
+            }
+        }
+    }
+}
+
+// serde mirrors AidokuRunner's `FilterValue` Codable shape: a flat object with
+// a numeric `type` discriminator plus the fields each case needs. This keeps
+// persisted filter selections interchangeable with Aidoku's own settings.
+mod filter_value_serde {
+    use super::{FilterValue, SortFilterValue};
+    use serde::de::{Error as DeError, MapAccess, Visitor};
+    use serde::ser::SerializeMap;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::fmt;
+
+    const TYPE_TEXT: u8 = 0;
+    const TYPE_SORT: u8 = 1;
+    const TYPE_CHECK: u8 = 2;
+    const TYPE_SELECT: u8 = 3;
+    const TYPE_MULTISELECT: u8 = 4;
+    const TYPE_RANGE: u8 = 5;
+
+    impl Serialize for FilterValue {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            // Upper bound on the number of fields; serde_json only needs an
+            // approximate hint via serialize_map(None) but a sized map is fine.
+            let mut map = serializer.serialize_map(None)?;
+            match self {
+                FilterValue::Text { id, value } => {
+                    map.serialize_entry("type", &TYPE_TEXT)?;
+                    map.serialize_entry("id", id)?;
+                    map.serialize_entry("value", value)?;
+                }
+                FilterValue::Sort(v) => {
+                    map.serialize_entry("type", &TYPE_SORT)?;
+                    map.serialize_entry("id", &v.id)?;
+                    map.serialize_entry("index", &v.index)?;
+                    map.serialize_entry("ascending", &v.ascending)?;
+                }
+                FilterValue::Check { id, value } => {
+                    map.serialize_entry("type", &TYPE_CHECK)?;
+                    map.serialize_entry("id", id)?;
+                    map.serialize_entry("value", value)?;
+                }
+                FilterValue::Select { id, value } => {
+                    map.serialize_entry("type", &TYPE_SELECT)?;
+                    map.serialize_entry("id", id)?;
+                    map.serialize_entry("value", value)?;
+                }
+                FilterValue::MultiSelect {
+                    id,
+                    included,
+                    excluded,
+                } => {
+                    map.serialize_entry("type", &TYPE_MULTISELECT)?;
+                    map.serialize_entry("id", id)?;
+                    map.serialize_entry("included", included)?;
+                    map.serialize_entry("excluded", excluded)?;
+                }
+                FilterValue::Range { id, from, to } => {
+                    map.serialize_entry("type", &TYPE_RANGE)?;
+                    map.serialize_entry("id", id)?;
+                    map.serialize_entry("from", from)?;
+                    map.serialize_entry("to", to)?;
+                }
+            }
+            map.end()
+        }
+    }
+
+    /// Helper decoded from the flat upstream shape. Unknown extra keys are
+    /// ignored; missing required fields produce an error.
+    #[derive(Default)]
+    struct Fields {
+        ty: Option<u8>,
+        id: Option<String>,
+        value: Option<serde_json::Value>,
+        index: Option<i32>,
+        ascending: Option<bool>,
+        included: Option<Vec<String>>,
+        excluded: Option<Vec<String>>,
+        from: Option<f32>,
+        to: Option<f32>,
+    }
+
+    impl<'de> Deserialize<'de> for FilterValue {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct FV;
+            impl<'de> Visitor<'de> for FV {
+                type Value = FilterValue;
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    f.write_str("an Aidoku FilterValue object")
+                }
+                fn visit_map<A: MapAccess<'de>>(
+                    self,
+                    mut access: A,
+                ) -> Result<Self::Value, A::Error> {
+                    let mut fields = Fields::default();
+                    while let Some(key) = access.next_key::<String>()? {
+                        match key.as_str() {
+                            "type" => fields.ty = Some(access.next_value::<u8>()?),
+                            "id" => fields.id = Some(access.next_value::<String>()?),
+                            "value" => {
+                                fields.value = Some(access.next_value::<serde_json::Value>()?)
+                            }
+                            "index" => fields.index = Some(access.next_value::<i32>()?),
+                            "ascending" => fields.ascending = Some(access.next_value::<bool>()?),
+                            "included" => {
+                                fields.included = Some(access.next_value::<Vec<String>>()?)
+                            }
+                            "excluded" => {
+                                fields.excluded = Some(access.next_value::<Vec<String>>()?)
+                            }
+                            "from" => fields.from = access.next_value::<Option<f32>>()?,
+                            "to" => fields.to = access.next_value::<Option<f32>>()?,
+                            _ => {
+                                let _ = access.next_value::<serde::de::IgnoredAny>()?;
+                            }
+                        }
+                    }
+                    finish(fields).map_err(A::Error::custom)
+                }
+            }
+            deserializer.deserialize_map(FV)
+        }
+    }
+
+    fn finish(f: Fields) -> Result<FilterValue, String> {
+        let ty =
+            f.ty.ok_or_else(|| "FilterValue missing `type`".to_string())?;
+        let id = || {
+            f.id.clone()
+                .ok_or_else(|| "FilterValue missing `id`".to_string())
+        };
+        // `value` is a string for text/select, an integer for check. Decode
+        // through serde_json so the JSON representation stays faithful.
+        let string_value = || -> Result<String, String> {
+            match f.value.clone() {
+                Some(serde_json::Value::String(s)) => Ok(s),
+                _ => Err("FilterValue missing string `value`".to_string()),
+            }
+        };
+        match ty {
+            TYPE_TEXT => Ok(FilterValue::Text {
+                id: id()?,
+                value: string_value()?,
+            }),
+            TYPE_SORT => Ok(FilterValue::Sort(SortFilterValue {
+                id: id()?,
+                index: f
+                    .index
+                    .ok_or_else(|| "FilterValue sort missing `index`".to_string())?,
+                ascending: f
+                    .ascending
+                    .ok_or_else(|| "FilterValue sort missing `ascending`".to_string())?,
+            })),
+            TYPE_CHECK => {
+                let raw = match f.value.clone() {
+                    Some(serde_json::Value::Number(n)) => n
+                        .as_i64()
+                        .ok_or_else(|| "FilterValue check `value` out of range".to_string())?,
+                    Some(serde_json::Value::Bool(b)) => i64::from(b),
+                    _ => return Err("FilterValue check missing `value`".to_string()),
+                };
+                Ok(FilterValue::Check {
+                    id: id()?,
+                    value: raw,
+                })
+            }
+            TYPE_SELECT => Ok(FilterValue::Select {
+                id: id()?,
+                value: string_value()?,
+            }),
+            TYPE_MULTISELECT => Ok(FilterValue::MultiSelect {
+                id: id()?,
+                included: f.included.unwrap_or_default(),
+                excluded: f.excluded.unwrap_or_default(),
+            }),
+            TYPE_RANGE => Ok(FilterValue::Range {
+                id: id()?,
+                from: f.from,
+                to: f.to,
+            }),
+            other => Err(format!("unknown FilterValue type {other}")),
+        }
+    }
+
+    impl Serialize for SortFilterValue {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            // Wrap as a full FilterValue::Sort so a standalone serialized
+            // SortFilterValue round-trips into FilterValue::Sort.
+            FilterValue::Sort(self.clone()).serialize(serializer)
+        }
+    }
+
+    impl<'de> Deserialize<'de> for SortFilterValue {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            let value = FilterValue::deserialize(deserializer)?;
+            match value {
+                FilterValue::Sort(v) => Ok(v),
+                _ => Err(D::Error::custom("expected a sort FilterValue")),
             }
         }
     }

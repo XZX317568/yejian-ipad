@@ -1,0 +1,17 @@
+[
+    {"id": "title", "type": "text", "title": "标题", "placeholder": "作品名"},
+    {"id": "order", "type": "sort", "title": "排序",
+     "options": ["相关", "最新", "人气"],
+     "default": {"index": 0, "ascending": false}},
+    {"id": "completed", "type": "check", "title": "状态", "name": "已完结",
+     "canExclude": true, "default": false},
+    {"id": "genre", "type": "select", "title": "题材",
+     "options": ["全部", "冒险", "恋爱"], "ids": ["", "adv", "rom"],
+     "default": ""},
+    {"id": "tags", "type": "multi-select", "title": "标签",
+     "options": ["热血", "治愈", "悬疑"], "ids": ["hot", "heal", "susp"],
+     "canExclude": true, "defaultIncluded": ["hot"]},
+    {"id": "note", "type": "note", "text": "筛选条件会写进搜索请求并改变标题"},
+    {"id": "year", "type": "range", "title": "年份", "min": 1980, "max": 2030,
+     "decimal": false}
+]

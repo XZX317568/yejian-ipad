@@ -2,7 +2,7 @@ use std::{
     collections::{HashSet, VecDeque},
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::{mpsc, Arc, atomic::{AtomicU8, Ordering}},
+    sync::{mpsc, Arc, atomic::{AtomicU8, AtomicU64, Ordering}},
     thread,
 };
 use egui::*;
@@ -10,13 +10,32 @@ use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use yejian_core::ChapterMetadata;
 use yejian_sources::*;
+use crate::source_filters::FilterEditor;
 
 /// The Aidoku community catalogue, kept as an explicit one-tap choice rather
 /// than a silently preinstalled repository.
 const COMMUNITY_INDEX:&str="https://aidoku-community.github.io/sources/index.min.json";
 
-enum Task { List, Fetch(String), Install(RepositorySource), Search{source:String,query:String,page:i32}, Chapters(String,Manga) }
-enum Reply { Installed(Vec<InstalledSource>), Repository(RepositoryIndex), Results{source:String,query:String,page:i32,entries:Vec<Manga>,has_next:bool}, Chapters(String,Manga,Vec<Chapter>), Error(Option<i32>,String) }
+#[derive(Clone)]
+enum Task {
+    List, Fetch(String), Install(RepositorySource), Metadata(String),
+    Search { source:String, query:String, page:i32, filters:Vec<FilterValue> },
+    Browse { source:String, listing:String, page:i32 },
+    Chapters(String,Manga),
+}
+enum Reply {
+    Installed { list:Vec<InstalledSource>, updated:Option<String> }, Repository(RepositoryIndex),
+    Metadata { filters:Vec<Filter>, listings:Vec<Listing>, filter_error:Option<String>, listing_error:Option<String> },
+    Results { source:String, query:String, page:i32, entries:Vec<Manga>, has_next:bool },
+    Chapters(String,Manga,Vec<Chapter>),
+}
+
+#[derive(Default, Clone)]
+struct BrowseSession {
+    query: String,
+    filters: Vec<FilterValue>,
+    listing: Option<String>,
+}
 
 /// One finished chapter ready for `Command::ImportChapter`.
 ///
@@ -194,10 +213,15 @@ struct ResultsState {
     page:i32,
     has_more:bool,
     entries:Vec<Manga>,
+    revision:u64,
 }
 impl ResultsState {
-    fn clear(&mut self){*self=Self::default();}
+    fn clear(&mut self){
+        let revision=self.revision.wrapping_add(1);
+        *self=Self{revision,..Self::default()};
+    }
     fn begin(&mut self,source:&str,query:&str){
+        self.revision=self.revision.wrapping_add(1);
         self.entries.clear();
         self.source=source.to_string();
         self.query=query.to_string();
@@ -630,8 +654,8 @@ fn next_queued(tasks:&[DownloadTask])->Option<usize> {
 
 pub struct Sources {
     root:PathBuf,
-    tx:mpsc::Sender<Task>,
-    rx:mpsc::Receiver<Reply>,
+    tx:mpsc::Sender<(u64,Task)>,
+    rx:mpsc::Receiver<(u64,Result<Reply,String>)>,
     installed:Vec<InstalledSource>,
     repository:Option<RepositoryIndex>,
     results:ResultsState,
@@ -640,6 +664,22 @@ pub struct Sources {
     selected_manga:Option<Manga>,
     url:String,
     query:String,
+    request_id:u64,
+    current_request:Arc<AtomicU64>,
+    pending:Option<Task>,
+    failed:Option<Task>,
+    filters:Vec<Filter>,
+    listings:Vec<Listing>,
+    applied_filters:Vec<FilterValue>,
+    listing:Option<String>,
+    filter_editor:Option<FilterEditor>,
+    metadata_loaded:bool,
+    filter_error:Option<String>,
+    listing_error:Option<String>,
+    sessions:std::collections::HashMap<String,BrowseSession>,
+    repository_search:String,
+    #[cfg(debug_assertions)]
+    preview_mode:Option<String>,
     busy:bool,
     status:String,
     tasks:Vec<DownloadTask>,
@@ -665,45 +705,120 @@ impl Sources {
         self.repository.as_ref().map_or(0, |repo| repo.sources.len())
     }
 
+    #[cfg(debug_assertions)]
+    pub(crate) fn preview_browser(&mut self,mode:&str)->anyhow::Result<()> {
+        // Only explicit debug snapshot/acceptance flags install this labelled,
+        // local WASM fixture. Release apps never embed it.
+        let directory=self.root.join("sources/local.filter-acceptance");
+        std::fs::create_dir_all(&directory)?;
+        for(name,bytes) in [
+            ("source.json",include_bytes!("../crates/source-engine/tests/fixtures/browser/source.json").as_slice()),
+            ("filters.json",include_bytes!("../crates/source-engine/tests/fixtures/browser/filters.json").as_slice()),
+            ("main.wasm",include_bytes!("../crates/source-engine/tests/fixtures/browser/main.wasm").as_slice()),
+        ] {std::fs::write(directory.join(name),bytes)?;}
+        self.installed=SourceCatalog::new(self.root.join("sources")).list()?;
+        self.preview_mode=Some(mode.into());
+        self.select_source("");
+        self.select_source("local.filter-acceptance");
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn browser_report(&self)->serde_json::Value {
+        serde_json::json!({
+            "source":self.selected_source,"loaded":self.metadata_loaded,
+            "filter_count":self.filters.len(),"listing_count":self.listings.len(),
+            "filter_editor":self.filter_editor.is_some(),"busy":self.busy,
+            "results":self.results.entries.iter().map(|manga|manga.title.as_str()).collect::<Vec<_>>(),
+            "applied":self.applied_filters,
+        })
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn preview_installed_source(&mut self,id:&str)->anyhow::Result<()> {
+        self.installed=SourceCatalog::new(self.root.join("sources")).list()?;
+        anyhow::ensure!(self.installed.iter().any(|source|source.manifest.id==id),"验收书源未安装：{id}");
+        self.preview_mode=Some("filters".into());
+        self.select_source(id);
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn browser_ready(&self,mode:&str)->bool {
+        self.metadata_loaded&&!self.busy&&!self.results.entries.is_empty()
+            &&(mode!="filters"||self.filter_editor.is_some())
+            &&(mode!="filtered"||self.results.entries.iter().any(|manga|manga.title=="筛选:冒险题材"))
+    }
+
     pub fn new(root:PathBuf,ctx:Context)->Self {
         let(tx,rx_task)=mpsc::channel();
         let(tx_reply,rx)=mpsc::channel();
         let meta_root=root.clone();
         let meta_ctx=ctx.clone();
+        let current_request=Arc::new(AtomicU64::new(0));
+        let worker_request=current_request.clone();
         thread::Builder::new().name("yejian-sources".into()).spawn(move||{
             let catalog=SourceCatalog::new(meta_root.join("sources"));
             let mut engines=std::collections::HashMap::<String,SourceEngine>::new();
-            let send=|reply|{let _=tx_reply.send(reply);meta_ctx.request_repaint();};
-            while let Ok(task)=rx_task.recv() {
-                let page=match &task{Task::Search{page,..}=>Some(*page),_=>None};
-                let result=(||->anyhow::Result<()> {
-                    match task {
-                        Task::List=>send(Reply::Installed(catalog.list()?)),
+            while let Ok((request_id,task))=rx_task.recv() {
+                // Skip queued reads already replaced by a newer user choice.
+                // An installation is an explicit mutation and must still finish.
+                if request_id!=worker_request.load(Ordering::Relaxed)&&!matches!(&task,Task::Install(_)){continue;}
+                let result=(||->anyhow::Result<Reply> {
+                    Ok(match task {
+                        Task::List=>Reply::Installed{list:catalog.list()?,updated:None},
                         Task::Fetch(url)=> {
                             let installer=SourceInstaller::new(SourceCatalog::new(catalog.root()))?;
-                            send(Reply::Repository(installer.fetch_index(&url)?));
+                            Reply::Repository(installer.fetch_index(&url)?)
                         }
                         Task::Install(entry)=>{
                             let installer=SourceInstaller::new(SourceCatalog::new(catalog.root()))?;
                             installer.install_entry(&entry)?;
                             engines.remove(&entry.id);
-                            send(Reply::Installed(catalog.list()?));
+                            Reply::Installed{list:catalog.list()?,updated:Some(entry.id)}
                         }
-                        Task::Search{source,query,page}=>{
+                        Task::Metadata(source)=>{
                             if !engines.contains_key(&source){engines.insert(source.clone(),SourceEngine::load(&catalog,&source)?);}
-                            let result=pollster::block_on(engines[&source].search_page(&query,page,Vec::new()))?;
-                            send(Reply::Results{source,query,page,entries:result.entries,has_next:result.has_next_page});
+                            let engine=&engines[&source];
+                            let (filters,filter_error)=match pollster::block_on(engine.filters()) {
+                                Ok(filters)=>(filters,None),
+                                Err(error)=>{
+                                    // A remote dynamic-filter failure must not
+                                    // conceal static options already installed.
+                                    let static_filters=catalog.get(&source).ok()
+                                        .and_then(|source|source.filters_path)
+                                        .and_then(|path|std::fs::read_to_string(path).ok())
+                                        .and_then(|text|parse_filters_json(&text).ok()).unwrap_or_default();
+                                    (static_filters,Some(error.to_string()))
+                                }
+                            };
+                            let (listings,listing_error)=match pollster::block_on(engine.listings()) {
+                                Ok(listings)=>(listings,None),
+                                Err(error)=>(engine.manifest().listings.clone(),Some(error.to_string())),
+                            };
+                            Reply::Metadata{filters,listings,filter_error,listing_error}
+                        }
+                        Task::Search{source,query,page,filters}=>{
+                            if !engines.contains_key(&source){engines.insert(source.clone(),SourceEngine::load(&catalog,&source)?);}
+                            let result=pollster::block_on(engines[&source].search_page(&query,page,filters))?;
+                            Reply::Results{source,query,page,entries:result.entries,has_next:result.has_next_page}
+                        }
+                        Task::Browse{source,listing,page}=>{
+                            if !engines.contains_key(&source){engines.insert(source.clone(),SourceEngine::load(&catalog,&source)?);}
+                            let result=pollster::block_on(engines[&source].browse(&listing,page))?;
+                            Reply::Results{source,query:String::new(),page,entries:result.entries,has_next:result.has_next_page}
                         }
                         Task::Chapters(source,manga)=>{
                             if !engines.contains_key(&source){engines.insert(source.clone(),SourceEngine::load(&catalog,&source)?);}
                             let engine=&engines[&source];
                             let detail=pollster::block_on(engine.manga_details(&manga.key))?;
                             let chapters=pollster::block_on(engine.chapters(&manga.key))?;
-                            send(Reply::Chapters(source,detail,chapters));
+                            Reply::Chapters(source,detail,chapters)
                         }
-                    } Ok(())
+                    })
                 })();
-                if let Err(error)=result {send(Reply::Error(page,format!("{error:#}")));}
+                let _=tx_reply.send((request_id,result.map_err(|error|format!("{error:#}"))));
+                meta_ctx.request_repaint();
             }
         }).expect("Unable to start source worker");
 
@@ -769,6 +884,22 @@ impl Sources {
             selected_manga:None,
             url:String::new(),
             query:String::new(),
+            request_id:0,
+            current_request,
+            pending:None,
+            failed:None,
+            filters:Vec::new(),
+            listings:Vec::new(),
+            applied_filters:Vec::new(),
+            listing:None,
+            filter_editor:None,
+            metadata_loaded:false,
+            filter_error:None,
+            listing_error:None,
+            sessions:Default::default(),
+            repository_search:String::new(),
+            #[cfg(debug_assertions)]
+            preview_mode:None,
             busy:false,
             status:load_warning.clone().unwrap_or_default(),
             tasks,
@@ -785,10 +916,11 @@ impl Sources {
             if let Err(error)=sources.persist() {
                 sources.status=format!("初始化下载队列失败：{error:#}；原有存档未被覆盖");
             }
-            let _=sources.tx.send(Task::List);
+            sources.submit(Task::List);
             return sources;
         }
-        let _=sources.tx.send(Task::List);
+        let mut sources=sources;
+        sources.submit(Task::List);
         sources
     }
 
@@ -863,11 +995,32 @@ impl Sources {
     }
 
     fn submit(&mut self,task:Task) {
-        if self.tx.send(task).is_err(){self.status="书源线程已停止，请重新打开应用".into();}
-        else {self.busy=true;self.status="正在加载…".into();}
+        self.request_id=self.request_id.wrapping_add(1);
+        self.current_request.store(self.request_id,Ordering::Relaxed);
+        self.failed=None;
+        self.pending=Some(task.clone());
+        if self.tx.send((self.request_id,task)).is_err(){
+            self.busy=false;self.failed=self.pending.take();self.status="书源线程已停止，请重新打开应用".into();
+        } else {self.busy=true;self.status="正在加载…".into();}
     }
     fn select_source(&mut self,id:&str) {
-        if apply_source_change(&mut self.selected_source,&mut self.results,&mut self.selected_manga,&mut self.chapters,id){self.status.clear();}
+        if self.selected_source==id{return;}
+        if !self.selected_source.is_empty() {
+            self.sessions.insert(self.selected_source.clone(),BrowseSession {
+                query:self.query.clone(),filters:self.applied_filters.clone(),listing:self.listing.clone(),
+            });
+        }
+        apply_source_change(&mut self.selected_source,&mut self.results,&mut self.selected_manga,&mut self.chapters,id);
+        let session=self.sessions.get(id).cloned().unwrap_or_default();
+        self.query=session.query;
+        self.applied_filters=session.filters;
+        self.listing=session.listing;
+        self.filters.clear();self.listings.clear();self.filter_editor=None;
+        self.filter_error=None;self.listing_error=None;self.metadata_loaded=false;
+        self.request_id=self.request_id.wrapping_add(1);
+        self.current_request.store(self.request_id,Ordering::Relaxed);
+        self.busy=false;self.pending=None;self.failed=None;self.status.clear();
+        if !id.is_empty(){self.submit(Task::Metadata(id.into()));}
     }
     /// New search from the text field: page one of this source and query.
     fn start_search(&mut self) {
@@ -875,13 +1028,36 @@ impl Sources {
         if source.is_empty(){return;}
         let query=self.query.trim().to_string();
         self.query=query.clone();
+        self.listing=None;
         self.results.begin(&source,&query);
         self.selected_manga=None;
         self.chapters.clear();
-        self.submit(Task::Search{source,query,page:1});
+        let filters=if self.filters_hidden(){Vec::new()}else{self.applied_filters.clone()};
+        self.submit(Task::Search{source,query,page:1,filters});
+    }
+    fn filters_hidden(&self)->bool {
+        !self.query.trim().is_empty() && self.installed.iter()
+            .any(|source|source.manifest.id==self.selected_source&&source.manifest.hides_filters_while_searching)
+    }
+    fn start_listing(&mut self,id:&str) {
+        self.query.clear();
+        self.listing=Some(id.into());
+        self.selected_manga=None;self.chapters.clear();
+        self.results.begin(&self.selected_source,"");
+        self.submit(Task::Browse{source:self.selected_source.clone(),listing:id.into(),page:1});
     }
     fn load_next_page(&mut self) {
-        if let Some((source,query,page))=self.results.next_page(){self.submit(Task::Search{source,query,page});}
+        if let Some((source,query,page))=self.results.next_page(){
+            // Pagination uses the committed request, never the edited text field.
+            let task=if let Some(listing)=&self.listing{Task::Browse{source,listing:listing.clone(),page}}
+            else{Task::Search{source,query,page,filters:self.committed_filters()}};
+            self.submit(task);
+        }
+    }
+    fn committed_filters(&self)->Vec<FilterValue> {
+        let hidden=!self.results.query.is_empty()&&self.installed.iter()
+            .any(|source|source.manifest.id==self.selected_source&&source.manifest.hides_filters_while_searching);
+        if hidden{Vec::new()}else{self.applied_filters.clone()}
     }
     fn open_manga(&mut self,manga:Manga) {
         let source=if manga.source_key.is_empty(){self.results.source.clone()}else{manga.source_key.clone()};
@@ -1132,27 +1308,73 @@ impl Sources {
     }
 
     pub fn poll(&mut self) {
-        while let Ok(reply)=self.rx.try_recv(){
+        while let Ok((request_id,result))=self.rx.try_recv(){
+            // Every operation (including failures and detail loads) belongs to
+            // one request. Same text with different filters/listing is a new
+            // identity; old replies cannot clear its spinner or replace data.
+            if request_id!=self.request_id {
+                // A completed installation still updates the catalogue even
+                // when the user has navigated to another source in the meantime.
+                if let Ok(Reply::Installed{list,updated:Some(_)})=result{self.installed=list;}
+                continue;
+            }
             self.busy=false;
+            let completed=self.pending.take();
+            let reply=match result {
+                Ok(reply)=>reply,
+                Err(error)=>{
+                    self.status=match &completed {
+                        Some(Task::Search{page,..}|Task::Browse{page,..}) if *page>1=>format!("第 {page} 页加载失败：{error}"),
+                        Some(Task::Metadata(_))=>format!("书源选项加载失败：{error}"),
+                        _=>format!("加载失败：{error}"),
+                    };
+                    self.failed=completed;continue;
+                }
+            };
             match reply {
-                Reply::Installed(list)=>{self.installed=list;self.status="书源列表已更新".into();}
+                Reply::Installed{list,updated}=>{
+                    self.installed=list;self.status="书源列表已更新".into();
+                    if let Some(id)=updated {
+                        if self.selected_source==id {
+                            self.metadata_loaded=false;self.applied_filters.clear();
+                            self.submit(Task::Metadata(id));
+                        }
+                    }
+                }
                 Reply::Repository(index)=>{self.status=format!("找到 {} 个书源",index.sources.len());self.repository=Some(index);}
+                Reply::Metadata{filters,listings,filter_error,listing_error}=>{
+                    self.filters=filters;self.listings=listings;
+                    self.filter_error=filter_error;self.listing_error=listing_error;
+                    self.metadata_loaded=true;
+                    // Source updates can remove options; a session must never
+                    // submit an identifier absent from the current schema.
+                    self.applied_filters=crate::source_filters::overrides(&self.filters,
+                        &crate::source_filters::effective_values(&self.filters,&self.applied_filters));
+                    #[cfg(debug_assertions)]
+                    if self.preview_mode.as_deref()==Some("filtered"){
+                        self.applied_filters=vec![FilterValue::Select{id:"genre".into(),value:"adv".into()}];
+                        self.start_search();continue;
+                    }
+                    let listing=self.listing.clone().filter(|id|self.listings.iter().any(|listing|listing.id==*id))
+                        .or_else(||if self.sessions.contains_key(&self.selected_source){None}else{self.listings.first().map(|listing|listing.id.clone())});
+                    if let Some(id)=listing{self.start_listing(&id);}else{self.start_search();}
+                }
                 Reply::Results{source,query,page,entries,has_next}=>{
                     if self.results.accept(&source,&query,page,entries,has_next){
                         self.selected_source=source;
                         self.status=if has_next{format!("已加载第 {page} 页，可继续加载下一页")}
                             else if page>1{format!("已加载到第 {page} 页，没有更多结果")}
-                            else{"搜索完成".into()};
+                            else if self.results.entries.is_empty(){"没有找到漫画，可调整关键词或筛选".into()}
+                            else{format!("共 {} 部漫画",self.results.entries.len())};
+                        #[cfg(debug_assertions)]
+                        if let Some(mode)=self.preview_mode.take(){
+                            if mode=="filters"{self.filter_editor=Some(FilterEditor::new(&self.filters,&self.applied_filters));}
+                        }
                     }
                 }
                 Reply::Chapters(source,manga,list)=>{
                     if source==self.selected_source{self.selected_manga=Some(manga);self.chapters=list;self.status.clear();}
                 }
-                Reply::Error(page,text)=>self.status=match page {
-                    Some(page) if page>1=>format!("第 {page} 页加载失败，可点“加载下一页”重试：{text}"),
-                    Some(_)=>format!("搜索失败，可重试：{text}"),
-                    None=>format!("未完成：{text}"),
-                },
             }
         }
         while let Ok(event)=self.dl_rx.try_recv(){self.handle_download_event(event);}
@@ -1217,70 +1439,175 @@ impl Sources {
         ui.add_space(10.);
     }
 
+    fn filter_page(&mut self,ui:&mut Ui) {
+        let Some(mut editor)=self.filter_editor.take() else{return;};
+        ui.label(RichText::new("筛选与排序").size(21.).strong());
+        let submitted=editor.submitted(&self.filters);
+        let mut leave=false;
+        ui.horizontal_wrapped(|ui|{
+            if ui.add_enabled(submitted.is_ok(),Button::new("应用筛选")).clicked() {
+                self.applied_filters=submitted.clone().unwrap_or_default();
+                leave=true;
+                self.start_search();
+            }
+            if ui.button("重置").clicked(){editor=FilterEditor::new(&self.filters,&[]);}
+            if ui.button("取消").clicked(){leave=true;}
+        });
+        if let Err(error)=submitted {ui.colored_label(ui.visuals().error_fg_color,error);}
+        ui.add_space(8.);
+        ScrollArea::vertical().id_salt("source-filter-editor").show(ui,|ui|{
+            editor.ui(ui,&self.filters);
+        });
+        if !leave{self.filter_editor=Some(editor);}
+    }
+
+    pub(crate) fn back(&mut self)->bool {
+        if self.filter_editor.take().is_some(){return true;}
+        if self.selected_manga.take().is_some(){self.chapters.clear();return true;}
+        if !self.selected_source.is_empty(){self.select_source("");return true;}
+        false
+    }
+
+    fn browser_header(&mut self,ui:&mut Ui) {
+        ui.horizontal_wrapped(|ui|{
+            if ui.button("‹ 我的书源").clicked(){self.select_source("");}
+            let name=self.installed.iter().find(|source|source.manifest.id==self.selected_source)
+                .map(|source|source.manifest.name.as_str()).unwrap_or("");
+            ui.add(Label::new(RichText::new(name).strong()).wrap());
+        });
+        if self.selected_source.is_empty(){return;}
+        let input=ui.add(TextEdit::singleline(&mut self.query)
+            .hint_text("在此书源搜索漫画").desired_width(ui.available_width()));
+        let enter=input.lost_focus()&&ui.input(|input|input.key_pressed(Key::Enter));
+        ui.horizontal_wrapped(|ui|{
+            if ui.add_enabled(self.metadata_loaded,Button::new("搜索")).clicked()||enter&&self.metadata_loaded{self.start_search();}
+            let hidden=self.filters_hidden();
+            let label=if self.applied_filters.is_empty(){"筛选与排序".into()}else{format!("筛选（{}）",self.applied_filters.len())};
+            if ui.add_enabled(self.metadata_loaded&&!hidden&&!self.filters.is_empty(),Button::new(label)).clicked(){
+                self.filter_editor=Some(FilterEditor::new(&self.filters,&self.applied_filters));
+            }
+            if !self.applied_filters.is_empty()&&!hidden&&ui.button("清除筛选").clicked(){
+                self.applied_filters.clear();self.start_search();
+            }
+        });
+        if self.filters_hidden(){ui.label("此书源的关键词搜索不使用筛选；清空关键词后可筛选。");}
+        else if self.metadata_loaded&&self.filters.is_empty()&&self.filter_error.is_none(){
+            ui.label("此书源未提供筛选选项。");
+        }
+        if let Some(error)=self.filter_error.clone(){
+            CollapsingHeader::new("部分筛选未能加载 · 查看原因").show(ui,|ui|{
+                ui.add(Label::new(error).wrap());
+            });
+        }
+        if let Some(error)=self.listing_error.clone(){
+            CollapsingHeader::new("部分列表未能加载 · 查看原因").show(ui,|ui|{
+                ui.add(Label::new(error).wrap());
+            });
+        }
+        if (self.filter_error.is_some()||self.listing_error.is_some())
+            && ui.add_enabled(!self.busy,Button::new("重新加载书源选项")).clicked(){
+            self.submit(Task::Metadata(self.selected_source.clone()));
+        }
+        if self.listings.len()>4 {
+            let label=self.listings.iter().find(|listing|self.listing.as_ref()==Some(&listing.id))
+                .map(|listing|listing.name.as_str()).unwrap_or("全部 / 搜索");
+            let mut selection=self.listing.clone();
+            ComboBox::from_id_salt("source-listing").selected_text(label)
+                .width(ui.available_width().min(400.)).show_ui(ui,|ui|{
+                    ui.selectable_value(&mut selection,None,"全部 / 搜索");
+                    for listing in &self.listings{
+                        ui.selectable_value(&mut selection,Some(listing.id.clone()),&listing.name);
+                    }
+                });
+            if selection!=self.listing {
+                if let Some(id)=selection{self.start_listing(&id);}else{self.start_search();}
+            }
+        } else {
+            ui.horizontal_wrapped(|ui|{
+                if ui.add_enabled(self.metadata_loaded,Button::new("全部 / 搜索").selected(self.listing.is_none())).clicked(){
+                    self.start_search();
+                }
+                for listing in self.listings.clone(){
+                    if ui.add(Button::new(&listing.name).selected(self.listing.as_ref()==Some(&listing.id)).wrap()).clicked(){
+                        self.start_listing(&listing.id);
+                    }
+                }
+            });
+        }
+        if self.listing.is_some()&&!self.applied_filters.is_empty(){ui.label("当前显示书源列表；应用筛选后切换到搜索结果。");}
+        ui.add_space(8.);
+    }
+
+    fn repository_ui(&mut self,ui:&mut Ui) {
+        ui.label(RichText::new("添加 Aidoku 书源仓库").strong());
+        ui.add_space(6.);
+        ui.add_enabled(!self.busy,TextEdit::singleline(&mut self.url)
+            .hint_text("粘贴书源仓库地址").desired_width(ui.available_width()));
+        ui.horizontal_wrapped(|ui|{
+            if ui.add_enabled(!self.busy,Button::new("读取")).clicked(){self.submit(Task::Fetch(self.url.trim().into()));}
+            if ui.add_enabled(!self.busy,Button::new("社区源")).clicked(){
+                self.url=COMMUNITY_INDEX.into();
+                self.submit(Task::Fetch(COMMUNITY_INDEX.into()));
+            }
+        });
+        if let Some(repo)=self.repository.clone(){
+            ui.add_space(10.);
+            ui.label(RichText::new(repo.name.unwrap_or_else(||"可安装书源".into())).strong());
+            ui.add(TextEdit::singleline(&mut self.repository_search).hint_text("查找书源名称或语言（如 zh）").desired_width(ui.available_width()));
+            let needle=self.repository_search.trim().to_lowercase();
+            for source in repo.sources.iter().filter(|source|format!("{} {} {}",source.name,source.id,source.languages.join(" ")).to_lowercase().contains(&needle)) {
+                ui.horizontal(|ui|{
+                    ui.with_layout(Layout::right_to_left(Align::Center),|ui|{
+                        let existing=self.installed.iter().find(|s|s.manifest.id==source.id);
+                        let installed=existing.is_some_and(|s|s.manifest.version>=source.version);
+                        let label=if installed{"已安装"}else if existing.is_some(){"更新"}else{"安装"};
+                        if ui.add_enabled(!self.busy&&!installed,Button::new(label)).clicked(){self.submit(Task::Install(source.clone()));}
+                        ui.with_layout(Layout::left_to_right(Align::Center),|ui|{
+                            let mut text=source.name.clone();
+                            if !source.languages.is_empty(){text.push_str("  ");text.push_str(&source.languages.join(" / "));}
+                            ui.add(Label::new(text).truncate());
+                        });
+                    });
+                });
+            }
+        }
+    }
+
     pub fn ui(&mut self,ui:&mut Ui) {
         self.poll();
-        ScrollArea::vertical().show(ui,|ui|{
+        if self.filter_editor.is_some(){self.filter_page(ui);return;}
+        if !self.selected_source.is_empty()&&self.selected_manga.is_none(){
+            self.browser_header(ui);
+            if self.filter_editor.is_some(){return;}
+        }
+        ScrollArea::vertical().id_salt(("source-content",&self.selected_source,self.results.revision)).show(ui,|ui|{
             // Never let one long row stretch the page beyond the viewport; rows
             // truncate or wrap inside this width instead.
             ui.set_max_width(ui.available_width());
             if self.selected_manga.is_none() {
                 let unfinished:Vec<DownloadTask>=self.tasks.iter().filter(|task|task.status!=DownloadStatus::Done).cloned().collect();
                 if !unfinished.is_empty() {
-                    CollapsingHeader::new(format!("下载队列（{}）",unfinished.len())).default_open(true).show(ui,|ui|{
+                    CollapsingHeader::new(format!("下载队列（{}）",unfinished.len())).default_open(self.selected_source.is_empty()).show(ui,|ui|{
                         for task in &unfinished{self.download_row(ui,task);}
                     });
                     ui.add_space(8.);
                 }
-                ui.add_space(2.);
-                ui.label(RichText::new("添加 Aidoku 书源仓库").strong());
-                ui.add_space(6.);
-                ui.add_enabled(!self.busy,TextEdit::singleline(&mut self.url)
-                    .hint_text("粘贴书源仓库地址").desired_width(ui.available_width()));
-                ui.horizontal_wrapped(|ui|{
-                    if ui.add_enabled(!self.busy,Button::new("读取")).clicked(){self.submit(Task::Fetch(self.url.trim().into()));}
-                    if ui.add_enabled(!self.busy,Button::new("社区源")).clicked(){
-                        self.url=COMMUNITY_INDEX.into();
-                        self.submit(Task::Fetch(COMMUNITY_INDEX.into()));
-                    }
-                });
-                if let Some(repo)=self.repository.clone(){
-                    ui.add_space(10.);
-                    CollapsingHeader::new(repo.name.unwrap_or_else(||"可安装书源".into())).default_open(true).show(ui,|ui|{
-                        for source in repo.sources.iter().take(400) {
-                            ui.horizontal(|ui|{
-                                // Place the button first from the right so a long
-                                // repository name can only truncate, never push
-                                // the button off screen.
-                                ui.with_layout(Layout::right_to_left(Align::Center),|ui|{
-                                    let label=if self.installed.iter().any(|s|s.manifest.id==source.id){"更新"}else{"安装"};
-                                    if ui.add_enabled(!self.busy,Button::new(label)).clicked(){self.submit(Task::Install(source.clone()));}
-                                    ui.with_layout(Layout::left_to_right(Align::Center),|ui|{
-                                        let mut text=source.name.clone();
-                                        if !source.languages.is_empty(){text.push_str("  ");text.push_str(&source.languages.join(" / "));}
-                                        ui.add(Label::new(text).truncate());
-                                    });
-                                });
-                            });
+                if self.selected_source.is_empty(){
+                    if !self.installed.is_empty() {
+                        ui.label(RichText::new("我的书源").size(19.).strong());
+                        for source in self.installed.clone(){
+                            let label=format!("{}   ›",source.manifest.name);
+                            if ui.add(Button::new(label).wrap().min_size(vec2(ui.available_width(),48.))).clicked(){
+                                self.select_source(&source.manifest.id);
+                            }
                         }
-                    });
-                }
-                ui.add_space(24.);
-                ui.label(RichText::new("已安装").size(19.).strong());
-                ui.add_space(4.);
-                if self.installed.is_empty(){ui.label("添加仓库并安装一个书源后，即可在这里搜索漫画。");}
-                for source in self.installed.clone(){
-                    if ui.selectable_label(self.selected_source==source.manifest.id,&source.manifest.name).clicked(){self.select_source(&source.manifest.id);}
-                }
-                if !self.selected_source.is_empty(){
-                    ui.add_enabled(!self.busy,TextEdit::singleline(&mut self.query)
-                        .hint_text("漫画名称").desired_width(ui.available_width()));
-                    ui.horizontal_wrapped(|ui|{
-                        if ui.add_enabled(!self.busy,Button::new("搜索")).clicked(){self.start_search();}
-                    });
+                        ui.add_space(20.);
+                    }
+                    self.repository_ui(ui);
                 }
                 ui.add_space(12.);
                 for manga in self.results.entries.clone(){
-                    if ui.add_enabled(!self.busy,Button::new(&manga.title).min_size(vec2(ui.available_width(),42.))).clicked(){self.open_manga(manga);}
+                    if ui.add_enabled(!self.busy,Button::new(&manga.title).wrap().min_size(vec2(ui.available_width(),52.))).clicked(){self.open_manga(manga);}
                 }
                 if self.results.has_more {
                     let next=self.results.page+1;
@@ -1343,6 +1670,10 @@ impl Sources {
                 }
             }
             if !self.status.is_empty(){ui.add_space(12.);ui.label(&self.status);}
+            if self.busy{ui.spinner();}
+            if let Some(task)=self.failed.clone(){
+                if ui.button("重试").clicked(){self.submit(task);}
+            }
         });
     }
 }
@@ -1578,6 +1909,22 @@ mod tests {
             selected_manga:None,
             url:String::new(),
             query:String::new(),
+            request_id:0,
+            current_request:Arc::new(AtomicU64::new(0)),
+            pending:None,
+            failed:None,
+            filters:Vec::new(),
+            listings:Vec::new(),
+            applied_filters:Vec::new(),
+            listing:None,
+            filter_editor:None,
+            metadata_loaded:false,
+            filter_error:None,
+            listing_error:None,
+            sessions:Default::default(),
+            repository_search:String::new(),
+            #[cfg(debug_assertions)]
+            preview_mode:None,
             busy:false,
             status:String::new(),
             tasks:Vec::new(),
@@ -1644,6 +1991,110 @@ mod tests {
         assert_eq!(keys,vec!["1","2","3"]);
         assert!(!results.accept("source.a","dragon",2,vec![manga("source.a","4")],true));
         assert_eq!(results.page,2);
+    }
+
+    #[test]
+    fn changing_filters_rejects_old_success_and_error_even_with_identical_query() {
+        let dir=tempfile::tempdir().unwrap();
+        let mut sources=test_sources(dir.path());
+        let(tx,rx)=mpsc::channel();sources.tx=tx;
+        let(reply_tx,reply_rx)=mpsc::channel();sources.rx=reply_rx;
+        sources.selected_source="fixture".into();
+        sources.query="same".into();
+        sources.start_search();
+        let (old,_) = rx.recv().unwrap();
+        sources.applied_filters=vec![FilterValue::Check{id:"completed".into(),value:1}];
+        sources.start_search();
+        let (new,task)=rx.recv().unwrap();
+        assert!(matches!(task,Task::Search{filters,..} if matches!(&filters[..],[FilterValue::Check{value:1,..}])));
+        reply_tx.send((old,Ok(Reply::Results{source:"fixture".into(),query:"same".into(),page:1,
+            entries:vec![manga("fixture","old")],has_next:true}))).unwrap();
+        reply_tx.send((old,Err("old failed".into()))).unwrap();
+        sources.poll();
+        assert!(sources.busy&&sources.results.entries.is_empty());
+        assert!(!sources.status.contains("old failed"));
+        reply_tx.send((new,Ok(Reply::Results{source:"fixture".into(),query:"same".into(),page:1,
+            entries:vec![manga("fixture","new")],has_next:true}))).unwrap();
+        sources.poll();
+        assert!(!sources.busy);
+        assert_eq!(sources.results.entries[0].key,"new");
+    }
+
+    #[test]
+    fn next_page_keeps_committed_filters_and_query_then_listing_starts_over() {
+        let dir=tempfile::tempdir().unwrap();
+        let mut sources=test_sources(dir.path());
+        let(tx,rx)=mpsc::channel();sources.tx=tx;
+        sources.selected_source="fixture".into();
+        sources.query="submitted".into();
+        sources.applied_filters=vec![FilterValue::Select{id:"language".into(),value:"zh".into()}];
+        sources.start_search();rx.recv().unwrap();
+        assert!(sources.results.accept("fixture","submitted",1,vec![manga("fixture","1")],true));
+        sources.query="not submitted".into();
+        sources.load_next_page();
+        let(_,Task::Search{query,page,filters,..})=rx.recv().unwrap() else{panic!("expected search")};
+        assert_eq!(query,"submitted");assert_eq!(page,2);assert_eq!(filters,sources.applied_filters);
+        sources.start_listing("latest");
+        let(_,Task::Browse{listing,page,..})=rx.recv().unwrap() else{panic!("expected browse")};
+        assert_eq!(listing,"latest");assert_eq!(page,1);
+        assert!(sources.results.entries.is_empty()&&sources.query.is_empty());
+    }
+
+    #[test]
+    fn source_that_hides_filters_uses_only_keyword_until_it_is_cleared() {
+        let dir=tempfile::tempdir().unwrap();
+        let mut sources=test_sources(dir.path());
+        let(tx,rx)=mpsc::channel();sources.tx=tx;
+        let mut manifest=source_manifest();
+        manifest.id="fixture".into();
+        manifest.hides_filters_while_searching=true;
+        sources.installed.push(InstalledSource{
+            manifest,directory:dir.path().into(),wasm_path:dir.path().join("main.wasm"),
+            settings_path:None,filters_path:None,icon_path:None,
+        });
+        sources.selected_source="fixture".into();
+        sources.applied_filters=vec![FilterValue::Select{id:"language".into(),value:"zh".into()}];
+        sources.query="keyword".into();sources.start_search();
+        assert!(matches!(rx.recv().unwrap().1,Task::Search{filters,..} if filters.is_empty()));
+        assert_eq!(sources.applied_filters.len(),1);
+        sources.query.clear();sources.start_search();
+        assert!(matches!(rx.recv().unwrap().1,Task::Search{filters,..} if filters.len()==1));
+    }
+
+    #[test]
+    fn filter_drafts_cancel_without_mutating_search_and_source_sessions_are_separate() {
+        let dir=tempfile::tempdir().unwrap();
+        let mut sources=test_sources(dir.path());
+        let(tx,_rx)=mpsc::channel();sources.tx=tx;
+        sources.selected_source="a".into();
+        sources.query="one".into();
+        sources.applied_filters=vec![FilterValue::Check{id:"done".into(),value:1}];
+        sources.filter_editor=Some(FilterEditor::new(&[],&[]));
+        sources.filter_editor=None;
+        assert_eq!(sources.applied_filters.len(),1);
+        sources.select_source("b");
+        assert!(sources.applied_filters.is_empty()&&sources.query.is_empty());
+        sources.select_source("a");
+        assert_eq!(sources.query,"one");
+        assert!(matches!(&sources.applied_filters[..],[FilterValue::Check{value:1,..}]));
+    }
+
+    #[test]
+    fn failed_first_page_remains_retryable_and_late_detail_cannot_reopen_old_source() {
+        let dir=tempfile::tempdir().unwrap();
+        let mut sources=test_sources(dir.path());
+        let(tx,rx)=mpsc::channel();sources.tx=tx;
+        let(reply_tx,reply_rx)=mpsc::channel();sources.rx=reply_rx;
+        sources.selected_source="a".into();sources.start_search();
+        let(id,_)=rx.recv().unwrap();
+        reply_tx.send((id,Err("HTTP 503".into()))).unwrap();sources.poll();
+        assert_eq!(sources.results.page,0);
+        assert!(sources.failed.is_some());
+        sources.submit(sources.failed.clone().unwrap());
+        let(retry,_)=rx.recv().unwrap();assert_ne!(id,retry);
+        sources.select_source("b");
+        reply_tx.send((retry,Ok(Reply::Chapters("a".into(),manga("a","old"),vec![])))).unwrap();
+        sources.poll();assert!(sources.selected_manga.is_none()&&sources.busy);
     }
 
     #[test]

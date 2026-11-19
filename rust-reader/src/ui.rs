@@ -207,6 +207,20 @@ impl ReaderApp {
         self.snapshot_request = Some(name);
     }
     #[cfg(debug_assertions)]
+    pub fn prepare_source_acceptance(&mut self,mode:&str)->anyhow::Result<()> {
+        self.tab=Tab::Sources;self.screen=Screen::Library;
+        self.sources.preview_browser(mode)
+    }
+    #[cfg(debug_assertions)]
+    pub fn source_browser_report(&self)->serde_json::Value{self.sources.browser_report()}
+    #[cfg(debug_assertions)]
+    pub fn source_browser_ready(&self)->bool{self.sources.browser_ready("browse")}
+    #[cfg(debug_assertions)]
+    pub fn prepare_installed_source_acceptance(&mut self,id:&str)->anyhow::Result<()> {
+        self.tab=Tab::Sources;self.screen=Screen::Library;
+        self.sources.preview_installed_source(id)
+    }
+    #[cfg(debug_assertions)]
     fn apply_snapshot(&mut self, name: &str) {
         match name {
             "detail" => {
@@ -228,6 +242,11 @@ impl ReaderApp {
                 self.tab = Tab::Sources;
                 self.screen = Screen::Library;
                 self.sources.preview_community();
+            }
+            "browse" | "filters" | "filtered" => {
+                self.tab = Tab::Sources;
+                self.screen = Screen::Library;
+                if let Err(error)=self.sources.preview_browser(name){self.error=Some(format!("验收书源准备失败：{error:#}"));}
             }
             "settings" => {
                 self.tab = Tab::Settings;
@@ -252,6 +271,7 @@ impl ReaderApp {
             && self.cover_failed.is_empty()
             && (!matches!(name.as_str(), "shelf" | "detail") || !self.covers.is_empty())
             && (name != "community" || self.sources.repository_size() > 0)
+            && (!matches!(name.as_str(),"browse"|"filters"|"filtered") || self.sources.browser_ready(name))
             && (!std::env::args().any(|arg| arg == "--ui-landscape")
                 || ctx.content_rect().width() > ctx.content_rect().height())
             && (!matches!(self.screen, Screen::Reader(_)) || self.page_loaded());
@@ -285,6 +305,7 @@ impl ReaderApp {
             "cover_files_available": self.books.iter().filter(|book| book.cover_path.as_ref().is_some_and(|path| path.is_file())).count(),
             "page_loaded": self.page_loaded(),
             "repository_sources": self.sources.repository_size(),
+            "source_browser":self.sources.browser_report(),
             "width": ctx.content_rect().width(),
             "height": ctx.content_rect().height(),
             "safe_area": [safe.left(), safe.top(), safe.right(), safe.bottom()],
@@ -813,6 +834,9 @@ impl ReaderApp {
             return;
         }
         if self.chapter_dialog.take().is_some() {
+            return;
+        }
+        if matches!(self.screen,Screen::Library)&&self.tab==Tab::Sources&&self.sources.back(){
             return;
         }
         let at_root = matches!(self.screen, Screen::Library)
@@ -2543,7 +2567,10 @@ impl ReaderApp {
     }
     fn sources_ui(&mut self, ui: &mut Ui, area: Rect) {
         let (_, ink, _) = self.colors();
-        let column = Self::page_column(area, 100. + 36. * self.font_scale, 88.);
+        let mut column = Self::page_column(area, 100. + 36. * self.font_scale, 88.);
+        let width=(area.width()-48.).min(1040.);
+        column.min.x=area.center().x-width/2.;
+        column.max.x=area.center().x+width/2.;
         self.label(
             ui.painter(),
             pos2(column.left(), area.top() + 80.),
