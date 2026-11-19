@@ -26,6 +26,9 @@ private final class YejianDocumentBridge: NSObject, UIApplicationDelegate, UIDoc
     )
     private var prepared = false
     private var scheduled = false
+    #if DEBUG
+    private var requestedLandscape = false
+    #endif
 
     private override init() {
         super.init()
@@ -68,22 +71,6 @@ private final class YejianDocumentBridge: NSObject, UIApplicationDelegate, UIDoc
         DispatchQueue.main.async { [weak self] in
             self?.prepareNow()
         }
-        #if DEBUG
-        if ProcessInfo.processInfo.arguments.contains("--ui-landscape") {
-            NotificationCenter.default.addObserver(
-                forName: UIApplication.didBecomeActiveNotification,
-                object: nil,
-                queue: .main
-            ) { [weak self] _ in
-                guard #available(iOS 16.0, *),
-                      let scene = self?.keyWindow()?.windowScene else { return }
-                self?.keyWindow()?.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
-                scene.requestGeometryUpdate(.iOS(interfaceOrientations: .landscapeRight)) { error in
-                    NSLog("Yejian simulator rotation failed: %@", error.localizedDescription)
-                }
-            }
-        }
-        #endif
     }
 
     private func prepareNow() {
@@ -457,6 +444,24 @@ private final class YejianDocumentBridge: NSObject, UIApplicationDelegate, UIDoc
         guard prepared else { return "0,0,0,0" }
         return onMain {
             guard let window = self.keyWindow() else { return "0,0,0,0" }
+            #if DEBUG
+            // The first activation notification can precede winit's window.
+            // Request test rotation only once the renderer has a real scene.
+            if #available(iOS 16.0, *),
+               !self.requestedLandscape,
+               ProcessInfo.processInfo.arguments.contains("--ui-landscape"),
+               let scene = window.windowScene,
+               scene.activationState == .foregroundActive {
+                self.requestedLandscape = true
+                DispatchQueue.main.async {
+                    NSLog("Yejian simulator: requesting landscape")
+                    window.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
+                    scene.requestGeometryUpdate(.iOS(interfaceOrientations: .landscapeRight)) { error in
+                        NSLog("Yejian simulator rotation failed: %@", error.localizedDescription)
+                    }
+                }
+            }
+            #endif
             let insets = window.safeAreaInsets
             let scale = window.screen.scale
             return [insets.left, insets.top, insets.right, insets.bottom]

@@ -6,6 +6,7 @@ on:
     branches: [main]
     paths:
       - "rust-reader/src/**"
+      - "rust-reader/vendor/**"
       - "rust-reader/platform/**"
       - "rust-reader/Cargo*"
       - "tools/*ipad*"
