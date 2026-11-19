@@ -77,6 +77,8 @@ pub struct ReaderApp {
     motion: ShelfMotion,
     #[cfg(debug_assertions)]
     snapshot_request: Option<String>,
+    #[cfg(debug_assertions)]
+    snapshot_pending: Option<(String, f64)>,
     first_frame: Option<f64>,
     shelf_viewport: Rect,
     shelf_shift: f32,
@@ -148,6 +150,8 @@ impl ReaderApp {
             motion: ShelfMotion::default(),
             #[cfg(debug_assertions)]
             snapshot_request: None,
+            #[cfg(debug_assertions)]
+            snapshot_pending: None,
             first_frame: None,
             shelf_viewport: Rect::NOTHING,
             shelf_shift: 0.,
@@ -229,6 +233,43 @@ impl ReaderApp {
                 self.screen = Screen::Library;
             }
             _ => {}
+        }
+    }
+    /// The simulator waits for a real rendered screen instead of a fixed delay.
+    #[cfg(debug_assertions)]
+    fn report_snapshot_ready(&mut self, ctx: &Context) {
+        let Some((name, applied_at)) = self.snapshot_pending.as_ref() else { return };
+        let now = ctx.input(|i| i.time);
+        let content_ready = self.ready
+            && self.startup_error.is_none()
+            && self.error.is_none()
+            && self.cover_pending.is_empty()
+            && self.cover_failed.is_empty()
+            && (!matches!(self.screen, Screen::Reader(_)) || self.page_loaded());
+        if !content_ready || now - applied_at < 3. {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            return;
+        }
+        let name = name.clone();
+        let report = serde_json::json!({
+            "screen": name,
+            "books": self.books.len(),
+            "page_loaded": self.page_loaded(),
+            "width": ctx.content_rect().width(),
+            "height": ctx.content_rect().height(),
+        });
+        let dir = self.root.join("ui-snapshots");
+        let result = std::fs::create_dir_all(&dir)
+            .and_then(|()| std::fs::write(dir.join(format!("{name}.json")), report.to_string()));
+        match result {
+            Ok(()) => {
+                log::info!("snapshot ready: {name}");
+                self.snapshot_pending = None;
+            }
+            Err(error) => {
+                log::error!("cannot write snapshot readiness: {error}");
+                self.snapshot_pending = None;
+            }
         }
     }
     fn send(&mut self, command: Command) {
@@ -956,6 +997,7 @@ impl ReaderApp {
         if self.snapshot_request.is_some() && self.ready && !self.books.is_empty() {
             let name = self.snapshot_request.take().unwrap_or_default();
             self.apply_snapshot(&name);
+            self.snapshot_pending = Some((name, ctx.input(|i| i.time)));
         }
         #[cfg(any(target_os = "android", target_os = "ios"))]
         {
@@ -2644,6 +2686,8 @@ impl ReaderApp {
 impl eframe::App for ReaderApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         self.draw(ui);
+        #[cfg(debug_assertions)]
+        self.report_snapshot_ready(ui.ctx());
     }
     fn on_exit(&mut self) {
         self.flush_position();

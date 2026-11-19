@@ -1,6 +1,16 @@
 name: 页间 iPad 模拟器截图
 
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "rust-reader/src/**"
+      - "rust-reader/platform/**"
+      - "rust-reader/Cargo*"
+      - "tools/*ipad*"
+      - "tools/build-rust-ios.sh"
+      - ".github/workflows/ipad-sim.yml"
 
 permissions:
   contents: read
@@ -36,57 +46,20 @@ jobs:
 
       - name: 启动 iPad 模拟器并截图
         run: |
-          set -euo pipefail
-          APP="$RUNNER_TEMP/sim-build/Build/Products/Debug-iphonesimulator/Yejian.app"
-          DEVICE=$(xcrun simctl list devices available -j | python3 -c '
-          import json, sys
-          devices = [d for runtimes in json.load(sys.stdin)["devices"].values() for d in runtimes]
-          ipads = [d for d in devices if "iPad" in d["name"]]
-          print(ipads[0]["udid"])')
-          echo "simulator: $DEVICE"
-          xcrun simctl boot "$DEVICE"
-          xcrun simctl bootstatus "$DEVICE" -b
-          xcrun simctl status_bar "$DEVICE" override --time 9:41 --batteryState charged --batteryLevel 100
-          xcrun simctl install "$DEVICE" "$APP"
-          mkdir -p artifacts/rust/ipad-sim
-          shoot() {
-            local name=$1 delay=$2
-            shift 2
-            xcrun simctl launch --terminate-running-process "$DEVICE" app.yejian.reader.rust "$@"
-            sleep "$delay"
-            xcrun simctl io "$DEVICE" screenshot "artifacts/rust/ipad-sim/$name.png"
-          }
-          shoot shelf 120 --seed-demo --ui-snapshot shelf
-          xcrun simctl launch --console-pty --terminate-running-process "$DEVICE" \
-            app.yejian.reader.rust --ui-snapshot shelf \
-            > artifacts/rust/ipad-sim/launch-console.txt 2>&1 &
-          LAUNCH_PID=$!
-          sleep 12
-          kill "$LAUNCH_PID" 2>/dev/null || true
-          CONTAINER=$(xcrun simctl get_app_container "$DEVICE" app.yejian.reader.rust data || true)
-          if [ -n "${CONTAINER:-}" ]; then
-            cp "$CONTAINER/Documents/yejian-startup.log" artifacts/rust/ipad-sim/ 2>/dev/null || true
-          fi
-          sleep 3
-          xcrun simctl io "$DEVICE" screenshot "artifacts/rust/ipad-sim/shelf-early.png"
-          shoot detail 20 --ui-snapshot detail
-          shoot reader 20 --ui-snapshot reader
-          shoot history 10 --ui-snapshot history
-          shoot sources 10 --ui-snapshot sources
-          shoot settings 10 --ui-snapshot settings
-          xcrun simctl spawn "$DEVICE" log show --style compact --last 15m \
-            --predicate 'process == "Yejian" OR eventMessage CONTAINS "yejian"' \
-            > artifacts/rust/ipad-sim/yejian-log.txt || true
-          cp ~/Library/Logs/DiagnosticReports/*.ips artifacts/rust/ipad-sim/ 2>/dev/null || true
-          xcrun simctl shutdown "$DEVICE"
+          bash tools/capture-ipad-simulator.sh \
+            "$RUNNER_TEMP/sim-build/Build/Products/Debug-iphonesimulator/Yejian.app" \
+            artifacts/rust/ipad-sim
 
       - name: 保存截图
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: Yejian-iPad-Sim
           path: |
             artifacts/rust/ipad-sim/*.png
             artifacts/rust/ipad-sim/*.txt
+            artifacts/rust/ipad-sim/*.log
+            artifacts/rust/ipad-sim/*.json
             artifacts/rust/ipad-sim/*.ips
           if-no-files-found: error
           retention-days: 3

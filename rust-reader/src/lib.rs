@@ -5,6 +5,8 @@ mod ui;
 mod sources;
 mod sync;
 mod vertical;
+#[cfg(target_os = "ios")]
+mod ios_diagnostics;
 pub use ui::ReaderApp;
 
 use std::path::PathBuf;
@@ -37,11 +39,7 @@ pub fn configure_fonts(ctx: &egui::Context) {
 
 pub fn run() -> eframe::Result {
     yejian_platform::init();
-    #[cfg(target_os = "ios")]
-    {
-        use std::io::Write as _;
-        let _ = std::io::stderr().write_all(b"YEJIAN_RUN_INIT\n");
-    }
+    log::debug!("platform initialized");
     let args: Vec<String> = std::env::args().collect();
     let root = args.iter().position(|x|x=="--data-dir").and_then(|i|args.get(i+1)).map(PathBuf::from)
         .unwrap_or_else(default_data_dir);
@@ -60,12 +58,9 @@ pub fn run() -> eframe::Result {
         run_and_return: !cfg!(target_os="ios"),
         ..Default::default()
     };
-    #[cfg(target_os = "ios")]
-    {
-        use std::io::Write as _;
-        let _ = std::io::stderr().write_all(b"YEJIAN_BEFORE_RUN_NATIVE\n");
-    }
+    log::info!("starting native renderer");
     eframe::run_native("页间", options, Box::new(move|cc| {
+        log::info!("renderer ready; creating library UI");
         configure_fonts(&cc.egui_ctx);
         let wake=cc.egui_ctx.clone();
         yejian_platform::set_event_waker(move||wake.request_repaint());
@@ -167,35 +162,11 @@ fn android_main(app: winit::platform::android::activity::AndroidApp) {
 #[cfg(target_os="ios")]
 #[unsafe(no_mangle)]
 pub extern "C" fn yejian_start_app() {
-    // stderr write reaches `simctl launch --console-pty` and the unified log
-    // even when HOME/Documents is unavailable, so we can tell whether this
-    // Rust entry point is actually invoked.
-    use std::io::Write as _;
-    let _ = std::io::stderr().write_all(b"YEJIAN_RUST_ENTER\n");
-    startup_note("yejian_start_app: enter");
+    ios_diagnostics::init();
+    log::info!("yejian_start_app: enter");
     match run() {
-        Ok(()) => startup_note("yejian_start_app: run returned Ok"),
-        Err(error) => startup_note(&format!("yejian_start_app: run failed: {error}")),
+        Ok(()) => log::info!("yejian_start_app: run returned"),
+        Err(error) => log::error!("yejian_start_app: {error}"),
     }
-    let _ = std::io::stderr().write_all(b"YEJIAN_RUST_EXIT\n");
-    let _ = std::io::stderr().flush();
-}
-
-/// Minimal file trace for iOS startup problems; the system log drops Rust
-/// output before a logger exists.
-#[cfg(target_os = "ios")]
-fn startup_note(message: &str) {
-    use std::io::Write;
-    let Some(home) = std::env::var_os("HOME") else {
-        return;
-    };
-    let documents = PathBuf::from(home).join("Documents");
-    let _ = std::fs::create_dir_all(&documents);
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(documents.join("yejian-startup.log"))
-    {
-        let _ = writeln!(file, "{message}");
-    }
+    log::logger().flush();
 }
