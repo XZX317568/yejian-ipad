@@ -94,4 +94,4 @@ JSON 里多了 `"kind": "comics" | "backup"`，启动时从 `Documents/Inbox` �
 - **没有 Share Extension**。真正的“分享到页间”（从其他 App 的分享面板直接进入）需要第二个 target、App Group、entitlement 和开发者账号签名；本工程没有伪造这一能力。
 - **冷启动 open-in-place**：没有 delegate 的启动参数，无法在 `didFinishLaunching` 之前接管 URL。通过“拷贝到页间”产生的 `Documents/Inbox` 文件会在启动时扫描；运行中的 open-in 由动态 delegate 处理。
 - 没有商店截图/宣传图，也没有自定义启动画面图片：启动屏用 `Info.plist` 的 `UILaunchScreen` 空字典（系统给的纯色底）。App 图标只在 asset catalog 里，不带 App Store 宣传素材。
-- 本机是 Windows，没有 macOS/Xcode，也没有 iOS 设备；图标 PNG、`Contents.json` 和 `pbxproj` 引用都在本机生成并检查过，但**这里没有编译、签名、归档或真机运行**，iPad 上 Swift/IPA 是否可用仍未验证。
+- 2026-11-19 已由 GitHub Actions 的 macOS 15 / Xcode 16.4 完成 Release 真机编译，生成 `artifacts/rust/v0.1.1/ipad/Yejian-0.1.1-2-ipad-unsigned.ipa`，检查到 arm64 主程序与 iPad 设备族。该包**没有签名，也还没在 iPad 上运行**；签名由 LiveContainer 在设备上完成，启动、触控与分屏仍需实机验收。

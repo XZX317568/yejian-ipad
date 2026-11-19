@@ -374,6 +374,116 @@ fn fixtures(root: &Path) -> Result<Vec<PathBuf>> {
     }
     Ok(paths)
 }
+/// Renders the production UI at iPad point sizes with iPad safe-area insets.
+///
+/// The GPU path is identical to the one the shells use, so layout can be
+/// checked on a desktop machine without a Mac, a simulator, or CI minutes.
+fn ipad_pass(h: &mut Harness) -> Result<()> {
+    use yejian_platform::{Insets, set_insets_override};
+    // iPad window sizes in points (one harness pixel per point), plus the
+    // narrow Split View widths and a no-inset control.
+    let profiles: [([u32; 2], i32, i32, &str); 8] = [
+        ([1024, 1366], 24, 20, "ipad-pro-129-portrait"),
+        ([1366, 1024], 24, 20, "ipad-pro-129-landscape"),
+        ([834, 1194], 24, 20, "ipad-11-portrait"),
+        ([1194, 834], 24, 20, "ipad-11-landscape"),
+        ([744, 1133], 24, 20, "ipad-mini-portrait"),
+        ([507, 1024], 24, 20, "ipad-split-half"),
+        ([320, 1024], 24, 20, "ipad-split-third"),
+        ([1024, 1366], 0, 0, "ipad-pro-129-portrait-no-insets"),
+    ];
+    for (size, top, bottom, name) in profiles {
+        set_insets_override(Some(Insets {
+            left: 0,
+            top,
+            right: 0,
+            bottom,
+        }));
+        h.size = size;
+        h.frames(8)?;
+        h.frame(vec![], Some(name))?;
+        if size[0] >= 880 {
+            anyhow::ensure!(
+                h.app.hitboxes.contains_key("nav-library"),
+                "{name}: tablet rail missing at {} pt wide",
+                size[0]
+            );
+        }
+        if top > 0 {
+            let bleed: Vec<String> = h
+                .app
+                .hitboxes
+                .iter()
+                .filter(|(_, rect)| rect.min.y < top as f32 - 0.5)
+                .map(|(id, rect)| format!("{id}={rect:?}"))
+                .collect();
+            anyhow::ensure!(
+                bleed.is_empty(),
+                "{name}: {} controls painted inside the {top} pt status-bar inset: {}",
+                bleed.len(),
+                bleed.join(", ")
+            );
+        }
+        let low: Vec<String> = h
+            .app
+            .hitboxes
+            .iter()
+            .filter(|(_, rect)| rect.max.y > size[1] as f32 - bottom as f32 + 0.5)
+            .map(|(id, rect)| format!("{id}={rect:?}"))
+            .collect();
+        anyhow::ensure!(
+            low.is_empty(),
+            "{name}: {} controls painted inside the {bottom} pt home-indicator inset: {}",
+            low.len(),
+            low.join(", ")
+        );
+        let small: Vec<String> = h
+            .app
+            .hitboxes
+            .iter()
+            .filter(|(_, rect)| rect.width() < 44. || rect.height() < 44.)
+            .map(|(id, rect)| {
+                format!(
+                    "{id}={}x{}",
+                    rect.width().round(),
+                    rect.height().round()
+                )
+            })
+            .collect();
+        if !small.is_empty() {
+            println!("  {name}: {} controls under 44 pt: {}", small.len(), small.join(", "));
+        }
+        println!(
+            "ipad {name}: {}x{} pt, insets top {top} bottom {bottom}",
+            size[0], size[1]
+        );
+    }
+    set_insets_override(Some(Insets {
+        left: 0,
+        top: 24,
+        right: 0,
+        bottom: 20,
+    }));
+    for (size, name) in [([1024, 1366], "portrait"), ([1366, 1024], "landscape")] {
+        h.size = size;
+        h.frames(10)?;
+        h.click("open-book")?;
+        h.frames(65)?;
+        h.frame(vec![], Some(&format!("ipad-pro-129-{name}-detail")))?;
+        h.click("read")?;
+        h.wait(ReaderApp::page_loaded)?;
+        h.frames(6)?;
+        h.frame(vec![], Some(&format!("ipad-pro-129-{name}-reader")))?;
+        h.click("reader-back")?;
+        h.frames(24)?;
+        h.click("back")?;
+        h.frames(45)?;
+    }
+    set_insets_override(None);
+    println!("PASS: iPad profiles rendered with real UI at 1024x1366, 1366x1024, 1194x834, 744x1133, 507x1024 and 320x1024");
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let output = std::env::args_os()
         .nth(1)
@@ -395,6 +505,9 @@ fn main() -> Result<()> {
     h.wait(ReaderApp::covers_loaded)?;
     h.now += 6.;
     h.frames(3)?;
+    if std::env::var_os("YEJIAN_IPAD_ONLY").is_some() {
+        return ipad_pass(&mut h);
+    }
     h.frame(vec![], Some("phone-shelf"))?;
     anyhow::ensure!(h.app.rendered_book_nodes < 45);
     anyhow::ensure!(h.texts.iter().any(|(text, _)| text == "开始阅读"));

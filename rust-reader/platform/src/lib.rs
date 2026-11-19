@@ -60,6 +60,29 @@ pub struct Insets {
     pub bottom: i32,
 }
 
+/// Forced insets used by offscreen iPad layout checks (debug builds only).
+#[cfg(debug_assertions)]
+static INSETS_OVERRIDE: std::sync::Mutex<Option<Insets>> = std::sync::Mutex::new(None);
+
+/// Force the safe-area insets instead of asking the shell.
+///
+/// Layout checks on a desktop GPU need the iPad insets, but those only exist
+/// inside UIKit. Debug builds may pin them here; release builds ignore the
+/// hook entirely, so shipped shells always read real values.
+#[cfg(debug_assertions)]
+pub fn set_insets_override(insets: Option<Insets>) {
+    *INSETS_OVERRIDE
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = insets;
+}
+
+#[cfg(debug_assertions)]
+fn overridden_insets() -> Option<Insets> {
+    *INSETS_OVERRIDE
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
 /// Outcome of one picker request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportStatus {
@@ -392,17 +415,29 @@ pub fn app_data_dir() -> Result<PathBuf> {
 /// main thread (the winit event loop already is).
 #[cfg(target_os = "android")]
 pub fn safe_insets() -> Result<Insets> {
+    #[cfg(debug_assertions)]
+    if let Some(insets) = overridden_insets() {
+        return Ok(insets);
+    }
     android::safe_insets()
 }
 
 /// Current safe-area insets in physical pixels.
 #[cfg(target_os = "ios")]
 pub fn safe_insets() -> Result<Insets> {
+    #[cfg(debug_assertions)]
+    if let Some(insets) = overridden_insets() {
+        return Ok(insets);
+    }
     ios::safe_insets()
 }
 /// Current safe-area insets in physical pixels.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn safe_insets() -> Result<Insets> {
+    #[cfg(debug_assertions)]
+    if let Some(insets) = overridden_insets() {
+        return Ok(insets);
+    }
     Ok(Insets::default())
 }
 

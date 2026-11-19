@@ -861,8 +861,8 @@ impl ReaderApp {
             // iPad landscape: a large stage on the left, the reading column on
             // the right. Both share the same visual centre instead of hugging
             // the top edge of a tall screen.
-            let height = (area.height() - 300.).clamp(320., 640.);
-            let width = (area.width() - 380.).clamp(320., 820.);
+            let height = (area.height() - 300.).clamp(320., 720.);
+            let width = (area.width() - 400.).clamp(320., 880.);
             let top = 96. + (area.height() - 96. - 40. - height).max(0.) * 0.42;
             return Rect::from_min_size(
                 pos2(area.left() + 24., area.top() + top),
@@ -872,8 +872,8 @@ impl ReaderApp {
         if area.width() >= 700. {
             // iPad portrait and Split View: keep the shelf generous, then put
             // the title and actions underneath it.
-            let height = (area.height() - 420.).clamp(416., 560.);
-            let width = (area.width() - 48.).clamp(1., 640.);
+            let height = (area.height() - 420.).clamp(416., 820.);
+            let width = (area.width() - 72.).clamp(1., 880.);
             let block = height + 190.;
             let top = 96. + (area.height() - 96. - 40. - block).max(0.) * 0.42;
             return Rect::from_min_size(
@@ -883,7 +883,10 @@ impl ReaderApp {
         }
         Rect::from_min_size(
             pos2(area.left() + 24., area.top() + 114.),
-            vec2((area.width() - 48.).clamp(1., 520.), 416.),
+            vec2(
+                (area.width() - 48.).clamp(1., 520.),
+                (area.height() - 380.).clamp(416., 560.),
+            ),
         )
     }
     fn detail_cover_rect(&self, area: Rect) -> Rect {
@@ -909,7 +912,9 @@ impl ReaderApp {
         if area.width() >= 700. {
             // iPad portrait and Split View: a generous centred cover with the
             // title block underneath.
-            let width = 320.;
+            // Tall iPads can carry a notably larger cover without crowding the
+            // title block underneath.
+            let width = (area.height() * 0.30).clamp(320., 400.);
             let height = width * 166. / 118.;
             let block = height + 220.;
             let top = 84. + (area.height() - 84. - 24. - block).max(0.) * 0.40;
@@ -1034,7 +1039,8 @@ impl ReaderApp {
         }
         self.hitboxes.clear();
         let full = ui.max_rect();
-        #[cfg(any(target_os = "android", target_os = "ios"))]
+        // Desktop builds answer with zero insets; debug builds may pin iPad
+        // values so the offscreen layout check exercises the same path.
         let full = match yejian_platform::safe_insets() {
             Ok(insets) => {
                 let scale = ctx.pixels_per_point();
@@ -1091,8 +1097,8 @@ impl ReaderApp {
                     ui,
                     "search",
                     Rect::from_min_size(
-                        pos2(content.right() - 49., content.top() + 8.),
-                        vec2(40., 40.),
+                        pos2(content.right() - 51., content.top() + 6.),
+                        vec2(44., 44.),
                     ),
                     "search",
                     "搜索书库",
@@ -1103,8 +1109,8 @@ impl ReaderApp {
                     ui,
                     "import",
                     Rect::from_min_size(
-                        pos2(content.right() - 94., content.top() + 8.),
-                        vec2(40., 40.),
+                        pos2(content.right() - 96., content.top() + 6.),
+                        vec2(44., 44.),
                     ),
                     "plus",
                     "导入漫画",
@@ -1249,8 +1255,14 @@ impl ReaderApp {
                     vec2(rail.width() / 4., 54.),
                 )
             };
+            // The whole item is the tap target: the glyph alone is only
+            // 32x29 pt, below the 44 pt Apple asks for.
+            let row_clicked = ui
+                .interact(rect, Id::unique(("nav-row", i)), Sense::click())
+                .clicked();
             let icon_rect = Rect::from_center_size(rect.center() - vec2(0., 8.), vec2(32., 29.));
             let clicked = self.icon(ui, &format!("nav-{kind}"), icon_rect, kind, label);
+            self.hitboxes.insert(format!("nav-{kind}"), rect);
             ui.painter().text(
                 rect.center() + vec2(0., 8.),
                 Align2::CENTER_TOP,
@@ -1274,7 +1286,7 @@ impl ReaderApp {
                     Stroke::new(1.2, ink),
                 );
             }
-            if clicked || text_clicked {
+            if clicked || row_clicked || text_clicked {
                 self.tab = tab;
                 self.screen = Screen::Library;
                 self.flight = None;
@@ -1605,7 +1617,10 @@ impl ReaderApp {
         );
         progress.wrap.max_rows = 1;
         let progress = ui.painter().layout_job(progress);
-        let action_y = progress_pos.y + progress.size().y + 16.;
+        // Stay inside the visible viewport: the shelf canvas can be taller than
+        // the screen (scrolling case), and on phones the tab bar sits below it.
+        let action_y =
+            (progress_pos.y + progress.size().y + 16.).min(ui.clip_rect().bottom() - 52.);
         ui.painter().galley(progress_pos, progress, muted);
         let open_x = if short_landscape {
             area.right() - 68.
