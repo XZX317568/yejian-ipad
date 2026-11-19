@@ -19,6 +19,8 @@ LAUNCH_PID=""
 collect() {
   local status=$?
   trap - EXIT
+  # XCTest can reinstall the app and change its container UUID.
+  CONTAINER=$(xcrun simctl get_app_container "$DEVICE" "$BUNDLE" data 2>/dev/null || true)
   if [ -n "$CONTAINER" ] && [ -f "$CONTAINER/Documents/yejian-startup.log" ]; then
     cp "$CONTAINER/Documents/yejian-startup.log" "$OUT/startup-last.log"
   fi
@@ -92,9 +94,11 @@ xcodebuild -project rust-reader/platform/ios/Yejian.xcodeproj -scheme Yejian \
   -derivedDataPath "$BUILD" -parallel-testing-enabled NO \
   -maximum-concurrent-test-simulator-destinations 1 \
   test-without-building CODE_SIGN_IDENTITY=- 2>&1 | tee "$OUT/rotation-tests.log"
+CONTAINER=$(xcrun simctl get_app_container "$DEVICE" "$BUNDLE" data)
 RUNNER_CONTAINER=$(xcrun simctl get_app_container "$DEVICE" app.yejian.reader.uitests.xctrunner data)
 for screen in shelf detail reader; do
   marker="$CONTAINER/Documents/Yejian/ui-snapshots/$screen.json"
+  cp "$RUNNER_CONTAINER/Documents/$screen-landscape.png" "$OUT/$screen-landscape.png"
   python3 - "$marker" <<'PY'
 import json, sys
 with open(sys.argv[1]) as stream:
@@ -105,6 +109,5 @@ if report["screen"] == "reader":
     assert report["page_loaded"], report
 PY
   cp "$marker" "$OUT/$screen-landscape.json"
-  cp "$RUNNER_CONTAINER/Documents/$screen-landscape.png" "$OUT/$screen-landscape.png"
 done
 echo "PASS: iPad rendered all production screens, rotated to landscape, and fetched the live Aidoku community repository"

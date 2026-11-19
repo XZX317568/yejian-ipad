@@ -47,9 +47,11 @@ jobs:
 
       - name: 启动 iPad 模拟器并截图
         run: |
+          mkdir -p artifacts/rust/ipad-sim
           bash tools/capture-ipad-simulator.sh \
             "$RUNNER_TEMP/sim-build/Build/Products/Debug-iphonesimulator/Yejian.app" \
-            artifacts/rust/ipad-sim "$RUNNER_TEMP/sim-build"
+            artifacts/rust/ipad-sim "$RUNNER_TEMP/sim-build" \
+            2>&1 | tee artifacts/rust/ipad-sim/capture.log
 
       - name: 保存截图
         if: always()
