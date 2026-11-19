@@ -23,7 +23,13 @@ run `44520003076` 已在模拟器联网读取到社区索引 **176 条**，但�
 
 run `44523387780`（commit `384598c`）的实际截图确认画布修正有效，底栏完整显示在系统横条之上，社区索引仍为 176 条。该轮按预期阻止打包：iPad 多任务窗口模式明确拒绝应用内 `requestGeometryUpdate`，错误为 “The current windowing mode does not allow for programmatic changes to interface orientation.” 随后删除应用内的测试旋转代码，改用 XCTest 的 `XCUIDevice.orientation` 模拟转动设备；独立测试目标不进入 Release 应用。
 
-run `44532550519`（commit `27124b5`）的“全部验收通过”结论已撤回。GitHub 将 sim 与 package 两个 job 标绿，但 `capture.log` 实际包含横屏 `shelf.json` 缺失的 `FileNotFoundError`：外层 workflow 缺少 `pipefail`，`tee` 的成功掩盖了截图脚本的失败。竖屏六页、阅读图片及社区索引 176 条仍有有效证据；旧 XCTest 仅证明窗口旋转，固定等待后截图没有证明横屏漫画加载完成。证据在 `artifacts/rust/ipad-startup-audit/run-44532550519/`。正在补齐失败阻断、每次启动独立确认、横屏真实内容与存放目录变化后的书库恢复检查。
+run `44532550519`（commit `27124b5`）的“全部验收通过”结论已撤回。GitHub 将 sim 与 package 两个 job 标绿，但 `capture.log` 实际包含横屏 `shelf.json` 缺失的 `FileNotFoundError`：外层 workflow 缺少 `pipefail`，`tee` 的成功掩盖了截图脚本的失败。竖屏六页、阅读图片及社区索引 176 条仍有有效证据；旧 XCTest 仅证明窗口旋转，固定等待后截图没有证明横屏漫画加载完成。证据在 `artifacts/rust/ipad-startup-audit/run-44532550519/`。本轮 build 4 已补齐失败阻断、每次启动独立确认、横屏真实内容与存放目录变化后的书库恢复检查。
+
+本轮 **0.1.1 / build 4**（commit `f0303c051fac8a9d0ec42351535e5632c9df290a`）已通过 run `44545119356` 的 sim 和 package。修复两类实际问题：书库保存绝对位置，iOS 重装换容器后找不到档案与封面；已完成下载也会保留旧 CBZ 位置。书库升级为 schema 4，以库内相对位置保存受管文件，兼容旧绝对值与 Windows 相对根，保留阅读进度、时间、分类、章节和隐藏状态。新版本打开后，旧版不能直接打开 schema 4；回退应使用更新前完整备份。
+
+SWE-2 负责 reader-core，主模型复核后退回修正旧库测试、相对根兼容和返回值合同，再整合下载路径和验收关卡。`.tools/ipad-audit-20261119/relocation-prefailure.log` 记录修前四项失败；`relocation-final.log` 记录修后54项通过；`sources-relocation-tests.log` 记录29项通过。`build4-local-gpu.log` 与 `artifacts/rust/ipad-startup-audit/build4-local/` 为本轮八组尺寸和大字布局的离屏验收，实际合成图已查看。`evidence-gate-tests.log` 的8项测试和 `pipeline-failure-test.log` 验证缺失内容会失败、日志管道不再吞退出码。真实模拟器的完整证据在 `artifacts/rust/ipad-startup-audit/run-44545119356/`：`verification.json` 确认七个竖屏和三个横屏就绪、横屏阅读已加载、社区索引176条、旧书库schema3→4升级。`legacy-library.json` 与 `relocated-library.json` 证明数据容器UUID确实改变而五个book ID保持不变。已人工查看横屏书架、详情、阅读和社区源截图：封面恢复彩色图、阅读页有实际图片、控件处于系统安全区。
+
+最新交付：`artifacts/rust/v0.1.1/ipad/Yejian-0.1.1-4-ipad-unsigned.ipa`，**13,706,347 字节**。`.tools/ipad-audit-20261119/build4-package-check.json` 记录包内验证：`app.yejian.reader.rust`、0.1.1 / build 4、iPhoneOS、设备族[1,2]、最低iOS15.0、arm64 Mach-O、主程序可执行权限0755、无签名或描述文件。更新先从旧版导出完整备份，再由已配置的 LiveContainer 沿用原数据容器导入新版。此前交付文件保留，安装说明已同步。
 
 此前交付为 **0.1.1 / build 3**：`artifacts/rust/v0.1.1/ipad/Yejian-0.1.1-3-ipad-unsigned.ipa`（13,702,953 字节），其横屏内容验收尚不成立。已核对包内 `app.yejian.reader.rust`、版本 0.1.1 / build 3、iPhoneOS、设备族含 iPad、最低 iOS 15.0、arm64 Mach-O 主程序、无签名。旧 build 2 保留在同目录，不含本轮修复。仓库经实时 API 确认为公开；源码与验证流程提交在该仓库，未发布商店版本。
 
