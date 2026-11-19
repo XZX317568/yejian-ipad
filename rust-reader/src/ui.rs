@@ -66,6 +66,8 @@ struct StreamBook {
     metadata: ChapterMetadata,
     done: usize,
     stopped: Option<String>,
+    signature: Option<String>,
+    to_end: bool,
     waiting: HashSet<usize>,
 }
 
@@ -422,6 +424,7 @@ impl ReaderApp {
     fn open_stream(&mut self, chapter: StreamChapter) {
         let id = format!("{STREAM_PREFIX}{}", chapter.id);
         let state = self.sources.stream_state(&chapter.id).unwrap_or_default();
+        let to_end = chapter.from_end && state.total == 0;
         let book = Book {
             id: id.clone(),
             title: format!(
@@ -432,7 +435,11 @@ impl ReaderApp {
             archive_path: PathBuf::new(),
             cover_path: None,
             page_count: state.total.max(1),
-            current_page: 0,
+            current_page: if chapter.from_end {
+                state.total.saturating_sub(1)
+            } else {
+                0
+            },
             page_fraction: 0.,
             updated_at: 0,
             last_read_at: None,
@@ -444,6 +451,8 @@ impl ReaderApp {
             metadata: chapter.metadata,
             done: state.done,
             stopped: state.stopped,
+            signature: state.signature,
+            to_end,
             waiting: HashSet::new(),
         });
         self.open_reader(&book);
@@ -497,11 +506,72 @@ impl ReaderApp {
         if state.total > 0 {
             stream.book.page_count = state.total;
         }
+        if state.signature != stream.signature {
+            stream.signature = state.signature.clone();
+            stream.waiting.clear();
+            self.pages.retain(|(key, _), _| key != &id);
+            self.page_errors.retain(|(key, _), _| key != &id);
+            self.page_pending.retain(|(key, _)| key != &id);
+            self.prefetch_blocked.retain(|(key, _)| key != &id);
+            self.page_generation += 1;
+            self.worker
+                .generation
+                .store(self.page_generation, Ordering::Relaxed);
+        }
+        let Some(stream) = self.stream.as_mut() else {
+            return;
+        };
         if state.done != stream.done || state.stopped != stream.stopped {
             stream.done = state.done;
             stream.stopped = state.stopped;
             stream.waiting.clear();
         }
+        if stream.to_end && state.total > 0 {
+            stream.to_end = false;
+            stream.book.current_page = state.total - 1;
+            stream.book.page_fraction = 0.;
+            let book = stream.book.clone();
+            self.open_reader(&book);
+        }
+    }
+    /// Opens the previous/next chapter in the source's order when that list
+    /// is known (library copy if present, online otherwise), else the
+    /// neighbouring library chapter.
+    fn open_neighbor(&mut self, id: &str, delta: i32) -> bool {
+        let start = |book: &mut Book| {
+            book.current_page = if delta < 0 {
+                book.page_count.saturating_sub(1)
+            } else {
+                0
+            };
+            book.page_fraction = 0.;
+        };
+        if let Some(metadata) = self.reading_metadata(id)
+            && let Some(key) = self.sources.adjacent_online_key(&metadata, delta)
+        {
+            let local = self
+                .chapters
+                .iter()
+                .find(|link| {
+                    link.metadata.source_id == metadata.source_id
+                        && link.metadata.manga_id == metadata.manga_id
+                        && link.metadata.chapter_id == key
+                })
+                .and_then(|link| self.books.iter().find(|book| book.id == link.book_id))
+                .cloned();
+            if let Some(mut book) = local {
+                start(&mut book);
+                self.open_reader(&book);
+                return true;
+            }
+            return self.sources.open_adjacent_online(&metadata, delta);
+        }
+        if let Some(mut adjacent) = self.adjacent_chapter(id, delta) {
+            start(&mut adjacent);
+            self.open_reader(&adjacent);
+            return true;
+        }
+        false
     }
     fn stream_waiting_text(&self, id: &str, page: usize) -> Option<String> {
         let stream = self.stream.as_ref().filter(|stream| stream.book.id == id)?;
@@ -975,20 +1045,7 @@ impl ReaderApp {
             .as_ref()
             .is_some_and(|stream| stream.book.id == id && stream.done == 0 && book.page_count <= 1);
         if (target < 0 || target >= book.page_count as i64) && !streaming_unknown {
-            let direction = if target < 0 { -1 } else { 1 };
-            if let Some(mut adjacent) = self.adjacent_chapter(id, direction) {
-                adjacent.current_page = if target < 0 {
-                    adjacent.page_count.saturating_sub(1)
-                } else {
-                    0
-                };
-                adjacent.page_fraction = 0.;
-                self.open_reader(&adjacent);
-                return;
-            }
-            if let Some(metadata) = self.reading_metadata(id)
-                && self.sources.open_adjacent_online(&metadata, direction)
-            {
+            if self.open_neighbor(id, if target < 0 { -1 } else { 1 }) {
                 return;
             }
         }
@@ -3160,13 +3217,7 @@ impl ReaderApp {
             if content.contains_rect(button)
                 && self.button(ui, "reader-next-chapter", button, "下一章", true)
             {
-                if let Some(mut next) = next_chapter {
-                    next.current_page = 0;
-                    next.page_fraction = 0.;
-                    self.open_reader(&next);
-                } else if let Some(metadata) = self.reading_metadata(id) {
-                    self.sources.open_adjacent_online(&metadata, 1);
-                }
+                self.open_neighbor(id, 1);
             }
         }
     }
@@ -3926,7 +3977,11 @@ mod tests {
             chapter_number: Some(1.),
             volume_number: None,
         };
-        app.open_stream(StreamChapter { id: "0123456789abcdef".into(), metadata: metadata.clone() });
+        app.open_stream(StreamChapter {
+            id: "0123456789abcdef".into(),
+            metadata: metadata.clone(),
+            from_end: false,
+        });
         let id = format!("{STREAM_PREFIX}0123456789abcdef");
         assert_eq!(app.screen_name(), "reader");
         assert_eq!(app.page_pending, HashSet::from([(id.clone(), 0)]));

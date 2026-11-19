@@ -611,6 +611,8 @@ pub(crate) fn stream_page(root: &Path, id: &str, page: usize) -> anyhow::Result<
 pub struct StreamChapter {
     pub id: String,
     pub metadata: ChapterMetadata,
+    /// Entered backwards from the following chapter: start on its last page.
+    pub from_end: bool,
 }
 
 /// Download progress of a chapter being read online.
@@ -619,6 +621,8 @@ pub struct StreamState {
     pub total: usize,
     pub done: usize,
     pub stopped: Option<String>,
+    /// Page-list signature; staged pages from another list are discarded.
+    pub signature: Option<String>,
 }
 
 /// Task ids are always the 16 lowercase hex digits produced by `identity_id`.
@@ -1608,6 +1612,7 @@ impl Sources {
             total: task.pages_total,
             done: task.pages_done,
             stopped,
+            signature: task.pages_signature.clone(),
         })
     }
 
@@ -1640,7 +1645,7 @@ impl Sources {
     /// Reads a chapter without waiting for the whole download: the chapter
     /// is downloaded first, the reader shows pages as they arrive, and the
     /// following chapter is queued so it is ready when this one ends.
-    fn read_online(&mut self, manga: &Manga, chapter: &Chapter) {
+    fn read_online(&mut self, manga: &Manga, chapter: &Chapter, from_end: bool) {
         let source = self.source_for(manga);
         let id = identity_id(&source, &manga.key, &chapter.key);
         if let Some(metadata) = self.library_chapters.get(&id) {
@@ -1670,7 +1675,7 @@ impl Sources {
         }
         let metadata = task.metadata();
         self.prioritize(&id);
-        self.stream_request = Some(StreamChapter { id, metadata });
+        self.stream_request = Some(StreamChapter { id, metadata, from_end });
         if let Some(next) = self.adjacent_online(&source, &manga.key, &chapter.key, 1)
             && self.chapter_needs_download(&source, &manga.key, &next)
         {
@@ -1692,6 +1697,13 @@ impl Sources {
         usize::try_from(index).ok().and_then(|index| chapters.get(index).cloned())
     }
 
+    /// Chapter key of the neighbour in the source's reading order, so the
+    /// reader does not skip a chapter that is not in the library yet.
+    pub fn adjacent_online_key(&self, metadata: &ChapterMetadata, delta: i32) -> Option<String> {
+        self.adjacent_online(&metadata.source_id, &metadata.manga_id, &metadata.chapter_id, delta)
+            .map(|chapter| chapter.key)
+    }
+
     pub fn has_adjacent_online(&self, metadata: &ChapterMetadata, delta: i32) -> bool {
         self.adjacent_online(&metadata.source_id, &metadata.manga_id, &metadata.chapter_id, delta)
             .is_some_and(|chapter| !chapter.locked)
@@ -1711,7 +1723,7 @@ impl Sources {
         let Some(manga) = self.selected_manga.clone() else {
             return false;
         };
-        self.read_online(&manga, &chapter);
+        self.read_online(&manga, &chapter, delta < 0);
         true
     }
 
@@ -2198,7 +2210,7 @@ impl Sources {
         true
     }
     fn handle_download_event(&mut self, event: DlEvent) {
-        if let DlEvent::Finished { id, .. } | DlEvent::Failed { id, .. } = &event
+        if let DlEvent::Finished { id, .. } = &event
             && self.preempted.as_deref() == Some(id.as_str())
         {
             self.preempted = None;
@@ -2247,6 +2259,9 @@ impl Sources {
                 if self.running.as_deref() == Some(id.as_str()) && stop != STOP_NONE {
                     self.handle_download_event(DlEvent::Aborted { id, how: stop });
                     return;
+                }
+                if self.preempted.as_deref() == Some(id.as_str()) {
+                    self.preempted = None;
                 }
                 if let Some(task) = self.tasks.iter_mut().find(|task| task.id == id) {
                     task.status = DownloadStatus::Failed;
@@ -3186,7 +3201,7 @@ impl Sources {
                                 } else if can_import {
                                     self.add_downloaded_to_library(&id);
                                 } else {
-                                    self.read_online(&manga, &chapter);
+                                    self.read_online(&manga, &chapter, false);
                                 }
                             }
                             if !readable && !can_import && !chapter.locked
@@ -3642,7 +3657,7 @@ mod tests {
         sources.running = Some(other.id.clone());
         sources.tasks.push(other.clone());
 
-        sources.read_online(&book, &chapter("c1", 1.));
+        sources.read_online(&book, &chapter("c1", 1.), false);
         let stream = sources.take_stream().expect("reader opens immediately");
         assert_eq!(stream.id, identity_id("source.a", "m", "c1"));
         assert_eq!(sources.tasks[0].id, stream.id, "read chapter downloads first");
@@ -3663,6 +3678,30 @@ mod tests {
 
         assert!(sources.has_adjacent_online(&stream.metadata, 1));
         assert!(!sources.has_adjacent_online(&stream.metadata, -1));
+        assert_eq!(sources.adjacent_online_key(&stream.metadata, 1).as_deref(), Some("c2"));
+
+        assert!(sources.open_adjacent_online(&sources.tasks[0].metadata(), 0));
+        let next = sources.tasks.iter().find(|task| task.chapter_id == "c2").unwrap().metadata();
+        assert!(sources.open_adjacent_online(&next, -1));
+        assert!(sources.take_stream().unwrap().from_end, "backwards starts on the last page");
+    }
+
+    #[test]
+    fn a_preempted_download_whose_request_fails_is_still_requeued() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sources = test_sources(root.path());
+        let mut other = task("source.a", "other", "x");
+        other.status = DownloadStatus::Running;
+        sources.running = Some(other.id.clone());
+        sources.tasks.push(other.clone());
+        let mut read = task("source.a", "m", "c");
+        read.status = DownloadStatus::Queued;
+        sources.tasks.push(read.clone());
+        sources.prioritize(&read.id);
+        sources.handle_download_event(DlEvent::Failed { id: other.id.clone(), error: "timeout".into() });
+        let other = sources.tasks.iter().find(|task| task.id == other.id).unwrap();
+        assert_eq!(other.status, DownloadStatus::Queued);
+        assert_eq!(sources.running.as_deref(), Some(read.id.as_str()));
     }
 
     #[test]
