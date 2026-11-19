@@ -1,24 +1,21 @@
-mod motion;
-mod shelf;
-mod worker;
-mod ui;
-mod sources;
-mod source_filters;
-mod sync;
-mod vertical;
+mod design;
 #[cfg(target_os = "ios")]
 mod ios_diagnostics;
+mod motion;
+mod shelf;
+mod source_filters;
+mod sources;
+mod sync;
+mod typography;
+mod ui;
+mod vertical;
+mod worker;
 pub use ui::ReaderApp;
 
 use std::path::PathBuf;
 
 pub fn configure_fonts(ctx: &egui::Context) {
-    let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert("yejian-cjk".into(),egui::FontData::from_static(include_bytes!("../assets/DroidSansFallback.ttf")).into());
-    for family in [egui::FontFamily::Proportional,egui::FontFamily::Monospace] {
-        fonts.families.entry(family).or_default().push("yejian-cjk".into());
-    }
-    ctx.set_fonts(fonts);
+    typography::configure(ctx);
     // Touch-sized controls and comfortable line spacing. The default egui
     // metrics are desktop-mouse sized and read as a debug panel on iPad.
     for theme in [egui::Theme::Light, egui::Theme::Dark] {
@@ -54,9 +51,17 @@ pub fn run() -> eframe::Result {
     yejian_platform::init();
     log::debug!("platform initialized");
     let args: Vec<String> = std::env::args().collect();
-    let root = args.iter().position(|x|x=="--data-dir").and_then(|i|args.get(i+1)).map(PathBuf::from)
+    let root = args
+        .iter()
+        .position(|x| x == "--data-dir")
+        .and_then(|i| args.get(i + 1))
+        .map(PathBuf::from)
         .unwrap_or_else(default_data_dir);
-    let imports: Vec<PathBuf> = args.iter().position(|x|x=="--import").map(|i|args[i+1..].iter().map(PathBuf::from).collect()).unwrap_or_default();
+    let imports: Vec<PathBuf> = args
+        .iter()
+        .position(|x| x == "--import")
+        .map(|i| args[i + 1..].iter().map(PathBuf::from).collect())
+        .unwrap_or_default();
     // Simulator-only UI snapshots. Release builds never see these flags.
     #[cfg(debug_assertions)]
     let seed_demo = args.iter().any(|x| x == "--seed-demo");
@@ -67,35 +72,41 @@ pub fn run() -> eframe::Result {
         .and_then(|i| args.get(i + 1))
         .cloned();
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_title("页间").with_inner_size([1024.,768.]).with_min_inner_size([320.,480.]).with_app_id("app.yejian.reader.rust"),
-        run_and_return: !cfg!(target_os="ios"),
+        viewport: egui::ViewportBuilder::default()
+            .with_title("页间")
+            .with_inner_size([1024., 768.])
+            .with_min_inner_size([320., 480.])
+            .with_app_id("app.yejian.reader.rust"),
+        run_and_return: !cfg!(target_os = "ios"),
         #[cfg(target_os = "ios")]
         wgpu_options: ios_renderer_configuration(),
         ..Default::default()
     };
     log::info!("starting native renderer");
-    eframe::run_native("页间", options, Box::new(move|cc| {
-        log::info!("renderer ready; creating library UI");
-        configure_fonts(&cc.egui_ctx);
-        let wake=cc.egui_ctx.clone();
-        yejian_platform::set_event_waker(move||wake.request_repaint());
-        #[cfg(debug_assertions)]
-        let demo_root = root.join("demo");
-        let mut app = ReaderApp::new(root,cc.egui_ctx.clone());
-        app.import_files(imports);
-        #[cfg(debug_assertions)]
-        {
-            if seed_demo
-                && let Ok(paths) = demo_archives(&demo_root)
+    eframe::run_native(
+        "页间",
+        options,
+        Box::new(move |cc| {
+            log::info!("renderer ready; creating library UI");
+            configure_fonts(&cc.egui_ctx);
+            let wake = cc.egui_ctx.clone();
+            yejian_platform::set_event_waker(move || wake.request_repaint());
+            #[cfg(debug_assertions)]
+            let demo_root = root.join("demo");
+            let mut app = ReaderApp::new(root, cc.egui_ctx.clone());
+            app.import_files(imports);
+            #[cfg(debug_assertions)]
             {
-                app.import_files(paths);
+                if seed_demo && let Ok(paths) = demo_archives(&demo_root) {
+                    app.import_files(paths);
+                }
+                if let Some(name) = snapshot {
+                    app.request_snapshot(name);
+                }
             }
-            if let Some(name) = snapshot {
-                app.request_snapshot(name);
-            }
-        }
-        Ok(Box::new(app))
-    }))
+            Ok(Box::new(app))
+        }),
+    )
 }
 
 #[cfg(target_os = "ios")]
@@ -189,31 +200,51 @@ fn demo_archives(root: &std::path::Path) -> anyhow::Result<Vec<PathBuf>> {
 }
 
 pub fn default_data_dir() -> PathBuf {
-    if let Some(path) = std::env::var_os("YEJIAN_DATA_DIR") { return path.into(); }
-    #[cfg(target_os="windows")]
-    if let Some(path) = std::env::var_os("LOCALAPPDATA") { return PathBuf::from(path).join("Yejian"); }
-    #[cfg(target_os="ios")]
-    if let Some(path) = std::env::var_os("HOME") { return PathBuf::from(path).join("Documents").join("Yejian"); }
+    if let Some(path) = std::env::var_os("YEJIAN_DATA_DIR") {
+        return path.into();
+    }
+    #[cfg(target_os = "windows")]
+    if let Some(path) = std::env::var_os("LOCALAPPDATA") {
+        return PathBuf::from(path).join("Yejian");
+    }
+    #[cfg(target_os = "ios")]
+    if let Some(path) = std::env::var_os("HOME") {
+        return PathBuf::from(path).join("Documents").join("Yejian");
+    }
     PathBuf::from("data")
 }
 
-#[cfg(target_os="android")]
+#[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 fn android_main(app: winit::platform::android::activity::AndroidApp) {
-    android_logger::init_once(android_logger::Config::default().with_max_level(log::LevelFilter::Info));
+    android_logger::init_once(
+        android_logger::Config::default().with_max_level(log::LevelFilter::Info),
+    );
     yejian_platform::init();
-    let Some(data)=app.internal_data_path() else {log::error!("Android app data directory unavailable");return;};
+    let Some(data) = app.internal_data_path() else {
+        log::error!("Android app data directory unavailable");
+        return;
+    };
     let root = data.join("library");
-    let options = eframe::NativeOptions { android_app:Some(app), ..Default::default() };
-    if let Err(e) = eframe::run_native("页间",options,Box::new(move|cc|{
-        configure_fonts(&cc.egui_ctx);
-        let wake=cc.egui_ctx.clone();
-        yejian_platform::set_event_waker(move||wake.request_repaint());
-        Ok(Box::new(ReaderApp::new(root,cc.egui_ctx.clone())))
-    })) { log::error!("页间启动失败：{e}"); }
+    let options = eframe::NativeOptions {
+        android_app: Some(app),
+        ..Default::default()
+    };
+    if let Err(e) = eframe::run_native(
+        "页间",
+        options,
+        Box::new(move |cc| {
+            configure_fonts(&cc.egui_ctx);
+            let wake = cc.egui_ctx.clone();
+            yejian_platform::set_event_waker(move || wake.request_repaint());
+            Ok(Box::new(ReaderApp::new(root, cc.egui_ctx.clone())))
+        }),
+    ) {
+        log::error!("页间启动失败：{e}");
+    }
 }
 
-#[cfg(target_os="ios")]
+#[cfg(target_os = "ios")]
 #[unsafe(no_mangle)]
 pub extern "C" fn yejian_start_app() {
     ios_diagnostics::init();

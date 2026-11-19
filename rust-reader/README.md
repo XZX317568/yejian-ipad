@@ -4,6 +4,8 @@
 
 Android arm64 开发包和 Windows 启动器在 `../artifacts/rust/v0.1.1/delivery/`。书架、纸张动画和阅读状态都在 Rust 中实现，egui / wgpu 负责交互与绘制，SQLite 保存书库。旧 Flutter 应用位于 `../app`，两版使用各自的应用标识和数据目录，旧数据通过备份迁入。
 
+2026-11-20第二版界面可从 `../artifacts/rust/ui-redesign-v2-20261120/windows/打开新版预览.cmd` 打开。预览使用独立样书库；要导入自己的漫画，使用同目录的 `打开页间.cmd`。当前书、进度与阅读操作集中展示，下方「藏书一览」可直接选书；设置有主题预览，书源按列表与添加区域排列。手机短横屏使用紧凑侧栏。移动端安装包尚未重打，第一轮预览保留在 `ui-redesign-20261120/`。
+
 ```powershell
 cd D:\Documents\aidoku\rust-reader
 cargo run --locked -j 1 -- --data-dir .\data
@@ -15,5 +17,5 @@ cargo run --locked -j 1 -- --data-dir .\data
 
 热门、更新、排行等列表由书源决定；没有提供的入口不会凭空添加。部分源不支持关键词和筛选同时使用，界面会提示清空关键词。网页验证、JavaScript 和部分图片处理接口仍有兼容限制；读取社区索引成功不代表每个源的搜索都成功。
 
-原书架来自 Wenku8 Flutter v0.5.6 的几何和动效实现，版权及 GPL 条款在 `licenses/`。本客户端使用 GPL-3.0-only；复用的其他库保留其原许可证。字体为上游 Droid Sans Fallback，Apache-2.0。
+原书架来自 Wenku8 Flutter v0.5.6 的几何和动效实现，版权及 GPL 条款在 `licenses/`。本客户端使用 GPL-3.0-only；复用的其他库保留其原许可证。正文与标题使用 Noto Sans SC / Noto Serif SC 的静态衍生字体，SIL OFL 1.1，来源及修改见 `licenses/ReadingFonts.md`；Droid Sans Fallback（Apache-2.0）继续作为缺字后备。
 

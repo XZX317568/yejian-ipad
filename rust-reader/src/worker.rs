@@ -1,8 +1,9 @@
 use egui::{ColorImage, Context};
 use std::{
+    collections::VecDeque,
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, RwLock,
         atomic::{AtomicU64, Ordering},
         mpsc,
     },
@@ -36,6 +37,11 @@ pub enum Command {
     Backup(PathBuf),
     Restore(PathBuf),
     Flush(mpsc::Sender<Result<(), String>>),
+    #[cfg(test)]
+    BlockLibrary {
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    },
 }
 pub enum Event {
     Ready(Vec<Book>, Vec<(String, String)>, Vec<ChapterLink>),
@@ -82,11 +88,18 @@ pub struct DecodedPage {
     pub tiles: Vec<ColorImage>,
     pub size: [usize; 2],
 }
+struct ImageRequest {
+    id: String,
+    page: usize,
+    cover: bool,
+    generation: u64,
+}
 pub struct Worker {
     pub tx: mpsc::Sender<Command>,
     pub rx: mpsc::Receiver<Event>,
     pub generation: Arc<AtomicU64>,
     position_tx: mpsc::Sender<PositionCommand>,
+    image_tx: mpsc::Sender<ImageRequest>,
 }
 impl Worker {
     pub fn start(root: PathBuf, ctx: Context) -> Self {
@@ -94,8 +107,11 @@ impl Worker {
         let (event_tx, rx) = mpsc::channel();
         let (position_tx, position_rx) = mpsc::channel();
         let position_queue = position_tx.clone();
+        let (image_tx, image_rx) = mpsc::channel();
+        let image_queue = image_tx.clone();
         let generation = Arc::new(AtomicU64::new(0));
         let latest = generation.clone();
+        let archive_access = Arc::new(RwLock::new(()));
         thread::Builder::new()
             .name("yejian-library".into())
             .spawn(move || {
@@ -116,6 +132,29 @@ impl Worker {
                     Ok(library)=>library,
                     Err(e)=>{notify(Event::StartupError(format!("无法打开阅读位置存储：{e:#}")));return;}
                 };
+                let image_library = match Library::open(&root) {
+                    Ok(library) => library,
+                    Err(error) => {
+                        notify(Event::StartupError(format!("无法打开漫画图片存储：{error:#}")));
+                        return;
+                    }
+                };
+                let image_events = event_tx.clone();
+                let image_ctx = ctx.clone();
+                let image_archives = archive_access.clone();
+                thread::Builder::new()
+                    .name("yejian-images".into())
+                    .spawn(move || {
+                        read_images(
+                            image_library,
+                            image_rx,
+                            image_events,
+                            image_ctx,
+                            latest,
+                            image_archives,
+                        );
+                    })
+                    .expect("Unable to start image worker");
                 let position_events=event_tx.clone();let position_ctx=ctx.clone();
                 thread::Builder::new().name("yejian-progress".into()).spawn(move||{
                     let mut last_error:Option<String>=None;
@@ -225,34 +264,8 @@ impl Worker {
                                 cover,
                                 generation,
                             } => {
-                                if !cover && generation != latest.load(Ordering::Relaxed) {
-                                    return Ok(());
-                                }
-                                let result = (|| -> anyhow::Result<DecodedPage> {
-                                    let bytes = if cover {
-                                        let book = library
-                                            .list_books("")?
-                                            .into_iter()
-                                            .find(|b| b.id == id)
-                                            .ok_or_else(|| anyhow::anyhow!("这本书已不在书库"))?;
-                                        if let Some(path) = book.cover_path {
-                                            std::fs::read(path)?
-                                        } else {
-                                            library.page_bytes(&id, 0)?
-                                        }
-                                    } else {
-                                        library.page_bytes(&id, page)?
-                                    };
-                                    decode(&bytes, cover)
-                                })()
-                                .map_err(|e| format!("{e:#}"));
-                                notify(Event::Image {
-                                    id,
-                                    page,
-                                    cover,
-                                    generation,
-                                    result,
-                                });
+                                image_queue.send(ImageRequest { id, page, cover, generation })
+                                    .map_err(|_| anyhow::anyhow!("图片读取线程已停止"))?;
                             }
                             Command::Progress {
                                 id,
@@ -312,6 +325,11 @@ impl Worker {
                             }
                             Command::Restore(path) => {
                                 wait_for_positions()?;
+                                // Restore may repair an existing archive or replace its
+                                // cover. Readers take the matching lock only while
+                                // fetching bytes, not during decoding.
+                                let _archive_guard = archive_access.write()
+                                    .map_err(|_| anyhow::anyhow!("漫画档案锁已失效"))?;
                                 let report = library.restore(&path)?;
                                 notify(Event::Ready(
                                     library.list_books("")?,
@@ -346,6 +364,11 @@ impl Worker {
                                     )));
                                 }
                             }
+                            #[cfg(test)]
+                            Command::BlockLibrary { entered, release } => {
+                                let _ = entered.send(());
+                                let _ = release.recv();
+                            }
                         }
                         Ok(())
                     })();
@@ -360,6 +383,7 @@ impl Worker {
             rx,
             generation,
             position_tx,
+            image_tx,
         }
     }
     pub fn send(&self, command: Command) -> Result<(), String> {
@@ -380,6 +404,23 @@ impl Worker {
                 })
                 .map_err(|_| "阅读位置线程已停止，请重新打开应用".into());
         }
+        if let Command::Image {
+            id,
+            page,
+            cover,
+            generation,
+        } = command
+        {
+            return self
+                .image_tx
+                .send(ImageRequest {
+                    id,
+                    page,
+                    cover,
+                    generation,
+                })
+                .map_err(|_| "图片读取线程已停止，请重新打开应用".into());
+        }
         self.tx
             .send(command)
             .map_err(|_| "书库线程已停止，请退出后重新打开应用".into())
@@ -389,6 +430,82 @@ impl Worker {
         self.send(Command::Flush(tx))?;
         rx.recv_timeout(timeout)
             .map_err(|_| "等待书库和阅读位置保存超时".to_string())?
+    }
+}
+
+fn next_image(pending: &mut VecDeque<ImageRequest>, generation: u64) -> Option<ImageRequest> {
+    pending.retain(|request| request.cover || request.generation == generation);
+    // The UI submits the visible page first and neighbours afterwards.
+    // Preserve that order, but never put reading behind shelf thumbnails.
+    let index = pending
+        .iter()
+        .position(|request| !request.cover)
+        .unwrap_or(0);
+    pending.remove(index)
+}
+
+fn read_images(
+    library: Library,
+    requests: mpsc::Receiver<ImageRequest>,
+    events: mpsc::Sender<Event>,
+    ctx: Context,
+    latest: Arc<AtomicU64>,
+    archive_access: Arc<RwLock<()>>,
+) {
+    let mut pending = VecDeque::new();
+    loop {
+        if pending.is_empty() {
+            match requests.recv() {
+                Ok(request) => pending.push_back(request),
+                Err(_) => return,
+            }
+        }
+        // Requests contain ids only. Stale image pixels are never decoded
+        // just to be discarded later by the UI.
+        pending.extend(requests.try_iter().take(1024));
+        let Some(request) = next_image(&mut pending, latest.load(Ordering::Relaxed)) else {
+            continue;
+        };
+        let current = || request.cover || request.generation == latest.load(Ordering::Relaxed);
+        let bytes = (|| -> anyhow::Result<Vec<u8>> {
+            let _guard = archive_access
+                .read()
+                .map_err(|_| anyhow::anyhow!("漫画档案锁已失效"))?;
+            if !current() {
+                anyhow::bail!("阅读请求已失效");
+            }
+            if request.cover {
+                let book = library.get_book(&request.id)?;
+                match book.cover_path {
+                    Some(path) => Ok(std::fs::read(path)?),
+                    None => library.page_bytes(&request.id, 0),
+                }
+            } else {
+                library.page_bytes(&request.id, request.page)
+            }
+        })();
+        if !current() {
+            continue;
+        }
+        let result = bytes
+            .and_then(|bytes| decode(&bytes, request.cover))
+            .map_err(|error| format!("{error:#}"));
+        if !current() {
+            continue;
+        }
+        if events
+            .send(Event::Image {
+                id: request.id,
+                page: request.page,
+                cover: request.cover,
+                generation: request.generation,
+                result,
+            })
+            .is_err()
+        {
+            return;
+        }
+        ctx.request_repaint();
     }
 }
 
@@ -409,7 +526,9 @@ fn read_settings(library: &Library) -> anyhow::Result<Vec<(String, String)>> {
     Ok(settings)
 }
 
-pub(super) fn image_reader(bytes: &[u8]) -> anyhow::Result<image::ImageReader<std::io::Cursor<&[u8]>>> {
+pub(super) fn image_reader(
+    bytes: &[u8],
+) -> anyhow::Result<image::ImageReader<std::io::Cursor<&[u8]>>> {
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()?;
     let mut limits = image::Limits::default();
     limits.max_alloc = Some(128 * 1024 * 1024);
@@ -429,15 +548,17 @@ pub fn decode(bytes: &[u8], cover: bool) -> anyhow::Result<DecodedPage> {
             .max(1.) as u32;
         image = image.resize_exact(3072, height, image::imageops::FilterType::Triangle);
     }
-    let image = image.to_rgba8();
+    let image = image.into_rgba8();
     let size = [image.width() as usize, image.height() as usize];
     let mut tiles = Vec::new();
     for top in (0..image.height()).step_by(2048) {
         let height = (image.height() - top).min(2048);
-        let tile = image::imageops::crop_imm(&image, 0, top, image.width(), height).to_image();
+        let stride = image.width() as usize * 4;
+        let start = top as usize * stride;
+        let end = start + height as usize * stride;
         tiles.push(ColorImage::from_rgba_unmultiplied(
             [image.width() as usize, height as usize],
-            tile.as_raw(),
+            &image.as_raw()[start..end],
         ));
     }
     Ok(DecodedPage { tiles, size })
@@ -445,6 +566,241 @@ pub fn decode(bytes: &[u8], cover: bool) -> anyhow::Result<DecodedPage> {
 
 #[cfg(test)]
 mod tests {
+    fn small_archive(path: &std::path::Path) {
+        use std::io::Write;
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbImage::from_pixel(4, 4, image::Rgb([55, 75, 95]))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        writer
+            .start_file("1.png", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(png.get_ref()).unwrap();
+        writer.finish().unwrap();
+    }
+
+    #[test]
+    fn image_queue_discards_old_pages_and_prioritizes_reading_over_covers() {
+        let request = |id: &str, page, cover, generation| super::ImageRequest {
+            id: id.into(),
+            page,
+            cover,
+            generation,
+        };
+        let mut pending = std::collections::VecDeque::from([
+            request("old", 0, false, 7),
+            request("cover-a", 0, true, 0),
+            request("old", 1, false, 7),
+            request("current", 3, false, 8),
+            request("current", 4, false, 8),
+            request("cover-b", 0, true, 0),
+        ]);
+        let first = super::next_image(&mut pending, 8).unwrap();
+        assert_eq!((first.id.as_str(), first.page), ("current", 3));
+        let second = super::next_image(&mut pending, 8).unwrap();
+        assert_eq!((second.id.as_str(), second.page), ("current", 4));
+        assert_eq!(super::next_image(&mut pending, 8).unwrap().id, "cover-a");
+        assert_eq!(super::next_image(&mut pending, 8).unwrap().id, "cover-b");
+        assert!(super::next_image(&mut pending, 8).is_none());
+    }
+
+    #[test]
+    fn visible_page_and_position_save_do_not_wait_for_bulk_library_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = tmp.path().join("comic.cbz");
+        small_archive(&archive);
+        let root = tmp.path().join("library");
+        let library = yejian_core::Library::open(&root).unwrap();
+        let book = library.import(&archive).unwrap();
+        let worker = super::Worker::start(root, egui::Context::default());
+        let timeout = std::time::Duration::from_secs(5);
+        assert!(matches!(
+            worker.rx.recv_timeout(timeout).unwrap(),
+            super::Event::Ready(..)
+        ));
+
+        // Hold the exact lane used by bulk import/backup, without making the
+        // test depend on filesystem speed or a huge artificial archive.
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        worker
+            .send(super::Command::BlockLibrary {
+                entered: entered_tx,
+                release: release_rx,
+            })
+            .unwrap();
+        entered_rx.recv_timeout(timeout).unwrap();
+        worker
+            .generation
+            .store(9, std::sync::atomic::Ordering::Relaxed);
+        worker
+            .send(super::Command::Image {
+                id: "old-invalid-book".into(),
+                page: 0,
+                cover: false,
+                generation: 8,
+            })
+            .unwrap();
+        worker
+            .send(super::Command::Image {
+                id: book.id.clone(),
+                page: 0,
+                cover: false,
+                generation: 9,
+            })
+            .unwrap();
+        worker
+            .send(super::Command::Progress {
+                id: book.id.clone(),
+                page: 0,
+                fraction: 0.4,
+                private: false,
+            })
+            .unwrap();
+        let mut image_ready = false;
+        let mut position_saved = false;
+        while !image_ready || !position_saved {
+            match worker.rx.recv_timeout(timeout).unwrap() {
+                super::Event::Image {
+                    id,
+                    generation,
+                    result,
+                    ..
+                } => {
+                    assert_eq!(
+                        id, book.id,
+                        "obsolete requests must not emit decoded results or errors"
+                    );
+                    assert_eq!(generation, 9);
+                    assert_eq!(result.unwrap().size, [4, 4]);
+                    image_ready = true;
+                }
+                super::Event::ProgressSaved { id, fraction, .. } => {
+                    assert_eq!(id, book.id);
+                    assert!((fraction - 0.4).abs() < 0.0001);
+                    position_saved = true;
+                }
+                _ => panic!("unexpected event while the library work lane is blocked"),
+            }
+        }
+        assert!((library.get_book(&book.id).unwrap().page_fraction - 0.4).abs() < 0.0001);
+        release_tx.send(()).unwrap();
+        worker.flush(timeout).unwrap();
+    }
+
+    #[test]
+    fn image_worker_reads_new_imports_and_restore_repairs_from_its_existing_connection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("library");
+        let worker = super::Worker::start(root.clone(), egui::Context::default());
+        let timeout = std::time::Duration::from_secs(5);
+        assert!(matches!(
+            worker.rx.recv_timeout(timeout).unwrap(),
+            super::Event::Ready(..)
+        ));
+        let archive = tmp.path().join("comic.cbz");
+        small_archive(&archive);
+        worker.send(super::Command::Import(vec![archive])).unwrap();
+        let book = loop {
+            if let super::Event::Library(books, _) = worker.rx.recv_timeout(timeout).unwrap() {
+                break books.into_iter().next().unwrap();
+            }
+        };
+        worker
+            .generation
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        worker
+            .send(super::Command::Image {
+                id: book.id.clone(),
+                page: 0,
+                cover: false,
+                generation: 1,
+            })
+            .unwrap();
+        loop {
+            match worker.rx.recv_timeout(timeout).unwrap() {
+                super::Event::Image {
+                    result,
+                    id,
+                    generation,
+                    ..
+                } => {
+                    assert_eq!(id, book.id);
+                    assert_eq!(generation, 1);
+                    assert_eq!(result.unwrap().size, [4, 4]);
+                    break;
+                }
+                super::Event::Error(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        let library = yejian_core::Library::open(&root).unwrap();
+        let backup = tmp.path().join("backup.zip");
+        library.export_backup(&backup).unwrap();
+        std::fs::remove_file(&book.archive_path).unwrap();
+        assert!(!book.archive_path.exists());
+        worker.send(super::Command::Restore(backup)).unwrap();
+        loop {
+            match worker.rx.recv_timeout(timeout).unwrap() {
+                super::Event::Ready(books, _, _) => {
+                    assert_eq!(books.len(), 1);
+                    assert_eq!(books[0].id, book.id);
+                    assert_eq!(books[0].current_page, book.current_page);
+                    break;
+                }
+                super::Event::Error(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        // Restoration repairs missing files before comparing reading state.
+        // The unchanged reading state is intentionally counted as skipped;
+        // consume and verify that summary instead of mistaking it for a
+        // failed archive repair when the subsequent image result arrives.
+        match worker.rx.recv_timeout(timeout).unwrap() {
+            super::Event::Error(summary) => {
+                assert!(summary.contains("新增 0 本，更新 0 本，跳过 1 本，失败 0 本"));
+                assert!(summary.contains("章节关联未恢复 0 条"));
+                assert!(summary.contains("already present with the same reading state"));
+            }
+            _ => panic!("expected the unchanged-reading-state restoration summary"),
+        }
+        assert!(
+            book.archive_path.is_file(),
+            "restore must repair the archive"
+        );
+        worker
+            .generation
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+        worker
+            .send(super::Command::Image {
+                id: book.id.clone(),
+                page: 0,
+                cover: false,
+                generation: 2,
+            })
+            .unwrap();
+        loop {
+            match worker.rx.recv_timeout(timeout).unwrap() {
+                super::Event::Image {
+                    result,
+                    id,
+                    generation,
+                    ..
+                } => {
+                    assert_eq!(id, book.id);
+                    assert_eq!(generation, 2);
+                    let page = result.unwrap();
+                    assert_eq!(page.size, [4, 4]);
+                    assert_eq!(page.tiles[0].pixels[0], egui::Color32::from_rgb(55, 75, 95));
+                    break;
+                }
+                super::Event::Error(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+    }
+
     #[test]
     fn position_flush_reports_failures_and_waits_for_a_corrected_save() {
         use std::io::Write;
@@ -498,14 +854,25 @@ mod tests {
 
         // Back requests a refresh immediately after a save. Backup likewise
         // has to include every earlier write without waiting in the UI.
-        worker.send(super::Command::Progress {
-            id: book.id.clone(), page: 0, fraction: 0.65, private: false,
-        }).unwrap();
+        worker
+            .send(super::Command::Progress {
+                id: book.id.clone(),
+                page: 0,
+                fraction: 0.65,
+                private: false,
+            })
+            .unwrap();
         worker.send(super::Command::Refresh).unwrap();
         let backup = tmp.path().join("reading-position.zip");
-        worker.tx.send(super::Command::Progress {
-            id: book.id.clone(), page: 0, fraction: 0.85, private: false,
-        }).unwrap();
+        worker
+            .tx
+            .send(super::Command::Progress {
+                id: book.id.clone(),
+                page: 0,
+                fraction: 0.85,
+                private: false,
+            })
+            .unwrap();
         worker.send(super::Command::Backup(backup.clone())).unwrap();
         let mut saw_refresh = false;
         loop {
@@ -612,7 +979,9 @@ mod tests {
     }
     #[test]
     fn long_comic_keeps_its_width_and_tiles_below_gpu_limits() {
-        let image = image::RgbImage::from_pixel(320, 9000, image::Rgb([21, 32, 43]));
+        let image = image::RgbImage::from_fn(320, 9000, |x, y| {
+            image::Rgb([(x % 251) as u8, (y % 251) as u8, 43])
+        });
         let mut encoded = std::io::Cursor::new(Vec::new());
         image
             .write_to(&mut encoded, image::ImageFormat::Png)
@@ -622,5 +991,17 @@ mod tests {
         assert_eq!(decoded.tiles.len(), 5);
         assert!(decoded.tiles.iter().all(|t| t.size[1] <= 2048));
         assert_eq!(decoded.tiles.iter().map(|t| t.size[1]).sum::<usize>(), 9000);
+        let mut top = 0;
+        for tile in &decoded.tiles {
+            for row in [0, tile.size[1] - 1] {
+                for x in [0, 319] {
+                    assert_eq!(
+                        tile.pixels[row * 320 + x],
+                        egui::Color32::from_rgb((x % 251) as u8, ((top + row) % 251) as u8, 43),
+                    );
+                }
+            }
+            top += tile.size[1];
+        }
     }
 }

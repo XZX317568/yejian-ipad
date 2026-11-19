@@ -6,7 +6,8 @@
 //! compares the *exact* postcard-encoded `FilterValue` it receives against a
 //! table of pre-encoded needles and returns a title that proves which value
 //! arrived; `get_manga_list` returns distinct titles for the two static
-//! listings and for page 2.
+//! listings and for page 2. `get_manga_update` supplies two offline chapters
+//! for the production detail → downloaded reading → return flow.
 //!
 //! The three fixture files are committed test assets, not build output.
 //! `build_fixture` is an explicit regenerator (run it after changing the WAT
@@ -18,7 +19,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use yejian_sources::{
-    FilterValue, InstalledSource, Listing, ListingKind, Manga, MangaPageResult, SortFilterValue,
+    Chapter, FilterValue, InstalledSource, Listing, ListingKind, Manga, MangaPageResult, SortFilterValue,
     SourceEngine, SourceManifest, default_filter_values,
 };
 
@@ -61,10 +62,14 @@ fn page_result_block(entries: &[Manga], has_next_page: bool) -> Vec<u8> {
         payload.extend_from_slice(&manga.to_postcard_bytes());
     }
     payload.push(has_next_page as u8);
+    result_block(&payload)
+}
+
+fn result_block(payload: &[u8]) -> Vec<u8> {
     let mut block = Vec::with_capacity(payload.len() + 8);
     block.extend_from_slice(&((payload.len() + 8) as u32).to_le_bytes());
     block.extend_from_slice(&[0u8; 4]);
-    block.extend_from_slice(&payload);
+    block.extend_from_slice(payload);
     block
 }
 
@@ -247,6 +252,19 @@ fn fixture_wasm() -> Vec<u8> {
     let pop1 = page_result_block(&[manga("fx-pop-1", "热门-第1页")], true);
     let pop2 = page_result_block(&[manga("fx-pop-2", "热门-第2页")], false);
     let lat1 = page_result_block(&[manga("fx-lat-1", "最新-第1页")], true);
+    // This is an incremental update: blank keys/titles preserve the selected
+    // listing result when the engine merges it. Return newest first so the
+    // app's reading-order control must do actual work during acceptance.
+    let detail = result_block(&Manga {
+        description: Some("本地日用验收示例，章节图片来自临时样书。".into()),
+        chapters: Some([2, 1].into_iter().map(|number| Chapter {
+            key: format!("daily-{number}"),
+            title: Some(format!("第 {number} 话")),
+            chapter_number: Some(number as f32),
+            ..Default::default()
+        }).collect()),
+        ..Default::default()
+    }.to_postcard_bytes());
 
     // listing-name needles for get_manga_list
     let n_popular = b"popular";
@@ -268,6 +286,7 @@ fn fixture_wasm() -> Vec<u8> {
     let p_pop1 = place(&pop1, &mut segs);
     let p_pop2 = place(&pop2, &mut segs);
     let p_lat1 = place(&lat1, &mut segs);
+    let p_detail = place(&detail, &mut segs);
     // each case's needle descriptor + its result block
     let mut case_offsets = Vec::new();
     for c in &cases {
@@ -375,7 +394,12 @@ fn fixture_wasm() -> Vec<u8> {
                 (if (call $contains (i32.const {scratch}) (local.get $llen)
                                     (i32.const {nl_off}) (i32.const {nl_len}))
                     (then (return (i32.const {p_lat1}))))
-                (i32.const {p_plain})))"#,
+                (i32.const {p_plain}))
+
+            ;; get_manga_update(manga_desc, needs_details, needs_chapters)
+            (func (export "get_manga_update")
+                (param i32 i32 i32) (result i32)
+                (i32.const {p_detail})))"#,
         np_len = n_popular.len(),
         nl_len = n_latest.len(),
     );
@@ -694,4 +718,24 @@ fn fixture_listings_return_distinct_pages() {
 
     let latest = pollster::block_on(engine.browse("latest", 1)).unwrap();
     assert_eq!(latest.entries[0].title, "最新-第1页");
+}
+
+#[test]
+fn fixture_details_preserve_selected_identity_and_supply_two_numbered_chapters() {
+    let engine = load_fixture();
+    let listed = pollster::block_on(engine.browse("popular", 1)).unwrap();
+    let selected = &listed.entries[0];
+    let detail = pollster::block_on(engine.manga_details(&selected.key)).unwrap();
+    assert_eq!(detail.source_key, "local.filter-acceptance");
+    assert_eq!(detail.key, "fx-pop-1");
+    assert_eq!(detail.title, "热门-第1页");
+    assert!(detail.description.as_deref().unwrap().contains("本地日用验收"));
+    let chapters = pollster::block_on(engine.chapters(&detail.key)).unwrap();
+    assert_eq!(chapters.len(), 2);
+    assert_eq!(chapters[0].key, "daily-2");
+    assert_eq!(chapters[0].title.as_deref(), Some("第 2 话"));
+    assert_eq!(chapters[0].chapter_number, Some(2.));
+    assert_eq!(chapters[1].key, "daily-1");
+    assert_eq!(chapters[1].title.as_deref(), Some("第 1 话"));
+    assert_eq!(chapters[1].chapter_number, Some(1.));
 }

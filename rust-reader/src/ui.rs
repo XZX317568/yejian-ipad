@@ -57,6 +57,16 @@ impl PageTexture {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ShelfLayout {
+    stage: Rect,
+    books: Rect,
+    info: Rect,
+    browse: Rect,
+    side_by_side: bool,
+    short_landscape: bool,
+}
+
 pub struct ReaderApp {
     root: PathBuf,
     worker: Worker,
@@ -73,7 +83,9 @@ pub struct ReaderApp {
     selected: HashSet<String>,
     tab: Tab,
     screen: Screen,
-    reader_from_shelf: bool,
+    reader_return: Screen,
+    reader_options: bool,
+    pending_reader_tap: Option<(f64, Pos2)>,
     motion: ShelfMotion,
     #[cfg(debug_assertions)]
     snapshot_request: Option<String>,
@@ -84,6 +96,9 @@ pub struct ReaderApp {
     shelf_shift: f32,
     flight: Option<Flight>,
     covers: HashMap<String, TextureHandle>,
+    cover_usage: HashMap<String, u64>,
+    cover_clock: u64,
+    visible_covers: HashSet<String>,
     cover_pending: HashSet<String>,
     cover_failed: HashSet<String>,
     pages: HashMap<(String, usize), PageTexture>,
@@ -146,7 +161,9 @@ impl ReaderApp {
             selected: HashSet::new(),
             tab: Tab::Library,
             screen: Screen::Library,
-            reader_from_shelf: false,
+            reader_return: Screen::Library,
+            reader_options: false,
+            pending_reader_tap: None,
             motion: ShelfMotion::default(),
             #[cfg(debug_assertions)]
             snapshot_request: None,
@@ -157,6 +174,9 @@ impl ReaderApp {
             shelf_shift: 0.,
             flight: None,
             covers: HashMap::new(),
+            cover_usage: HashMap::new(),
+            cover_clock: 0,
+            visible_covers: HashSet::new(),
             cover_pending: HashSet::new(),
             cover_failed: HashSet::new(),
             pages: HashMap::new(),
@@ -207,17 +227,23 @@ impl ReaderApp {
         self.snapshot_request = Some(name);
     }
     #[cfg(debug_assertions)]
-    pub fn prepare_source_acceptance(&mut self,mode:&str)->anyhow::Result<()> {
-        self.tab=Tab::Sources;self.screen=Screen::Library;
+    pub fn prepare_source_acceptance(&mut self, mode: &str) -> anyhow::Result<()> {
+        self.tab = Tab::Sources;
+        self.screen = Screen::Library;
         self.sources.preview_browser(mode)
     }
     #[cfg(debug_assertions)]
-    pub fn source_browser_report(&self)->serde_json::Value{self.sources.browser_report()}
+    pub fn source_browser_report(&self) -> serde_json::Value {
+        self.sources.browser_report()
+    }
     #[cfg(debug_assertions)]
-    pub fn source_browser_ready(&self)->bool{self.sources.browser_ready("browse")}
+    pub fn source_browser_ready(&self) -> bool {
+        self.sources.browser_ready("browse")
+    }
     #[cfg(debug_assertions)]
-    pub fn prepare_installed_source_acceptance(&mut self,id:&str)->anyhow::Result<()> {
-        self.tab=Tab::Sources;self.screen=Screen::Library;
+    pub fn prepare_installed_source_acceptance(&mut self, id: &str) -> anyhow::Result<()> {
+        self.tab = Tab::Sources;
+        self.screen = Screen::Library;
         self.sources.preview_installed_source(id)
     }
     #[cfg(debug_assertions)]
@@ -246,7 +272,9 @@ impl ReaderApp {
             "browse" | "filters" | "filtered" => {
                 self.tab = Tab::Sources;
                 self.screen = Screen::Library;
-                if let Err(error)=self.sources.preview_browser(name){self.error=Some(format!("验收书源准备失败：{error:#}"));}
+                if let Err(error) = self.sources.preview_browser(name) {
+                    self.error = Some(format!("验收书源准备失败：{error:#}"));
+                }
             }
             "settings" => {
                 self.tab = Tab::Settings;
@@ -262,7 +290,9 @@ impl ReaderApp {
     /// The simulator waits for a real rendered screen instead of a fixed delay.
     #[cfg(debug_assertions)]
     fn report_snapshot_ready(&mut self, ctx: &Context) {
-        let Some((name, applied_at)) = self.snapshot_pending.as_ref() else { return };
+        let Some((name, applied_at)) = self.snapshot_pending.as_ref() else {
+            return;
+        };
         let now = ctx.input(|i| i.time);
         let content_ready = self.ready
             && self.startup_error.is_none()
@@ -271,7 +301,8 @@ impl ReaderApp {
             && self.cover_failed.is_empty()
             && (!matches!(name.as_str(), "shelf" | "detail") || !self.covers.is_empty())
             && (name != "community" || self.sources.repository_size() > 0)
-            && (!matches!(name.as_str(),"browse"|"filters"|"filtered") || self.sources.browser_ready(name))
+            && (!matches!(name.as_str(), "browse" | "filters" | "filtered")
+                || self.sources.browser_ready(name))
             && (!std::env::args().any(|arg| arg == "--ui-landscape")
                 || ctx.content_rect().width() > ctx.content_rect().height())
             && (!matches!(self.screen, Screen::Reader(_)) || self.page_loaded());
@@ -280,7 +311,9 @@ impl ReaderApp {
             return;
         }
         let safe = ctx.content_rect();
-        let nav_safe = self.hitboxes.iter()
+        let nav_safe = self
+            .hitboxes
+            .iter()
             .filter(|(id, _)| id.starts_with("nav-") || id.as_str() == "reader-back")
             .all(|(_, rect)| safe.contains_rect(*rect));
         if !nav_safe {
@@ -290,8 +323,12 @@ impl ReaderApp {
         }
         let name = name.clone();
         let args: Vec<String> = std::env::args().collect();
-        let run_id = args.iter().position(|arg| arg == "--ui-snapshot-run")
-            .and_then(|index| args.get(index + 1)).cloned().unwrap_or_default();
+        let run_id = args
+            .iter()
+            .position(|arg| arg == "--ui-snapshot-run")
+            .and_then(|index| args.get(index + 1))
+            .cloned()
+            .unwrap_or_default();
         let report = serde_json::json!({
             "screen": name,
             "run_id": run_id,
@@ -317,7 +354,12 @@ impl ReaderApp {
         let json = report.to_string();
         let result = std::fs::create_dir_all(&dir)
             .and_then(|()| std::fs::write(dir.join(format!("{name}.tmp")), &json))
-            .and_then(|()| std::fs::rename(dir.join(format!("{name}.tmp")), dir.join(format!("{name}.json"))));
+            .and_then(|()| {
+                std::fs::rename(
+                    dir.join(format!("{name}.tmp")),
+                    dir.join(format!("{name}.json")),
+                )
+            });
         match result {
             Ok(()) => {
                 // XCTest receives the same report from this running app,
@@ -327,7 +369,9 @@ impl ReaderApp {
                     unsafe extern "C" {
                         fn yejian_ios_snapshot_ready(json: *const std::ffi::c_char);
                     }
-                    unsafe { yejian_ios_snapshot_ready(json.as_ptr()); }
+                    unsafe {
+                        yejian_ios_snapshot_ready(json.as_ptr());
+                    }
                 }
                 log::info!("snapshot ready: {name}");
                 self.snapshot_pending = None;
@@ -353,7 +397,8 @@ impl ReaderApp {
         for book in &self.books {
             let chapter = self.chapter(&book.id);
             if (!self.category.is_empty() && book.category != self.category)
-                || (!query.is_empty() && !book.title.to_lowercase().contains(&query)
+                || (!query.is_empty()
+                    && !book.title.to_lowercase().contains(&query)
                     && !book.author.to_lowercase().contains(&query)
                     && !chapter.is_some_and(|m| m.manga_title.to_lowercase().contains(&query)))
             {
@@ -376,16 +421,21 @@ impl ReaderApp {
             }
             representatives.push(book);
         }
-        representatives.into_iter().map(|book| {
-            let mut entry = book.clone();
-            if let Some(chapter) = self.chapter(&book.id) {
-                entry.title.clone_from(&chapter.manga_title);
-            }
-            entry
-        }).collect()
+        representatives
+            .into_iter()
+            .map(|book| {
+                let mut entry = book.clone();
+                if let Some(chapter) = self.chapter(&book.id) {
+                    entry.title.clone_from(&chapter.manga_title);
+                }
+                entry
+            })
+            .collect()
     }
     fn chapter(&self, id: &str) -> Option<&ChapterMetadata> {
-        self.chapter_indices.get(id).map(|&index| &self.chapters[index].metadata)
+        self.chapter_indices
+            .get(id)
+            .map(|&index| &self.chapters[index].metadata)
     }
     fn same_series(&self, a: &str, b: &str) -> bool {
         match (self.chapter(a), self.chapter(b)) {
@@ -394,7 +444,10 @@ impl ReaderApp {
         }
     }
     fn replace_links(&mut self, links: Vec<ChapterLink>) {
-        self.chapter_indices = links.iter().enumerate()
+        self.sources.set_library_chapters(&links);
+        self.chapter_indices = links
+            .iter()
+            .enumerate()
             .map(|(i, link)| (link.book_id.clone(), i))
             .collect();
         self.chapters = links;
@@ -403,7 +456,12 @@ impl ReaderApp {
         self.chapters
             .iter()
             .filter(|link| self.same_series(id, &link.book_id))
-            .filter_map(|link| self.books.iter().find(|book| book.id == link.book_id).cloned())
+            .filter_map(|link| {
+                self.books
+                    .iter()
+                    .find(|book| book.id == link.book_id)
+                    .cloned()
+            })
             .collect()
     }
     fn adjacent_chapter(&self, id: &str, delta: i32) -> Option<Book> {
@@ -415,7 +473,9 @@ impl ReaderApp {
         chapters.get(index as usize).cloned()
     }
     fn cover_id(&self, id: &str) -> String {
-        if self.chapter(id).is_none() { return id.to_string(); }
+        if self.chapter(id).is_none() {
+            return id.to_string();
+        }
         self.chapters
             .iter()
             .find(|link| self.same_series(id, &link.book_id))
@@ -651,6 +711,9 @@ impl ReaderApp {
         }
     }
     fn ask_cover(&mut self, id: &str) {
+        self.visible_covers.insert(id.into());
+        self.cover_clock += 1;
+        self.cover_usage.insert(id.into(), self.cover_clock);
         if !self.covers.contains_key(id)
             && !self.cover_failed.contains(id)
             && self.cover_pending.insert(id.into())
@@ -661,6 +724,21 @@ impl ReaderApp {
                 cover: true,
                 generation: 0,
             });
+        }
+    }
+    fn trim_covers(&mut self) {
+        let mut bytes: usize = self.covers.values().map(|texture| texture.size()[0] * texture.size()[1] * 4).sum();
+        while self.covers.len() > 48 || bytes > 64 * 1024 * 1024 {
+            let candidate = self.covers.keys()
+                .filter(|id| !self.visible_covers.contains(*id)
+                    && !self.flight.as_ref().is_some_and(|flight| &flight.id == *id))
+                .min_by_key(|id| self.cover_usage.get(*id).copied().unwrap_or(0))
+                .cloned();
+            let Some(id) = candidate else { break };
+            if let Some(texture) = self.covers.remove(&id) {
+                bytes -= texture.size()[0] * texture.size()[1] * 4;
+            }
+            self.cover_usage.remove(&id);
         }
     }
     fn ask_page(&mut self, id: &str, page: usize) {
@@ -708,13 +786,15 @@ impl ReaderApp {
     fn open_reader(&mut self, book: &Book) {
         self.flush_position();
         if !matches!(self.screen, Screen::Reader(_)) {
-            self.reader_from_shelf = matches!(self.screen, Screen::Library) && self.tab == Tab::Library;
+            self.reader_return = self.screen.clone();
         }
         self.page = book.current_page.min(book.page_count.saturating_sub(1));
         self.screen = Screen::Reader(book.id.clone());
         self.vertical_reader.reset(self.page, book.page_fraction);
         self.saved_position = None;
         self.chapter_dialog = None;
+        self.reader_options = false;
+        self.pending_reader_tap = None;
         self.pages
             .retain(|(id, page), _| id == &book.id && page.abs_diff(self.page) <= 2);
         self.zoom = 1.;
@@ -733,6 +813,7 @@ impl ReaderApp {
         }
     }
     fn next_page(&mut self, id: &str, delta: i32) {
+        self.pending_reader_tap = None;
         let Some(book) = self.books.iter().find(|b| b.id == id).cloned() else {
             return;
         };
@@ -774,7 +855,7 @@ impl ReaderApp {
     }
     fn back(&mut self, now: f64, area: Rect) {
         match self.screen.clone() {
-            Screen::Reader(id) => {
+            Screen::Reader(_) => {
                 self.flush_position();
                 self.vertical_reader.stop();
                 self.page_generation += 1;
@@ -782,22 +863,31 @@ impl ReaderApp {
                     .generation
                     .store(self.page_generation, Ordering::Relaxed);
                 self.page_pending.clear();
-                self.screen = if self.reader_from_shelf { Screen::Library } else { Screen::Detail(id) };
+                self.screen = self.reader_return.clone();
+                self.reader_options = false;
+                self.pending_reader_tap = None;
                 self.send(Command::Refresh);
             }
             Screen::Detail(id) => {
                 let books = self.visible_books();
+                self.shelf_viewport = area;
                 let shelf_area = self.shelf_area(area.translate(vec2(0., self.shelf_shift)));
                 if let Some(index) = books.iter().position(|b| self.same_series(&b.id, &id)) {
                     self.motion.select(index as f32, now, true);
                 }
                 let volumes = shelf::geometry(shelf_area, books.len(), self.motion.focus, 1.);
-                if self.tab == Tab::Library && let Some(volume) = volumes
-                    .iter()
-                    .find(|v| v.lane == self.motion.focus.round() as i32 && self.same_series(&books[v.index].id, &id))
+                if self.tab == Tab::Library
+                    && let Some(volume) = volumes.iter().find(|v| {
+                        v.lane == self.motion.focus.round() as i32
+                            && self.same_series(&books[v.index].id, &id)
+                    })
                 {
                     if !self.reduced && self.covers.contains_key(&self.cover_id(&id)) {
-                        let (started, source) = if let Some(out) = self.flight.as_ref().filter(|f| !f.returning && f.book_id == id) {
+                        let (started, source) = if let Some(out) = self
+                            .flight
+                            .as_ref()
+                            .filter(|f| !f.returning && f.book_id == id)
+                        {
                             let progress = ((now - out.started) / motion::OPEN).clamp(0., 1.);
                             (now - (1. - progress) * motion::CLOSE, out.from)
                         } else {
@@ -836,7 +926,12 @@ impl ReaderApp {
         if self.chapter_dialog.take().is_some() {
             return;
         }
-        if matches!(self.screen,Screen::Library)&&self.tab==Tab::Sources&&self.sources.back(){
+        if self.reader_options {
+            self.reader_options = false;
+            return;
+        }
+        if matches!(self.screen, Screen::Library) && self.tab == Tab::Sources && self.sources.back()
+        {
             return;
         }
         let at_root = matches!(self.screen, Screen::Library)
@@ -853,19 +948,8 @@ impl ReaderApp {
         }
     }
     fn colors(&self) -> (Color32, Color32, Color32) {
-        if self.dark {
-            (
-                Color32::from_rgb(24, 27, 29),
-                Color32::from_rgb(237, 239, 238),
-                Color32::from_rgb(158, 168, 175),
-            )
-        } else {
-            (
-                Color32::from_rgb(245, 248, 250),
-                Color32::from_rgb(33, 44, 50),
-                Color32::from_rgb(91, 108, 120),
-            )
-        }
+        let p = crate::design::palette(self.dark);
+        (p.paper, p.ink, p.muted)
     }
     fn label(&self, p: &Painter, pos: Pos2, text: &str, size: f32, color: Color32) {
         p.text(
@@ -880,32 +964,74 @@ impl ReaderApp {
         self.hitboxes.insert(id.into(), rect);
         let response = ui.interact(rect, Id::unique(id), Sense::click());
         response.widget_info(|| WidgetInfo::labeled(Role::Button, true, label));
-        let (_, ink, muted) = self.colors();
+        let palette = crate::design::palette(self.dark);
         let fill = if primary {
-            ink
+            if response.hovered() {
+                palette.accent.gamma_multiply(0.88)
+            } else {
+                palette.accent
+            }
         } else if response.hovered() {
-            muted.gamma_multiply(0.12)
+            palette.accent_soft
         } else {
-            Color32::TRANSPARENT
+            palette.soft
         };
-        ui.painter().rect_filled(rect, 8., fill);
-        ui.painter().text(
-            rect.center(),
-            Align2::CENTER_CENTER,
-            label,
-            FontId::proportional(13. * self.font_scale),
-            if primary { self.colors().0 } else { ink },
+        ui.painter().rect_filled(rect, 10., fill);
+        if !primary {
+            ui.painter()
+                .rect_stroke(rect, 10., Stroke::new(1., palette.line), StrokeKind::Inside);
+        }
+        let text_color = if primary {
+            palette.on_accent
+        } else {
+            palette.ink
+        };
+        let mut text = egui::text::LayoutJob::simple(
+            label.to_owned(),
+            FontId::proportional(15. * self.font_scale),
+            text_color,
+            (rect.width() - 20.).max(1.),
         );
+        text.wrap.max_rows = 1;
+        let galley = ui.painter().layout_job(text);
+        ui.painter()
+            .galley(rect.center() - galley.size() / 2., galley, text_color);
         response.clicked()
     }
     fn icon(&mut self, ui: &mut Ui, id: &str, rect: Rect, kind: &str, label: &str) -> bool {
         self.hitboxes.insert(id.into(), rect);
         let response = ui.interact(rect, Id::unique(id), Sense::click());
         response.widget_info(|| WidgetInfo::labeled(Role::Button, true, label));
-        let color = self.colors().2;
+        let palette = crate::design::palette(self.dark);
+        let is_reader = matches!(self.screen, Screen::Reader(_));
+        let active = match id {
+            "nav-library" => self.tab == Tab::Library,
+            "nav-search" => self.tab == Tab::Sources,
+            "nav-history" => self.tab == Tab::History,
+            "nav-settings" => self.tab == Tab::Settings,
+            _ => false,
+        };
+        let color = if is_reader {
+            Color32::from_gray(232)
+        } else if active {
+            palette.accent
+        } else {
+            palette.muted
+        };
         let p = ui.painter();
+        if !id.starts_with("nav-") && !is_reader {
+            p.rect_filled(
+                rect,
+                12.,
+                if response.hovered() {
+                    palette.accent_soft
+                } else {
+                    palette.surface
+                },
+            );
+        }
         let c = rect.center();
-        let stroke = Stroke::new(1.4, color);
+        let stroke = Stroke::new(1.7, color);
         match kind {
             "search" => {
                 p.circle_stroke(c - vec2(2., 2.), 5.6, stroke);
@@ -962,44 +1088,77 @@ impl ReaderApp {
         response.clicked()
     }
     fn shelf_area(&self, area: Rect) -> Rect {
-        if Self::detail_side_by_side(area) {
-            let height = (area.height() - 173.).clamp(88., 416.);
-            return Rect::from_min_size(
-                area.min + vec2(24., 92.),
-                vec2((area.width() * 0.55 - 32.).min(520.), height),
-            );
-        }
-        if Self::shelf_two_column(area) {
-            // iPad landscape: a large stage on the left, the reading column on
-            // the right. Both share the same visual centre instead of hugging
-            // the top edge of a tall screen.
-            let height = (area.height() - 300.).clamp(320., 720.);
-            let width = (area.width() - 400.).clamp(320., 880.);
-            let top = 96. + (area.height() - 96. - 40. - height).max(0.) * 0.42;
-            return Rect::from_min_size(
-                pos2(area.left() + 24., area.top() + top),
-                vec2(width, height),
-            );
-        }
-        if area.width() >= 700. {
-            // iPad portrait and Split View: keep the shelf generous, then put
-            // the title and actions underneath it.
-            let height = (area.height() - 420.).clamp(416., 820.);
-            let width = (area.width() - 72.).clamp(1., 880.);
-            let block = height + 190.;
-            let top = 96. + (area.height() - 96. - 40. - block).max(0.) * 0.42;
-            return Rect::from_min_size(
-                pos2(area.left() + 24., area.top() + top),
-                vec2(width, height),
-            );
-        }
-        Rect::from_min_size(
-            pos2(area.left() + 24., area.top() + 114.),
+        self.shelf_layout(area).books
+    }
+    fn shelf_layout(&self, area: Rect) -> ShelfLayout {
+        let margin = if area.width() >= 700. { 32. } else { 16. };
+        let width = (area.width() - margin * 2.).min(1200.);
+        let side_by_side = width >= 660.;
+        let short_landscape = side_by_side && self.shelf_viewport.height() < 600.;
+        let stacked_header = self.font_scale > 1.4 && area.width() < 520.;
+        let top = 144.
+            + if stacked_header {
+                84.
+            } else {
+                14. * (self.font_scale - 1.)
+            };
+        let tall_extra = if side_by_side {
+            ((self.shelf_viewport.height() - 900.) * 0.30).clamp(0., 100.)
+        } else {
+            0.
+        };
+        let height = if short_landscape {
+            224. + (self.font_scale - 1.) * 16.
+        } else if side_by_side {
+            374. + tall_extra + (self.font_scale - 1.) * 40.
+        } else {
+            384. + (self.font_scale - 1.) * 112.
+        };
+        let stage = Rect::from_min_size(
+            pos2(area.center().x - width / 2., area.top() + top),
+            vec2(width, height),
+        );
+        let books = if side_by_side {
+            Rect::from_min_size(
+                stage.min + vec2(12., 12.),
+                vec2(width * 0.55 - 12., height - 24.),
+            )
+        } else {
+            Rect::from_min_size(stage.min + vec2(8., 6.), vec2(width - 16., 212.))
+        };
+        let info = if side_by_side {
+            Rect::from_min_max(
+                pos2(
+                    books.right() + 28.,
+                    stage.top() + if short_landscape { 14. } else { 76. },
+                ),
+                stage.max - vec2(28., 26.),
+            )
+        } else {
+            Rect::from_min_max(
+                pos2(stage.left() + 20., books.bottom() + 8.),
+                stage.max - vec2(20., 20.),
+            )
+        };
+        let browse = Rect::from_min_size(
+            pos2(stage.left(), stage.bottom() + 28.),
             vec2(
-                (area.width() - 48.).clamp(1., 520.),
-                (area.height() - 380.).clamp(416., 560.),
+                width,
+                if side_by_side {
+                    236. + tall_extra * 0.5
+                } else {
+                    170.
+                } + 28. * (self.font_scale - 1.),
             ),
-        )
+        );
+        ShelfLayout {
+            stage,
+            books,
+            info,
+            browse,
+            side_by_side,
+            short_landscape,
+        }
     }
     fn detail_cover_rect(&self, area: Rect) -> Rect {
         if Self::detail_side_by_side(area) {
@@ -1016,17 +1175,14 @@ impl ReaderApp {
             let width = height * 118. / 166.;
             let top = area.top() + (area.height() - height).max(0.) * 0.46;
             let left = area.center().x - (width + 432.) / 2.;
-            return Rect::from_min_size(
-                pos2(left, top),
-                vec2(width, height),
-            );
+            return Rect::from_min_size(pos2(left, top), vec2(width, height));
         }
         if area.width() >= 700. {
             // iPad portrait and Split View: a generous centred cover with the
             // title block underneath.
             // Tall iPads can carry a notably larger cover without crowding the
             // title block underneath.
-            let width = (area.height() * 0.30).clamp(320., 400.);
+            let width = (area.height() * 0.25).clamp(250., 320.);
             let height = width * 166. / 118.;
             let block = height + 220.;
             let top = 84. + (area.height() - 84. - 24. - block).max(0.) * 0.40;
@@ -1045,10 +1201,6 @@ impl ReaderApp {
     fn detail_side_by_side(area: Rect) -> bool {
         area.height() < 600. && area.width() >= 480. && area.width() > area.height()
     }
-    /// Enough room for the shelf and a separate reading column.
-    fn shelf_two_column(area: Rect) -> bool {
-        area.width() >= 1100. && area.height() >= 620.
-    }
     /// iPad-sized detail page with a separate column beside the cover.
     fn detail_wide(area: Rect) -> bool {
         area.width() >= 1100. && area.height() >= 620.
@@ -1063,6 +1215,7 @@ impl ReaderApp {
     }
     pub fn draw(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
+        self.visible_covers.clear();
         self.receive(&ctx);
         #[cfg(debug_assertions)]
         if self.snapshot_request.is_some() && self.ready && !self.books.is_empty() {
@@ -1102,6 +1255,24 @@ impl ReaderApp {
             }
         }
         self.sources.poll();
+        if let Some(chapter) = self.sources.take_open_chapter() {
+            let book = self
+                .chapters
+                .iter()
+                .find(|link| {
+                    link.metadata.source_id == chapter.source_id
+                        && link.metadata.manga_id == chapter.manga_id
+                        && link.metadata.chapter_id == chapter.chapter_id
+                })
+                .and_then(|link| self.books.iter().find(|book| book.id == link.book_id))
+                .cloned();
+            if let Some(book) = book {
+                self.open_reader(&book);
+            } else {
+                self.send(Command::Refresh);
+                self.error = Some("这章还没有加入书架，正在刷新书库。请稍后再点「阅读」。".into());
+            }
+        }
         self.sync.poll();
         if self.sync.changed {
             self.sync.changed = false;
@@ -1134,11 +1305,9 @@ impl ReaderApp {
             "light" => false,
             _ => ctx.input(|i| i.raw.system_theme == Some(Theme::Dark)),
         };
-        ctx.set_visuals(if self.dark {
-            Visuals::dark()
-        } else {
-            Visuals::light()
-        });
+        let visuals = crate::design::visuals(self.dark);
+        ctx.set_visuals(visuals.clone());
+        ui.style_mut().visuals = visuals;
         if self.widget_font_scale != self.font_scale {
             let fonts = crate::text_styles(self.font_scale);
             for theme in [Theme::Light, Theme::Dark] {
@@ -1165,9 +1334,10 @@ impl ReaderApp {
         };
         let (background, ink, _) = self.colors();
         ui.painter().rect_filled(full, 0., background);
-        let tablet = full.width() >= 880.;
+        let tablet = Self::side_navigation(full);
+        let rail_width = if full.width() >= 1280. { 176. } else { 88. };
         let content = if tablet {
-            Rect::from_min_max(full.min + vec2(72., 0.), full.max)
+            Rect::from_min_max(full.min + vec2(rail_width, 0.), full.max)
         } else {
             full
         };
@@ -1191,49 +1361,67 @@ impl ReaderApp {
                 if self.icon(
                     ui,
                     "back",
-                    Rect::from_min_size(content.min + vec2(12., 10.), vec2(40., 40.)),
+                    Rect::from_min_size(content.min + vec2(24., 14.), vec2(44., 44.)),
                     "back",
                     "返回书架",
                 ) {
                     self.back(now, content);
                 }
             } else {
+                let title = match self.tab {
+                    Tab::Library => "书架",
+                    Tab::Sources => "发现书源",
+                    Tab::History => "阅读足迹",
+                    Tab::Settings => "设置",
+                };
                 ui.painter().text(
-                    content.min + vec2(20., 29.),
+                    content.min + vec2(24., 37.),
                     Align2::LEFT_CENTER,
-                    "页间",
-                    FontId::proportional(23.),
+                    title,
+                    crate::typography::display(30. * self.font_scale.min(1.3)),
                     ink,
                 );
-                if self.icon(
-                    ui,
-                    "search",
-                    Rect::from_min_size(
-                        pos2(content.right() - 51., content.top() + 6.),
-                        vec2(44., 44.),
-                    ),
-                    "search",
-                    "搜索书库",
-                ) {
+                if self.tab == Tab::Library
+                    && self.icon(
+                        ui,
+                        "search",
+                        Rect::from_min_size(
+                            pos2(content.right() - 68., content.top() + 16.),
+                            vec2(44., 44.),
+                        ),
+                        "search",
+                        "搜索书库",
+                    )
+                {
                     self.search = !self.search;
                 }
-                if self.icon(
-                    ui,
-                    "import",
-                    Rect::from_min_size(
-                        pos2(content.right() - 96., content.top() + 6.),
-                        vec2(44., 44.),
-                    ),
-                    "plus",
-                    "导入漫画",
-                ) {
+                if self.tab == Tab::Library
+                    && self.icon(
+                        ui,
+                        "import",
+                        Rect::from_min_size(
+                            pos2(content.right() - 120., content.top() + 16.),
+                            vec2(44., 44.),
+                        ),
+                        "plus",
+                        "导入漫画",
+                    )
+                {
                     self.pick_import();
                 }
             }
             let transition = self.flight.as_ref().map(|flight| {
-                let duration = if flight.returning { motion::CLOSE } else { motion::OPEN };
+                let duration = if flight.returning {
+                    motion::CLOSE
+                } else {
+                    motion::OPEN
+                };
                 let elapsed = ((now - flight.started) / duration).clamp(0., 1.) as f32;
-                let progress = if flight.returning { 1. - elapsed } else { elapsed };
+                let progress = if flight.returning {
+                    1. - elapsed
+                } else {
+                    elapsed
+                };
                 (flight.book_id.clone(), motion::travel(progress))
             });
             if let Some((id, reveal)) = transition {
@@ -1247,16 +1435,18 @@ impl ReaderApp {
                     ui.set_opacity(motion::smooth(((reveal - 0.5) / 0.5).max(0.)));
                     self.detail_ui(ui, content, &id);
                 });
-            } else { match self.screen.clone() {
-                Screen::Library => match self.tab {
-                    Tab::Library => self.library_viewport(ui, content, now, entrance),
-                    Tab::History => self.history_ui(ui, content),
-                    Tab::Settings => self.settings_ui(ui, content),
-                    Tab::Sources => self.sources_ui(ui, content),
-                },
-                Screen::Detail(id) => self.detail_ui(ui, content, &id),
-                _ => {}
-            } }
+            } else {
+                match self.screen.clone() {
+                    Screen::Library => match self.tab {
+                        Tab::Library => self.library_viewport(ui, content, now, entrance),
+                        Tab::History => self.history_ui(ui, content),
+                        Tab::Settings => self.settings_ui(ui, content),
+                        Tab::Sources => self.sources_ui(ui, content),
+                    },
+                    Screen::Detail(id) => self.detail_ui(ui, content, &id),
+                    _ => {}
+                }
+            }
             if tablet || matches!(self.screen, Screen::Library) {
                 self.navigation(ui, full, tablet);
             }
@@ -1279,13 +1469,22 @@ impl ReaderApp {
                     );
                     if progress < 0.12 {
                         let mut mask = ui.painter().with_clip_rect(flight.clip);
-                        mask.multiply_opacity(1. - motion::cubic(progress / 0.12, 0.42, 0., 0.58, 1.));
+                        mask.multiply_opacity(
+                            1. - motion::cubic(progress / 0.12, 0.42, 0., 0.58, 1.),
+                        );
                         let books = self.visible_books();
                         for volume in &flight.foreground {
                             if let Some(book) = books.get(volume.index) {
                                 let cover = self.cover_id(&book.id);
-                                shelf::paint_volume(&mask, volume, &book.title, self.covers.get(&cover),
-                                    self.dark, false, self.selected.contains(&book.id));
+                                shelf::paint_volume(
+                                    &mask,
+                                    volume,
+                                    &book.title,
+                                    self.covers.get(&cover),
+                                    self.dark,
+                                    false,
+                                    self.selected.contains(&book.id),
+                                );
                             }
                         }
                     }
@@ -1312,6 +1511,7 @@ impl ReaderApp {
             }
         }
         self.dialogs(&ctx);
+        self.trim_covers();
         self.frame_is_animating = self.motion.active()
             || entrance < 1.
             || self.flight.is_some()
@@ -1323,64 +1523,103 @@ impl ReaderApp {
         }
     }
     fn navigation(&mut self, ui: &mut Ui, full: Rect, tablet: bool) {
-        let (_, ink, muted) = self.colors();
+        let palette = crate::design::palette(self.dark);
         let tabs = [
             (Tab::Library, "书架", "library"),
             (Tab::Sources, "书源", "search"),
             (Tab::History, "历史", "history"),
             (Tab::Settings, "设置", "settings"),
         ];
+        let expanded = tablet && full.width() >= 1280.;
         let rail = if tablet {
-            Rect::from_min_size(full.min, vec2(72., full.height()))
+            Rect::from_min_size(
+                full.min,
+                vec2(if expanded { 176. } else { 88. }, full.height()),
+            )
         } else {
             Rect::from_min_size(
-                pos2(full.left() + 28., full.bottom() - 62.),
-                vec2(full.width() - 56., 54.),
+                pos2(
+                    full.center().x - (full.width() - 32.).min(480.) / 2.,
+                    full.bottom() - 72.,
+                ),
+                vec2((full.width() - 32.).min(480.), 64.),
             )
         };
-        ui.painter().rect_filled(
-            rail,
-            if tablet { 0. } else { 27. },
-            if self.dark {
-                Color32::from_rgb(34, 38, 40)
-            } else {
-                Color32::from_rgb(250, 252, 253)
-            },
-        );
+        ui.painter()
+            .rect_filled(rail, if tablet { 0. } else { 23. }, palette.surface);
         if !tablet {
-            ui.painter().rect_stroke(
-                rail,
-                27.,
-                Stroke::new(0.6, muted.gamma_multiply(0.2)),
-                StrokeKind::Inside,
+            ui.painter()
+                .rect_stroke(rail, 23., Stroke::new(1., palette.line), StrokeKind::Inside);
+        } else {
+            ui.painter().line_segment(
+                [rail.right_top(), rail.right_bottom()],
+                Stroke::new(1., palette.line),
+            );
+            ui.painter().text(
+                pos2(rail.center().x, rail.top() + 38.),
+                Align2::CENTER_CENTER,
+                "页间",
+                crate::typography::display(23.),
+                palette.accent,
             );
         }
         for (i, (tab, label, kind)) in tabs.into_iter().enumerate() {
             let rect = if tablet {
                 Rect::from_min_size(
-                    pos2(rail.left() + 10., rail.top() + 96. + i as f32 * 78.),
-                    vec2(52., 60.),
+                    pos2(
+                        rail.left() + 10.,
+                        rail.top()
+                            + if full.height() < 600. {
+                                80. + i as f32 * ((full.height() - 150.) / 3.).min(72.)
+                            } else {
+                                112. + i as f32 * 84.
+                            },
+                    ),
+                    vec2(rail.width() - 20., 64.),
                 )
             } else {
                 Rect::from_min_size(
                     pos2(rail.left() + i as f32 * rail.width() / 4., rail.top()),
-                    vec2(rail.width() / 4., 54.),
+                    vec2(rail.width() / 4., 64.),
                 )
             };
+            if tab == self.tab {
+                ui.painter()
+                    .rect_filled(rect.shrink2(vec2(5., 5.)), 16., palette.accent_soft);
+            }
             // The whole item is the tap target: the glyph alone is only
             // 32x29 pt, below the 44 pt Apple asks for.
             let row_clicked = ui
                 .interact(rect, Id::unique(("nav-row", i)), Sense::click())
                 .clicked();
-            let icon_rect = Rect::from_center_size(rect.center() - vec2(0., 8.), vec2(32., 29.));
+            let icon_rect = Rect::from_center_size(
+                if expanded {
+                    pos2(rect.left() + 28., rect.center().y)
+                } else {
+                    rect.center() - vec2(0., 9.)
+                },
+                vec2(32., 29.),
+            );
             let clicked = self.icon(ui, &format!("nav-{kind}"), icon_rect, kind, label);
             self.hitboxes.insert(format!("nav-{kind}"), rect);
             ui.painter().text(
-                rect.center() + vec2(0., 8.),
-                Align2::CENTER_TOP,
+                if expanded {
+                    pos2(rect.left() + 55., rect.center().y)
+                } else {
+                    rect.center() + vec2(0., 8.)
+                },
+                if expanded {
+                    Align2::LEFT_CENTER
+                } else {
+                    Align2::CENTER_TOP
+                },
                 label,
-                FontId::proportional(10.),
-                if tab == self.tab { ink } else { muted },
+                FontId::proportional(if expanded { 16. } else { 12. }),
+                if tab == self.tab {
+                    palette.accent
+                } else {
+                    palette.muted
+                },
             );
             let text_clicked = ui
                 .interact(
@@ -1389,15 +1628,6 @@ impl ReaderApp {
                     Sense::click(),
                 )
                 .clicked();
-            if tab == self.tab {
-                ui.painter().line_segment(
-                    [
-                        rect.center() + vec2(-5., 19.),
-                        rect.center() + vec2(5., 19.),
-                    ],
-                    Stroke::new(1.2, ink),
-                );
-            }
             if clicked || row_clicked || text_clicked {
                 self.tab = tab;
                 self.screen = Screen::Library;
@@ -1405,29 +1635,44 @@ impl ReaderApp {
             }
         }
     }
+    fn side_navigation(area: Rect) -> bool {
+        area.width() >= 1000. || (area.width() >= 700. && area.height() < 600.)
+    }
     fn library_viewport(&mut self, ui: &mut Ui, area: Rect, now: f64, entrance: f32) {
         self.shelf_viewport = area;
-        let height = (680. + (self.font_scale - 1.) * 110.).max(area.height() - 76.);
-        if area.height() >= height + 62. || Self::detail_side_by_side(area) {
+        let height = self.shelf_layout(area).browse.bottom() - area.top() + 24.;
+        let bottom = if Self::side_navigation(ui.ctx().content_rect()) {
+            16.
+        } else {
+            80.
+        };
+        if area.height() >= height + bottom {
             self.shelf_shift = 0.;
             self.library_ui(ui, area, now, entrance);
             return;
         }
-        let rect = Rect::from_min_max(area.min + vec2(0., 60.), area.max - vec2(0., 68.));
+        let rect = Rect::from_min_max(area.min + vec2(0., 70.), area.max - vec2(0., bottom));
         ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-            ScrollArea::vertical().id_salt("library-scroll").show(ui, |ui| {
-                let size = vec2(area.width(), height);
-                let (inner, _) = ui.allocate_exact_size(size - vec2(0., 60.), Sense::hover());
-                self.shelf_shift = inner.top() - 60. - area.top();
-                self.library_ui(ui, Rect::from_min_size(inner.min - vec2(0., 60.), size), now, entrance);
-            });
+            ScrollArea::vertical()
+                .id_salt("library-scroll")
+                .show(ui, |ui| {
+                    let size = vec2(area.width(), height);
+                    let (inner, _) = ui.allocate_exact_size(size - vec2(0., 70.), Sense::hover());
+                    self.shelf_shift = inner.top() - 70. - area.top();
+                    self.library_ui(
+                        ui,
+                        Rect::from_min_size(inner.min - vec2(0., 70.), size),
+                        now,
+                        entrance,
+                    );
+                });
         });
     }
     fn library_ui(&mut self, ui: &mut Ui, area: Rect, now: f64, entrance: f32) {
         let (_, ink, muted) = self.colors();
         if self.search {
             let rect =
-                Rect::from_min_size(area.min + vec2(24., 66.), vec2(area.width() - 48., 36.));
+                Rect::from_min_size(area.min + vec2(24., 86.), vec2(area.width() - 48., 44.));
             self.hitboxes.insert("search-field".into(), rect);
             if ui
                 .put(
@@ -1439,18 +1684,27 @@ impl ReaderApp {
                 self.motion.focus = 0.;
             }
         } else {
-            ui.painter().line_segment(
-                [
-                    area.min + vec2(24., 78.),
-                    pos2(area.right() - 24., area.top() + 78.),
-                ],
-                Stroke::new(0.6, muted.gamma_multiply(0.25)),
+            self.label(
+                ui.painter(),
+                area.min + vec2(24., 97.),
+                &format!("我的收藏 · {} 本", self.shelf_book_count()),
+                14.,
+                muted,
             );
-            self.label(ui.painter(), area.min + vec2(24., 93.), "书架", 17., ink);
+            let stacked = self.font_scale > 1.4 && area.width() < 520.;
+            let category_width = (80. * self.font_scale + 26.).min(area.width() - 48.);
+            let category_rect = Rect::from_min_size(
+                if stacked {
+                    area.min + vec2(24., 142.)
+                } else {
+                    pos2(area.right() - 24. - category_width, area.top() + 82.)
+                },
+                vec2(category_width, (24. * self.font_scale + 20.).max(44.)),
+            );
             if self.button(
                 ui,
                 "categories",
-                Rect::from_min_size(pos2(area.right() - 130., area.top() + 82.), vec2(106., 44.)),
+                category_rect,
                 &if self.category.is_empty() {
                     "全部分类".into()
                 } else {
@@ -1555,19 +1809,22 @@ impl ReaderApp {
             });
             return;
         }
-        let shelf_area = self.shelf_area(area);
-        // Faint drafting grid matches the reference's spatial cue.
-        let grid = muted.gamma_multiply(0.035);
-        for x in (0..=(area.width() / 32.) as usize).map(|i| area.left() + 24. + i as f32 * 32.) {
+        let layout = self.shelf_layout(area);
+        let shelf_area = layout.books;
+        let palette = crate::design::palette(self.dark);
+        let stage_color = if self.dark {
+            Color32::from_rgb(40, 43, 39)
+        } else {
+            Color32::from_rgb(235, 233, 223)
+        };
+        ui.painter().rect_filled(layout.stage, 22., stage_color);
+        if layout.side_by_side {
             ui.painter().line_segment(
-                [pos2(x, area.top() + 60.), pos2(x, shelf_area.bottom())],
-                Stroke::new(0.5, grid),
-            );
-        }
-        for y in (0..).map(|i| area.top() + 60. + i as f32 * 32.).take_while(|&y| y < shelf_area.bottom()) {
-            ui.painter().line_segment(
-                [pos2(area.left() + 24., y), pos2(area.right() - 24., y)],
-                Stroke::new(0.5, grid),
+                [
+                    pos2(layout.info.left() - 20., layout.stage.top() + 40.),
+                    pos2(layout.info.left() - 20., layout.stage.bottom() - 40.),
+                ],
+                Stroke::new(1., palette.ink.gamma_multiply(0.08)),
             );
         }
         let volumes = shelf::geometry(shelf_area, books.len(), self.motion.focus, entrance);
@@ -1600,22 +1857,15 @@ impl ReaderApp {
                 self.selected.contains(&book.id),
             );
             if is_central {
-                self.hitboxes.insert(
-                    "shelf-center".into(),
-                    Rect::from_min_max(volume.cover.point(0., 0.), volume.cover.point(1., 1.)),
-                );
+                self.hitboxes.insert("shelf-center".into(), volume.bounds());
             }
         }
         // The row is an endless shelf, so spines must dissolve into the page
         // instead of ending on a hard clip line.
         {
-            let (background, _, _) = self.colors();
-            let clear = Color32::from_rgba_unmultiplied(
-                background.r(),
-                background.g(),
-                background.b(),
-                0,
-            );
+            let background = stage_color;
+            let clear =
+                Color32::from_rgba_unmultiplied(background.r(), background.g(), background.b(), 0);
             let fade = 30.;
             let mut mesh = egui::Mesh::default();
             mesh.colored_vertex(pos2(shelf_area.left(), shelf_area.top()), background);
@@ -1637,7 +1887,7 @@ impl ReaderApp {
             Id::unique("shelf-gesture"),
             Sense::click_and_drag(),
         );
-        let pitch = shelf::lane_pitch(shelf_area);
+        let pitch = shelf::lane_pitch_for(shelf_area, books.len());
         if gesture.dragged() && books.len() > 1 {
             self.motion.drag(-ui.input(|i| i.pointer.delta().x) / pitch);
         }
@@ -1682,33 +1932,25 @@ impl ReaderApp {
         }
         let index = (self.motion.focus.round() as i32).rem_euclid(books.len() as i32) as usize;
         let book = &books[index];
-        let short_landscape = Self::detail_side_by_side(area);
-        let wide = Self::shelf_two_column(area) && self.font_scale < 1.5;
-        let info = if short_landscape {
-            pos2(shelf_area.right() + 24., area.top() + (area.height() * 0.34).max(112.))
-        } else if wide {
-            pos2(shelf_area.right() + 48., shelf_area.center().y - 70.)
-        } else {
-            pos2(area.left() + 24., shelf_area.bottom() + 34.)
-        };
-        let title_width = (area.right() - 126. - info.x).max(80.);
-        let title_size = if wide {
-            30.
-        } else if area.width() >= 700. {
-            26.
-        } else {
+        let info = layout.info.min;
+        let info_right = layout.info.right();
+        let title_width = layout.info.width();
+        let title_size = if layout.short_landscape {
             22.
+        } else if layout.side_by_side {
+            34.
+        } else {
+            26.
         } * self.font_scale;
         let mut title = egui::text::LayoutJob::simple(
             book.title.clone(),
-            FontId::proportional(title_size),
+            crate::typography::display(title_size),
             ink,
             title_width,
         );
         title.wrap.max_rows = 1;
         let title = ui.painter().layout_job(title);
-        let title_width_px = title.size().x;
-        let progress_pos = info + vec2(0., title.size().y + 6.);
+        let progress_pos = info + vec2(0., title.size().y + 10.);
         ui.painter().galley(info, title, ink);
         let has_progress = book.last_read_at.is_some();
         let pages = if has_progress {
@@ -1723,24 +1965,43 @@ impl ReaderApp {
         };
         let mut progress = egui::text::LayoutJob::simple(
             progress,
-            FontId::proportional(12. * self.font_scale),
+            FontId::proportional(14. * self.font_scale),
             muted,
-            (area.right() - 24. - info.x).max(80.),
+            (info_right - info.x).max(80.),
         );
         progress.wrap.max_rows = 1;
         let progress = ui.painter().layout_job(progress);
-        // Stay inside the visible viewport: the shelf canvas can be taller than
-        // the screen (scrolling case), and on phones the tab bar sits below it.
-        let action_y =
-            (progress_pos.y + progress.size().y + 16.).min(ui.clip_rect().bottom() - 52.);
+        // Keep the action with the title and progress when the column scrolls.
+        let action_y = progress_pos.y + progress.size().y + 25.;
+        let palette = crate::design::palette(self.dark);
+        let track = Rect::from_min_size(
+            pos2(info.x, progress_pos.y + progress.size().y + 12.),
+            vec2((info_right - info.x).min(360.), 3.),
+        );
+        ui.painter().rect_filled(track, 2., palette.line);
+        if has_progress {
+            ui.painter().rect_filled(
+                Rect::from_min_size(
+                    track.min,
+                    vec2(
+                        track.width() * (book.current_page + 1) as f32
+                            / book.page_count.max(1) as f32,
+                        3.,
+                    ),
+                ),
+                2.,
+                palette.accent,
+            );
+        }
         ui.painter().galley(progress_pos, progress, muted);
-        let open_x = if short_landscape {
-            area.right() - 68.
-        } else {
-            (info.x + title_width_px + 16.).min(area.right() - 68.)
-        };
-        let open_rect = Rect::from_min_size(pos2(open_x, info.y - 5.), vec2(44., 44.));
-        if self.selected.is_empty() && self.icon(ui, "open-book", open_rect, "open", "查看漫画详情") {
+        let detail_width = 30. * self.font_scale + 24.;
+        let action_width =
+            (84. * self.font_scale + 68.).min(layout.info.width() - detail_width - 12.);
+        let open_rect = Rect::from_min_size(
+            pos2(info.x + action_width + 12., action_y),
+            vec2(detail_width, 50.),
+        );
+        if self.selected.is_empty() && self.button(ui, "open-book", open_rect, "详情", false) {
             if let Some(volume) = volumes
                 .iter()
                 .find(|v| v.lane == self.motion.focus.round() as i32)
@@ -1748,49 +2009,65 @@ impl ReaderApp {
                 self.open_detail(book, volume, &volumes, area, now);
             }
         }
-        let action_width = (52. * self.font_scale + 36.).max(112.);
-        let action = Rect::from_min_size(pos2(info.x, action_y), vec2(action_width, 44.));
+        let action = Rect::from_min_size(pos2(info.x, action_y), vec2(action_width, 50.));
         if self.selected.is_empty()
-            && self.button(ui, "shelf-read", action, if has_progress { "继续阅读" } else { "开始阅读" }, true)
+            && self.button(
+                ui,
+                "shelf-read",
+                action,
+                if has_progress {
+                    "继续阅读"
+                } else {
+                    "开始阅读"
+                },
+                true,
+            )
         {
             self.open_reader(book);
         }
-        let pager_right = shelf_area.right();
-        let tally = format!("{:02} / {:02}", index + 1, books.len());
-        let tally = ui.painter().layout_no_wrap(tally, FontId::monospace(11.), muted);
-        let pager_left = pager_right - 88. - tally.size().x - 4.;
-        let y = if short_landscape {
-            shelf_area.bottom() - 28.
-        } else if wide {
-            shelf_area.bottom() + 8.
-        } else if action.right() + 8. > pager_left {
-            action.bottom() + 4.
+        let pager_right = if layout.short_landscape {
+            layout.books.right() - 8.
         } else {
-            action_y
+            layout.stage.right() - 16.
         };
-        if books.len() > 1 && self.icon(
-            ui,
-            "shelf-prev",
-            Rect::from_min_size(pos2(pager_left, y), vec2(44., 44.)),
-            "prev",
-            "上一本",
-        ) {
+        let tally = format!("{:02} / {:02}", index + 1, books.len());
+        let tally = ui
+            .painter()
+            .layout_no_wrap(tally, FontId::monospace(11.), muted);
+        let pager_left = pager_right - 88. - tally.size().x - 4.;
+        let y = layout.stage.top() + 12.;
+        if books.len() > 1
+            && self.icon(
+                ui,
+                "shelf-prev",
+                Rect::from_min_size(pos2(pager_left, y), vec2(44., 44.)),
+                "prev",
+                "上一本",
+            )
+        {
             self.motion
                 .select(self.motion.focus.round() - 1., now, self.reduced);
         }
         if books.len() > 1 {
-            ui.painter().galley(pos2(pager_left + 46., y + (44. - tally.size().y) / 2.), tally, muted);
+            ui.painter().galley(
+                pos2(pager_left + 46., y + (44. - tally.size().y) / 2.),
+                tally,
+                muted,
+            );
         }
-        if books.len() > 1 && self.icon(
-            ui,
-            "shelf-next",
-            Rect::from_min_size(pos2(pager_right - 44., y), vec2(44., 44.)),
-            "next",
-            "下一本",
-        ) {
+        if books.len() > 1
+            && self.icon(
+                ui,
+                "shelf-next",
+                Rect::from_min_size(pos2(pager_right - 44., y), vec2(44., 44.)),
+                "next",
+                "下一本",
+            )
+        {
             self.motion
                 .select(self.motion.focus.round() + 1., now, self.reduced);
         }
+        self.library_thumbnails(ui, layout.browse, &books, index, now);
         if !self.selected.is_empty() {
             let rect = Rect::from_min_size(
                 pos2(area.left() + 24., area.bottom() - 122.),
@@ -1840,7 +2117,136 @@ impl ReaderApp {
             }
         }
     }
-    fn open_detail(&mut self, book: &Book, volume: &shelf::Volume, volumes: &[shelf::Volume], area: Rect, now: f64) {
+    fn library_thumbnails(
+        &mut self,
+        ui: &mut Ui,
+        area: Rect,
+        books: &[Book],
+        selected: usize,
+        now: f64,
+    ) {
+        let palette = crate::design::palette(self.dark);
+        ui.painter().text(
+            area.min,
+            Align2::LEFT_TOP,
+            "藏书一览",
+            crate::typography::display(19. * self.font_scale),
+            palette.ink,
+        );
+        ui.painter().text(
+            pos2(area.right(), area.top() + 4.),
+            Align2::RIGHT_TOP,
+            format!("{} 本", books.len()),
+            FontId::proportional(12. * self.font_scale),
+            palette.muted,
+        );
+        let top = area.top() + 34. * self.font_scale;
+        let canvas = Rect::from_min_max(pos2(area.left(), top), area.max);
+        let cover_height = if area.width() >= 660. {
+            area.height() - 98. - 28. * (self.font_scale - 1.)
+        } else {
+            92.
+        };
+        let cover_width = cover_height * 118. / 166.;
+        let cell_width = cover_width + if area.width() >= 660. { 38. } else { 20. };
+        let cell_height = cover_height + 38. * self.font_scale;
+        ui.scope_builder(UiBuilder::new().max_rect(canvas), |ui| {
+            ui.set_clip_rect(ui.clip_rect().intersect(canvas));
+            ScrollArea::horizontal()
+                .id_salt("library-thumbnails")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    let total = vec2(
+                        (books.len() as f32 * cell_width).max(canvas.width()),
+                        cell_height,
+                    );
+                    let (row, _) = ui.allocate_exact_size(total, Sense::hover());
+                    for (index, book) in books.iter().enumerate() {
+                        let rect = Rect::from_min_size(
+                            row.min + vec2(index as f32 * cell_width, 0.),
+                            vec2(cell_width - 8., cell_height),
+                        );
+                        if !rect.intersects(ui.clip_rect()) {
+                            continue;
+                        }
+                        let response = ui.interact(
+                            rect,
+                            Id::unique(("library-thumbnail", &book.id)),
+                            Sense::click(),
+                        );
+                        response
+                            .widget_info(|| WidgetInfo::labeled(Role::Button, true, &book.title));
+                        if ui.clip_rect().contains_rect(rect) {
+                            self.hitboxes
+                                .insert(format!("shelf-thumbnail-{}", book.id), rect);
+                        }
+                        let cover = Rect::from_min_size(
+                            rect.min + vec2(4., 3.),
+                            vec2(cover_width, cover_height),
+                        );
+                        if index == selected || response.hovered() {
+                            ui.painter()
+                                .rect_filled(cover.expand(4.), 9., palette.accent_soft);
+                            ui.painter().rect_stroke(
+                                cover.expand(4.),
+                                9.,
+                                Stroke::new(1., palette.accent),
+                                StrokeKind::Inside,
+                            );
+                        }
+                        let cover_id = self.cover_id(&book.id);
+                        self.ask_cover(&cover_id);
+                        if let Some(texture) = self.covers.get(&cover_id) {
+                            shelf::paint_art(
+                                ui.painter(),
+                                Plane::rect(cover),
+                                cover.size(),
+                                texture,
+                                palette.soft,
+                            );
+                        } else {
+                            ui.painter().rect_filled(cover, 5., palette.soft);
+                        }
+                        let mut title = egui::text::LayoutJob::simple(
+                            book.title.clone(),
+                            FontId::proportional(12. * self.font_scale),
+                            if index == selected {
+                                palette.accent
+                            } else {
+                                palette.ink
+                            },
+                            cover_width,
+                        );
+                        title.wrap.max_rows = 1;
+                        ui.painter().galley(
+                            pos2(cover.left(), cover.bottom() + 9.),
+                            ui.painter().layout_job(title),
+                            palette.ink,
+                        );
+                        if response.clicked() {
+                            let count = books.len() as i32;
+                            let current = self.motion.focus.round() as i32;
+                            let delta = (index as i32 - current).rem_euclid(count);
+                            let delta = if delta > count / 2 {
+                                delta - count
+                            } else {
+                                delta
+                            };
+                            self.motion
+                                .select((current + delta) as f32, now, self.reduced);
+                        }
+                    }
+                });
+        });
+    }
+    fn open_detail(
+        &mut self,
+        book: &Book,
+        volume: &shelf::Volume,
+        volumes: &[shelf::Volume],
+        area: Rect,
+        now: f64,
+    ) {
         self.screen = Screen::Detail(book.id.clone());
         let cover = self.cover_id(&book.id);
         if !self.reduced && self.covers.contains_key(&cover) {
@@ -1863,11 +2269,28 @@ impl ReaderApp {
         let cover_id = self.cover_id(id);
         self.ask_cover(&cover_id);
         let cover = self.detail_cover_rect(area);
-        if self.flight.is_none() && let Some(texture) = self.covers.get(&cover_id) {
-            shelf::paint_art(ui.painter(), Plane::rect(cover), cover.size(), texture, self.colors().0);
+        let palette = crate::design::palette(self.dark);
+        ui.painter()
+            .rect_filled(cover.expand2(vec2(24., 24.)), 24., palette.soft);
+        ui.painter().rect_filled(
+            cover.translate(vec2(7., 9.)).expand(2.),
+            9.,
+            palette.ink.gamma_multiply(0.08),
+        );
+        if self.flight.is_none()
+            && let Some(texture) = self.covers.get(&cover_id)
+        {
+            shelf::paint_art(
+                ui.painter(),
+                Plane::rect(cover),
+                cover.size(),
+                texture,
+                self.colors().0,
+            );
         }
         let (_, ink, muted) = self.colors();
-        let title = self.chapter(id)
+        let title = self
+            .chapter(id)
             .map(|m| m.manga_title.clone())
             .unwrap_or_else(|| book.title.clone());
         let text = if let Some(chapter) = self.chapter(id) {
@@ -1890,7 +2313,7 @@ impl ReaderApp {
         } else if Self::detail_wide(area) {
             pos2(cover.right() + 72., cover.top() + cover.height() * 0.15)
         } else {
-            pos2(area.left() + 24., cover.bottom() + 30.)
+            pos2(area.left() + 24., cover.bottom() + 44.)
         };
         if Self::detail_wide(area) {
             let body = Rect::from_min_size(
@@ -1898,35 +2321,57 @@ impl ReaderApp {
                 vec2(360., (area.bottom() - 24. - details_start.y).max(160.)),
             );
             ui.scope_builder(UiBuilder::new().max_rect(body), |ui| {
-                ScrollArea::vertical().id_salt(("detail-body", id)).show(ui, |ui| {
-                    ui.add(
-                        Label::new(RichText::new(title).size(36. * self.font_scale).color(ink)).wrap(),
-                    );
-                    ui.add_space(8.);
-                    ui.add(
-                        Label::new(RichText::new(text).size(15. * self.font_scale).color(muted)).wrap(),
-                    );
-                    ui.add_space(28.);
-                    self.detail_actions(ui, &book, id, 280., 52.);
-                });
+                ScrollArea::vertical()
+                    .id_salt(("detail-body", id))
+                    .show(ui, |ui| {
+                        ui.add(
+                            Label::new(
+                                RichText::new(title)
+                                    .font(crate::typography::display(36. * self.font_scale))
+                                    .color(ink),
+                            )
+                            .wrap(),
+                        );
+                        ui.add_space(8.);
+                        ui.add(
+                            Label::new(
+                                RichText::new(text).size(15. * self.font_scale).color(muted),
+                            )
+                            .wrap(),
+                        );
+                        ui.add_space(28.);
+                        self.detail_actions(ui, &book, id, 280., 52.);
+                    });
             });
             return;
         }
         let body = Rect::from_min_max(details_start, area.max - vec2(24., 12.));
         ui.scope_builder(UiBuilder::new().max_rect(body), |ui| {
-            ScrollArea::vertical().id_salt(("detail-body", id)).show(ui, |ui| {
-                ui.vertical_centered(|ui| {
-                    let title_size = if area.width() >= 700. { 30. } else { 24. };
-                    ui.add(
-                        Label::new(RichText::new(title).size(title_size * self.font_scale).color(ink)).wrap(),
-                    );
-                    ui.add_space(6.);
-                    ui.add(Label::new(RichText::new(text).size(13. * self.font_scale).color(muted)).wrap());
-                    ui.add_space(18.);
-                    let width = (218. * self.font_scale.sqrt()).min(ui.available_width());
-                    self.detail_actions(ui, &book, id, width, 48.);
+            ScrollArea::vertical()
+                .id_salt(("detail-body", id))
+                .show(ui, |ui| {
+                    ui.vertical_centered(|ui| {
+                        let title_size = if area.width() >= 700. { 30. } else { 24. };
+                        ui.add(
+                            Label::new(
+                                RichText::new(title)
+                                    .font(crate::typography::display(title_size * self.font_scale))
+                                    .color(ink),
+                            )
+                            .wrap(),
+                        );
+                        ui.add_space(6.);
+                        ui.add(
+                            Label::new(
+                                RichText::new(text).size(13. * self.font_scale).color(muted),
+                            )
+                            .wrap(),
+                        );
+                        ui.add_space(18.);
+                        let width = (218. * self.font_scale.sqrt()).min(ui.available_width());
+                        self.detail_actions(ui, &book, id, width, 48.);
+                    });
                 });
-            });
         });
     }
     fn detail_actions(
@@ -1966,6 +2411,31 @@ impl ReaderApp {
             }
         }
     }
+    fn reader_input_blocked(&self) -> bool {
+        self.reader_options || self.chapter_dialog.is_some() || self.error.is_some()
+    }
+    fn set_reading_mode(&mut self, mode: &str) {
+        if self.vertical == (mode == "vertical") && self.spread == (mode == "spread") {
+            return;
+        }
+        self.flush_position();
+        self.vertical = mode == "vertical";
+        self.spread = mode == "spread";
+        self.vertical_reader.reset(self.page, 0.);
+        self.zoom = 1.;
+        self.pan = Vec2::ZERO;
+        self.pending_reader_tap = None;
+        self.setting("reading-mode", mode.into());
+    }
+    fn reader_tap(&mut self, id: &str, relative: f32, step: i32) {
+        if self.vertical || self.zoom > 1. || (0.27..=0.73).contains(&relative) {
+            self.controls = !self.controls;
+        } else if relative < 0.27 {
+            self.next_page(id, if self.rtl { step } else { -step });
+        } else {
+            self.next_page(id, if self.rtl { -step } else { step });
+        }
+    }
     fn reader_ui(&mut self, ui: &mut Ui, area: Rect, id: &str, now: f64) {
         let Some(book) = self.books.iter().find(|b| b.id == id).cloned() else {
             return;
@@ -1983,23 +2453,33 @@ impl ReaderApp {
             self.ask_page(id, self.page + 1);
         }
         let content = area.shrink2(vec2(8., if self.controls { 64. } else { 0. }));
+        let input_blocked = self.reader_input_blocked();
         let gesture = ui.interact(
             content,
             Id::unique("reader-canvas"),
-            Sense::click_and_drag(),
+            if input_blocked {
+                Sense::hover()
+            } else {
+                Sense::click_and_drag()
+            },
         );
         self.hitboxes.insert("reader-canvas".into(), content);
-        let zoom = ui.input(|i| i.zoom_delta());
+        let zoom = if input_blocked {
+            1.
+        } else {
+            ui.input(|i| i.zoom_delta())
+        };
         if zoom != 1. {
             self.zoom = (self.zoom * zoom).clamp(1., 5.);
-        }
-        if gesture.double_clicked() {
-            self.zoom = if self.zoom > 1. { 1. } else { 2. };
-            self.pan = Vec2::ZERO;
+            self.pending_reader_tap = None;
+            if self.zoom == 1. {
+                self.pan = Vec2::ZERO;
+            }
         }
         if gesture.drag_started() {
             self.reader_drag = 0.;
             self.vertical_reader.stop();
+            self.pending_reader_tap = None;
         }
         if gesture.dragged() {
             self.reader_drag += ui.input(|i| i.pointer.delta().x);
@@ -2026,32 +2506,64 @@ impl ReaderApp {
                 );
             }
         }
-        if gesture.clicked() {
-            if self.vertical {
-                self.controls = !self.controls;
-            } else if let Some(pos) = gesture.interact_pointer_pos() {
-                let relative = (pos.x - content.left()) / content.width();
-                if relative < 0.27 {
-                    self.next_page(id, if self.rtl { step } else { -step });
-                } else if relative > 0.73 {
-                    self.next_page(id, if self.rtl { -step } else { step });
+        if input_blocked {
+            self.pending_reader_tap = None;
+            self.vertical_reader.stop();
+        } else {
+            // Wait for the same double-click interval as egui. Otherwise the
+            // first tap turns a page before the second can request zoom.
+            let tapped = gesture
+                .clicked()
+                .then(|| gesture.interact_pointer_pos())
+                .flatten();
+            let double_tap = tapped.is_some_and(|pos| {
+                self.pending_reader_tap.is_some_and(|(deadline, first)| {
+                    now <= deadline
+                        && first.distance(pos)
+                            <= ctx.options(|options| options.input_options.max_click_dist)
+                })
+            });
+            if double_tap {
+                self.zoom = if self.zoom > 1. { 1. } else { 2. };
+                self.pan = Vec2::ZERO;
+                self.pending_reader_tap = None;
+            }
+            if let Some((deadline, pos)) = self.pending_reader_tap {
+                if now >= deadline && !ctx.input(|i| i.pointer.primary_down()) {
+                    self.pending_reader_tap = None;
+                    self.reader_tap(id, (pos.x - content.left()) / content.width(), step);
                 } else {
-                    self.controls = !self.controls;
+                    ctx.request_repaint_after(std::time::Duration::from_secs_f64(
+                        (deadline - now).max(0.01),
+                    ));
                 }
             }
+            if !double_tap && let Some(pos) = tapped {
+                if let Some((_, first)) = self.pending_reader_tap.take() {
+                    self.reader_tap(id, (first.x - content.left()) / content.width(), step);
+                }
+                let delay = ctx.options(|options| options.input_options.max_double_click_delay);
+                self.pending_reader_tap = Some((now + delay, pos));
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64(delay));
+            }
         }
-        let next = ctx.input(|i| {
-            i.key_pressed(Key::ArrowRight)
-                || (!self.vertical && (i.key_pressed(Key::PageDown) || i.key_pressed(Key::Space)))
-        });
-        let prev = ctx.input(|i| {
-            i.key_pressed(Key::ArrowLeft) || (!self.vertical && i.key_pressed(Key::PageUp))
-        });
-        if next {
-            self.next_page(id, if self.rtl { -step } else { step });
-        }
-        if prev {
-            self.next_page(id, if self.rtl { step } else { -step });
+        if !input_blocked && !ctx.egui_wants_keyboard_input() {
+            let delta = ctx.input(|i| {
+                if !self.vertical && (i.key_pressed(Key::PageDown) || i.key_pressed(Key::Space)) {
+                    step
+                } else if !self.vertical && i.key_pressed(Key::PageUp) {
+                    -step
+                } else if i.key_pressed(Key::ArrowRight) {
+                    if self.rtl { -step } else { step }
+                } else if i.key_pressed(Key::ArrowLeft) {
+                    if self.rtl { step } else { -step }
+                } else {
+                    0
+                }
+            });
+            if delta != 0 {
+                self.next_page(id, delta);
+            }
         }
         if !matches!(&self.screen,Screen::Reader(current) if current==id) {
             return;
@@ -2098,8 +2610,12 @@ impl ReaderApp {
             let size = texture.size;
             let scale = (available.width() / size.x).min(available.height() / size.y);
             let size = size * scale * self.zoom;
+            let limit = ((size - available.size()) * 0.5).max(Vec2::ZERO);
+            self.pan.x = self.pan.x.clamp(-limit.x, limit.x);
+            self.pan.y = self.pan.y.clamp(-limit.y, limit.y);
             let center = available.center();
             let image_rect = Rect::from_center_size(center + self.pan, size);
+            self.hitboxes.insert("reader-image".into(), image_rect);
             texture.paint(&ui.painter().with_clip_rect(content), image_rect);
             self.rendered_page_nodes = 1;
             if step == 2 {
@@ -2179,8 +2695,13 @@ impl ReaderApp {
                 Color32::LIGHT_GRAY,
             );
         }
+        if !matches!(&self.screen, Screen::Reader(current) if current == id) {
+            return;
+        }
         if self.controls {
-            let (bar, ink, muted) = self.colors();
+            let palette = crate::design::palette(true);
+            let (bar, ink, muted) = (palette.surface, palette.ink, palette.muted);
+            ui.style_mut().visuals = crate::design::visuals(true);
             ui.painter().rect_filled(
                 Rect::from_min_size(area.min, vec2(area.width(), 56.)),
                 0.,
@@ -2197,16 +2718,29 @@ impl ReaderApp {
             if self.icon(
                 ui,
                 "reader-back",
-                Rect::from_min_size(area.min + vec2(8., 8.), vec2(40., 40.)),
+                Rect::from_min_size(area.min + vec2(8., 8.), vec2(44., 44.)),
                 "back",
-                if self.reader_from_shelf { "返回书架" } else { "返回详情" },
+                match (&self.reader_return, self.tab) {
+                    (Screen::Library, Tab::History) => "返回阅读足迹",
+                    (Screen::Library, Tab::Sources) => "返回书源",
+                    (Screen::Library, _) => "返回书架",
+                    _ => "返回详情",
+                },
             ) {
                 self.back(now, area);
             }
             ui.painter()
                 .with_clip_rect(Rect::from_min_max(
                     area.min + vec2(56., 0.),
-                    pos2(area.right() - 58., area.top() + 56.),
+                    pos2(
+                        area.right()
+                            - if self.chapter(id).is_some() {
+                                110.
+                            } else {
+                                58.
+                            },
+                        area.top() + 56.,
+                    ),
                 ))
                 .text(
                     area.min + vec2(56., 20.),
@@ -2219,7 +2753,7 @@ impl ReaderApp {
                 && self.icon(
                     ui,
                     "reader-chapters",
-                    Rect::from_min_size(pos2(area.right() - 50., area.top() + 8.), vec2(40., 40.)),
+                    Rect::from_min_size(pos2(area.right() - 104., area.top() + 8.), vec2(44., 44.)),
                     "chapters",
                     "已下载章节",
                 )
@@ -2228,8 +2762,19 @@ impl ReaderApp {
             }
             if self.icon(
                 ui,
+                "reader-settings",
+                Rect::from_min_size(pos2(area.right() - 52., area.top() + 8.), vec2(44., 44.)),
+                "settings",
+                "阅读设置",
+            ) {
+                self.reader_options = true;
+                self.vertical_reader.stop();
+                self.pending_reader_tap = None;
+            }
+            if self.icon(
+                ui,
                 "reader-prev",
-                Rect::from_min_size(pos2(area.left() + 10., area.bottom() - 55.), vec2(40., 40.)),
+                Rect::from_min_size(pos2(area.left() + 10., area.bottom() - 55.), vec2(44., 44.)),
                 "prev",
                 "上一页",
             ) {
@@ -2240,7 +2785,7 @@ impl ReaderApp {
                 "reader-next",
                 Rect::from_min_size(
                     pos2(area.right() - 50., area.bottom() - 55.),
-                    vec2(40., 40.),
+                    vec2(44., 44.),
                 ),
                 "next",
                 "下一页",
@@ -2287,7 +2832,12 @@ impl ReaderApp {
         now: f64,
         gesture: &Response,
     ) {
-        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+        let input_blocked = self.reader_input_blocked();
+        let scroll = if input_blocked {
+            0.
+        } else {
+            ui.input(|i| i.smooth_scroll_delta.y)
+        };
         self.vertical_reader.scroll(-scroll);
         if gesture.dragged() {
             self.vertical_reader
@@ -2297,10 +2847,16 @@ impl ReaderApp {
             self.vertical_reader
                 .release(-ui.input(|i| i.pointer.velocity().y), now, self.reduced);
         }
-        if ui.input(|i| i.key_pressed(Key::PageDown) || i.key_pressed(Key::Space)) {
+        if !input_blocked
+            && !ui.ctx().egui_wants_keyboard_input()
+            && ui.input(|i| i.key_pressed(Key::PageDown) || i.key_pressed(Key::Space))
+        {
             self.vertical_reader.scroll(content.height() * 0.85);
         }
-        if ui.input(|i| i.key_pressed(Key::PageUp)) {
+        if !input_blocked
+            && !ui.ctx().egui_wants_keyboard_input()
+            && ui.input(|i| i.key_pressed(Key::PageUp))
+        {
             self.vertical_reader.scroll(-content.height() * 0.85);
         }
         if self.vertical_reader.tick(now) {
@@ -2317,8 +2873,12 @@ impl ReaderApp {
             .filter(|((key, _), _)| key == id)
             .map(|((_, page), image)| (*page, image.size.y / image.size.x * width))
             .collect();
+        let next_chapter = self.adjacent_chapter(id, 1);
+        let footer = if next_chapter.is_some() { 68. } else { 0. };
         self.vertical_reader
-            .settle(count, content.height(), |page| heights.get(&page).copied());
+            .settle(count, content.height() - footer, |page| {
+                heights.get(&page).copied()
+            });
         if self.page != self.vertical_reader.page {
             self.page = self.vertical_reader.page;
             self.prefetch_blocked.clear();
@@ -2386,17 +2946,31 @@ impl ReaderApp {
             self.record_page(id, self.page);
             self.last_position_save = now;
         }
+        if let Some(mut next) = next_chapter
+            && let Some(last) = self
+                .hitboxes
+                .get(&format!("vertical-page-{}", count.saturating_sub(1)))
+                .copied()
+        {
+            let button = Rect::from_min_size(
+                pos2(
+                    content.center().x - (content.width() - 24.).min(420.) / 2.,
+                    last.bottom() + 12.,
+                ),
+                vec2((content.width() - 24.).min(420.), 48.),
+            );
+            if content.contains_rect(button)
+                && self.button(ui, "reader-next-chapter", button, "下一章", true)
+            {
+                next.current_page = 0;
+                next.page_fraction = 0.;
+                self.open_reader(&next);
+            }
+        }
     }
     fn history_ui(&mut self, ui: &mut Ui, area: Rect) {
-        let (_, ink, muted) = self.colors();
-        let column = Self::page_column(area, 100. + 36. * self.font_scale, 88.);
-        self.label(
-            ui.painter(),
-            pos2(column.left(), area.top() + 80.),
-            "阅读历史",
-            23.,
-            ink,
-        );
+        let palette = crate::design::palette(self.dark);
+        let mut column = Self::page_column(area, 112. + 20. * (self.font_scale - 1.), 88.);
         let mut books: Vec<_> = self
             .books
             .iter()
@@ -2404,181 +2978,357 @@ impl ReaderApp {
             .cloned()
             .collect();
         books.sort_by_key(|b| std::cmp::Reverse(b.last_read_at));
+        let introduction = ui.painter().layout(
+            if books.is_empty() {
+                "下一次打开，从离开的那一页继续。"
+            } else {
+                "最近读过的故事，都在这里。"
+            }
+            .into(),
+            FontId::proportional(14. * self.font_scale),
+            palette.muted,
+            column.width(),
+        );
+        column.min.y = area.top() + 82. + introduction.size().y + 20.;
+        ui.painter().galley(
+            pos2(column.left(), area.top() + 82.),
+            introduction,
+            palette.muted,
+        );
         ui.scope_builder(UiBuilder::new().max_rect(column), |ui| {
-            ScrollArea::vertical().show(ui, |ui| {
-                if books.is_empty() {
-                    ui.label("还没有阅读记录。");
-                }
-                for book in books {
-                    let (rect, _) =
-                        ui.allocate_exact_size(vec2(ui.available_width(), 72.), Sense::hover());
-                    let mut title = egui::text::LayoutJob::simple(
-                        self.reading_title(&book),
-                        FontId::proportional(16. * self.font_scale),
-                        ink,
-                        (rect.width() - 94.).max(80.),
-                    );
-                    title.wrap.max_rows = 1;
-                    ui.painter().galley(
-                        rect.min + vec2(4., 8.),
-                        ui.painter().layout_job(title),
-                        ink,
-                    );
-                    self.label(
-                        ui.painter(),
-                        rect.min + vec2(4., 35.),
-                        &format!("第 {} / {} 页", book.current_page + 1, book.page_count),
-                        12.,
-                        muted,
-                    );
-                    if self.button(
-                        ui,
-                        &format!("history-{}", book.id),
-                        Rect::from_min_size(
-                            pos2(rect.right() - 80., rect.top() + 12.),
-                            vec2(76., 44.),
-                        ),
-                        "继续",
-                        false,
-                    ) {
-                        self.open_reader(&book);
+            ScrollArea::vertical()
+                .id_salt("reading-history")
+                .show(ui, |ui| {
+                    if books.is_empty() {
+                        crate::design::surface(ui).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.add_space(24.);
+                            crate::design::section(ui, "还没有阅读记录");
+                            ui.label("打开书架上的一本漫画，读到哪里就会记到哪里。");
+                            ui.add_space(16.);
+                            if ui
+                                .add(crate::design::primary("去书架看看", self.dark))
+                                .clicked()
+                            {
+                                self.tab = Tab::Library;
+                            }
+                            ui.add_space(16.);
+                        });
                     }
-                }
-            });
+                    for book in books {
+                        let narrow = ui.available_width() < 380. || self.font_scale > 1.4;
+                        let height = if narrow {
+                            156. * self.font_scale.sqrt()
+                        } else {
+                            116.
+                        };
+                        let (rect, _) = ui.allocate_exact_size(
+                            vec2(ui.available_width(), height),
+                            Sense::hover(),
+                        );
+                        if !ui.is_rect_visible(rect) {
+                            continue;
+                        }
+                        let cover_id = self.cover_id(&book.id);
+                        self.ask_cover(&cover_id);
+                        ui.painter().rect_filled(rect, 18., palette.surface);
+                        let cover = Rect::from_min_size(rect.min + vec2(14., 14.), vec2(58., 82.));
+                        if let Some(texture) = self.covers.get(&cover_id) {
+                            shelf::paint_art(
+                                ui.painter(),
+                                Plane::rect(cover),
+                                cover.size(),
+                                texture,
+                                palette.soft,
+                            );
+                        } else {
+                            ui.painter().rect_filled(cover, 7., palette.soft);
+                        }
+                        let text_pos = rect.min + vec2(88., 16.);
+                        let mut title = egui::text::LayoutJob::simple(
+                            self.reading_title(&book),
+                            FontId::proportional(17. * self.font_scale),
+                            palette.ink,
+                            (rect.width() - if narrow { 104. } else { 210. }).max(60.),
+                        );
+                        title.wrap.max_rows = 1;
+                        ui.painter()
+                            .galley(text_pos, ui.painter().layout_job(title), palette.ink);
+                        self.label(
+                            ui.painter(),
+                            text_pos + vec2(0., 24. * self.font_scale + 4.),
+                            &format!("第 {} / {} 页", book.current_page + 1, book.page_count),
+                            13.,
+                            palette.muted,
+                        );
+                        let track = Rect::from_min_size(
+                            pos2(text_pos.x, cover.bottom() - 5.),
+                            vec2(
+                                (rect.right() - text_pos.x - if narrow { 16. } else { 120. })
+                                    .max(20.),
+                                3.,
+                            ),
+                        );
+                        if self.font_scale <= 1.4 {
+                            ui.painter().rect_filled(track, 2., palette.line);
+                            ui.painter().rect_filled(
+                                Rect::from_min_size(
+                                    track.min,
+                                    vec2(
+                                        track.width() * (book.current_page + 1) as f32
+                                            / book.page_count.max(1) as f32,
+                                        3.,
+                                    ),
+                                ),
+                                2.,
+                                palette.accent,
+                            );
+                        }
+                        if self.button(
+                            ui,
+                            &format!("history-{}", book.id),
+                            Rect::from_min_size(
+                                pos2(
+                                    rect.right() - 104.,
+                                    if narrow {
+                                        rect.bottom() - 58.
+                                    } else {
+                                        rect.center().y - 24.
+                                    },
+                                ),
+                                vec2(88., 48.),
+                            ),
+                            "继续",
+                            true,
+                        ) {
+                            self.open_reader(&book);
+                        }
+                    }
+                });
         });
     }
     fn settings_ui(&mut self, ui: &mut Ui, area: Rect) {
-        let (_, ink, _) = self.colors();
-        let column = Self::page_column(area, 100. + 36. * self.font_scale, 88.);
-        self.label(
-            ui.painter(),
-            pos2(column.left(), area.top() + 80.),
-            "设置",
-            23.,
-            ink,
-        );
+        let palette = crate::design::palette(self.dark);
+        let column = Self::page_column(area, 92., 88.);
         ui.scope_builder(UiBuilder::new().max_rect(column), |ui| {
-            ScrollArea::vertical().show(ui, |ui| {
-                ui.style_mut().wrap_mode = Some(TextWrapMode::Wrap);
-                ui.spacing_mut().slider_width = (ui.available_width() - 12.).clamp(80., 280.);
-                ui.heading("外观与阅读");
-                ui.label("主题");
-                ui.horizontal_wrapped(|ui| {
-                    for (key, name) in [("system", "跟随系统"), ("light", "浅色"), ("dark", "深色")]
-                    {
-                        if ui
-                            .selectable_value(&mut self.theme, key.into(), name)
-                            .changed()
-                        {
-                            self.setting("theme", self.theme.clone());
+            ScrollArea::vertical()
+                .id_salt("reader-settings")
+                .show(ui, |ui| {
+                    ui.style_mut().wrap_mode = Some(TextWrapMode::Wrap);
+                    Frame::new()
+                        .inner_margin(Margin::symmetric(2, 12))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            crate::design::section(ui, "外观");
+                            ui.label(RichText::new("主题").color(palette.muted).small());
+                            let choice_width = if ui.available_width() < 330. {
+                                ui.available_width()
+                            } else {
+                                ((ui.available_width() - 20.) / 3.).floor() - 1.
+                            };
+                            ui.horizontal_wrapped(|ui| {
+                                for (key, name) in
+                                    [("system", "跟随系统"), ("light", "浅色"), ("dark", "深色")]
+                                {
+                                    if crate::design::theme_choice(
+                                        ui,
+                                        name,
+                                        key,
+                                        self.theme == key,
+                                        choice_width,
+                                    ) {
+                                        self.theme = key.into();
+                                        self.setting("theme", self.theme.clone());
+                                    }
+                                }
+                            });
+                            ui.add_space(22.);
+                            let mut percent = (self.font_scale * 100.).round();
+                            ui.label(format!("文字大小 · {percent:.0}%"));
+                            ui.spacing_mut().slider_width = (ui.available_width() - 12.).max(80.);
+                            if ui
+                                .add(
+                                    Slider::new(&mut percent, 100. ..=200.)
+                                        .show_value(false)
+                                        .step_by(5.),
+                                )
+                                .changed()
+                            {
+                                self.font_scale = percent / 100.;
+                                self.setting("font-scale", self.font_scale.to_string());
+                            }
+                            ui.add_space(12.);
+                            if crate::design::toggle(
+                                ui,
+                                &mut self.reduced,
+                                "减少动态效果",
+                                "切书和打开封面时，使用更轻的过渡",
+                            ) {
+                                self.setting("reduce-motion", self.reduced.to_string());
+                            }
+                        });
+                    ui.add_space(10.);
+                    ui.separator();
+                    Frame::new()
+                        .inner_margin(Margin::symmetric(2, 16))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            crate::design::section(ui, "阅读");
+                            let mut mode = if self.vertical {
+                                "vertical"
+                            } else if self.spread {
+                                "spread"
+                            } else {
+                                "paged"
+                            };
+                            let mode_width = if ui.available_width() < 370. {
+                                ((ui.available_width() - 10.) / 2.).floor() - 1.
+                            } else {
+                                ((ui.available_width() - 20.) / 3.).floor() - 1.
+                            };
+                            ui.horizontal_wrapped(|ui| {
+                                for (key, name) in [
+                                    ("paged", "单页"),
+                                    ("spread", "平板双页"),
+                                    ("vertical", "上下滚动"),
+                                ] {
+                                    if ui
+                                        .add(
+                                            Button::new(name)
+                                                .selected(mode == key)
+                                                .min_size(vec2(mode_width, 48.))
+                                                .wrap(),
+                                        )
+                                        .clicked()
+                                    {
+                                        mode = key;
+                                    }
+                                }
+                            });
+                            if self.vertical != (mode == "vertical")
+                                || self.spread != (mode == "spread")
+                            {
+                                self.set_reading_mode(mode);
+                            }
+                            ui.add_space(14.);
+                            if crate::design::toggle(
+                                ui,
+                                &mut self.rtl,
+                                "从右向左翻页",
+                                "适合日式漫画的阅读顺序",
+                            ) {
+                                self.setting(
+                                    "reading-direction",
+                                    if self.rtl { "rtl" } else { "ltr" }.into(),
+                                );
+                            }
+                            ui.separator();
+                            ui.add_space(6.);
+                            if crate::design::toggle(
+                                ui,
+                                &mut self.private,
+                                "私密阅读",
+                                "不保存新的阅读进度和历史",
+                            ) {
+                                self.setting("private", self.private.to_string());
+                            }
+                        });
+                    ui.add_space(10.);
+                    ui.separator();
+                    Frame::new()
+                        .inner_margin(Margin::symmetric(2, 16))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            crate::design::section(ui, "书库与备份");
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.button("选择漫画文件").clicked() {
+                                    self.pick_import();
+                                }
+                                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                                if ui.button("选择图片文件夹").clicked() {
+                                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                        self.import_files(vec![path]);
+                                    }
+                                }
+                            });
+                            ui.add_space(6.);
+                            ui.label(
+                                RichText::new("支持 CBZ / ZIP、CBT / TAR、CBR / RAR")
+                                    .small()
+                                    .color(palette.muted),
+                            );
+                            ui.add_space(12.);
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.button("创建完整备份").clicked() {
+                                    self.send(Command::Backup(self.backup_path.clone().into()));
+                                }
+                                if ui.button("恢复备份").clicked() {
+                                    self.pick_restore();
+                                }
+                            });
+                            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                            {
+                                ui.add_space(8.);
+                                CollapsingHeader::new("文件位置").show(ui, |ui| {
+                                    ui.add(
+                                        TextEdit::singleline(&mut self.import_text)
+                                            .desired_width(ui.available_width())
+                                            .hint_text("漫画文件或文件夹路径"),
+                                    );
+                                    if ui.button("导入上述路径").clicked() {
+                                        self.import_files(vec![PathBuf::from(
+                                            self.import_text.trim(),
+                                        )]);
+                                    }
+                                    ui.label("备份保存到");
+                                    ui.add(
+                                        TextEdit::singleline(&mut self.backup_path)
+                                            .desired_width(ui.available_width()),
+                                    );
+                                });
+                            }
+                        });
+                    ui.add_space(10.);
+                    ui.separator();
+                    Frame::new()
+                        .inner_margin(Margin::symmetric(2, 16))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            CollapsingHeader::new(RichText::new("设备间同步").strong()).show(
+                                ui,
+                                |ui| {
+                                    self.sync.ui(ui);
+                                },
+                            );
+                        });
+                    ui.add_space(24.);
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            RichText::new(concat!("页间  ", env!("CARGO_PKG_VERSION")))
+                                .color(palette.muted),
+                        );
+                        ui.small("书架设计源自 Wenku8");
+                        if ui.button("查看开源许可").clicked() {
+                            self.error = Some(format!(
+                                "Wenku8 Flutter v0.5.6\n\n{}\n\nGPL-3.0\n\n{}\n\n阅读字体\n\n{}\n\nNoto Sans SC · SIL OFL 1.1\n\n{}\n\nNoto Serif SC · SIL OFL 1.1\n\n{}",
+                                include_str!("../licenses/Wenku8-NOTICE"),
+                                include_str!("../licenses/Wenku8-GPL-3.0.txt"),
+                                include_str!("../licenses/ReadingFonts.md"),
+                                include_str!("../licenses/ReadingSans-OFL.txt"),
+                                include_str!("../licenses/ReadingSerif-OFL.txt")
+                            ));
                         }
-                    }
+                    });
                 });
-                if ui.checkbox(&mut self.reduced, "减少动态效果").changed() {
-                    self.setting("reduce-motion", self.reduced.to_string());
-                }
-                if ui
-                    .checkbox(&mut self.private, "私密阅读：不保存新进度和历史")
-                    .changed()
-                {
-                    self.setting("private", self.private.to_string());
-                }
-                if ui.checkbox(&mut self.rtl, "从右向左翻页").changed() {
-                    self.setting(
-                        "reading-direction",
-                        if self.rtl { "rtl" } else { "ltr" }.into(),
-                    );
-                }
-                let mut mode = if self.vertical {
-                    "vertical"
-                } else if self.spread {
-                    "spread"
-                } else {
-                    "paged"
-                };
-                ui.label("阅读方式");
-                ui.horizontal_wrapped(|ui| {
-                    ui.selectable_value(&mut mode, "paged", "单页");
-                    ui.selectable_value(&mut mode, "spread", "平板双页");
-                    ui.selectable_value(&mut mode, "vertical", "上下滚动");
-                });
-                if self.vertical != (mode == "vertical") || self.spread != (mode == "spread") {
-                    self.vertical = mode == "vertical";
-                    self.spread = mode == "spread";
-                    self.setting("reading-mode", mode.into());
-                }
-                let mut percent = (self.font_scale * 100.).round();
-                ui.label(format!("文字大小 · {percent:.0}%"));
-                if ui.add(Slider::new(&mut percent, 100. ..=200.).show_value(false).step_by(5.)).changed() {
-                    self.font_scale = percent / 100.;
-                    self.setting("font-scale", self.font_scale.to_string());
-                }
-                ui.add_space(24.);
-                ui.heading("导入与备份");
-                ui.label("支持 CBZ / ZIP、CBT / TAR、CBR / RAR 和图片文件夹。");
-                if ui.button("选择漫画文件").clicked() {
-                    self.pick_import();
-                }
-                #[cfg(not(any(target_os = "android", target_os = "ios")))] {
-                    if ui.button("选择图片文件夹").clicked() {
-                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                            self.import_files(vec![path]);
-                        }
-                    }
-                    ui.add_space(8.);
-                    ui.add(TextEdit::singleline(&mut self.import_text)
-                        .desired_width(ui.available_width()).hint_text("漫画文件或文件夹路径"));
-                    if ui.button("导入上述路径").clicked() {
-                        self.import_files(vec![PathBuf::from(self.import_text.trim())]);
-                    }
-                }
-                ui.add_space(16.);
-                #[cfg(not(any(target_os = "android", target_os = "ios")))] {
-                    ui.label("备份文件");
-                    ui.add(TextEdit::singleline(&mut self.backup_path).desired_width(ui.available_width()));
-                }
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("创建完整备份").clicked() {
-                        self.send(Command::Backup(self.backup_path.clone().into()));
-                    }
-                    if ui.button("恢复备份").clicked() {
-                        self.pick_restore();
-                    }
-                });
-                ui.add_space(24.);
-                self.sync.ui(ui);
-                ui.add_space(24.);
-                ui.heading("关于页间");
-                ui.label("书架设计改编自 Wenku8 Flutter v0.5.6");
-                ui.label(concat!(
-                    "页间 ",
-                    env!("CARGO_PKG_VERSION"),
-                    " · Rust · egui / wgpu · GPL-3.0"
-                ));
-                if ui.button("查看开源许可").clicked() {
-                    self.error = Some(format!(
-                        "Wenku8 Flutter v0.5.6\n\n{}\n\nGPL-3.0\n\n{}",
-                        include_str!("../licenses/Wenku8-NOTICE"),
-                        include_str!("../licenses/Wenku8-GPL-3.0.txt")
-                    ));
-                }
-            });
         });
     }
     fn sources_ui(&mut self, ui: &mut Ui, area: Rect) {
-        let (_, ink, _) = self.colors();
-        let mut column = Self::page_column(area, 100. + 36. * self.font_scale, 88.);
-        let width=(area.width()-48.).min(1040.);
-        column.min.x=area.center().x-width/2.;
-        column.max.x=area.center().x+width/2.;
-        self.label(
-            ui.painter(),
-            pos2(column.left(), area.top() + 80.),
-            "书源",
-            23.,
-            ink,
-        );
+        let mut column = Self::page_column(area, 88., 88.);
+        let width = (area.width() - 48.).min(1040.);
+        column.min.x = area.center().x - width / 2.;
+        column.max.x = area.center().x + width / 2.;
         ui.scope_builder(UiBuilder::new().max_rect(column), |ui| {
+            ui.style_mut().wrap_mode = Some(TextWrapMode::Wrap);
             self.sources.ui(ui);
         });
     }
@@ -2613,79 +3363,164 @@ impl ReaderApp {
         }
     }
     fn dialogs(&mut self, ctx: &Context) {
+        if self.reader_options {
+            let response = Modal::new(Id::unique("reader-options"))
+                .frame(
+                    Frame::popup(&ctx.style_of(Theme::Dark))
+                        .fill(crate::design::palette(true).surface)
+                        .inner_margin(18)
+                        .corner_radius(16),
+                )
+                .show(ctx, |ui| {
+                    ui.set_width((ctx.content_rect().width() - 56.).clamp(200., 440.));
+                    ui.set_max_width((ctx.content_rect().width() - 56.).clamp(200., 440.));
+                    ui.style_mut().visuals = crate::design::visuals(true);
+                    ui.horizontal(|ui| {
+                        ui.heading("阅读设置");
+                    });
+                    let height = (ctx.content_rect().height() - 180.).max(120.);
+                    ScrollArea::vertical().max_height(height).show(ui, |ui| {
+                        ui.label("阅读方式");
+                        let mode = if self.vertical {
+                            "vertical"
+                        } else if self.spread {
+                            "spread"
+                        } else {
+                            "paged"
+                        };
+                        for (key, name) in [
+                            ("paged", "单页"),
+                            ("spread", "平板双页"),
+                            ("vertical", "上下滚动"),
+                        ] {
+                            let response = ui.add_sized(
+                                [ui.available_width(), 48.],
+                                Button::new(name).selected(mode == key).wrap(),
+                            );
+                            self.hitboxes
+                                .insert(format!("reader-mode-{key}"), response.rect);
+                            if response.clicked() {
+                                self.set_reading_mode(key);
+                            }
+                        }
+                        ui.add_space(8.);
+                        let direction = ui.add_sized(
+                            [ui.available_width(), 48.],
+                            Button::new(if self.rtl {
+                                "翻页方向：从右向左"
+                            } else {
+                                "翻页方向：从左向右"
+                            })
+                            .wrap(),
+                        );
+                        self.hitboxes
+                            .insert("reader-direction".into(), direction.rect);
+                        if direction.clicked() {
+                            self.rtl = !self.rtl;
+                            self.setting(
+                                "reading-direction",
+                                if self.rtl { "rtl" } else { "ltr" }.into(),
+                            );
+                        }
+                        let reset = ui.add_sized(
+                            [ui.available_width(), 48.],
+                            Button::new("恢复原始大小").wrap(),
+                        );
+                        self.hitboxes.insert("reader-reset-zoom".into(), reset.rect);
+                        if reset.clicked() {
+                            self.zoom = 1.;
+                            self.pan = Vec2::ZERO;
+                        }
+                    });
+                    ui.add_space(8.);
+                    let close = ui.add_sized(
+                        [ui.available_width(), 48.],
+                        crate::design::primary("继续阅读", true),
+                    );
+                    self.hitboxes
+                        .insert("reader-options-close".into(), close.rect);
+                    if close.clicked() {
+                        self.reader_options = false;
+                    }
+                });
+            if response.should_close() {
+                self.reader_options = false;
+            }
+        }
         if let Some(id) = self.chapter_dialog.clone() {
-            let title = self.chapter(&id)
+            let title = self
+                .chapter(&id)
                 .map(|m| m.manga_title.clone())
                 .unwrap_or_else(|| "已下载章节".into());
             let chapters = self.chapters_for(&id);
-            Window::new(title)
-                .id(Id::unique("chapter-picker"))
-                .collapsible(false)
-                .resizable(false)
-                .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
-                .max_width(460.)
-                .show(ctx, |ui| {
-                    ScrollArea::vertical().max_height(380.).show(ui, |ui| {
-                        for book in chapters {
-                            let name = self.chapter(&book.id)
-                                .map(|m| m.chapter_title.clone())
-                                .unwrap_or_else(|| book.title.clone());
-                            let label = format!(
-                                "{}{}\n第 {} / {} 页",
-                                if book.id == id {
-                                    "正在阅读 · "
-                                } else {
-                                    ""
-                                },
-                                name,
-                                book.current_page + 1,
-                                book.page_count
-                            );
-                            let response = ui.add_sized(
-                                [ui.available_width().min(420.).max(250.), 58.],
-                                Button::new(label).wrap(),
-                            );
-                            self.hitboxes
-                                .insert(format!("chapter-{}", book.id), response.rect);
-                            if response.clicked() {
-                                self.open_reader(&book);
-                            }
+            let response = Modal::new(Id::unique("chapter-picker")).show(ctx, |ui| {
+                ui.set_width((ctx.content_rect().width() - 56.).clamp(200., 460.));
+                ui.heading(title);
+                ScrollArea::vertical().max_height(380.).show(ui, |ui| {
+                    for book in chapters {
+                        let name = self
+                            .chapter(&book.id)
+                            .map(|m| m.chapter_title.clone())
+                            .unwrap_or_else(|| book.title.clone());
+                        let label = format!(
+                            "{}{}\n第 {} / {} 页",
+                            if book.id == id {
+                                "正在阅读 · "
+                            } else {
+                                ""
+                            },
+                            name,
+                            book.current_page + 1,
+                            book.page_count
+                        );
+                        let response = ui.add_sized(
+                            [ui.available_width(), 58. * self.font_scale.sqrt()],
+                            Button::new(label).wrap(),
+                        );
+                        self.hitboxes
+                            .insert(format!("chapter-{}", book.id), response.rect);
+                        if response.clicked() {
+                            self.open_reader(&book);
                         }
-                    });
-                    if ui.button("关闭").clicked() {
-                        self.chapter_dialog = None;
                     }
                 });
+                if ui.button("关闭").clicked() {
+                    self.chapter_dialog = None;
+                }
+            });
+            if response.should_close() {
+                self.chapter_dialog = None;
+            }
         }
         if let Some(text) = self.error.clone() {
-            Window::new("提示")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
-                .max_width(520.)
-                .show(ctx, |ui| {
-                    ScrollArea::vertical().max_height(300.).show(ui, |ui| {
-                        ui.label(&text);
-                    });
-                    ui.horizontal(|ui| {
-                        if let Some((id, page, fraction, private)) = self.failed_position.clone() {
-                            if ui.button("重试保存阅读位置").clicked() {
-                                self.send(Command::Progress {
-                                    id,
-                                    page,
-                                    fraction,
-                                    private,
-                                });
-                            }
-                        }
-                        if ui.button("复制内容").clicked() {
-                            ctx.copy_text(text.clone());
-                        }
-                        if ui.button("关闭").clicked() {
-                            self.error = None;
-                        }
-                    });
+            let response = Modal::new(Id::unique("reader-notice")).show(ctx, |ui| {
+                ui.set_width((ctx.content_rect().width() - 56.).clamp(200., 520.));
+                ui.heading("提示");
+                ScrollArea::vertical().max_height(300.).show(ui, |ui| {
+                    ui.label(&text);
                 });
+                ui.horizontal_wrapped(|ui| {
+                    if let Some((id, page, fraction, private)) = self.failed_position.clone() {
+                        if ui.button("重试保存阅读位置").clicked() {
+                            self.send(Command::Progress {
+                                id,
+                                page,
+                                fraction,
+                                private,
+                            });
+                        }
+                    }
+                    if ui.button("复制内容").clicked() {
+                        ctx.copy_text(text.clone());
+                    }
+                    if ui.button("关闭").clicked() {
+                        self.error = None;
+                    }
+                });
+            });
+            if response.should_close() {
+                self.error = None;
+            }
         }
         if self.confirm_remove {
             Window::new("移出书架")
@@ -2818,20 +3653,68 @@ mod tests {
         let input = RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(834., 1210.))),
             safe_area_insets: Some(SafeAreaInsets(egui::epaint::MarginF32 {
-                top: 24., bottom: 25., left: 0., right: 0.,
+                top: 24.,
+                bottom: 25.,
+                left: 0.,
+                right: 0.,
             })),
             ..Default::default()
         };
-        ctx.run_ui(input, |ui| app.draw(ui)).drop_without_applying_deltas();
+        ctx.run_ui(input, |ui| app.draw(ui))
+            .drop_without_applying_deltas();
         let nav = app.hitboxes["nav-library"];
-        assert!(nav.bottom() <= 1185., "home indicator overlaps navigation: {nav:?}");
-        assert!(nav.bottom() >= 1170., "safe inset was deducted twice: {nav:?}");
+        assert!(
+            nav.bottom() <= 1185.,
+            "home indicator overlaps navigation: {nav:?}"
+        );
+        assert!(
+            nav.bottom() >= 1170.,
+            "safe inset was deducted twice: {nav:?}"
+        );
         assert!(nav.height() >= 44.);
+    }
+    #[test]
+    fn cover_cache_keeps_visible_books_and_evicts_old_entries() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = Context::default();
+        let mut app = ReaderApp::new(root.path().into(), ctx.clone());
+        for index in 0..80 {
+            let id = format!("book-{index}");
+            app.covers.insert(id.clone(), ctx.load_texture(
+                id.clone(), ColorImage::filled([2, 2], Color32::WHITE), TextureOptions::LINEAR,
+            ));
+            app.cover_usage.insert(id, index);
+        }
+        app.visible_covers.insert("book-0".into());
+        app.trim_covers();
+        assert_eq!(app.covers.len(), 48);
+        assert!(app.covers.contains_key("book-0"));
+        assert!(app.covers.contains_key("book-79"));
+        assert!(!app.covers.contains_key("book-1"));
+    }
+    #[test]
+    fn history_only_requests_covers_for_visible_rows() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = Context::default();
+        crate::configure_fonts(&ctx);
+        let mut app = ReaderApp::new(root.path().into(), ctx.clone());
+        app.books = (0..500).map(|index| {
+            let mut book = book(&format!("book-{index}"));
+            book.last_read_at = Some(index);
+            book
+        }).collect();
+        ctx.run_ui(RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(390., 844.))),
+            ..Default::default()
+        }, |ui| app.history_ui(ui, ui.max_rect())).drop_without_applying_deltas();
+        assert!(!app.cover_pending.is_empty());
+        assert!(app.cover_pending.len() <= 6, "hidden history rows requested {} covers", app.cover_pending.len());
     }
     #[test]
     fn returning_closes_dialog_before_leaving_the_reader() {
         let root = tempfile::tempdir().unwrap();
         let mut app = ReaderApp::new(root.path().into(), Context::default());
+        app.reader_return = Screen::Detail("book".into());
         app.screen = Screen::Reader("book".into());
         app.error = Some("page decode failed".into());
         let area = Rect::from_min_size(Pos2::ZERO, vec2(390., 844.));
@@ -2842,7 +3725,11 @@ mod tests {
         app.request_back(2., area, true);
         assert!(!app.confirm_remove);
         assert_eq!(app.screen_name(), "reader");
+        app.reader_options = true;
         app.request_back(3., area, true);
+        assert!(!app.reader_options);
+        assert_eq!(app.screen_name(), "reader");
+        app.request_back(4., area, true);
         assert_eq!(app.screen_name(), "detail");
     }
     #[test]
@@ -2902,7 +3789,11 @@ mod tests {
         assert!(app.adjacent_chapter("extra", 1).is_none());
         app.books.swap(0, 2);
         assert_eq!(app.visible_books()[0].id, "one");
-        app.books.iter_mut().find(|b| b.id == "extra").unwrap().last_read_at = Some(123);
+        app.books
+            .iter_mut()
+            .find(|b| b.id == "extra")
+            .unwrap()
+            .last_read_at = Some(123);
         assert_eq!(app.visible_books()[0].id, "extra");
         app.selected.insert("two".into());
         let selected = app.selected_books();

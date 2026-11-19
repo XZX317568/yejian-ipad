@@ -2,7 +2,9 @@
 
 ## Rust 客户端（当前迁移入口）
 
-本轮交付在 `artifacts/rust/v0.1.1/delivery/`。Android 选 `Yejian-0.1.1-rust-arm64-debug.apk`，Windows 双击 `打开页间.cmd`。启动器使用同目录的 `data/`。从 Windows 0.1.0 迁入书库时，先在旧版设置中创建完整备份，再到新版恢复。
+2026-11-20第二版界面预览在 `artifacts/rust/ui-redesign-v2-20261120/windows/`，双击 `打开新版预览.cmd` 可直接体验带原创样书的新界面，数据存于独立的 `preview-data/`。`打开页间.cmd` 使用旁边的 `data/`，供导入自己的漫画或恢复备份。第一轮预览保留在 `ui-redesign-20261120/`。
+
+既有0.1.1交付在 `artifacts/rust/v0.1.1/delivery/`，Android包为 `Yejian-0.1.1-rust-arm64-debug.apk`。本轮仅生成Windows界面预览，未更新移动端安装包。从旧Windows版迁入书库时，先在旧版设置中创建完整备份，再到新版恢复。
 
 ```powershell
 cd D:\Documents\aidoku\rust-reader
@@ -16,7 +18,18 @@ cargo run --locked -j 1 --features acceptance --bin acceptance -- ..\artifacts\r
 cargo test --locked --workspace -j 1 -- --test-threads=1
 ```
 
-Windows 可执行文件单独构建，`cargo build --locked -j 1 --bin yejian` 生成 `target/debug/yejian.exe`。动画与布局取自生产 UI，最新录制在 `artifacts/rust/v0.1.1/shelf-motion.webm`。
+Windows 可执行文件单独构建，`cargo build --locked -j 1 --bin yejian` 生成 `target/debug/yejian.exe`。动画与布局取自生产 UI，第二轮录制在 `artifacts/rust/ui-redesign-v2-20261120/书架开合.mp4`，早期版本保留在各自的交付目录。
+
+### 界面更新的定向验收
+
+```powershell
+cd D:\Documents\aidoku\rust-reader
+$env:YEJIAN_DESIGN_ONLY='1'
+cargo run --locked -j 1 --features acceptance --bin acceptance -- ..\artifacts\rust\ui-redesign-v2-20261120
+Remove-Item Env:YEJIAN_DESIGN_ONLY
+```
+
+该入口输出16张实际GPU截图与 `design-acceptance.json`，覆盖手机、iPad横竖屏、深色、320pt和1194pt的200%字号。真实点击缩略封面并验证阅读的是同一本书，再检查详情、返回、历史续读、主题与WASM筛选；使用原始文字边界及实际裁剪区域检查可见性。书架几何另有边界连续性单测。完整回归、书源筛选和iPad矩阵使用既有入口，输出见该目录下 `regression/`、`filters/`、`ipad/`。`前后对比.png` 与 `界面预览.png` 仅排版实际截图，`书架开合.mp4` 为本轮160帧录制。
 
 ### iPad 布局检查与模拟器验收
 
