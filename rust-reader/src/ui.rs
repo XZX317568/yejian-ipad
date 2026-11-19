@@ -1,7 +1,8 @@
 use crate::{
     motion::{self, ShelfMotion},
     shelf::{self, Plane},
-    worker::{Command, Event, Worker},
+    sources::{STREAM_PREFIX, StreamChapter},
+    worker::{Command, Event, PAGE_NOT_READY, Worker},
 };
 use egui::*;
 use std::{
@@ -55,6 +56,17 @@ impl PageTexture {
             top += height;
         }
     }
+}
+
+/// A chapter read while its download is still running. Its position lives
+/// only in memory until the finished chapter joins the library.
+struct StreamBook {
+    book: Book,
+    task: String,
+    metadata: ChapterMetadata,
+    done: usize,
+    stopped: Option<String>,
+    waiting: HashSet<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -133,6 +145,7 @@ pub struct ReaderApp {
     import_text: String,
     backup_path: String,
     sources: crate::sources::Sources,
+    stream: Option<StreamBook>,
     sync: crate::sync::ProgressSync,
     pub hitboxes: BTreeMap<String, Rect>,
     pub rendered_book_nodes: usize,
@@ -148,6 +161,7 @@ impl ReaderApp {
             sync: crate::sync::ProgressSync::new(root.clone(), ctx.clone()),
             sources: crate::sources::Sources::new(root.clone(), ctx),
             root,
+            stream: None,
             books: vec![],
             chapters: Vec::new(),
             chapter_indices: HashMap::new(),
@@ -390,6 +404,124 @@ impl ReaderApp {
     fn setting(&mut self, key: &str, value: String) {
         self.send(Command::Setting(key.into(), value));
     }
+    fn reader_book(&self, id: &str) -> Option<Book> {
+        self.books
+            .iter()
+            .find(|b| b.id == id)
+            .or_else(|| self.stream.as_ref().map(|s| &s.book).filter(|b| b.id == id))
+            .cloned()
+    }
+    fn reading_metadata(&self, id: &str) -> Option<ChapterMetadata> {
+        self.chapter(id).cloned().or_else(|| {
+            self.stream
+                .as_ref()
+                .filter(|stream| stream.book.id == id)
+                .map(|stream| stream.metadata.clone())
+        })
+    }
+    fn open_stream(&mut self, chapter: StreamChapter) {
+        let id = format!("{STREAM_PREFIX}{}", chapter.id);
+        let state = self.sources.stream_state(&chapter.id).unwrap_or_default();
+        let book = Book {
+            id: id.clone(),
+            title: format!(
+                "{} · {}",
+                chapter.metadata.manga_title, chapter.metadata.chapter_title
+            ),
+            author: String::new(),
+            archive_path: PathBuf::new(),
+            cover_path: None,
+            page_count: state.total.max(1),
+            current_page: 0,
+            page_fraction: 0.,
+            updated_at: 0,
+            last_read_at: None,
+            category: String::new(),
+        };
+        self.stream = Some(StreamBook {
+            book: book.clone(),
+            task: chapter.id,
+            metadata: chapter.metadata,
+            done: state.done,
+            stopped: state.stopped,
+            waiting: HashSet::new(),
+        });
+        self.open_reader(&book);
+    }
+    /// Follows the online chapter's download, and hands the reader over to
+    /// the library copy (same page) once it has been imported.
+    fn update_stream(&mut self) {
+        let Some(stream) = self.stream.as_ref() else {
+            return;
+        };
+        let id = stream.book.id.clone();
+        if !matches!(&self.screen, Screen::Reader(current) if current == &id) {
+            self.stream = None;
+            return;
+        }
+        let metadata = stream.metadata.clone();
+        let imported = self
+            .chapters
+            .iter()
+            .find(|link| {
+                link.metadata.source_id == metadata.source_id
+                    && link.metadata.manga_id == metadata.manga_id
+                    && link.metadata.chapter_id == metadata.chapter_id
+            })
+            .and_then(|link| self.books.iter().find(|book| book.id == link.book_id))
+            .cloned();
+        if let Some(mut book) = imported {
+            book.current_page = self.page.min(book.page_count.saturating_sub(1));
+            book.page_fraction = if self.vertical {
+                self.vertical_reader.fraction
+            } else {
+                0.
+            };
+            let pages: Vec<_> = self.pages.keys().filter(|(key, _)| key == &id).cloned().collect();
+            for key in pages {
+                if let Some(texture) = self.pages.remove(&key) {
+                    self.pages.insert((book.id.clone(), key.1), texture);
+                }
+            }
+            self.stream = None;
+            self.open_reader(&book);
+            return;
+        }
+        let task = stream.task.clone();
+        let Some(state) = self.sources.stream_state(&task) else {
+            return;
+        };
+        let Some(stream) = self.stream.as_mut() else {
+            return;
+        };
+        if state.total > 0 {
+            stream.book.page_count = state.total;
+        }
+        if state.done != stream.done || state.stopped != stream.stopped {
+            stream.done = state.done;
+            stream.stopped = state.stopped;
+            stream.waiting.clear();
+        }
+    }
+    fn stream_waiting_text(&self, id: &str, page: usize) -> Option<String> {
+        let stream = self.stream.as_ref().filter(|stream| stream.book.id == id)?;
+        if !stream.waiting.contains(&page) {
+            return None;
+        }
+        Some(if let Some(reason) = &stream.stopped {
+            format!("第 {} 页还没下载
+{reason}", page + 1)
+        } else if stream.book.page_count > 1 || stream.done > 0 {
+            format!(
+                "正在下载第 {} 页…（{}/{}）",
+                page + 1,
+                stream.done,
+                stream.book.page_count
+            )
+        } else {
+            "正在获取章节页面…".into()
+        })
+    }
     fn visible_books(&self) -> Vec<Book> {
         let query = self.query.trim().to_lowercase();
         let mut representatives: Vec<&Book> = Vec::new();
@@ -587,6 +719,14 @@ impl ReaderApp {
                             continue;
                         }
                         self.page_pending.remove(&(id.clone(), page));
+                        if result.as_ref().is_err_and(|error| error == PAGE_NOT_READY) {
+                            if let Some(stream) =
+                                self.stream.as_mut().filter(|stream| stream.book.id == id)
+                            {
+                                stream.waiting.insert(page);
+                            }
+                            continue;
+                        }
                         if !matches!(&self.screen,Screen::Reader(current) if current==&id)
                             || page.abs_diff(self.page) > 2
                         {
@@ -686,6 +826,11 @@ impl ReaderApp {
             return;
         }
         self.saved_position = Some((id.to_string(), page, fraction));
+        if let Some(stream) = self.stream.as_mut().filter(|stream| stream.book.id == id) {
+            stream.book.current_page = page;
+            stream.book.page_fraction = fraction;
+            return;
+        }
         self.send(Command::Progress {
             id: id.into(),
             page,
@@ -744,6 +889,13 @@ impl ReaderApp {
     fn ask_page(&mut self, id: &str, page: usize) {
         let key = (id.to_string(), page);
         if page != self.page && self.prefetch_blocked.contains(&key) {
+            return;
+        }
+        if self
+            .stream
+            .as_ref()
+            .is_some_and(|stream| stream.book.id == id && stream.waiting.contains(&page))
+        {
             return;
         }
         if !self.pages.contains_key(&key)
@@ -814,12 +966,17 @@ impl ReaderApp {
     }
     fn next_page(&mut self, id: &str, delta: i32) {
         self.pending_reader_tap = None;
-        let Some(book) = self.books.iter().find(|b| b.id == id).cloned() else {
+        let Some(book) = self.reader_book(id) else {
             return;
         };
         let target = self.page as i64 + delta as i64;
-        if target < 0 || target >= book.page_count as i64 {
-            if let Some(mut adjacent) = self.adjacent_chapter(id, if target < 0 { -1 } else { 1 }) {
+        let streaming_unknown = self
+            .stream
+            .as_ref()
+            .is_some_and(|stream| stream.book.id == id && stream.done == 0 && book.page_count <= 1);
+        if (target < 0 || target >= book.page_count as i64) && !streaming_unknown {
+            let direction = if target < 0 { -1 } else { 1 };
+            if let Some(mut adjacent) = self.adjacent_chapter(id, direction) {
                 adjacent.current_page = if target < 0 {
                     adjacent.page_count.saturating_sub(1)
                 } else {
@@ -827,6 +984,11 @@ impl ReaderApp {
                 };
                 adjacent.page_fraction = 0.;
                 self.open_reader(&adjacent);
+                return;
+            }
+            if let Some(metadata) = self.reading_metadata(id)
+                && self.sources.open_adjacent_online(&metadata, direction)
+            {
                 return;
             }
         }
@@ -1255,6 +1417,10 @@ impl ReaderApp {
             }
         }
         self.sources.poll();
+        if let Some(chapter) = self.sources.take_stream() {
+            self.open_stream(chapter);
+        }
+        self.update_stream();
         if let Some(chapter) = self.sources.take_open_chapter() {
             let book = self
                 .chapters
@@ -2437,7 +2603,7 @@ impl ReaderApp {
         }
     }
     fn reader_ui(&mut self, ui: &mut Ui, area: Rect, id: &str, now: f64) {
-        let Some(book) = self.books.iter().find(|b| b.id == id).cloned() else {
+        let Some(book) = self.reader_book(id) else {
             return;
         };
         let ctx = ui.ctx().clone();
@@ -2687,16 +2853,41 @@ impl ReaderApp {
                 }
             }
         } else {
-            ui.painter().text(
-                content.center(),
-                Align2::CENTER_CENTER,
-                "正在打开这一页…",
-                FontId::proportional(15.),
-                Color32::LIGHT_GRAY,
+            let text = self
+                .stream_waiting_text(id, self.page)
+                .unwrap_or_else(|| "正在打开这一页…".into());
+            ui.put(
+                Rect::from_center_size(content.center(), vec2(content.width() - 40., 120.)),
+                Label::new(RichText::new(text).size(15.).color(Color32::LIGHT_GRAY)).wrap(),
             );
         }
         if !matches!(&self.screen, Screen::Reader(current) if current == id) {
             return;
+        }
+        if let Some((task, reason)) = self
+            .stream
+            .as_ref()
+            .filter(|stream| stream.book.id == id)
+            .and_then(|stream| stream.stopped.clone().map(|reason| (stream.task.clone(), reason)))
+        {
+            let banner = Rect::from_center_size(
+                pos2(content.center().x, content.bottom() - 60.),
+                vec2((content.width() - 24.).min(420.), 96.),
+            );
+            ui.painter().rect_filled(banner, 12., Color32::from_black_alpha(200));
+            ui.put(
+                Rect::from_min_size(banner.min + vec2(12., 8.), vec2(banner.width() - 24., 36.)),
+                Label::new(RichText::new(format!("下载中断：{reason}")).color(Color32::WHITE)).truncate(),
+            );
+            if self.button(
+                ui,
+                "stream-resume",
+                Rect::from_center_size(pos2(banner.center().x, banner.bottom() - 30.), vec2(160., 44.)),
+                "继续下载",
+                true,
+            ) {
+                self.sources.resume_stream(&task);
+            }
         }
         if self.controls {
             let palette = crate::design::palette(true);
@@ -2874,7 +3065,11 @@ impl ReaderApp {
             .map(|((_, page), image)| (*page, image.size.y / image.size.x * width))
             .collect();
         let next_chapter = self.adjacent_chapter(id, 1);
-        let footer = if next_chapter.is_some() { 68. } else { 0. };
+        let next_online = next_chapter.is_none()
+            && self
+                .reading_metadata(id)
+                .is_some_and(|metadata| self.sources.has_adjacent_online(&metadata, 1));
+        let footer = if next_chapter.is_some() || next_online { 68. } else { 0. };
         self.vertical_reader
             .settle(count, content.height() - footer, |page| {
                 heights.get(&page).copied()
@@ -2930,10 +3125,13 @@ impl ReaderApp {
                     self.ask_page(id, page);
                 }
             } else {
+                let text = self
+                    .stream_waiting_text(id, page)
+                    .unwrap_or_else(|| "正在打开这一页…".into());
                 painter.text(
                     target.intersect(content).center(),
                     Align2::CENTER_CENTER,
-                    "正在打开这一页…",
+                    text,
                     FontId::proportional(15.),
                     Color32::LIGHT_GRAY,
                 );
@@ -2946,7 +3144,7 @@ impl ReaderApp {
             self.record_page(id, self.page);
             self.last_position_save = now;
         }
-        if let Some(mut next) = next_chapter
+        if (next_chapter.is_some() || next_online)
             && let Some(last) = self
                 .hitboxes
                 .get(&format!("vertical-page-{}", count.saturating_sub(1)))
@@ -2962,9 +3160,13 @@ impl ReaderApp {
             if content.contains_rect(button)
                 && self.button(ui, "reader-next-chapter", button, "下一章", true)
             {
-                next.current_page = 0;
-                next.page_fraction = 0.;
-                self.open_reader(&next);
+                if let Some(mut next) = next_chapter {
+                    next.current_page = 0;
+                    next.page_fraction = 0.;
+                    self.open_reader(&next);
+                } else if let Some(metadata) = self.reading_metadata(id) {
+                    self.sources.open_adjacent_online(&metadata, 1);
+                }
             }
         }
     }
@@ -3709,6 +3911,44 @@ mod tests {
         }, |ui| app.history_ui(ui, ui.max_rect())).drop_without_applying_deltas();
         assert!(!app.cover_pending.is_empty());
         assert!(app.cover_pending.len() <= 6, "hidden history rows requested {} covers", app.cover_pending.len());
+    }
+    #[test]
+    fn online_chapter_waits_for_pages_and_hands_over_to_the_library_copy_at_the_same_page() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = Context::default();
+        let mut app = ReaderApp::new(root.path().into(), ctx.clone());
+        let metadata = ChapterMetadata {
+            source_id: "source.a".into(),
+            manga_id: "story".into(),
+            manga_title: "Story".into(),
+            chapter_id: "c1".into(),
+            chapter_title: "第 1 话".into(),
+            chapter_number: Some(1.),
+            volume_number: None,
+        };
+        app.open_stream(StreamChapter { id: "0123456789abcdef".into(), metadata: metadata.clone() });
+        let id = format!("{STREAM_PREFIX}0123456789abcdef");
+        assert_eq!(app.screen_name(), "reader");
+        assert_eq!(app.page_pending, HashSet::from([(id.clone(), 0)]));
+        app.page_pending.clear();
+        app.stream.as_mut().unwrap().waiting.insert(0);
+        app.ask_page(&id, 0);
+        assert!(app.page_pending.is_empty(), "a missing page is not requested every frame");
+        assert!(app.stream_waiting_text(&id, 0).is_some());
+
+        app.stream.as_mut().unwrap().book.page_count = 20;
+        app.pages.insert((id.clone(), 5), page(&ctx));
+        app.page = 5;
+        app.record_page(&id, 5);
+        assert_eq!(app.stream.as_ref().unwrap().book.current_page, 5);
+
+        app.books = vec![book("imported")];
+        app.replace_links(vec![ChapterLink { book_id: "imported".into(), metadata }]);
+        app.update_stream();
+        assert!(app.stream.is_none());
+        assert_eq!(app.current_book_id(), Some("imported"));
+        assert_eq!(app.page, 5);
+        assert!(app.pages.contains_key(&("imported".to_string(), 5)), "no reload flash");
     }
     #[test]
     fn returning_closes_dialog_before_leaving_the_reader() {

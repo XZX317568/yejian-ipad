@@ -84,6 +84,9 @@ enum PositionCommand {
     },
     Flush(mpsc::Sender<Result<(), String>>),
 }
+/// Image result for a page of an online chapter that has not downloaded yet.
+pub const PAGE_NOT_READY: &str = "page-not-ready";
+
 pub struct DecodedPage {
     pub tiles: Vec<ColorImage>,
     pub size: [usize; 2],
@@ -142,10 +145,12 @@ impl Worker {
                 let image_events = event_tx.clone();
                 let image_ctx = ctx.clone();
                 let image_archives = archive_access.clone();
+                let image_root = root.clone();
                 thread::Builder::new()
                     .name("yejian-images".into())
                     .spawn(move || {
                         read_images(
+                            image_root,
                             image_library,
                             image_rx,
                             image_events,
@@ -445,6 +450,7 @@ fn next_image(pending: &mut VecDeque<ImageRequest>, generation: u64) -> Option<I
 }
 
 fn read_images(
+    root: PathBuf,
     library: Library,
     requests: mpsc::Receiver<ImageRequest>,
     events: mpsc::Sender<Event>,
@@ -474,6 +480,10 @@ fn read_images(
             if !current() {
                 anyhow::bail!("阅读请求已失效");
             }
+            if let Some(task) = request.id.strip_prefix(crate::sources::STREAM_PREFIX) {
+                return crate::sources::stream_page(&root, task, request.page)?
+                    .ok_or_else(|| anyhow::anyhow!(PAGE_NOT_READY));
+            }
             if request.cover {
                 let book = library.get_book(&request.id)?;
                 match book.cover_path {
@@ -487,9 +497,12 @@ fn read_images(
         if !current() {
             continue;
         }
-        let result = bytes
-            .and_then(|bytes| decode(&bytes, request.cover))
-            .map_err(|error| format!("{error:#}"));
+        let result = match bytes {
+            Err(error) if error.to_string() == PAGE_NOT_READY => Err(PAGE_NOT_READY.to_string()),
+            bytes => bytes
+                .and_then(|bytes| decode(&bytes, request.cover))
+                .map_err(|error| format!("{error:#}")),
+        };
         if !current() {
             continue;
         }

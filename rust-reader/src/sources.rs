@@ -593,6 +593,34 @@ fn work_root(root: &Path) -> PathBuf {
     root.join("download-work")
 }
 
+/// Reader book ids that point at a chapter still being downloaded.
+pub const STREAM_PREFIX: &str = "stream:";
+
+/// Bytes of one zero-based page already staged by a running or paused
+/// download, or `None` while that page has not arrived yet.
+pub(crate) fn stream_page(root: &Path, id: &str, page: usize) -> anyhow::Result<Option<Vec<u8>>> {
+    let dir = task_dir(root, id)?;
+    match stored_page(&dir, page + 1) {
+        Some(path) => Ok(Some(std::fs::read(path)?)),
+        None => Ok(None),
+    }
+}
+
+/// A chapter the user opened for reading before its download finished.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StreamChapter {
+    pub id: String,
+    pub metadata: ChapterMetadata,
+}
+
+/// Download progress of a chapter being read online.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StreamState {
+    pub total: usize,
+    pub done: usize,
+    pub stopped: Option<String>,
+}
+
 /// Task ids are always the 16 lowercase hex digits produced by `identity_id`.
 /// Anything else is treated as a corrupt queue entry, never as a path.
 fn valid_task_id(id: &str) -> bool {
@@ -1148,6 +1176,10 @@ pub struct Sources {
     dl_tx: mpsc::Sender<DlCmd>,
     dl_rx: mpsc::Receiver<DlEvent>,
     dl_stop: Arc<AtomicU8>,
+    stream_request: Option<StreamChapter>,
+    /// A download paused only so that a chapter being read can run first.
+    /// It goes back to the queue instead of waiting for a manual "继续".
+    preempted: Option<String>,
 }
 impl Sources {
     #[cfg(debug_assertions)]
@@ -1505,6 +1537,8 @@ impl Sources {
             dl_tx,
             dl_rx,
             dl_stop,
+            stream_request: None,
+            preempted: None,
         };
         // Never overwrite a file that startup could not fully parse.
         if load_warning.is_none() {
@@ -1552,6 +1586,133 @@ impl Sources {
     /// page as the reader's return destination.
     pub fn take_open_chapter(&mut self) -> Option<ChapterMetadata> {
         self.open_chapter.take()
+    }
+
+    /// Pops a chapter the user started reading online.
+    pub fn take_stream(&mut self) -> Option<StreamChapter> {
+        self.stream_request.take()
+    }
+
+    pub fn stream_state(&self, id: &str) -> Option<StreamState> {
+        let task = self.tasks.iter().find(|task| task.id == id)?;
+        let stopped = match task.status {
+            DownloadStatus::Failed => Some(
+                task.error.clone().unwrap_or_else(|| "下载失败".into()),
+            ),
+            DownloadStatus::Paused if self.preempted.as_deref() != Some(id) => {
+                Some(task.error.clone().unwrap_or_else(|| "下载已暂停".into()))
+            }
+            _ => None,
+        };
+        Some(StreamState {
+            total: task.pages_total,
+            done: task.pages_done,
+            stopped,
+        })
+    }
+
+    /// Runs this chapter's download next. A different running download is
+    /// paused at its next page boundary and re-queued behind it.
+    fn prioritize(&mut self, id: &str) {
+        if self.running.as_deref() == Some(id) {
+            return;
+        }
+        if !self.tasks.iter().any(|task| {
+            task.id == id
+                && matches!(
+                    task.status,
+                    DownloadStatus::Queued | DownloadStatus::Paused | DownloadStatus::Failed
+                )
+        }) {
+            return;
+        }
+        if let Some(running) = self.running.clone() {
+            self.preempted = Some(running);
+            self.dl_stop.store(STOP_PAUSE, Ordering::SeqCst);
+        }
+        self.set_task_queued(id);
+    }
+
+    pub fn resume_stream(&mut self, id: &str) {
+        self.prioritize(id);
+    }
+
+    /// Reads a chapter without waiting for the whole download: the chapter
+    /// is downloaded first, the reader shows pages as they arrive, and the
+    /// following chapter is queued so it is ready when this one ends.
+    fn read_online(&mut self, manga: &Manga, chapter: &Chapter) {
+        let source = self.source_for(manga);
+        let id = identity_id(&source, &manga.key, &chapter.key);
+        if let Some(metadata) = self.library_chapters.get(&id) {
+            self.open_chapter = Some(metadata.clone());
+            return;
+        }
+        if chapter.locked {
+            self.status = "这一章暂不可阅读".into();
+            return;
+        }
+        let queued = self.tasks.iter().any(|task| {
+            task.id == id && task.status != DownloadStatus::Failed
+        });
+        if !queued {
+            self.enqueue_chapter(manga, chapter);
+        }
+        let Some(task) = self.tasks.iter().find(|task| task.id == id) else {
+            return;
+        };
+        if task.status == DownloadStatus::Done {
+            if task.linked || self.import_attempts.contains(&id) {
+                return;
+            }
+            self.add_downloaded_to_library(&id);
+            self.status = "这一章已下载，正在加入书架".into();
+            return;
+        }
+        let metadata = task.metadata();
+        self.prioritize(&id);
+        self.stream_request = Some(StreamChapter { id, metadata });
+        if let Some(next) = self.adjacent_online(&source, &manga.key, &chapter.key, 1)
+            && self.chapter_needs_download(&source, &manga.key, &next)
+        {
+            let status = std::mem::take(&mut self.status);
+            self.enqueue_chapter(manga, &next);
+            self.status = status;
+        }
+    }
+
+    /// The neighbouring chapter in reading order, when that manga's chapter
+    /// list is the one currently loaded.
+    fn adjacent_online(&self, source: &str, manga: &str, chapter: &str, delta: i32) -> Option<Chapter> {
+        let selected = self.selected_manga.as_ref()?;
+        if selected.key != manga || self.source_for(selected) != source {
+            return None;
+        }
+        let chapters = chapter_list(&self.chapters, "", false);
+        let index = chapters.iter().position(|item| item.key == chapter)? as i64 + delta as i64;
+        usize::try_from(index).ok().and_then(|index| chapters.get(index).cloned())
+    }
+
+    pub fn has_adjacent_online(&self, metadata: &ChapterMetadata, delta: i32) -> bool {
+        self.adjacent_online(&metadata.source_id, &metadata.manga_id, &metadata.chapter_id, delta)
+            .is_some_and(|chapter| !chapter.locked)
+    }
+
+    /// Opens the previous/next chapter of `metadata`, from the library when it
+    /// is already there and online otherwise. Returns false when unknown.
+    pub fn open_adjacent_online(&mut self, metadata: &ChapterMetadata, delta: i32) -> bool {
+        let Some(chapter) = self.adjacent_online(
+            &metadata.source_id, &metadata.manga_id, &metadata.chapter_id, delta,
+        ) else {
+            return false;
+        };
+        if chapter.locked {
+            return false;
+        }
+        let Some(manga) = self.selected_manga.clone() else {
+            return false;
+        };
+        self.read_online(&manga, &chapter);
+        true
     }
 
     pub fn set_library_chapters(&mut self, links: &[ChapterLink]) {
@@ -2037,6 +2198,11 @@ impl Sources {
         true
     }
     fn handle_download_event(&mut self, event: DlEvent) {
+        if let DlEvent::Finished { id, .. } | DlEvent::Failed { id, .. } = &event
+            && self.preempted.as_deref() == Some(id.as_str())
+        {
+            self.preempted = None;
+        }
         match event {
             DlEvent::Progress {
                 id,
@@ -2102,11 +2268,23 @@ impl Sources {
                         self.pump();
                     }
                 } else {
+                    let preempted = self.preempted.as_deref() == Some(id.as_str());
+                    if preempted {
+                        self.preempted = None;
+                    }
                     if let Some(task) = self.tasks.iter_mut().find(|task| task.id == id) {
-                        task.status = DownloadStatus::Paused;
+                        task.status = if preempted {
+                            DownloadStatus::Queued
+                        } else {
+                            DownloadStatus::Paused
+                        };
                         task.error = None;
                     }
-                    self.status = "下载已暂停，可稍后继续".into();
+                    self.status = if preempted {
+                        "正在优先下载正在阅读的章节".into()
+                    } else {
+                        "下载已暂停，可稍后继续".into()
+                    };
                     if let Err(error) = self.persist() {
                         self.status = format!("下载已暂停，但队列状态保存失败：{error:#}");
                         return;
@@ -2984,13 +3162,13 @@ impl Sources {
                         }) && !self.import_attempts.contains(&id)
                             && !self.ready.iter().any(|queued| queued == &id);
                         let failed = task.is_some_and(|task| task.status == DownloadStatus::Failed);
-                        let enabled = readable || can_import || (!self.busy && !chapter.locked
-                            && (task.is_none() || failed));
+                        let downloading = task.is_some_and(|task| task.status != DownloadStatus::Done);
+                        let enabled = readable || can_import || !chapter.locked;
                         let action = if readable { "阅读" }
                             else if can_import { "加入书架" }
-                            else if failed { "重试下载" }
-                            else if chapter.locked { "暂不可下载" }
-                            else { "下载" };
+                            else if chapter.locked { "暂不可阅读" }
+                            else if downloading && !failed { "边下边读" }
+                            else { "在线阅读" };
                         let label = format!("{name}    {action}");
                         ui.push_id(("chapter", &chapter.key), |ui| {
                             if ui
@@ -3008,8 +3186,16 @@ impl Sources {
                                 } else if can_import {
                                     self.add_downloaded_to_library(&id);
                                 } else {
-                                    self.enqueue_chapter(&manga, &chapter);
+                                    self.read_online(&manga, &chapter);
                                 }
+                            }
+                            if !readable && !can_import && !chapter.locked
+                                && (task.is_none() || failed)
+                                && ui.add_enabled(!self.busy, quiet_action(
+                                    if failed { "重试下载" } else { "仅下载" },
+                                )).clicked()
+                            {
+                                self.enqueue_chapter(&manga, &chapter);
                             }
                             if readable {
                                 ui.label(RichText::new("已在书架，可离线阅读")
@@ -3432,7 +3618,83 @@ mod tests {
             dl_tx,
             dl_rx: mpsc::channel().1,
             dl_stop: Arc::new(AtomicU8::new(STOP_NONE)),
+            stream_request: None,
+            preempted: None,
         }
+    }
+
+    #[test]
+    fn online_reading_runs_first_requeues_the_preempted_download_and_queues_the_next_chapter() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sources = test_sources(root.path());
+        let book = manga("source.a", "m");
+        let chapter = |key: &str, number: f32| Chapter {
+            key: key.into(),
+            title: Some(key.into()),
+            chapter_number: Some(number),
+            ..Default::default()
+        };
+        sources.selected_source = "source.a".into();
+        sources.selected_manga = Some(book.clone());
+        sources.chapters = vec![chapter("c2", 2.), chapter("c1", 1.), chapter("c3", 3.)];
+        let mut other = task("source.a", "other", "x");
+        other.status = DownloadStatus::Running;
+        sources.running = Some(other.id.clone());
+        sources.tasks.push(other.clone());
+
+        sources.read_online(&book, &chapter("c1", 1.));
+        let stream = sources.take_stream().expect("reader opens immediately");
+        assert_eq!(stream.id, identity_id("source.a", "m", "c1"));
+        assert_eq!(sources.tasks[0].id, stream.id, "read chapter downloads first");
+        assert_eq!(sources.preempted.as_deref(), Some(other.id.as_str()));
+        assert_eq!(sources.dl_stop.load(Ordering::SeqCst), STOP_PAUSE);
+        assert!(
+            sources.tasks.iter().any(|task| task.chapter_id == "c2"),
+            "next chapter in reading order is prefetched"
+        );
+        assert!(!sources.tasks.iter().any(|task| task.chapter_id == "c3"));
+        assert_eq!(sources.stream_state(&stream.id).unwrap().stopped, None);
+
+        sources.handle_download_event(DlEvent::Aborted { id: other.id.clone(), how: STOP_PAUSE });
+        let requeued = sources.tasks.iter().find(|task| task.id == other.id).unwrap();
+        assert_eq!(requeued.status, DownloadStatus::Queued, "no manual continue needed");
+        assert!(sources.preempted.is_none());
+        assert_eq!(sources.running.as_deref(), Some(stream.id.as_str()));
+
+        assert!(sources.has_adjacent_online(&stream.metadata, 1));
+        assert!(!sources.has_adjacent_online(&stream.metadata, -1));
+    }
+
+    #[test]
+    fn online_pages_are_served_from_the_download_staging_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let id = identity_id("source.a", "m", "c");
+        assert!(stream_page(root.path(), &id, 0).unwrap().is_none());
+        let dir = task_dir(root.path(), &id).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("page-0001.png"), png()).unwrap();
+        std::fs::write(dir.join("page-0002.part"), b"half").unwrap();
+        assert_eq!(stream_page(root.path(), &id, 0).unwrap(), Some(png()));
+        assert!(stream_page(root.path(), &id, 1).unwrap().is_none(), "partial page is not ready");
+        assert!(stream_page(root.path(), "../escape", 0).is_err());
+    }
+
+    #[test]
+    fn a_paused_or_failed_online_chapter_reports_why_it_stopped() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sources = test_sources(root.path());
+        let mut item = task("source.a", "m", "c");
+        item.status = DownloadStatus::Failed;
+        item.error = Some("图片服务器返回 HTTP 403".into());
+        item.pages_total = 12;
+        item.pages_done = 4;
+        sources.tasks.push(item.clone());
+        let state = sources.stream_state(&item.id).unwrap();
+        assert_eq!((state.total, state.done), (12, 4));
+        assert_eq!(state.stopped.as_deref(), Some("图片服务器返回 HTTP 403"));
+        sources.resume_stream(&item.id);
+        assert_eq!(sources.running.as_deref(), Some(item.id.as_str()));
+        assert_eq!(sources.stream_state(&item.id).unwrap().stopped, None);
     }
 
     #[test]
