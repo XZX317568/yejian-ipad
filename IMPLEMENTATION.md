@@ -4,15 +4,19 @@
 
 页间 / Yejian 面向 iPad 和安卓手机。用户于 2026-11-17 选择 Rust，11 月 18 日确认界面可按阅读体验改进。`rust-reader/` 用 egui / wgpu 绘制 Wenku8 Flutter **v0.5.6** 风格的物理书架和纸张开合。选书、看详情、直接续读是三个独立动作。原 Flutter 版本位于 `app/`。
 
-## 书源筛选与列表补全（build 5，验收中）
+## 书源筛选与列表补全（2026-11-20，build 5）
 
 此前书源搜索始终传空筛选，静态 `filters.json` 未读取，源自带列表也未显示。本轮接入静态与动态筛选、源提供的列表、文字/排序/三态条件/单选/多选排除/说明/数值范围；按源的默认值显示，未改动的默认值不额外提交。筛选用独立草稿，应用才重搜，取消保留原条件，重置回到默认。iPad 宽屏双列，窄分屏单列，动作按钮固定在表单顶部。
 
 搜索、列表、详情和错误回复均带请求序号，旧请求不能替换新条件的结果。下一页使用已提交的关键词与条件，失败仍可重试；新条件回到第一页及顶部。按源保留本次会话的条件。静态文件损坏只阻止筛选，不阻断已有搜索；动态选项请求失败时保留可读静态选项并显示失败原因。`hidesFiltersWhileSearching` 按源协议处理。
 
-本地证据在 `.tools/source-filters-20261119/` 与 `artifacts/rust/source-filters-build5/`。SWE-2 实现引擎并经主模型退回修正默认值、损坏文件边界及实际参数测试；主模型负责源 UI、请求状态、真实点击验收。引擎30项和WASM夹具4项通过，客户端55项通过；生产离屏GPU已实际完成列表翻页、题材/完结/排序方向/多选改变WASM结果、取消、重置、横竖屏/分屏/200%字体。MangaDex真实13项筛选页也已渲染并查看。canvas ABI两项通过，其中真实模块明确手动启用，常规测试不会假装联网执行。最终模拟器与包信息待下方交付记录。
+本地证据在 `.tools/source-filters-20261119/` 与 `artifacts/rust/source-filters-build5/`。SWE-2 实现引擎并经主模型退回修正默认值、损坏文件边界及实际参数测试；主模型负责源 UI、请求状态、真实点击验收。引擎30项和WASM夹具4项通过，随后补测静态列表在动态请求失败时仍可浏览；客户端55项通过。生产离屏GPU已实际完成列表翻页、题材/完结/排序方向/多选改变WASM结果、取消、重置、横竖屏/分屏/200%字体。MangaDex真实13项筛选页也已渲染并查看。canvas ABI两项通过，其中真实模块明确手动启用，常规测试不会假装联网执行。
 
 真实社区抽查：MangaDex v15 读出13项筛选，带真实条件搜索返回20条；MangaBall v1 读出10项筛选，但搜索返回上游HTTP500；拷贝漫画 v24 合并得到4项筛选（含动态题材）和3个列表，搜索要求JS/网页验证。香香腐宅v13原先无法实例化：canvas宽高返回类型及坐标签名不匹配；现已对齐官方f32 ABI，实际模块可加载、合并得到5项筛选和11个列表（该项使用无网络响应夹具，未证明网站搜索）。既有字体/路径绘制占位实现仍有限制，不把接口能加载等同于完整图片处理。此记录区分元数据能读取与搜索实际可用。
+
+最终联网结果在 `.tools/source-filters-20261119/live-results.json`：香香腐宅实际网络调用失败，11个静态列表可读取；UI会保留可解析的4个静态筛选并显示动态请求失败。源码 `f9c05a1acceb34c3d319714193647a399caea1a2` 已推送到既定公开仓库，run `44563594979` 的模拟器关卡通过。`artifacts/rust/source-filters-build5/run-44563594979/verification.json` 核验十个竖屏和四个横屏画面、真实WASM筛选结果、176条社区源、旧库升级与容器变更后内容可读。筛选页横屏及结果页截图已人工查看，安全区与表单正常。第一次package因GitHub无法分配托管runner而取消；仅重试package后，job `135721150088` 成功，复用同一源码的有效模拟器结果。
+
+已交付 **0.1.1 / build 5**：`artifacts/rust/v0.1.1/ipad/Yejian-0.1.1-5-ipad-unsigned.ipa`，**13,791,557 字节**，arm64 / iPhoneOS / iOS15+ / 设备族[1,2] / 主程序0755 / 未签名。包内版本、标识及权限核验见 `.tools/source-filters-20261119/package-check.json`。应用标识保持 `app.yejian.reader.rust`；按已有LiveContainer更新路线保留数据容器，更新前导出完整备份。build4及以前文件仍保留。本次不重打Android，未声称用户iPad真机安装、触控或功耗已验收。
 
 ## iPad 启动与适配复查（2026-11-19）
 
@@ -39,7 +43,7 @@ run `44532550519`（commit `27124b5`）的“全部验收通过”结论已撤�
 
 SWE-2 负责 reader-core，主模型复核后退回修正旧库测试、相对根兼容和返回值合同，再整合下载路径和验收关卡。`.tools/ipad-audit-20261119/relocation-prefailure.log` 记录修前四项失败；`relocation-final.log` 记录修后54项通过；`sources-relocation-tests.log` 记录29项通过。`build4-local-gpu.log` 与 `artifacts/rust/ipad-startup-audit/build4-local/` 为本轮八组尺寸和大字布局的离屏验收，实际合成图已查看。`evidence-gate-tests.log` 的8项测试和 `pipeline-failure-test.log` 验证缺失内容会失败、日志管道不再吞退出码。真实模拟器的完整证据在 `artifacts/rust/ipad-startup-audit/run-44545119356/`：`verification.json` 确认七个竖屏和三个横屏就绪、横屏阅读已加载、社区索引176条、旧书库schema3→4升级。`legacy-library.json` 与 `relocated-library.json` 证明数据容器UUID确实改变而五个book ID保持不变。已人工查看横屏书架、详情、阅读和社区源截图：封面恢复彩色图、阅读页有实际图片、控件处于系统安全区。
 
-最新交付：`artifacts/rust/v0.1.1/ipad/Yejian-0.1.1-4-ipad-unsigned.ipa`，**13,706,347 字节**。`.tools/ipad-audit-20261119/build4-package-check.json` 记录包内验证：`app.yejian.reader.rust`、0.1.1 / build 4、iPhoneOS、设备族[1,2]、最低iOS15.0、arm64 Mach-O、主程序可执行权限0755、无签名或描述文件。更新先从旧版导出完整备份，再由已配置的 LiveContainer 沿用原数据容器导入新版。此前交付文件保留，安装说明已同步。
+build 4 交付：`artifacts/rust/v0.1.1/ipad/Yejian-0.1.1-4-ipad-unsigned.ipa`，**13,706,347 字节**。`.tools/ipad-audit-20261119/build4-package-check.json` 记录包内验证：`app.yejian.reader.rust`、0.1.1 / build 4、iPhoneOS、设备族[1,2]、最低iOS15.0、arm64 Mach-O、主程序可执行权限0755、无签名或描述文件。更新先从旧版导出完整备份，再由已配置的 LiveContainer 沿用原数据容器导入新版。此前交付文件保留，安装说明已同步。
 
 此前交付为 **0.1.1 / build 3**：`artifacts/rust/v0.1.1/ipad/Yejian-0.1.1-3-ipad-unsigned.ipa`（13,702,953 字节），其横屏内容验收尚不成立。已核对包内 `app.yejian.reader.rust`、版本 0.1.1 / build 3、iPhoneOS、设备族含 iPad、最低 iOS 15.0、arm64 Mach-O 主程序、无签名。旧 build 2 保留在同目录，不含本轮修复。仓库经实时 API 确认为公开；源码与验证流程提交在该仓库，未发布商店版本。
 
