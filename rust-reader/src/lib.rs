@@ -37,6 +37,11 @@ pub fn configure_fonts(ctx: &egui::Context) {
 
 pub fn run() -> eframe::Result {
     yejian_platform::init();
+    #[cfg(target_os = "ios")]
+    {
+        use std::io::Write as _;
+        let _ = std::io::stderr().write_all(b"YEJIAN_RUN_INIT\n");
+    }
     let args: Vec<String> = std::env::args().collect();
     let root = args.iter().position(|x|x=="--data-dir").and_then(|i|args.get(i+1)).map(PathBuf::from)
         .unwrap_or_else(default_data_dir);
@@ -55,6 +60,11 @@ pub fn run() -> eframe::Result {
         run_and_return: !cfg!(target_os="ios"),
         ..Default::default()
     };
+    #[cfg(target_os = "ios")]
+    {
+        use std::io::Write as _;
+        let _ = std::io::stderr().write_all(b"YEJIAN_BEFORE_RUN_NATIVE\n");
+    }
     eframe::run_native("页间", options, Box::new(move|cc| {
         configure_fonts(&cc.egui_ctx);
         let wake=cc.egui_ctx.clone();
@@ -168,6 +178,7 @@ pub extern "C" fn yejian_start_app() {
         Err(error) => startup_note(&format!("yejian_start_app: run failed: {error}")),
     }
     let _ = std::io::stderr().write_all(b"YEJIAN_RUST_EXIT\n");
+    let _ = std::io::stderr().flush();
 }
 
 /// Minimal file trace for iOS startup problems; the system log drops Rust
