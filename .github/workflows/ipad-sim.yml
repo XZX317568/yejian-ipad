@@ -43,13 +43,13 @@ jobs:
             -destination 'generic/platform=iOS Simulator' \
             ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
             ENABLE_DEBUG_DYLIB=NO \
-            -derivedDataPath "$RUNNER_TEMP/sim-build" build CODE_SIGNING_ALLOWED=NO
+            -derivedDataPath "$RUNNER_TEMP/sim-build" build-for-testing CODE_SIGN_IDENTITY=-
 
       - name: 启动 iPad 模拟器并截图
         run: |
           bash tools/capture-ipad-simulator.sh \
             "$RUNNER_TEMP/sim-build/Build/Products/Debug-iphonesimulator/Yejian.app" \
-            artifacts/rust/ipad-sim
+            artifacts/rust/ipad-sim "$RUNNER_TEMP/sim-build"
 
       - name: 保存截图
         if: always()

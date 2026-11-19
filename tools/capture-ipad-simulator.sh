@@ -3,6 +3,7 @@
 set -euo pipefail
 APP="${1:?path to Yejian.app is required}"
 OUT="${2:?artifact directory is required}"
+BUILD="${3:?Xcode derived data directory is required}"
 BUNDLE=app.yejian.reader.rust
 mkdir -p "$OUT"
 OUT="$(cd "$OUT" && pwd)"
@@ -80,7 +81,30 @@ shoot history
 shoot sources
 shoot settings
 shoot community
-shoot shelf-landscape --ui-landscape
-shoot detail-landscape --ui-landscape
-shoot reader-landscape --ui-landscape
+# Exercise real device rotation with XCTest. requestGeometryUpdate from inside
+# an app is rejected in iPad multitasking mode, so it is not a rotation test.
+for screen in shelf detail reader; do
+  marker="$CONTAINER/Documents/Yejian/ui-snapshots/$screen.json"
+  if [ -f "$marker" ]; then rm "$marker"; fi
+done
+xcodebuild -project rust-reader/platform/ios/Yejian.xcodeproj -scheme Yejian \
+  -configuration Debug -sdk iphonesimulator -destination "id=$DEVICE" \
+  -derivedDataPath "$BUILD" -parallel-testing-enabled NO \
+  -maximum-concurrent-test-simulator-destinations 1 \
+  test-without-building CODE_SIGN_IDENTITY=- 2>&1 | tee "$OUT/rotation-tests.log"
+RUNNER_CONTAINER=$(xcrun simctl get_app_container "$DEVICE" app.yejian.reader.uitests.xctrunner data)
+for screen in shelf detail reader; do
+  marker="$CONTAINER/Documents/Yejian/ui-snapshots/$screen.json"
+  python3 - "$marker" <<'PY'
+import json, sys
+with open(sys.argv[1]) as stream:
+    report = json.load(stream)
+assert report["width"] > report["height"], report
+assert report["books"] > 0, report
+if report["screen"] == "reader":
+    assert report["page_loaded"], report
+PY
+  cp "$marker" "$OUT/$screen-landscape.json"
+  cp "$RUNNER_CONTAINER/Documents/$screen-landscape.png" "$OUT/$screen-landscape.png"
+done
 echo "PASS: iPad rendered all production screens, rotated to landscape, and fetched the live Aidoku community repository"

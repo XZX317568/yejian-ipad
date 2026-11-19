@@ -10,7 +10,18 @@
 		AA0000000000000000000101 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000201 /* main.swift */; };
 		AA0000000000000000000102 /* DocumentBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000202 /* DocumentBridge.swift */; };
 		AA0000000000000000000103 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000205 /* Assets.xcassets */; };
+		AA0000000000000000000104 /* IPadRotationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000206 /* IPadRotationTests.swift */; };
 /* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		AA0000000000000000000901 = {
+			isa = PBXContainerItemProxy;
+			containerPortal = AA0000000000000000000601;
+			proxyType = 1;
+			remoteGlobalIDString = AA0000000000000000000501;
+			remoteInfo = Yejian;
+		};
+/* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
 		AA0000000000000000000201 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
@@ -18,6 +29,8 @@
 		AA0000000000000000000203 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		AA0000000000000000000204 /* Yejian.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Yejian.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		AA0000000000000000000205 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		AA0000000000000000000206 /* IPadRotationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = YejianUITests/IPadRotationTests.swift; sourceTree = "<group>"; };
+		AA0000000000000000000207 /* YejianUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; path = YejianUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -36,6 +49,7 @@
 			children = (
 				AA0000000000000000000402 /* Yejian */,
 				AA0000000000000000000403 /* Products */,
+				AA0000000000000000000206 /* IPadRotationTests.swift */,
 			);
 			sourceTree = "<group>";
 		};
@@ -54,6 +68,7 @@
 			isa = PBXGroup;
 			children = (
 				AA0000000000000000000204 /* Yejian.app */,
+				AA0000000000000000000207 /* YejianUITests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -61,6 +76,21 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
+		AA0000000000000000000502 /* YejianUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = AA0000000000000000000703;
+			buildPhases = (
+				AA0000000000000000000304,
+			);
+			buildRules = ();
+			dependencies = (
+				AA0000000000000000000902,
+			);
+			name = YejianUITests;
+			productName = YejianUITests;
+			productReference = AA0000000000000000000207;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
 		AA0000000000000000000501 /* Yejian */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = AA0000000000000000000701 /* Build configuration list for PBXNativeTarget "Yejian" */;
@@ -91,6 +121,10 @@
 					AA0000000000000000000501 = {
 						CreatedOnToolsVersion = 15.0;
 					};
+					AA0000000000000000000502 = {
+						CreatedOnToolsVersion = 15.0;
+						TestTargetID = AA0000000000000000000501;
+					};
 				};
 			};
 			buildConfigurationList = AA0000000000000000000702 /* Build configuration list for PBXProject "Yejian" */;
@@ -108,6 +142,7 @@
 			projectRoot = "";
 			targets = (
 				AA0000000000000000000501 /* Yejian */,
+				AA0000000000000000000502 /* YejianUITests */,
 			);
 		};
 /* End PBXProject section */
@@ -124,6 +159,14 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
+		AA0000000000000000000304 = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				AA0000000000000000000104,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		AA0000000000000000000302 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -135,7 +178,47 @@
 		};
 /* End PBXSourcesBuildPhase section */
 
+/* Begin PBXTargetDependency section */
+		AA0000000000000000000902 = {
+			isa = PBXTargetDependency;
+			target = AA0000000000000000000501;
+			targetProxy = AA0000000000000000000901;
+		};
+/* End PBXTargetDependency section */
+
 /* Begin XCBuildConfiguration section */
+		AA0000000000000000000805 /* Debug UI Tests */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks", "@loader_path/Frameworks");
+				PRODUCT_BUNDLE_IDENTIFIER = app.yejian.reader.uitests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = Yejian;
+			};
+			name = Debug;
+		};
+		AA0000000000000000000806 /* Release UI Tests */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks", "@loader_path/Frameworks");
+				PRODUCT_BUNDLE_IDENTIFIER = app.yejian.reader.uitests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = Yejian;
+			};
+			name = Release;
+		};
 		AA0000000000000000000801 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -283,6 +366,15 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		AA0000000000000000000703 = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				AA0000000000000000000805,
+				AA0000000000000000000806,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
 		AA0000000000000000000701 /* Build configuration list for PBXNativeTarget "Yejian" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
