@@ -1,6 +1,8 @@
 name: 页间 iPad 安装包
 
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read

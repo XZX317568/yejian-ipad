@@ -651,6 +651,17 @@ pub struct Sources {
     dl_stop:Arc<AtomicU8>,
 }
 impl Sources {
+    #[cfg(debug_assertions)]
+    pub(crate) fn preview_community(&mut self) {
+        self.url = COMMUNITY_INDEX.into();
+        self.submit(Task::Fetch(COMMUNITY_INDEX.into()));
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn repository_size(&self) -> usize {
+        self.repository.as_ref().map_or(0, |repo| repo.sources.len())
+    }
+
     pub fn new(root:PathBuf,ctx:Context)->Self {
         let(tx,rx_task)=mpsc::channel();
         let(tx_reply,rx)=mpsc::channel();

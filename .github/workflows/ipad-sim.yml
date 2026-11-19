@@ -63,4 +63,8 @@ jobs:
             artifacts/rust/ipad-sim/*.ips
           if-no-files-found: error
           retention-days: 3
-          compression-level: 0
+          compression-level: 6
+
+  package:
+    needs: sim
+    uses: ./.github/workflows/ipad.yml

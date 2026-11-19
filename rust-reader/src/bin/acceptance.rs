@@ -378,7 +378,7 @@ fn fixtures(root: &Path) -> Result<Vec<PathBuf>> {
 ///
 /// The GPU path is identical to the one the shells use, so layout can be
 /// checked on a desktop machine without a Mac, a simulator, or CI minutes.
-fn ipad_pass(h: &mut Harness) -> Result<()> {
+fn ipad_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
     use yejian_platform::{Insets, set_insets_override};
     // iPad window sizes in points (one harness pixel per point), plus the
     // narrow Split View widths and a no-inset control.
@@ -490,6 +490,26 @@ fn ipad_pass(h: &mut Harness) -> Result<()> {
         h.click("back")?;
         h.frames(45)?;
     }
+    let library = yejian_core::Library::open(library_root)?;
+    library.set_setting("font-scale", "2")?;
+    h.app = ReaderApp::new(library_root.into(), h.ctx.clone());
+    h.wait(ReaderApp::ready)?;
+    for (size, name) in [([507, 1024], "half"), ([320, 1024], "third")] {
+        h.size = size;
+        h.frames(5)?;
+        for (tab, label) in [("search", "sources"), ("settings", "settings")] {
+            h.click(&format!("nav-{tab}"))?;
+            h.frames(4)?;
+            h.frame(vec![], Some(&format!("ipad-split-{name}-{label}-large-text")))?;
+            if tab == "search" {
+                for control in ["读取", "社区源"] {
+                    anyhow::ensure!(h.texts.iter().any(|(text, _)| text == control),
+                        "200 percent {name}: {control} is clipped");
+                }
+            }
+        }
+    }
+    library.set_setting("font-scale", "1")?;
     set_insets_override(None);
     println!("PASS: iPad profiles rendered with real UI at 1024x1366, 1366x1024, 1194x834, 744x1133, 507x1024 and 320x1024");
     Ok(())
@@ -517,7 +537,7 @@ fn main() -> Result<()> {
     h.now += 6.;
     h.frames(3)?;
     if std::env::var_os("YEJIAN_IPAD_ONLY").is_some() {
-        return ipad_pass(&mut h);
+        return ipad_pass(&mut h, &data.join("library"));
     }
     h.frame(vec![], Some("phone-shelf"))?;
     anyhow::ensure!(h.app.rendered_book_nodes < 45);

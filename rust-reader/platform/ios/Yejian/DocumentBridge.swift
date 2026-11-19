@@ -68,6 +68,22 @@ private final class YejianDocumentBridge: NSObject, UIApplicationDelegate, UIDoc
         DispatchQueue.main.async { [weak self] in
             self?.prepareNow()
         }
+        #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("--ui-landscape") {
+            NotificationCenter.default.addObserver(
+                forName: UIApplication.didBecomeActiveNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                guard #available(iOS 16.0, *),
+                      let scene = self?.keyWindow()?.windowScene else { return }
+                self?.keyWindow()?.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
+                scene.requestGeometryUpdate(.iOS(interfaceOrientations: .landscapeRight)) { error in
+                    NSLog("Yejian simulator rotation failed: %@", error.localizedDescription)
+                }
+            }
+        }
+        #endif
     }
 
     private func prepareNow() {

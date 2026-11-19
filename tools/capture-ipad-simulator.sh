@@ -42,12 +42,13 @@ printf '%s\n' "$DEVICE" > "$OUT/device.txt"
 
 shoot() {
   local name=$1
+  local screen=${name%%-*}
   shift
   # Each screen must acknowledge this launch, never reuse an earlier marker.
-  local marker="$CONTAINER/Documents/Yejian/ui-snapshots/$name.json"
+  local marker="$CONTAINER/Documents/Yejian/ui-snapshots/$screen.json"
   if [ -f "$marker" ]; then rm "$marker"; fi
   xcrun simctl launch --console --terminate-running-process "$DEVICE" \
-    "$BUNDLE" --ui-snapshot "$name" "$@" > "$OUT/$name-console.log" 2>&1 &
+    "$BUNDLE" --ui-snapshot "$screen" "$@" > "$OUT/$name-console.log" 2>&1 &
   LAUNCH_PID=$!
   local ready=0
   for ((attempt=0; attempt<90; attempt++)); do
@@ -78,4 +79,8 @@ shoot reader
 shoot history
 shoot sources
 shoot settings
-echo "PASS: iPad launched and rendered all six production screens"
+shoot community
+shoot shelf-landscape --ui-landscape
+shoot detail-landscape --ui-landscape
+shoot reader-landscape --ui-landscape
+echo "PASS: iPad rendered all production screens, rotated to landscape, and fetched the live Aidoku community repository"

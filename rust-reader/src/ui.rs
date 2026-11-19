@@ -224,6 +224,11 @@ impl ReaderApp {
                 self.tab = Tab::Sources;
                 self.screen = Screen::Library;
             }
+            "community" => {
+                self.tab = Tab::Sources;
+                self.screen = Screen::Library;
+                self.sources.preview_community();
+            }
             "settings" => {
                 self.tab = Tab::Settings;
                 self.screen = Screen::Library;
@@ -245,9 +250,21 @@ impl ReaderApp {
             && self.error.is_none()
             && self.cover_pending.is_empty()
             && self.cover_failed.is_empty()
+            && (name != "community" || self.sources.repository_size() > 0)
+            && (!std::env::args().any(|arg| arg == "--ui-landscape")
+                || ctx.content_rect().width() > ctx.content_rect().height())
             && (!matches!(self.screen, Screen::Reader(_)) || self.page_loaded());
         if !content_ready || now - applied_at < 3. {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            return;
+        }
+        let safe = ctx.content_rect();
+        let nav_safe = self.hitboxes.iter()
+            .filter(|(id, _)| id.starts_with("nav-") || id.as_str() == "reader-back")
+            .all(|(_, rect)| safe.contains_rect(*rect));
+        if !nav_safe {
+            log::error!("snapshot navigation outside native safe area: {safe:?}");
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
             return;
         }
         let name = name.clone();
@@ -255,8 +272,13 @@ impl ReaderApp {
             "screen": name,
             "books": self.books.len(),
             "page_loaded": self.page_loaded(),
+            "repository_sources": self.sources.repository_size(),
             "width": ctx.content_rect().width(),
             "height": ctx.content_rect().height(),
+            "safe_area": [safe.left(), safe.top(), safe.right(), safe.bottom()],
+            "navigation": self.hitboxes.iter().filter(|(id, _)| id.starts_with("nav-"))
+                .map(|(id, rect)| (id.clone(), [rect.left(), rect.top(), rect.right(), rect.bottom()]))
+                .collect::<BTreeMap<_, _>>(),
         });
         let dir = self.root.join("ui-snapshots");
         let result = std::fs::create_dir_all(&dir)
@@ -1077,16 +1099,18 @@ impl ReaderApp {
             self.widget_font_scale = self.font_scale;
         }
         self.hitboxes.clear();
-        let full = ui.max_rect();
-        // Desktop builds answer with zero insets; debug builds may pin iPad
-        // values so the offscreen layout check exercises the same path.
+        let viewport = ui.max_rect().intersect(ctx.viewport_rect());
+        // eframe already obtains UIKit's safe content rectangle. Intersect it
+        // with the shell's rectangle so either provider can protect the home
+        // indicator, without subtracting the same inset twice.
+        let full = viewport.intersect(ctx.content_rect());
         let full = match yejian_platform::safe_insets() {
             Ok(insets) => {
                 let scale = ctx.pixels_per_point();
-                Rect::from_min_max(
-                    full.min + vec2(insets.left as f32 / scale, insets.top as f32 / scale),
-                    full.max - vec2(insets.right as f32 / scale, insets.bottom as f32 / scale),
-                )
+                full.intersect(Rect::from_min_max(
+                    viewport.min + vec2(insets.left as f32 / scale, insets.top as f32 / scale),
+                    viewport.max - vec2(insets.right as f32 / scale, insets.bottom as f32 / scale),
+                ))
             }
             Err(_) => full,
         };
@@ -2316,7 +2340,7 @@ impl ReaderApp {
     }
     fn history_ui(&mut self, ui: &mut Ui, area: Rect) {
         let (_, ink, muted) = self.colors();
-        let column = Self::page_column(area, 128., 88.);
+        let column = Self::page_column(area, 100. + 36. * self.font_scale, 88.);
         self.label(
             ui.painter(),
             pos2(column.left(), area.top() + 80.),
@@ -2376,7 +2400,7 @@ impl ReaderApp {
     }
     fn settings_ui(&mut self, ui: &mut Ui, area: Rect) {
         let (_, ink, _) = self.colors();
-        let column = Self::page_column(area, 130., 88.);
+        let column = Self::page_column(area, 100. + 36. * self.font_scale, 88.);
         self.label(
             ui.painter(),
             pos2(column.left(), area.top() + 80.),
@@ -2387,7 +2411,7 @@ impl ReaderApp {
         ui.scope_builder(UiBuilder::new().max_rect(column), |ui| {
             ScrollArea::vertical().show(ui, |ui| {
                 ui.style_mut().wrap_mode = Some(TextWrapMode::Wrap);
-                ui.spacing_mut().slider_width = (ui.available_width() - 100.).clamp(80., 280.);
+                ui.spacing_mut().slider_width = (ui.available_width() - 12.).clamp(80., 280.);
                 ui.heading("外观与阅读");
                 ui.label("主题");
                 ui.horizontal_wrapped(|ui| {
@@ -2434,9 +2458,9 @@ impl ReaderApp {
                     self.spread = mode == "spread";
                     self.setting("reading-mode", mode.into());
                 }
-                ui.label("文字大小");
                 let mut percent = (self.font_scale * 100.).round();
-                if ui.add(Slider::new(&mut percent, 100. ..=200.).suffix(" %").step_by(5.)).changed() {
+                ui.label(format!("文字大小 · {percent:.0}%"));
+                if ui.add(Slider::new(&mut percent, 100. ..=200.).show_value(false).step_by(5.)).changed() {
                     self.font_scale = percent / 100.;
                     self.setting("font-scale", self.font_scale.to_string());
                 }
@@ -2494,7 +2518,7 @@ impl ReaderApp {
     }
     fn sources_ui(&mut self, ui: &mut Ui, area: Rect) {
         let (_, ink, _) = self.colors();
-        let column = Self::page_column(area, 132., 88.);
+        let column = Self::page_column(area, 100. + 36. * self.font_scale, 88.);
         self.label(
             ui.painter(),
             pos2(column.left(), area.top() + 80.),
@@ -2732,6 +2756,25 @@ mod tests {
             )],
             size: vec2(2., 2.),
         }
+    }
+    #[test]
+    fn ipad_navigation_stays_inside_native_safe_area() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = Context::default();
+        crate::configure_fonts(&ctx);
+        let mut app = ReaderApp::new(root.path().into(), ctx.clone());
+        let input = RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(834., 1210.))),
+            safe_area_insets: Some(SafeAreaInsets(egui::epaint::MarginF32 {
+                top: 24., bottom: 25., left: 0., right: 0.,
+            })),
+            ..Default::default()
+        };
+        ctx.run_ui(input, |ui| app.draw(ui)).drop_without_applying_deltas();
+        let nav = app.hitboxes["nav-library"];
+        assert!(nav.bottom() <= 1185., "home indicator overlaps navigation: {nav:?}");
+        assert!(nav.bottom() >= 1170., "safe inset was deducted twice: {nav:?}");
+        assert!(nav.height() >= 44.);
     }
     #[test]
     fn returning_closes_dialog_before_leaving_the_reader() {
