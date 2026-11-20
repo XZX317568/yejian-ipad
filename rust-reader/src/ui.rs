@@ -38,23 +38,72 @@ struct Flight {
 struct PageTexture {
     tiles: Vec<TextureHandle>,
     size: Vec2,
+    /// Drawn content inside the full image, normalized to 0..1.
+    content: Rect,
 }
 impl PageTexture {
-    fn paint(&self, painter: &Painter, rect: Rect) {
-        let mut top = rect.top();
-        for tile in &self.tiles {
-            let height = tile.size()[1] as f32 / self.size.y * rect.height();
-            let target = Rect::from_min_size(pos2(rect.left(), top), vec2(rect.width(), height));
-            if target.intersects(painter.clip_rect()) {
-                painter.image(
-                    tile.id(),
-                    target,
-                    Rect::from_min_max(Pos2::ZERO, pos2(1., 1.)),
-                    Color32::WHITE,
-                );
-            }
-            top += height;
+    /// Pixels the layout should measure when white/black margins are cropped.
+    fn shown_size(&self, crop: bool) -> Vec2 {
+        if crop {
+            vec2(
+                self.size.x * self.content.width(),
+                self.size.y * self.content.height(),
+            )
+        } else {
+            self.size
         }
+    }
+    /// Paints the page; with `crop` only the content sub-rect is drawn,
+    /// stretched to fill `rect`. Tiles still slice vertically.
+    fn paint(&self, painter: &Painter, rect: Rect, crop: bool) {
+        let content = if crop {
+            self.content
+        } else {
+            Rect::from_min_max(Pos2::ZERO, pos2(1., 1.))
+        };
+        let mut top = 0.;
+        for tile in &self.tiles {
+            let tile_height = tile.size()[1] as f32 / self.size.y;
+            let (tile_top, tile_bottom) = (top, top + tile_height);
+            top = tile_bottom;
+            let (visible_top, visible_bottom) = (
+                tile_top.max(content.top()),
+                tile_bottom.min(content.bottom()),
+            );
+            if visible_bottom <= visible_top {
+                continue;
+            }
+            let uv = Rect::from_min_max(
+                pos2(content.left(), (visible_top - tile_top) / tile_height),
+                pos2(content.right(), (visible_bottom - tile_top) / tile_height),
+            );
+            let target = Rect::from_min_size(
+                pos2(
+                    rect.left(),
+                    rect.top()
+                        + (visible_top - content.top()) / content.height() * rect.height(),
+                ),
+                vec2(
+                    rect.width(),
+                    (visible_bottom - visible_top) / content.height() * rect.height(),
+                ),
+            );
+            if target.intersects(painter.clip_rect()) {
+                painter.image(tile.id(), target, uv, Color32::WHITE);
+            }
+        }
+    }
+}
+
+/// The pair shown in two-page mode: with `spread_offset` page 0 stands
+/// alone and the following spreads start on odd pages.
+fn spread_pair(page: usize, spread_offset: bool) -> (usize, Option<usize>) {
+    if spread_offset && page == 0 {
+        (0, None)
+    } else if spread_offset && page % 2 == 0 {
+        (page - 1, Some(page))
+    } else {
+        (page, Some(page + 1))
     }
 }
 
@@ -132,10 +181,18 @@ pub struct ReaderApp {
     pan: Vec2,
     controls: bool,
     reader_drag: f32,
+    reader_drag_y: f32,
+    reader_fit_limit: f32,
     private: bool,
     rtl: bool,
     vertical: bool,
     spread: bool,
+    crop: bool,
+    fit_width: bool,
+    brightness: f32,
+    spread_offset: bool,
+    reader_globals: crate::reader_prefs::ReaderPrefs,
+    reader_prefs: HashMap<String, crate::reader_prefs::ReaderPrefs>,
     dark: bool,
     reduced: bool,
     theme: String,
@@ -159,6 +216,7 @@ pub struct ReaderApp {
 impl ReaderApp {
     pub fn new(root: PathBuf, ctx: Context) -> Self {
         let backup_path = root.join("backup.yejian.zip").to_string_lossy().to_string();
+        let reader_prefs = crate::reader_prefs::load(&root).unwrap_or_default();
         Self {
             worker: Worker::start(root.clone(), ctx.clone()),
             sync: crate::sync::ProgressSync::new(root.clone(), ctx.clone()),
@@ -212,10 +270,18 @@ impl ReaderApp {
             pan: Vec2::ZERO,
             controls: true,
             reader_drag: 0.,
+            reader_drag_y: 0.,
+            reader_fit_limit: 0.,
             private: false,
             rtl: false,
             vertical: false,
             spread: false,
+            crop: false,
+            fit_width: false,
+            brightness: 1.,
+            spread_offset: false,
+            reader_globals: crate::reader_prefs::ReaderPrefs::default(),
+            reader_prefs,
             dark: false,
             reduced: false,
             theme: "system".into(),
@@ -742,11 +808,36 @@ impl ReaderApp {
                         match key.as_str() {
                             "theme" => self.theme = value,
                             "reduce-motion" => self.reduced = value == "true",
-                            "reading-direction" => self.rtl = value == "rtl",
+                            "reading-direction" => {
+                                self.reader_globals.rtl = value == "rtl";
+                                self.rtl = self.reader_globals.rtl;
+                            }
                             "private" => self.private = value == "true",
                             "reading-mode" => {
+                                self.reader_globals.mode = match value.as_str() {
+                                    "vertical" => crate::reader_prefs::Mode::Vertical,
+                                    "spread" => crate::reader_prefs::Mode::Spread,
+                                    _ => crate::reader_prefs::Mode::Paged,
+                                };
                                 self.vertical = value == "vertical";
                                 self.spread = value == "spread";
+                            }
+                            "reader-crop" => {
+                                self.reader_globals.crop = value == "true";
+                                self.crop = self.reader_globals.crop;
+                            }
+                            "reader-fit" => {
+                                self.reader_globals.fit_width = value == "true";
+                                self.fit_width = self.reader_globals.fit_width;
+                            }
+                            "reader-brightness" => {
+                                self.reader_globals.brightness =
+                                    value.parse::<f32>().unwrap_or(1.);
+                                self.brightness = self.reader_globals.brightness();
+                            }
+                            "reader-spread-offset" => {
+                                self.reader_globals.spread_offset = value == "true";
+                                self.spread_offset = self.reader_globals.spread_offset;
                             }
                             "font-scale" => {
                                 self.font_scale = value.parse::<f32>().unwrap_or(1.).clamp(1., 2.)
@@ -819,8 +910,17 @@ impl ReaderApp {
                                         )
                                     })
                                     .collect();
-                                self.pages
-                                    .insert((id.clone(), page), PageTexture { tiles, size });
+                                self.pages.insert(
+                                    (id.clone(), page),
+                                    PageTexture {
+                                        tiles,
+                                        size,
+                                        content: Rect::from_min_max(
+                                            pos2(image.content[0], image.content[1]),
+                                            pos2(image.content[2], image.content[3]),
+                                        ),
+                                    },
+                                );
                                 self.trim_pages(&id);
                                 if matches!(&self.screen,Screen::Reader(current) if current==&id)
                                     && self.page == page
@@ -1000,7 +1100,11 @@ impl ReaderApp {
                 .pages
                 .keys()
                 .filter(|(_, page)| {
-                    *page != self.page && !(self.spread && !self.vertical && *page == self.page + 1)
+                    *page != self.page
+                        && !(self.spread && !self.vertical && {
+                            let (base, second) = spread_pair(self.page, self.spread_offset);
+                            *page == base || Some(*page) == second
+                        })
                 })
                 .max_by_key(|(_, page)| page.abs_diff(self.page))
                 .cloned()
@@ -1011,8 +1115,95 @@ impl ReaderApp {
             self.prefetch_blocked.insert(key);
         }
     }
+    /// The effective reader settings of one book: a saved per-work entry
+    /// wins, then the source's viewer hint, then the global defaults.
+    fn apply_reader_prefs(&mut self, book: &Book) {
+        let metadata = self.reading_metadata(&book.id);
+        let key = crate::reader_prefs::key_for(metadata.as_ref(), &book.id);
+        let mut prefs = self.reader_prefs.get(&key).cloned().unwrap_or_else(|| {
+            let mut prefs = self.reader_globals.clone();
+            if let Some(viewer) = metadata.and_then(|metadata| {
+                self.sources
+                    .viewer_hint(&metadata.source_id, &metadata.manga_id)
+            }) {
+                match viewer {
+                    yejian_sources::Viewer::RightToLeft => {
+                        prefs.mode = crate::reader_prefs::Mode::Paged;
+                        prefs.rtl = true;
+                    }
+                    yejian_sources::Viewer::LeftToRight => {
+                        prefs.mode = crate::reader_prefs::Mode::Paged;
+                        prefs.rtl = false;
+                    }
+                    yejian_sources::Viewer::Vertical | yejian_sources::Viewer::Webtoon => {
+                        prefs.mode = crate::reader_prefs::Mode::Vertical;
+                    }
+                    yejian_sources::Viewer::Unknown => {}
+                }
+            }
+            prefs
+        });
+        prefs.brightness = prefs.brightness();
+        self.vertical = prefs.mode == crate::reader_prefs::Mode::Vertical;
+        self.spread = prefs.mode == crate::reader_prefs::Mode::Spread;
+        self.rtl = prefs.rtl;
+        self.crop = prefs.crop;
+        self.fit_width = prefs.fit_width;
+        self.brightness = prefs.brightness;
+        self.spread_offset = prefs.spread_offset;
+    }
+    fn current_prefs(&self) -> crate::reader_prefs::ReaderPrefs {
+        crate::reader_prefs::ReaderPrefs {
+            mode: if self.vertical {
+                crate::reader_prefs::Mode::Vertical
+            } else if self.spread {
+                crate::reader_prefs::Mode::Spread
+            } else {
+                crate::reader_prefs::Mode::Paged
+            },
+            rtl: self.rtl,
+            crop: self.crop,
+            fit_width: self.fit_width,
+            brightness: self.brightness,
+            spread_offset: self.spread_offset,
+        }
+    }
+    /// Changes made inside the reader always land on the current work.
+    fn save_reader_prefs(&mut self) {
+        let Screen::Reader(id) = self.screen.clone() else {
+            return;
+        };
+        let key = crate::reader_prefs::key_for(self.reading_metadata(&id).as_ref(), &id);
+        self.reader_prefs.insert(key, self.current_prefs());
+        if let Err(error) = crate::reader_prefs::save(&self.root, &self.reader_prefs) {
+            self.error = Some(format!("阅读设置保存失败：{error:#}"));
+        }
+    }
+    /// The "default for every work" action copies the live settings into the
+    /// global keys works without their own entry resolve from.
+    fn save_reader_globals(&mut self) {
+        self.reader_globals = self.current_prefs();
+        self.setting(
+            "reading-mode",
+            match self.reader_globals.mode {
+                crate::reader_prefs::Mode::Vertical => "vertical",
+                crate::reader_prefs::Mode::Spread => "spread",
+                crate::reader_prefs::Mode::Paged => "paged",
+            }
+            .into(),
+        );
+        self.setting(
+            "reading-direction",
+            if self.rtl { "rtl" } else { "ltr" }.into(),
+        );
+        self.setting("reader-crop", self.crop.to_string());
+        self.setting("reader-fit", self.fit_width.to_string());
+        self.setting("reader-brightness", self.brightness.to_string());
+        self.setting("reader-spread-offset", self.spread_offset.to_string());
+    }
     fn open_reader(&mut self, book: &Book) {
         self.flush_position();
+        self.apply_reader_prefs(book);
         if !matches!(self.screen, Screen::Reader(_)) {
             self.reader_return = self.screen.clone();
         }
@@ -2667,7 +2858,18 @@ impl ReaderApp {
         self.zoom = 1.;
         self.pan = Vec2::ZERO;
         self.pending_reader_tap = None;
-        self.setting("reading-mode", mode.into());
+        if matches!(self.screen, Screen::Reader(_)) {
+            self.save_reader_prefs();
+        } else {
+            self.reader_globals.mode = if self.vertical {
+                crate::reader_prefs::Mode::Vertical
+            } else if self.spread {
+                crate::reader_prefs::Mode::Spread
+            } else {
+                crate::reader_prefs::Mode::Paged
+            };
+            self.setting("reading-mode", mode.into());
+        }
     }
     fn reader_tap(&mut self, id: &str, relative: f32, step: i32) {
         if self.vertical || self.zoom > 1. || (0.27..=0.73).contains(&relative) {
@@ -2687,12 +2889,20 @@ impl ReaderApp {
             .rect_filled(area, 0., Color32::from_rgb(18, 20, 22));
         self.ask_page(id, self.page);
         let step = if self.spread && !self.vertical && area.width() > 700. {
-            2
+            if self.spread_offset && self.page == 0 {
+                1
+            } else {
+                2
+            }
         } else {
             1
         };
-        if self.page + 1 < book.page_count {
-            self.ask_page(id, self.page + 1);
+        let (pair_base, _) = spread_pair(self.page, self.spread_offset && step != 1);
+        if pair_base + 1 < book.page_count {
+            self.ask_page(id, pair_base + 1);
+        }
+        if pair_base != self.page {
+            self.ask_page(id, pair_base);
         }
         let content = area.shrink2(vec2(8., if self.controls { 64. } else { 0. }));
         let input_blocked = self.reader_input_blocked();
@@ -2720,23 +2930,31 @@ impl ReaderApp {
         }
         if gesture.drag_started() {
             self.reader_drag = 0.;
+            self.reader_drag_y = 0.;
             self.vertical_reader.stop();
             self.pending_reader_tap = None;
         }
         if gesture.dragged() {
-            self.reader_drag += ui.input(|i| i.pointer.delta().x);
+            let delta = ui.input(|i| i.pointer.delta());
+            self.reader_drag += delta.x;
+            self.reader_drag_y += delta.y;
         }
-        if gesture.dragged() && self.zoom > 1. {
+        let fit_single = self.fit_width && !self.vertical && step == 1;
+        if gesture.dragged() && (self.zoom > 1. || fit_single) {
             let delta = ui.input(|i| i.pointer.delta());
             self.pan += if self.vertical {
                 vec2(delta.x, 0.)
-            } else {
+            } else if self.zoom > 1. {
                 delta
+            } else {
+                vec2(0., delta.y)
             };
         }
         if gesture.drag_stopped() && self.zoom <= 1. && !self.vertical {
             let distance = self.reader_drag;
+            let distance_y = self.reader_drag_y;
             self.reader_drag = 0.;
+            self.reader_drag_y = 0.;
             if distance.abs() > 45. {
                 self.next_page(
                     id,
@@ -2746,6 +2964,14 @@ impl ReaderApp {
                         -step
                     },
                 );
+            } else if fit_single && distance_y.abs() > 45. {
+                // Once the fitted page cannot pan any further, a vertical
+                // swipe turns like the usual next/previous controls.
+                if distance_y < 0. && self.pan.y <= -self.reader_fit_limit + 1. {
+                    self.next_page(id, step);
+                } else if distance_y > 0. && self.pan.y >= self.reader_fit_limit - 1. {
+                    self.next_page(id, -step);
+                }
             }
         }
         if input_blocked {
@@ -2832,8 +3058,14 @@ impl ReaderApp {
                 self.ask_page(id, self.page);
             }
         } else if let Some(texture) = self.pages.get(&(id.into(), self.page)) {
-            let first_on_right = step == 2 && self.rtl;
-            let available = if step == 2 {
+            let pair = step == 2;
+            let (base, partner) = if pair {
+                spread_pair(self.page, self.spread_offset)
+            } else {
+                (self.page, None)
+            };
+            let first_on_right = pair && self.rtl;
+            let available = if pair {
                 Rect::from_min_size(
                     content.min
                         + vec2(
@@ -2849,18 +3081,47 @@ impl ReaderApp {
             } else {
                 content
             };
-            let size = texture.size;
-            let scale = (available.width() / size.x).min(available.height() / size.y);
-            let size = size * scale * self.zoom;
-            let limit = ((size - available.size()) * 0.5).max(Vec2::ZERO);
-            self.pan.x = self.pan.x.clamp(-limit.x, limit.x);
-            self.pan.y = self.pan.y.clamp(-limit.y, limit.y);
-            let center = available.center();
-            let image_rect = Rect::from_center_size(center + self.pan, size);
-            self.hitboxes.insert("reader-image".into(), image_rect);
-            texture.paint(&ui.painter().with_clip_rect(content), image_rect);
-            self.rendered_page_nodes = 1;
-            if step == 2 {
+            let painter = ui.painter().with_clip_rect(content);
+            let crop = self.crop;
+            let slot = |texture: &PageTexture, center: Pos2, pan: Vec2, zoom: f32| {
+                let size = texture.shown_size(crop);
+                let scale = (available.width() / size.x).min(available.height() / size.y);
+                let target = Rect::from_center_size(center + pan, size * scale * zoom);
+                texture.paint(&painter, target, crop);
+                target
+            };
+            if base == self.page {
+                let size = texture.shown_size(self.crop);
+                let scale = if fit_single {
+                    available.width() / size.x
+                } else {
+                    (available.width() / size.x).min(available.height() / size.y)
+                };
+                let size = size * scale * self.zoom;
+                let limit = ((size - available.size()) * 0.5).max(Vec2::ZERO);
+                self.reader_fit_limit = if pair { 0. } else { limit.y };
+                self.pan.x = self.pan.x.clamp(-limit.x, limit.x);
+                self.pan.y = self.pan.y.clamp(-limit.y, limit.y);
+                let image_rect = Rect::from_center_size(available.center() + self.pan, size);
+                self.hitboxes.insert("reader-image".into(), image_rect);
+                texture.paint(&painter, image_rect, self.crop);
+                self.rendered_page_nodes += 1;
+            } else {
+                self.reader_fit_limit = 0.;
+                if let Some(first) = self.pages.get(&(id.into(), base)) {
+                    slot(first, available.center(), self.pan, self.zoom);
+                    self.rendered_page_nodes += 1;
+                } else {
+                    painter.text(
+                        available.center(),
+                        Align2::CENTER_CENTER,
+                        "正在打开这一页…",
+                        FontId::proportional(15.),
+                        Color32::LIGHT_GRAY,
+                    );
+                }
+            }
+            if let Some(partner) = partner {
                 let second_center = available.center()
                     + vec2(
                         if first_on_right {
@@ -2870,38 +3131,25 @@ impl ReaderApp {
                         },
                         0.,
                     );
-                if let Some(second) = self.pages.get(&(id.into(), self.page + 1)) {
-                    let size = second.size;
-                    let scale = (available.width() / size.x).min(available.height() / size.y);
-                    let target = Rect::from_center_size(
-                        available.center()
-                            + vec2(
-                                if first_on_right {
-                                    -available.width()
-                                } else {
-                                    available.width()
-                                },
-                                0.,
-                            )
-                            + self.pan,
-                        size * scale * self.zoom,
-                    );
-                    second.paint(&ui.painter().with_clip_rect(content), target);
+                if let Some(texture) = self.pages.get(&(id.into(), partner)) {
+                    let target = slot(texture, second_center, self.pan, self.zoom);
+                    if partner == self.page {
+                        self.hitboxes.insert("reader-image".into(), target);
+                    }
                     self.rendered_page_nodes += 1;
-                } else if self.page + 1 < book.page_count {
+                } else if partner < book.page_count {
                     if let Some(error) = self
                         .page_errors
-                        .get(&(id.to_string(), self.page + 1))
+                        .get(&(id.to_string(), partner))
                         .cloned()
                     {
-                        let page = self.page + 1;
                         ui.put(
                             Rect::from_center_size(
                                 second_center,
                                 vec2(available.width() - 28., 130.),
                             ),
                             Label::new(
-                                RichText::new(format!("第 {} 页无法打开\n{error}", page + 1))
+                                RichText::new(format!("第 {} 页无法打开\n{error}", partner + 1))
                                     .color(Color32::WHITE),
                             )
                             .wrap(),
@@ -2913,9 +3161,9 @@ impl ReaderApp {
                             "重试这一页",
                             false,
                         ) {
-                            self.page_errors.remove(&(id.to_string(), page));
-                            self.prefetch_blocked.remove(&(id.to_string(), page));
-                            self.ask_page(id, page);
+                            self.page_errors.remove(&(id.to_string(), partner));
+                            self.prefetch_blocked.remove(&(id.to_string(), partner));
+                            self.ask_page(id, partner);
                         }
                     } else {
                         ui.painter().text(
@@ -2935,6 +3183,13 @@ impl ReaderApp {
             ui.put(
                 Rect::from_center_size(content.center(), vec2(content.width() - 40., 120.)),
                 Label::new(RichText::new(text).size(15.).color(Color32::LIGHT_GRAY)).wrap(),
+            );
+        }
+        if self.brightness < 1. {
+            ui.painter().rect_filled(
+                content,
+                0.,
+                Color32::from_black_alpha(((1. - self.brightness) * 255.).round() as u8),
             );
         }
         if !matches!(&self.screen, Screen::Reader(current) if current == id) {
@@ -3138,7 +3393,10 @@ impl ReaderApp {
             .pages
             .iter()
             .filter(|((key, _), _)| key == id)
-            .map(|((_, page), image)| (*page, image.size.y / image.size.x * width))
+            .map(|((_, page), image)| {
+                let size = image.shown_size(self.crop);
+                (*page, size.y / size.x * width)
+            })
             .collect();
         let next_chapter = self.adjacent_chapter(id, 1);
         let next_online = next_chapter.is_none()
@@ -3178,7 +3436,7 @@ impl ReaderApp {
             self.hitboxes
                 .insert(format!("vertical-page-{page}"), target);
             if let Some(texture) = self.pages.get(&(id.to_string(), page)) {
-                texture.paint(&painter, target);
+                texture.paint(&painter, target, self.crop);
                 self.rendered_page_nodes += 1;
             } else if let Some(error) = self.page_errors.get(&(id.to_string(), page)).cloned() {
                 let center = target.intersect(content).center();
@@ -3489,6 +3747,7 @@ impl ReaderApp {
                                 "从右向左翻页",
                                 "适合日式漫画的阅读顺序",
                             ) {
+                                self.reader_globals.rtl = self.rtl;
                                 self.setting(
                                     "reading-direction",
                                     if self.rtl { "rtl" } else { "ltr" }.into(),
@@ -3689,10 +3948,51 @@ impl ReaderApp {
                             .insert("reader-direction".into(), direction.rect);
                         if direction.clicked() {
                             self.rtl = !self.rtl;
-                            self.setting(
-                                "reading-direction",
-                                if self.rtl { "rtl" } else { "ltr" }.into(),
+                            self.save_reader_prefs();
+                        }
+                        for (name, hitbox, on) in [
+                            ("裁剪白边", "reader-crop", self.crop),
+                            ("适应宽度", "reader-fit", self.fit_width),
+                            ("双页首页单独", "reader-spread-offset", self.spread_offset),
+                        ] {
+                            let toggle = ui.add_sized(
+                                [ui.available_width(), 48.],
+                                Button::new(format!(
+                                    "{name}：{}",
+                                    if on { "开" } else { "关" }
+                                ))
+                                .wrap(),
                             );
+                            self.hitboxes.insert(hitbox.into(), toggle.rect);
+                            if toggle.clicked() {
+                                match hitbox {
+                                    "reader-crop" => self.crop = !self.crop,
+                                    "reader-fit" => self.fit_width = !self.fit_width,
+                                    _ => self.spread_offset = !self.spread_offset,
+                                }
+                                self.save_reader_prefs();
+                            }
+                        }
+                        let brightness = ui.add_sized(
+                            [ui.available_width(), 48.],
+                            Slider::new(&mut self.brightness, 0.3..=1.)
+                                .text("亮度")
+                                .fixed_decimals(2),
+                        );
+                        self.hitboxes
+                            .insert("reader-brightness".into(), brightness.rect);
+                        if brightness.changed() {
+                            self.brightness = self.brightness.clamp(0.3, 1.);
+                            self.save_reader_prefs();
+                        }
+                        let defaults = ui.add_sized(
+                            [ui.available_width(), 48.],
+                            Button::new("设为所有作品的默认").wrap(),
+                        );
+                        self.hitboxes
+                            .insert("reader-save-default".into(), defaults.rect);
+                        if defaults.clicked() {
+                            self.save_reader_globals();
                         }
                         let reset = ui.add_sized(
                             [ui.available_width(), 48.],
@@ -3914,6 +4214,7 @@ mod tests {
                 TextureOptions::LINEAR,
             )],
             size: vec2(2., 2.),
+            content: Rect::from_min_max(Pos2::ZERO, pos2(1., 1.)),
         }
     }
     #[test]
@@ -4114,6 +4415,75 @@ mod tests {
         assert_eq!(selected.len(), 3);
         assert!(!selected.contains(&"foreign".into()));
     }
+    #[test]
+    fn reader_prefs_save_per_work_and_beat_the_viewer_hint() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = Context::default();
+        let mut app = ReaderApp::new(root.path().into(), ctx.clone());
+        app.books = vec![book("one"), book("two"), book("other")];
+        let metadata = |chapter: &str| ChapterMetadata {
+            source_id: "source.a".into(),
+            manga_id: "story".into(),
+            manga_title: "Story".into(),
+            chapter_id: chapter.into(),
+            chapter_title: chapter.into(),
+            chapter_number: None,
+            volume_number: None,
+        };
+        app.replace_links(vec![
+            ChapterLink {
+                book_id: "one".into(),
+                metadata: metadata("c1"),
+            },
+            ChapterLink {
+                book_id: "two".into(),
+                metadata: metadata("c2"),
+            },
+        ]);
+        let mut stored = yejian_sources::Manga {
+            source_key: "source.a".into(),
+            key: "story".into(),
+            viewer: yejian_sources::Viewer::Vertical,
+            ..Default::default()
+        };
+        crate::sources::save_manga_snapshot(root.path(), &stored).unwrap();
+
+        // No saved entry: the source hint chooses vertical.
+        app.open_reader(&book("one"));
+        assert!(app.vertical, "viewer hint should apply");
+
+        // A reader-side change lands on the work and beats the hint.
+        app.set_reading_mode("paged");
+        assert!(!app.vertical);
+        app.open_reader(&book("two"));
+        assert!(!app.vertical, "chapters of one work share settings");
+        stored.viewer = yejian_sources::Viewer::Unknown;
+        app.open_reader(&book("other"));
+        assert!(!app.vertical && !app.spread, "no link means global defaults");
+        assert!(root.path().join("reader-prefs.json").is_file());
+
+        // A fresh instance reloads the same per-work entry.
+        let mut reopened = ReaderApp::new(root.path().into(), ctx);
+        reopened.books = vec![book("one")];
+        reopened.replace_links(vec![ChapterLink {
+            book_id: "one".into(),
+            metadata: metadata("c1"),
+        }]);
+        reopened.open_reader(&book("one"));
+        assert!(!reopened.vertical && !reopened.spread);
+    }
+
+    #[test]
+    fn spread_offset_shows_page_zero_alone_then_odd_pairs() {
+        assert_eq!(spread_pair(0, true), (0, None));
+        assert_eq!(spread_pair(1, true), (1, Some(2)));
+        assert_eq!(spread_pair(2, true), (1, Some(2)));
+        assert_eq!(spread_pair(3, true), (3, Some(4)));
+        assert_eq!(spread_pair(4, true), (3, Some(4)));
+        assert_eq!(spread_pair(0, false), (0, Some(1)));
+        assert_eq!(spread_pair(2, false), (2, Some(3)));
+    }
+
     #[test]
     fn page_cache_never_evicts_the_visible_spread_partner() {
         let root = tempfile::tempdir().unwrap();

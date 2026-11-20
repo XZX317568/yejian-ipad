@@ -715,7 +715,7 @@ fn manga_snapshot_path(root: &Path, key: &str) -> anyhow::Result<PathBuf> {
 /// postcard bytes the interpreter would send to `get_page_list` are written, so
 /// a restored task passes authors/tags/viewer/description unchanged and never
 /// needs a new details request. Existing identical bytes are reused.
-fn save_manga_snapshot(root: &Path, manga: &Manga) -> anyhow::Result<String> {
+pub(crate) fn save_manga_snapshot(root: &Path, manga: &Manga) -> anyhow::Result<String> {
     let key = manga_snapshot_key(&manga.source_key, &manga.key);
     let path = manga_snapshot_path(root, &key)?;
     let bytes = manga.to_postcard_bytes();
@@ -2322,6 +2322,24 @@ impl Sources {
     pub fn has_adjacent_online(&self, metadata: &ChapterMetadata, delta: i32) -> bool {
         self.adjacent_online(&metadata.source_id, &metadata.manga_id, &metadata.chapter_id, delta)
             .is_some_and(|chapter| !chapter.locked)
+    }
+
+    /// The source's preferred reading direction for this work, from the
+    /// manga details still in memory or its saved snapshot. `Unknown` counts
+    /// as no hint.
+    pub fn viewer_hint(&self, source_id: &str, manga_id: &str) -> Option<Viewer> {
+        let viewer = self
+            .selected_manga
+            .as_ref()
+            .filter(|manga| self.source_for(manga) == source_id && manga.key == manga_id)
+            .map(|manga| manga.viewer)
+            .or_else(|| {
+                let path =
+                    manga_snapshot_path(&self.root, &manga_snapshot_key(source_id, manga_id)).ok()?;
+                let bytes = std::fs::read(path).ok()?;
+                Manga::from_postcard_bytes(&bytes).ok().map(|manga| manga.viewer)
+            });
+        viewer.filter(|viewer| *viewer != Viewer::Unknown)
     }
 
     /// Opens the previous/next chapter of `metadata`, from the library when it
@@ -5396,6 +5414,37 @@ mod tests {
         .unwrap();
         assert_eq!(summary.done, 6);
         assert_eq!(fetched.load(Ordering::SeqCst), 6 - stored.len());
+    }
+
+    #[test]
+    fn viewer_hint_reads_memory_then_the_saved_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sources = test_sources(root.path());
+        assert!(sources.viewer_hint("source.a", "m").is_none());
+        let mut stored = manga("source.a", "m");
+        stored.viewer = Viewer::RightToLeft;
+        save_manga_snapshot(root.path(), &stored).unwrap();
+        assert_eq!(
+            sources.viewer_hint("source.a", "m"),
+            Some(Viewer::RightToLeft)
+        );
+        let mut selected = manga("source.a", "m");
+        selected.viewer = Viewer::LeftToRight;
+        sources.selected_manga = Some(selected);
+        assert_eq!(
+            sources.viewer_hint("source.a", "m"),
+            Some(Viewer::LeftToRight),
+            "loaded details win over the snapshot"
+        );
+        let mut unknown = manga("source.a", "other");
+        unknown.viewer = Viewer::Unknown;
+        sources.selected_manga = Some(unknown);
+        assert!(sources.viewer_hint("source.a", "other").is_none());
+        assert_eq!(
+            sources.viewer_hint("source.a", "m"),
+            Some(Viewer::RightToLeft),
+            "a different open detail still falls back to the snapshot"
+        );
     }
 
     #[test]
