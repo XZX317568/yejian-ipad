@@ -1450,7 +1450,7 @@ impl Sources {
                             if !engines.contains_key(&source) {
                                 engines.insert(source.clone(), SourceEngine::load(&catalog, &source)?);
                             }
-                            let list = pollster::block_on(engines[&source].chapters(&manga.key))?;
+                            let list = pollster::block_on(engines[&source].chapters_with(manga.clone()))?;
                             Ok(list.into_iter().map(|chapter| chapter.key).collect())
                         })()
                         .map_err(|error| format!("{error:#}"));

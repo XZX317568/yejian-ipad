@@ -369,6 +369,16 @@ impl SourceEngine {
         self.submit(move |state| state.chapters(&manga_id))
     }
 
+    /// Chapter list for a manga restored from storage, so sources that read
+    /// its `url`/`title` work without a fresh search or details request.
+    pub fn chapters_with(&self, manga: Manga) -> BoxFuture<Result<Vec<Chapter>, SourceError>> {
+        self.submit(move |state| {
+            let key = manga.key.clone();
+            state.remember_manga(manga);
+            state.chapters(&key)
+        })
+    }
+
     /// Returns page entries for a chapter previously returned by
     /// [`Self::chapters`]. Returns [`SourceError::UnknownChapter`] when the
     /// chapter has not been loaded yet.
