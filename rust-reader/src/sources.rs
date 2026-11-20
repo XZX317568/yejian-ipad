@@ -226,6 +226,30 @@ fn chapter_name(chapter: &Chapter) -> String {
 
 /// Use one comparable volume group for chapters without explicit volumes,
 /// matching the library's reading order (including decimal extra chapters).
+/// Result-grid columns: as many `min_cell` covers as the row fits, never
+/// fewer than one and never overflowing horizontally.
+fn grid_columns(width: f32) -> usize {
+    let min_cell = if width >= 600. { 150. } else { 112. };
+    (((width + 16.) / (min_cell + 16.)).floor() as usize).max(1)
+}
+
+/// Retains queued covers that are still wanted, appends new wants in order
+/// and drops the oldest entries once the queue exceeds `COVER_QUEUE_CAP`.
+/// `skip` holds keys already in flight or known failed, so they never queue.
+fn plan_covers(queue: &mut VecDeque<CoverReq>, want: Vec<CoverReq>, skip: &HashSet<String>) {
+    let wanted: HashSet<&str> = want.iter().map(|req| req.key.as_str()).collect();
+    queue.retain(|req| wanted.contains(req.key.as_str()));
+    for req in want {
+        if skip.contains(&req.key) || queue.iter().any(|queued| queued.key == req.key) {
+            continue;
+        }
+        queue.push_back(req);
+    }
+    while queue.len() > COVER_QUEUE_CAP {
+        queue.pop_front();
+    }
+}
+
 fn chapter_list(chapters: &[Chapter], query: &str, newest_first: bool) -> Vec<Chapter> {
     let first_volume = chapters.iter()
         .filter_map(|chapter| chapter.volume_number.filter(|number| number.is_finite()))
@@ -468,6 +492,37 @@ struct TaskStore {
 struct ChapterQueueState {
     status: DownloadStatus,
     has_archive: bool,
+}
+
+const COVER_QUEUE_CAP: usize = 24;
+const COVER_INFLIGHT_CAP: usize = 8;
+const COVER_TEXTURE_CAP: usize = 120;
+const COVER_MAX_HEIGHT: u32 = 360;
+
+/// One cover the results grid wants on screen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CoverReq {
+    key: String,
+    source: String,
+    url: String,
+}
+
+/// `CoverReq` resolved through the source's interpreter, ready for raw HTTP on
+/// any of the pool workers. The handler shares the source's cookie jar.
+struct CoverHttpJob {
+    key: String,
+    root: PathBuf,
+    handler: RequestHandler,
+    url: String,
+    headers: Vec<(String, String)>,
+    body: Option<Vec<u8>>,
+}
+
+/// Decoded cover delivered to the UI; `None` marks the URL as failed for the
+/// session so a placeholder is drawn instead of retrying every frame.
+struct CoverDone {
+    key: String,
+    image: Option<ColorImage>,
 }
 
 enum DlCmd {
@@ -1268,6 +1323,31 @@ pub struct Sources {
     up_rx: mpsc::Receiver<UpdateEvent>,
     /// Decoded follow covers by snapshot key; `None` means not on disk yet.
     covers: std::collections::HashMap<String, Option<TextureHandle>>,
+    /// Result-grid covers. `cover_queue` only holds cells near the viewport;
+    /// `cover_inflight` dedupes sent-but-unfinished requests and
+    /// `cover_outstanding` bounds how many are with the workers at once.
+    cover_req_tx: mpsc::Sender<CoverReq>,
+    cover_done_rx: mpsc::Receiver<CoverDone>,
+    cover_queue: VecDeque<CoverReq>,
+    cover_inflight: HashSet<String>,
+    cover_outstanding: usize,
+    /// URLs that failed once this session; placeholders render instead of
+    /// hammering a dead image host every frame.
+    cover_failed: HashSet<String>,
+    cover_ready: std::collections::HashMap<String, Option<ColorImage>>,
+    cover_missing_disk: HashSet<String>,
+    cover_textures: std::collections::HashMap<String, TextureHandle>,
+    cover_lru: VecDeque<String>,
+    /// Page already auto-loaded when its last grid row scrolled into view, so
+    /// the marker cannot fire the same request again on the next frame.
+    auto_next_page: Option<i32>,
+    /// Reading progress per `identity_id` chapter, fed by the host each frame
+    /// so the detail page can offer 继续阅读 and row read states.
+    chapter_progress: std::collections::HashMap<String, (usize, usize, Option<i64>)>,
+    description_expanded: bool,
+    /// Clickable rects registered this frame, merged into the app's hitboxes
+    /// so acceptance and automation can find grid cells and detail actions.
+    pub(crate) hitboxes: std::collections::BTreeMap<String, Rect>,
     settings_open: bool,
     settings_changed: bool,
     /// User choices per source, persisted in `source-settings.json`.
@@ -1419,6 +1499,70 @@ fn url_host(url: &str) -> String {
 fn follow_cover_path(root: &Path, snapshot: &str) -> anyhow::Result<PathBuf> {
     anyhow::ensure!(valid_task_id(snapshot), "非法的封面 id：{snapshot:?}");
     Ok(root.join("follow-covers").join(format!("{snapshot}.img")))
+}
+
+/// Result-grid covers are keyed by the exact URL they came from so the same
+/// image shared by two manga is fetched and cached once.
+fn cover_key(source: &str, url: &str) -> String {
+    identity_id(source, url, "cover")
+}
+
+fn source_cover_path(root: &Path, key: &str) -> anyhow::Result<PathBuf> {
+    anyhow::ensure!(valid_task_id(key), "非法的封面 id：{key:?}");
+    Ok(root.join("source-covers").join(format!("{key}.img")))
+}
+
+/// Downscales to the grid's display size; small covers are kept as-is rather
+/// than upscaled into a blur.
+fn shrink_cover(image: image::DynamicImage) -> image::DynamicImage {
+    if image.width() > 240 || image.height() > COVER_MAX_HEIGHT {
+        image.thumbnail(240, COVER_MAX_HEIGHT)
+    } else {
+        image
+    }
+}
+
+/// Writes a downscaled cover into the disk cache and returns the decoded
+/// image. The `.part` + rename pattern matches the rest of the cache so a
+/// crash mid-write never leaves a half file behind.
+fn store_source_cover(path: &Path, image: &image::DynamicImage) -> anyhow::Result<ColorImage> {
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    image.write_to(&mut encoded, image::ImageFormat::Png)?;
+    let part = path.with_extension("part");
+    std::fs::write(&part, encoded.get_ref())?;
+    std::fs::rename(&part, path)?;
+    let rgba = image.to_rgba8();
+    Ok(ColorImage::from_rgba_unmultiplied(
+        [rgba.width() as usize, rgba.height() as usize],
+        rgba.as_raw(),
+    ))
+}
+
+/// Downloads one cover through the source's own request handler, keeps the
+/// downscaled image in the disk cache and decodes it for the UI. The disk
+/// copy skips the network entirely on later launches.
+#[cfg(test)]
+fn fetch_source_cover(
+    root: &Path,
+    engine: &SourceEngine,
+    source: &str,
+    url: &str,
+) -> anyhow::Result<ColorImage> {
+    let key = cover_key(source, url);
+    let path = source_cover_path(root, &key)?;
+    if let Ok(bytes) = std::fs::read(&path) {
+        if let Ok(image) = image::load_from_memory(&bytes) {
+            return store_source_cover(&path, &image);
+        }
+    }
+    let handler = engine.request_handler();
+    let bytes = match pollster::block_on(engine.image_request(url, None))? {
+        Some(req) => request(&handler, req.url, req.headers, req.body)?,
+        None => request(&handler, url.to_string(), vec![], None)?,
+    };
+    let image = shrink_cover(image::load_from_memory(&bytes)?);
+    store_source_cover(&path, &image)
 }
 
 /// Downloads a follow's cover once, through the source's image request hook.
@@ -1766,6 +1910,107 @@ impl Sources {
             })
             .expect("Unable to start update worker");
 
+        // Result covers resolve through each source's interpreter on a single
+        // thread, then fetch bytes on a small HTTP pool so a slow image host
+        // never blocks browsing. Both stages share the source's cookie jar.
+        let (cover_req_tx, cover_req_rx) = mpsc::channel::<CoverReq>();
+        let (cover_done_tx, cover_done_rx) = mpsc::channel::<CoverDone>();
+        let cover_jobs: Arc<(std::sync::Mutex<VecDeque<CoverHttpJob>>, std::sync::Condvar)> =
+            Arc::new((std::sync::Mutex::new(VecDeque::new()), std::sync::Condvar::new()));
+        {
+            let cover_root = root.clone();
+            let cover_ctx = ctx.clone();
+            let queue = cover_jobs.clone();
+            let done_tx = cover_done_tx.clone();
+            let stale = stale_engines.clone();
+            thread::Builder::new()
+                .name("yejian-covers".into())
+                .spawn(move || {
+                    let catalog = SourceCatalog::new(cover_root.join("sources"));
+                    let mut engines = std::collections::HashMap::<String, SourceEngine>::new();
+                    while let Ok(req) = cover_req_rx.recv() {
+                        for id in stale.lock().unwrap().drain() {
+                            engines.remove(&id);
+                        }
+                        let job = (|| -> anyhow::Result<CoverHttpJob> {
+                            if !engines.contains_key(&req.source) {
+                                engines.insert(
+                                    req.source.clone(),
+                                    SourceEngine::load(&catalog, &req.source)?,
+                                );
+                            }
+                            let engine = &engines[&req.source];
+                            let (url, headers, body) =
+                                match pollster::block_on(engine.image_request(&req.url, None))? {
+                                    Some(image) => (image.url, image.headers, image.body),
+                                    None => (req.url.clone(), Vec::new(), None),
+                                };
+                            Ok(CoverHttpJob {
+                                key: req.key.clone(),
+                                root: cover_root.clone(),
+                                handler: engine.request_handler(),
+                                url,
+                                headers,
+                                body,
+                            })
+                        })();
+                        match job {
+                            Ok(job) => {
+                                let (lock, cvar) = &*queue;
+                                lock.lock().unwrap().push_back(job);
+                                cvar.notify_one();
+                            }
+                            Err(_) => {
+                                if done_tx.send(CoverDone { key: req.key, image: None }).is_err() {
+                                    return;
+                                }
+                                cover_ctx.request_repaint();
+                            }
+                        }
+                    }
+                })
+                .expect("Unable to start cover worker");
+        }
+        for _ in 0..4 {
+            let queue = cover_jobs.clone();
+            let done_tx = cover_done_tx.clone();
+            let ctx = ctx.clone();
+            thread::Builder::new()
+                .name("yejian-cover-http".into())
+                .spawn(move || {
+                    let (lock, cvar) = &*queue;
+                    loop {
+                        let job = {
+                            let mut guard = lock.lock().unwrap();
+                            loop {
+                                if let Some(job) = guard.pop_front() {
+                                    break job;
+                                }
+                                guard = cvar.wait(guard).unwrap();
+                            }
+                        };
+                        let image = request(&job.handler, job.url, job.headers, job.body)
+                            .and_then(|bytes| {
+                                let image = shrink_cover(image::load_from_memory(&bytes)?);
+                                let path = source_cover_path(&job.root, &job.key)?;
+                                store_source_cover(&path, &image)
+                            })
+                            .ok();
+                        if done_tx
+                            .send(CoverDone {
+                                key: job.key,
+                                image,
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                        ctx.request_repaint();
+                    }
+                })
+                .expect("Unable to start cover http worker");
+        }
+
         // Downloads live on their own thread and run one task at a time, so a
         // slow image server never blocks search, chapter loading or the UI.
         let (dl_tx, dl_cmd_rx) = mpsc::channel::<DlCmd>();
@@ -1903,6 +2148,20 @@ impl Sources {
             up_tx,
             up_rx,
             covers: Default::default(),
+            cover_req_tx,
+            cover_done_rx,
+            cover_queue: VecDeque::new(),
+            cover_inflight: HashSet::new(),
+            cover_outstanding: 0,
+            cover_failed: HashSet::new(),
+            cover_ready: Default::default(),
+            cover_missing_disk: HashSet::new(),
+            cover_textures: Default::default(),
+            cover_lru: VecDeque::new(),
+            auto_next_page: None,
+            chapter_progress: Default::default(),
+            description_expanded: false,
+            hitboxes: Default::default(),
             settings_open: false,
             settings_changed: false,
             source_settings,
@@ -2072,7 +2331,88 @@ impl Sources {
         texture
     }
 
-    /// Asks every followed manga's source for its current chapter list.
+    /// Returns the texture for a result-grid cover, or `None` while it is
+    /// still missing (the caller then queues a fetch). Freshly delivered
+    /// images are textured on first paint; the disk cache is probed once per
+    /// URL so a cold start never hits the filesystem twice for the same key.
+    fn cover_image(&mut self, ctx: &Context, source: &str, url: &str) -> Option<TextureHandle> {
+        if url.is_empty() {
+            return None;
+        }
+        let key = cover_key(source, url);
+        if let Some(texture) = self.cover_textures.get(&key) {
+            let texture = texture.clone();
+            self.cover_lru.retain(|entry| entry != &key);
+            self.cover_lru.push_back(key);
+            return Some(texture);
+        }
+        let image = match self.cover_ready.remove(&key) {
+            Some(image) => image.clone(),
+            None if self.cover_missing_disk.contains(&key) => None,
+            None => {
+                let image = source_cover_path(&self.root, &key)
+                    .ok()
+                    .and_then(|path| std::fs::read(path).ok())
+                    .and_then(|bytes| image::load_from_memory(&bytes).ok())
+                    .map(|image| {
+                        let rgba = image.to_rgba8();
+                        ColorImage::from_rgba_unmultiplied(
+                            [rgba.width() as usize, rgba.height() as usize],
+                            rgba.as_raw(),
+                        )
+                    });
+                if image.is_none() {
+                    self.cover_missing_disk.insert(key.clone());
+                }
+                image
+            }
+        }?;
+        let texture = ctx.load_texture(
+            format!("source-cover-{key}"),
+            image,
+            TextureOptions::LINEAR,
+        );
+        self.cover_textures.insert(key.clone(), texture.clone());
+        self.cover_lru.push_back(key);
+        while self.cover_textures.len() > COVER_TEXTURE_CAP {
+            match self.cover_lru.pop_front() {
+                Some(evicted) => {
+                    self.cover_textures.remove(&evicted);
+                }
+                None => break,
+            }
+        }
+        Some(texture)
+    }
+
+    /// Keeps the cover queue to what is nearly visible: cells that scrolled
+    /// away drop out, new wants append in order, and the queue never exceeds
+    /// `COVER_QUEUE_CAP` (the oldest requests are dropped first).
+    fn plan_covers(&mut self, want: Vec<CoverReq>) {
+        let skip: HashSet<String> = self
+            .cover_inflight
+            .iter()
+            .chain(self.cover_failed.iter())
+            .cloned()
+            .collect();
+        plan_covers(&mut self.cover_queue, want, &skip);
+        while self.cover_outstanding < COVER_INFLIGHT_CAP {
+            let Some(req) = self.cover_queue.pop_back() else {
+                break;
+            };
+            if self.cover_req_tx.send(req.clone()).is_err() {
+                break;
+            }
+            self.cover_inflight.insert(req.key);
+            self.cover_outstanding += 1;
+        }
+    }
+
+    /// Reading progress the host knows about, by `identity_id` chapter key.
+    /// Called once per sources frame so 继续阅读 and row states stay current.
+    pub fn set_chapter_progress(&mut self, map: std::collections::HashMap<String, (usize, usize, Option<i64>)>) {
+        self.chapter_progress = map;
+    }
     pub fn check_updates(&mut self) {
         if self.checking > 0 {
             return;
@@ -3031,6 +3371,14 @@ impl Sources {
     }
 
     pub fn poll(&mut self) {
+        while let Ok(done) = self.cover_done_rx.try_recv() {
+            self.cover_outstanding = self.cover_outstanding.saturating_sub(1);
+            self.cover_inflight.remove(&done.key);
+            if done.image.is_none() {
+                self.cover_failed.insert(done.key.clone());
+            }
+            self.cover_ready.insert(done.key, done.image);
+        }
         if let Some(origin) = take_web_challenge() {
             self.challenge = Some(origin);
         }
@@ -3929,7 +4277,142 @@ impl Sources {
         }
     }
 
+    /// Search and listing results as a cover grid: cover on top, a two-line
+    /// title and one muted metadata line below, the whole cell a single tap
+    /// target. Covers are requested only for cells near the viewport and the
+    /// next page auto-loads when the last row scrolls into view.
+    fn results_grid(&mut self, ui: &mut Ui) {
+        let palette = design::palette(ui.visuals().dark_mode);
+        let width = ui.available_width();
+        let gap = 16.;
+        let cols = grid_columns(width);
+        let cell_w = (width - gap * cols.saturating_sub(1) as f32) / cols as f32;
+        let cover_h = cell_w * 1.5;
+        let body = TextStyle::Body.resolve(ui.style());
+        let body_h = ui.text_style_height(&TextStyle::Body);
+        let small_h = ui.text_style_height(&TextStyle::Small);
+        let cell_h = cover_h + 6. + body_h * 2. + 2. + small_h + 6.;
+        let expanded = ui.clip_rect().expand(cell_h + gap);
+        let entries = self.results.entries.clone();
+        let mut want = Vec::new();
+        let mut last_row = None;
+        let mut open = None;
+        for (row, chunk) in entries.chunks(cols).enumerate() {
+            let (rect, _) = ui.allocate_exact_size(vec2(width, cell_h), Sense::hover());
+            last_row = Some(rect);
+            for (offset, manga) in chunk.iter().enumerate() {
+                let index = row * cols + offset;
+                let cell = Rect::from_min_size(
+                    pos2(rect.left() + offset as f32 * (cell_w + gap), rect.top()),
+                    vec2(cell_w, cell_h),
+                );
+                let response = ui.interact(
+                    cell,
+                    ui.scope_id().with(("source-result", index)),
+                    if self.busy { Sense::hover() } else { Sense::click() },
+                );
+                response.widget_info(|| {
+                    WidgetInfo::labeled(Role::Button, !self.busy, &manga.title)
+                });
+                self.hitboxes.insert(format!("source-result-{index}"), cell);
+                if response.clicked() {
+                    open = Some(manga.clone());
+                }
+                let source = self.source_for(manga);
+                let url = manga.cover.clone().unwrap_or_default();
+                let texture = if expanded.intersects(cell) {
+                    let texture = self.cover_image(ui.ctx(), &source, &url);
+                    if texture.is_none() && !url.is_empty() {
+                        want.push(CoverReq {
+                            key: cover_key(&source, &url),
+                            source,
+                            url,
+                        });
+                    }
+                    texture
+                } else {
+                    None
+                };
+                if response.hovered() && !self.busy {
+                    ui.painter().rect_filled(cell, 8., palette.accent_soft);
+                }
+                let cover_rect = Rect::from_min_size(cell.min, vec2(cell_w, cover_h));
+                let painter = ui.painter().with_clip_rect(ui.clip_rect().intersect(cell));
+                match texture {
+                    Some(texture) => {
+                        painter.image(
+                            texture.id(),
+                            cover_rect,
+                            Rect::from_min_max(pos2(0., 0.), pos2(1., 1.)),
+                            Color32::WHITE,
+                        );
+                    }
+                    None => {
+                        painter.rect_filled(cover_rect, 8., palette.surface);
+                        if let Some(initial) = manga.title.chars().next() {
+                            painter.text(
+                                cover_rect.center(),
+                                Align2::CENTER_CENTER,
+                                initial.to_string(),
+                                TextStyle::Heading.resolve(ui.style()),
+                                palette.muted,
+                            );
+                        }
+                    }
+                }
+                let mut title_job = egui::text::LayoutJob::simple(
+                    manga.title.clone(),
+                    body.clone(),
+                    palette.ink,
+                    cell_w,
+                );
+                title_job.wrap.max_rows = 2;
+                let title_galley = painter.layout_job(title_job);
+                painter.galley(
+                    pos2(cell.left(), cover_rect.bottom() + 6.),
+                    title_galley,
+                    palette.ink,
+                );
+                let meta = manga
+                    .authors
+                    .as_ref()
+                    .filter(|values| !values.is_empty())
+                    .map(|values| values.join(" / "))
+                    .or_else(|| {
+                        manga.tags.as_ref().and_then(|values| values.first().cloned())
+                    })
+                    .unwrap_or_default();
+                let mut meta_job = egui::text::LayoutJob::simple(
+                    meta,
+                    TextStyle::Small.resolve(ui.style()),
+                    palette.muted,
+                    cell_w,
+                );
+                meta_job.wrap.max_rows = 1;
+                let meta_galley = painter.layout_job(meta_job);
+                painter.galley(
+                    pos2(cell.left(), cover_rect.bottom() + 6. + body_h * 2. + 2.),
+                    meta_galley,
+                    palette.muted,
+                );
+            }
+        }
+        if self.results.has_more
+            && !self.busy
+            && self.auto_next_page != Some(self.results.page + 1)
+            && last_row.is_some_and(|rect| rect.intersects(ui.clip_rect().expand(2.)))
+        {
+            self.auto_next_page = Some(self.results.page + 1);
+            self.load_next_page();
+        }
+        self.plan_covers(want);
+        if let Some(manga) = open {
+            self.open_manga(manga);
+        }
+    }
+
     pub fn ui(&mut self, ui: &mut Ui) {
+        self.hitboxes.clear();
         self.poll();
         if let Some(origin) = self.challenge.clone() {
             ui.horizontal_wrapped(|ui| {
@@ -4001,34 +4484,7 @@ impl Sources {
                             .unwrap_or_else(|| "搜索结果".into());
                         design::section(ui, &format!("{label} · {}", self.results.entries.len()));
                     }
-                    for manga in self.results.entries.clone() {
-                        let metadata = manga
-                            .authors
-                            .as_ref()
-                            .filter(|values| !values.is_empty())
-                            .map(|values| values.join(" / "))
-                            .or_else(|| {
-                                manga.tags.as_ref().map(|values| {
-                                    values
-                                        .iter()
-                                        .take(3)
-                                        .cloned()
-                                        .collect::<Vec<_>>()
-                                        .join(" · ")
-                                })
-                            })
-                            .unwrap_or_default();
-                        if source_item(
-                            ui,
-                            ("manga", &manga.key),
-                            &manga.title,
-                            &metadata,
-                            false,
-                            !self.busy,
-                        ) {
-                            self.open_manga(manga);
-                        }
-                    }
+                    self.results_grid(ui);
                     if self.results.has_more {
                         let next = self.results.page + 1;
                         ui.add_space(8.);
@@ -4625,6 +5081,20 @@ mod tests {
             up_tx: mpsc::channel().0,
             up_rx: mpsc::channel().1,
             covers: Default::default(),
+            cover_req_tx: mpsc::channel().0,
+            cover_done_rx: mpsc::channel().1,
+            cover_queue: VecDeque::new(),
+            cover_inflight: HashSet::new(),
+            cover_outstanding: 0,
+            cover_failed: HashSet::new(),
+            cover_ready: Default::default(),
+            cover_missing_disk: HashSet::new(),
+            cover_textures: Default::default(),
+            cover_lru: VecDeque::new(),
+            auto_next_page: None,
+            chapter_progress: Default::default(),
+            description_expanded: false,
+            hitboxes: Default::default(),
             settings_open: false,
             settings_changed: false,
             source_settings: Default::default(),
@@ -6294,5 +6764,101 @@ mod tests {
             .manga_for(root.path())
             .expect("re-join writes a readable snapshot");
         assert_eq!(rebuilt.authors, Some(vec!["New Author".into()]));
+    }
+
+    #[test]
+    fn result_grid_columns_never_underflow_or_overflow() {
+        let expect = [
+            (320., 2),
+            (507., 4),
+            (744., 4),
+            (834., 5),
+            (1024., 6),
+            (1366., 8),
+        ];
+        for (width, cols) in expect {
+            assert_eq!(grid_columns(width), cols, "width {width}");
+        }
+        // Even at 200% type the math is font-independent: one column minimum
+        // and every cell stays at least its minimum width inside the row.
+        for width in [200., 320., 507.] {
+            let cols = grid_columns(width);
+            assert!(cols >= 1);
+            let min_cell = if width >= 600. { 150. } else { 112. };
+            let cell_w = (width - 16. * cols.saturating_sub(1) as f32) / cols as f32;
+            assert!(cell_w >= min_cell, "width {width} cell {cell_w}");
+        }
+    }
+
+    #[test]
+    fn cover_queue_tracks_only_the_visible_window() {
+        let req = |key: &str| CoverReq {
+            key: key.into(),
+            source: "s".into(),
+            url: format!("https://img/{key}"),
+        };
+        let keys = |queue: &VecDeque<CoverReq>| {
+            queue.iter().map(|req| req.key.clone()).collect::<Vec<_>>()
+        };
+        let skip = HashSet::from(["in-flight".to_string(), "failed".to_string()]);
+        let mut queue = VecDeque::new();
+        plan_covers(
+            &mut queue,
+            vec![req("a"), req("b"), req("in-flight"), req("failed")],
+            &skip,
+        );
+        assert_eq!(keys(&queue), ["a", "b"], "sent and failed covers never queue");
+        plan_covers(&mut queue, vec![req("a"), req("c"), req("d")], &skip);
+        assert_eq!(keys(&queue), ["a", "c", "d"], "scrolled-away cells drop out");
+        let many: Vec<CoverReq> = (0..30).map(|i| req(&format!("k{i}"))).collect();
+        plan_covers(&mut queue, many, &skip);
+        assert_eq!(queue.len(), COVER_QUEUE_CAP);
+        assert_eq!(queue.back().unwrap().key, "k29", "newest requests win");
+        assert!(!queue.iter().any(|req| req.key == "a"), "oldest drops first");
+    }
+
+    #[test]
+    fn cover_key_is_stable_and_scoped() {
+        assert_eq!(cover_key("s", "u"), cover_key("s", "u"));
+        assert_ne!(cover_key("a", "u"), cover_key("b", "u"));
+        assert_ne!(cover_key("s", "u1"), cover_key("s", "u2"));
+        assert!(source_cover_path(Path::new("root"), &cover_key("s", "u")).is_ok());
+    }
+
+    #[test]
+    fn source_cover_store_writes_atomically_and_reads_back() {
+        let root = tempfile::tempdir().unwrap();
+        let path = source_cover_path(root.path(), &cover_key("s", "u")).unwrap();
+        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            8,
+            8,
+            image::Rgba([1, 2, 3, 255]),
+        ));
+        let decoded = store_source_cover(&path, &image).unwrap();
+        assert_eq!(decoded.size, [8, 8]);
+        assert!(path.is_file());
+        assert!(!path.with_extension("part").exists());
+        assert!(image::load_from_memory(&std::fs::read(&path).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn cover_fetch_runs_end_to_end_and_caches_on_disk() {
+        let root = tempfile::tempdir().unwrap();
+        let (base, server) = serve_png(1);
+        let engine = SourceEngine::load_wasm(
+            source_manifest(),
+            pages_wasm(&[]),
+            EngineOptions::default(),
+        )
+        .unwrap();
+        let url = format!("{base}/cover.png");
+        let image = fetch_source_cover(root.path(), &engine, "test.source", &url).unwrap();
+        assert_eq!(image.size, [4, 4]);
+        server.join().unwrap();
+        let path = source_cover_path(root.path(), &cover_key("test.source", &url)).unwrap();
+        assert!(path.is_file());
+        // The second fetch must come from disk: the server only answered once.
+        let cached = fetch_source_cover(root.path(), &engine, "test.source", &url).unwrap();
+        assert_eq!(cached.size, image.size);
     }
 }

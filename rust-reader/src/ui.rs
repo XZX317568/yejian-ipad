@@ -4285,6 +4285,8 @@ impl ReaderApp {
             ui.style_mut().wrap_mode = Some(TextWrapMode::Wrap);
             self.sources.ui(ui);
         });
+        self.hitboxes
+            .extend(self.sources.hitboxes.iter().map(|(id, rect)| (id.clone(), *rect)));
     }
     fn pick_import(&mut self) {
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
