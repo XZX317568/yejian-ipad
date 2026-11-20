@@ -471,6 +471,8 @@ public class RustActivity extends NativeActivity {
         WebSettings settings = webView.getSettings();
         settings.setJavaScriptEnabled(true);
         settings.setDomStorageEnabled(true);
+        settings.setAllowFileAccess(false);
+        settings.setAllowContentAccess(false);
         if (userAgent != null && !userAgent.isEmpty()) {
             settings.setUserAgentString(userAgent);
         }
@@ -483,17 +485,9 @@ public class RustActivity extends NativeActivity {
                     WebView view, WebResourceRequest request) {
                 Uri target = request.getUrl();
                 String scheme = target.getScheme();
-                // Regular http/https stays inside the WebView; custom schemes
-                // (app callbacks, market links) are handed to the system.
-                if ("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme)) {
-                    return false;
-                }
-                try {
-                    startActivity(new Intent(Intent.ACTION_VIEW, target));
-                } catch (Throwable ignored) {
-                    // No handler for this scheme; keep the page open.
-                }
-                return true;
+                // Only http/https may load. A source page must not launch other
+                // apps through intent:, market: or custom schemes.
+                return !("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme));
             }
         });
         column.addView(webView, new LinearLayout.LayoutParams(
