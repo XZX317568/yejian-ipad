@@ -27,8 +27,30 @@ use reqwest::header::{HeaderName, HeaderValue};
 
 /// One cookie jar for every source engine, so cookies from a platform web
 /// view (Cloudflare clearance, web login) reach all later requests.
-static JAR: once_cell::sync::Lazy<Arc<reqwest::cookie::Jar>> =
-    once_cell::sync::Lazy::new(|| Arc::new(reqwest::cookie::Jar::default()));
+static JAR: once_cell::sync::Lazy<Arc<SharedJar>> =
+    once_cell::sync::Lazy::new(|| Arc::new(SharedJar(std::sync::RwLock::new(Default::default()))));
+
+/// A jar that can be emptied on logout while clients keep referencing it.
+struct SharedJar(std::sync::RwLock<reqwest::cookie::Jar>);
+
+impl reqwest::cookie::CookieStore for SharedJar {
+    fn set_cookies(
+        &self,
+        headers: &mut dyn Iterator<Item = &HeaderValue>,
+        url: &url::Url,
+    ) {
+        self.0.read().unwrap().set_cookies(headers, url);
+    }
+
+    fn cookies(&self, url: &url::Url) -> Option<HeaderValue> {
+        self.0.read().unwrap().cookies(url)
+    }
+}
+
+/// Forgets every cookie, from servers and from web views alike.
+pub fn clear_cookies() {
+    *JAR.0.write().unwrap() = reqwest::cookie::Jar::default();
+}
 
 /// Origin of the last request a Cloudflare challenge blocked.
 static CHALLENGE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
@@ -38,8 +60,10 @@ pub fn add_web_cookies(url: &str, cookies: &[(String, String)]) {
     let Ok(url) = url::Url::parse(url) else {
         return;
     };
+    let secure = if url.scheme() == "https" { "; Secure" } else { "" };
+    let jar = JAR.0.read().unwrap();
     for (name, value) in cookies {
-        JAR.add_cookie_str(&format!("{name}={value}; Path=/"), &url);
+        jar.add_cookie_str(&format!("{name}={value}; Path=/{secure}"), &url);
     }
 }
 

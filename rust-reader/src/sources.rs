@@ -191,6 +191,7 @@ enum Reply {
         key: String,
         user: String,
         ok: bool,
+        web: bool,
     },
     Metadata {
         filters: Vec<Filter>,
@@ -1357,6 +1358,13 @@ fn setting_row(ui: &mut Ui, item: &SettingItem, current: Option<SettingValue>) -
     changed
 }
 
+fn url_host(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    host.split(':').next().unwrap_or("").to_ascii_lowercase()
+}
+
 fn follow_cover_path(root: &Path, snapshot: &str) -> anyhow::Result<PathBuf> {
     anyhow::ensure!(valid_task_id(snapshot), "非法的封面 id：{snapshot:?}");
     Ok(root.join("follow-covers").join(format!("{snapshot}.img")))
@@ -1637,6 +1645,7 @@ impl Sources {
                                     );
                                 }
                                 let engine = &engines[&source];
+                                let web = credentials.is_err();
                                 let (user, ok) = match credentials {
                                     Ok((user, password)) => {
                                         let ok = pollster::block_on(
@@ -1649,7 +1658,7 @@ impl Sources {
                                         ("网页登录".to_string(), ok)
                                     }
                                 };
-                                Reply::Login { key, user, ok }
+                                Reply::Login { key, user, ok, web }
                             }
                         })
                     })();
@@ -3024,10 +3033,17 @@ impl Sources {
                         }
                     }
                 }
-                Reply::Login { key, user, ok } => {
+                Reply::Login { key, user, ok, web } => {
                     if ok {
                         self.login_pass.clear();
-                        self.change_setting(&format!("{key}.username"), SettingValue::Str(user));
+                        let marker = format!("{key}.username");
+                        if web {
+                            self.change_setting(&marker, SettingValue::Str(user));
+                        } else {
+                            // A basic-login session lives only in this process,
+                            // so the form returns after a restart.
+                            set_setting(&self.selected_source, &marker, SettingValue::Str(user));
+                        }
                         self.status = "登录成功".into();
                     } else {
                         self.status = "登录失败，请检查账号或稍后再试".into();
@@ -3424,15 +3440,7 @@ impl Sources {
         };
         add_web_cookies(&result.url, &cookies);
         self.web_cookies.insert(result.url.clone(), cookies.clone());
-        let saved = serde_json::to_vec_pretty(&self.web_cookies)
-            .map_err(anyhow::Error::from)
-            .and_then(|bytes| {
-                let part = self.root.join(format!("{WEB_COOKIES_FILE}.part"));
-                std::fs::write(&part, bytes)?;
-                std::fs::rename(&part, self.root.join(WEB_COOKIES_FILE))?;
-                Ok(())
-            });
-        if let Err(error) = saved {
+        if let Err(error) = self.save_web_cookies() {
             self.status = format!("网页验证结果保存失败：{error:#}");
         }
         if let Some(key) = login {
@@ -3447,6 +3455,42 @@ impl Sources {
         }
     }
 
+    /// Drops this source's saved web cookies and every live cookie, then
+    /// re-adds the other sources' saved web cookies.
+    fn forget_source_cookies(&mut self) {
+        let hosts: Vec<String> = self
+            .installed
+            .iter()
+            .find(|source| source.manifest.id == self.selected_source)
+            .map(|source| {
+                source
+                    .manifest
+                    .urls
+                    .iter()
+                    .map(|url| url_host(url))
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.web_cookies.retain(|url, _| {
+            let host = url_host(url);
+            !hosts.iter().any(|known| host == *known || host.ends_with(&format!(".{known}")) || known.ends_with(&format!(".{host}")))
+        });
+        clear_cookies();
+        for (url, cookies) in &self.web_cookies {
+            add_web_cookies(url, cookies);
+        }
+        if let Err(error) = self.save_web_cookies() {
+            self.status = format!("网页登录信息清除失败：{error:#}");
+        }
+    }
+
+    fn save_web_cookies(&self) -> anyhow::Result<()> {
+        let part = self.root.join(format!("{WEB_COOKIES_FILE}.part"));
+        std::fs::write(&part, serde_json::to_vec_pretty(&self.web_cookies)?)?;
+        std::fs::rename(&part, self.root.join(WEB_COOKIES_FILE))?;
+        Ok(())
+    }
+
     fn login_row(&mut self, ui: &mut Ui, item: &SettingItem, web: bool, url: Option<&str>) {
         let source = self.selected_source.clone();
         let marker = format!("{}.username", item.key);
@@ -3459,6 +3503,7 @@ impl Sources {
             ui.label(format!("已登录：{user}"));
             if ui.add(quiet_action("退出登录")).clicked() {
                 self.change_setting(&marker, SettingValue::Str(String::new()));
+                self.forget_source_cookies();
             }
             return;
         }
@@ -3510,6 +3555,9 @@ impl Sources {
                 ui.set_max_width(ui.available_width());
                 design::section(ui, "书源设置");
                 ui.label(RichText::new("修改后返回书源即生效。").small());
+                if self.busy || !self.status.is_empty() {
+                    ui.add(Label::new(RichText::new(&self.status).color(design::palette(ui.visuals().dark_mode).muted)).wrap());
+                }
                 let mut group = String::new();
                 for item in items {
                     if item.group != group {
