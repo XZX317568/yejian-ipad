@@ -174,6 +174,12 @@ enum Task {
         page: i32,
     },
     Chapters(String, Manga),
+    Login {
+        source: String,
+        key: String,
+        /// `Ok((user, password))` for basic login, `Err(cookies)` for web.
+        credentials: Result<(String, String), Vec<(String, String)>>,
+    },
 }
 enum Reply {
     Installed {
@@ -181,6 +187,11 @@ enum Reply {
         updated: Option<String>,
     },
     Repository(RepositoryIndex),
+    Login {
+        key: String,
+        user: String,
+        ok: bool,
+    },
     Metadata {
         filters: Vec<Filter>,
         listings: Vec<Listing>,
@@ -1211,7 +1222,17 @@ pub struct Sources {
     source_settings: SettingsStore,
     /// Sources whose loaded engines must restart to read changed settings.
     stale_engines: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// Origin a Cloudflare challenge blocked, until the user verifies.
+    challenge: Option<String>,
+    /// Source and optional login key of the open in-app browser page.
+    web_purpose: Option<(String, Option<String>)>,
+    login_user: String,
+    login_pass: String,
+    /// Cookies from verification/login pages by URL, in `web-cookies.json`.
+    web_cookies: std::collections::BTreeMap<String, Vec<(String, String)>>,
 }
+
+const WEB_COOKIES_FILE: &str = "web-cookies.json";
 
 type SettingsStore =
     std::collections::BTreeMap<String, std::collections::BTreeMap<String, SettingValue>>;
@@ -1240,6 +1261,7 @@ fn setting_row(ui: &mut Ui, item: &SettingItem, current: Option<SettingValue>) -
         ui.add(Label::new(RichText::new(&item.title).strong()).wrap());
     };
     match &item.kind {
+        SettingKind::Login { .. } => {}
         SettingKind::Toggle => {
             let mut on = matches!(current, Some(SettingValue::Bool(true)));
             if ui.add(Checkbox::new(&mut on, &item.title)).changed() {
@@ -1466,6 +1488,14 @@ impl Sources {
             }
         }
         let stale_engines = Arc::new(std::sync::Mutex::new(HashSet::<String>::new()));
+        let web_cookies: std::collections::BTreeMap<String, Vec<(String, String)>> =
+            std::fs::read(root.join(WEB_COOKIES_FILE))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or_default();
+        for (url, cookies) in &web_cookies {
+            add_web_cookies(url, cookies);
+        }
         let worker_stale = stale_engines.clone();
         thread::Builder::new()
             .name("yejian-sources".into())
@@ -1598,6 +1628,28 @@ impl Sources {
                                 let detail = pollster::block_on(engine.manga_details(&manga.key))?;
                                 let chapters = pollster::block_on(engine.chapters(&manga.key))?;
                                 Reply::Chapters(source, detail, chapters)
+                            }
+                            Task::Login { source, key, credentials } => {
+                                if !engines.contains_key(&source) {
+                                    engines.insert(
+                                        source.clone(),
+                                        SourceEngine::load(&catalog, &source)?,
+                                    );
+                                }
+                                let engine = &engines[&source];
+                                let (user, ok) = match credentials {
+                                    Ok((user, password)) => {
+                                        let ok = pollster::block_on(
+                                            engine.basic_login(&key, &user, &password),
+                                        )?;
+                                        (user, ok)
+                                    }
+                                    Err(cookies) => {
+                                        let ok = pollster::block_on(engine.web_login(&key, cookies))?;
+                                        ("网页登录".to_string(), ok)
+                                    }
+                                };
+                                Reply::Login { key, user, ok }
                             }
                         })
                     })();
@@ -1794,6 +1846,11 @@ impl Sources {
             settings_changed: false,
             source_settings,
             stale_engines,
+            challenge: None,
+            web_purpose: None,
+            login_user: String::new(),
+            login_pass: String::new(),
+            web_cookies,
         };
         let mut sources = sources;
         match follows::load(&sources.root) {
@@ -2822,6 +2879,14 @@ impl Sources {
     }
 
     pub fn poll(&mut self) {
+        if let Some(origin) = take_web_challenge() {
+            self.challenge = Some(origin);
+        }
+        match yejian_platform::poll_web() {
+            Ok(Some(result)) => self.finish_web(result),
+            Ok(None) => {}
+            Err(error) => self.status = format!("网页结果读取失败：{error:?}"),
+        }
         while let Ok((request_id, result)) = self.rx.try_recv() {
             // Every operation (including failures and detail loads) belongs to
             // one request. Same text with different filters/listing is a new
@@ -2850,6 +2915,7 @@ impl Sources {
                             format!("第 {page} 页加载失败：{error}")
                         }
                         Some(Task::Metadata(_)) => format!("书源选项加载失败：{error}"),
+                        Some(Task::Login { .. }) => format!("登录失败：{error}"),
                         _ => format!("加载失败：{error}"),
                     };
                     self.failed = completed;
@@ -2956,6 +3022,15 @@ impl Sources {
                                     Some(FilterEditor::new(&self.filters, &self.applied_filters));
                             }
                         }
+                    }
+                }
+                Reply::Login { key, user, ok } => {
+                    if ok {
+                        self.login_pass.clear();
+                        self.change_setting(&format!("{key}.username"), SettingValue::Str(user));
+                        self.status = "登录成功".into();
+                    } else {
+                        self.status = "登录失败，请检查账号或稍后再试".into();
                     }
                 }
                 Reply::Chapters(source, manga, list) => {
@@ -3164,6 +3239,16 @@ impl Sources {
                 {
                     self.settings_open = true;
                 }
+                let site = self
+                    .installed
+                    .iter()
+                    .find(|source| source.manifest.id == self.selected_source)
+                    .and_then(|source| source.manifest.primary_url().map(str::to_string));
+                if let Some(site) = site.filter(|_| cfg!(target_os = "ios")) {
+                    if ui.add(quiet_action("网页验证")).clicked() {
+                        self.open_web(&site, None);
+                    }
+                }
             });
             if self.selected_source.is_empty() {
                 return;
@@ -3320,6 +3405,88 @@ impl Sources {
         }
     }
 
+    /// Opens `url` in the in-app browser for verification (`login` = None)
+    /// or a source's web login.
+    fn open_web(&mut self, url: &str, login: Option<String>) {
+        match yejian_platform::open_web(url, DEFAULT_USER_AGENT) {
+            Ok(()) => self.web_purpose = Some((self.selected_source.clone(), login)),
+            Err(error) => self.status = format!("无法打开网页：{error:?}"),
+        }
+    }
+
+    fn finish_web(&mut self, result: yejian_platform::WebResult) {
+        let Some((source, login)) = self.web_purpose.take() else {
+            return;
+        };
+        let Some(cookies) = result.cookies else {
+            self.status = "已取消网页验证".into();
+            return;
+        };
+        add_web_cookies(&result.url, &cookies);
+        self.web_cookies.insert(result.url.clone(), cookies.clone());
+        let saved = serde_json::to_vec_pretty(&self.web_cookies)
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| {
+                let part = self.root.join(format!("{WEB_COOKIES_FILE}.part"));
+                std::fs::write(&part, bytes)?;
+                std::fs::rename(&part, self.root.join(WEB_COOKIES_FILE))?;
+                Ok(())
+            });
+        if let Err(error) = saved {
+            self.status = format!("网页验证结果保存失败：{error:#}");
+        }
+        if let Some(key) = login {
+            self.submit(Task::Login { source, key, credentials: Err(cookies) });
+            return;
+        }
+        self.challenge = None;
+        self.status = "网页验证完成，正在重新加载".into();
+        if self.selected_source == source && !source.is_empty() {
+            self.select_source("");
+            self.select_source(&source);
+        }
+    }
+
+    fn login_row(&mut self, ui: &mut Ui, item: &SettingItem, web: bool, url: Option<&str>) {
+        let source = self.selected_source.clone();
+        let marker = format!("{}.username", item.key);
+        let user = match setting_value(&source, &marker) {
+            Some(SettingValue::Str(user)) if !user.is_empty() => Some(user),
+            _ => None,
+        };
+        ui.add(Label::new(RichText::new(&item.title).strong()).wrap());
+        if let Some(user) = user {
+            ui.label(format!("已登录：{user}"));
+            if ui.add(quiet_action("退出登录")).clicked() {
+                self.change_setting(&marker, SettingValue::Str(String::new()));
+            }
+            return;
+        }
+        if web {
+            if ui.add_enabled(!self.busy, quiet_action("打开网页登录")).clicked() {
+                if let Some(url) = url {
+                    self.open_web(url, Some(item.key.clone()));
+                }
+            }
+            return;
+        }
+        ui.add(TextEdit::singleline(&mut self.login_user).hint_text("账号").desired_width(ui.available_width()));
+        ui.add(
+            TextEdit::singleline(&mut self.login_pass)
+                .password(true)
+                .hint_text("密码")
+                .desired_width(ui.available_width()),
+        );
+        let ready = !self.busy && !self.login_user.is_empty() && !self.login_pass.is_empty();
+        if ui.add_enabled(ready, design::primary("登录", ui.visuals().dark_mode)).clicked() {
+            self.submit(Task::Login {
+                source,
+                key: item.key.clone(),
+                credentials: Ok((self.login_user.clone(), self.login_pass.clone())),
+            });
+        }
+    }
+
     fn close_settings(&mut self) {
         self.settings_open = false;
         if std::mem::take(&mut self.settings_changed) {
@@ -3351,8 +3518,12 @@ impl Sources {
                             design::section(ui, &group);
                         }
                     }
-                    let current = setting_value(&source, &item.key).or(item.default.clone());
                     ui.add_space(6.);
+                    if let SettingKind::Login { web, url } = &item.kind {
+                        self.login_row(ui, &item, *web, url.as_deref());
+                        continue;
+                    }
+                    let current = setting_value(&source, &item.key).or(item.default.clone());
                     if let Some(value) = setting_row(ui, &item, current) {
                         self.change_setting(&item.key, value);
                     }
@@ -3571,6 +3742,18 @@ impl Sources {
 
     pub fn ui(&mut self, ui: &mut Ui) {
         self.poll();
+        if let Some(origin) = self.challenge.clone() {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("书源被 Cloudflare 拦截，需要网页验证").strong());
+                if ui.add(design::primary("网页验证", ui.visuals().dark_mode)).clicked() {
+                    self.open_web(&origin, None);
+                }
+                if ui.add(quiet_action("忽略")).clicked() {
+                    self.challenge = None;
+                }
+            });
+            ui.add_space(6.);
+        }
         if self.settings_open {
             self.settings_page(ui);
             return;
@@ -4253,6 +4436,11 @@ mod tests {
             settings_changed: false,
             source_settings: Default::default(),
             stale_engines: Default::default(),
+            challenge: None,
+            web_purpose: None,
+            login_user: String::new(),
+            login_pass: String::new(),
+            web_cookies: Default::default(),
         }
     }
 

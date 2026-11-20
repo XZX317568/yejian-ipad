@@ -441,6 +441,62 @@ pub fn safe_insets() -> Result<Insets> {
     Ok(Insets::default())
 }
 
+/// What a web verification/login page handed back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebResult {
+    pub url: String,
+    /// `None` when the user closed the page without finishing.
+    pub cookies: Option<Vec<(String, String)>>,
+}
+
+/// Opens `url` in an in-app browser using `user_agent`; finishing hands its
+/// cookies back through [`poll_web`].
+#[cfg(target_os = "ios")]
+pub fn open_web(url: &str, user_agent: &str) -> Result<()> {
+    ios::open_web(url, user_agent)
+}
+
+/// Only the iOS shell has an in-app browser so far.
+#[cfg(not(target_os = "ios"))]
+pub fn open_web(url: &str, user_agent: &str) -> Result<()> {
+    let _ = (url, user_agent);
+    Err(PlatformError::Unsupported("in-app browser"))
+}
+
+/// Next finished web page, if any.
+#[cfg(target_os = "ios")]
+pub fn poll_web() -> Result<Option<WebResult>> {
+    ios::poll_web()
+}
+
+#[cfg(not(target_os = "ios"))]
+pub fn poll_web() -> Result<Option<WebResult>> {
+    Ok(None)
+}
+
+#[cfg_attr(not(target_os = "ios"), allow(dead_code))]
+pub(crate) fn parse_web_json(json: &str) -> Result<WebResult> {
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|error| PlatformError::Protocol(format!("invalid web JSON: {error}")))?;
+    let url = value
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let cookies = value.get("cookies").and_then(serde_json::Value::as_array).map(|items| {
+        items
+            .iter()
+            .filter_map(|item| {
+                Some((
+                    item.get("name")?.as_str()?.to_string(),
+                    item.get("value")?.as_str()?.to_string(),
+                ))
+            })
+            .collect()
+    });
+    Ok(WebResult { url, cookies })
+}
+
 /// Parse the JSON contract produced by `RustActivity.pollImport()` and
 /// `yejian_ios_poll_import()`.
 pub(crate) fn parse_import_json(json: &str) -> Result<ImportBatch> {
@@ -574,3 +630,17 @@ pub(crate) fn parse_insets_csv(csv: &str) -> Result<Insets> {
 mod android;
 #[cfg(target_os = "ios")]
 mod ios;
+
+#[cfg(test)]
+mod web_tests {
+    #[test]
+    fn web_results_carry_cookies_or_cancellation() {
+        let done = super::parse_web_json(
+            r#"{"url":"https://a.test","cookies":[{"name":"cf_clearance","value":"x"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(done.cookies, Some(vec![("cf_clearance".into(), "x".into())]));
+        let cancelled = super::parse_web_json(r#"{"url":"https://a.test"}"#).unwrap();
+        assert_eq!(cancelled.cookies, None);
+    }
+}

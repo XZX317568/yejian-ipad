@@ -193,3 +193,9 @@ iPad 工程版本为 0.1.1 / 2。2026-11-19 在用户授权下，源码上传到
 ## 书源设置（2026-11-20）
 
 书源页标题旁的「书源设置」列出该书源 `settings.json` 中可编辑的选项（开关、单选、多选、文本、步进），以及多语言书源的语言和可切换站点地址。修改立即写入 `source-settings.json` 和书源读取的 defaults 存储；返回书源时重启该书源的引擎并重新加载列表。登录、按钮、链接类选项暂不支持。
+
+## 网页验证与书源登录（2026-11-20）
+
+所有书源引擎共用一个 cookie jar（`http.rs` 的 `JAR`）。请求返回 Cloudflare 挑战页（403/429/503 且带 `cf-mitigated: challenge`，或 `server: cloudflare` 加挑战页正文）时记录该站点，书源页顶部提示「网页验证」。iOS 用 `yejian_ios_open_web` 弹出全屏 WKWebView（UA 与引擎一致），点「完成」后把该站点 cookie 交回 Rust，写入共用 jar 和 `web-cookies.json`（启动时恢复），然后重新加载书源。书源标题栏也有「网页验证」可手动打开主站。
+
+`settings.json` 的 `login` 项显示在书源设置里：basic 方式输入账号密码后调用 `handle_basic_login`；web 方式打开登录网页，完成后把 cookie 交给 `handle_web_login`。登录成功后在 `{key}.username` 记录登录名，可退出登录。Android/Windows 暂无内置浏览器。

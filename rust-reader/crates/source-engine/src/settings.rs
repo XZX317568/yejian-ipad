@@ -27,6 +27,12 @@ pub enum SettingKind {
     Segment {
         titles: Vec<String>,
     },
+    /// `web`: open `url` in a browser and pass its cookies to the source;
+    /// otherwise ask for a username and password.
+    Login {
+        web: bool,
+        url: Option<String>,
+    },
     MultiSelect {
         values: Vec<String>,
         titles: Vec<String>,
@@ -169,6 +175,15 @@ fn collect(value: &Value, group: &str, out: &mut Vec<SettingItem>) {
                     SettingKind::MultiSelect { values, titles },
                     Some(SettingValue::StrList(strings(default))),
                 ),
+                "login" => {
+                    let url = map.get("url").and_then(Value::as_str).map(str::to_string);
+                    let method = map.get("method").and_then(Value::as_str).unwrap_or("basic");
+                    let web = method == "web" || (method != "basic" && url.is_some());
+                    if web && url.is_none() {
+                        return;
+                    }
+                    (SettingKind::Login { web, url }, None)
+                }
                 "text" => (
                     SettingKind::Text {
                         placeholder: map

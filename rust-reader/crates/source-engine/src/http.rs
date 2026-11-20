@@ -25,6 +25,47 @@ use reqwest::Method;
 use reqwest::blocking::{Client, RequestBuilder};
 use reqwest::header::{HeaderName, HeaderValue};
 
+/// One cookie jar for every source engine, so cookies from a platform web
+/// view (Cloudflare clearance, web login) reach all later requests.
+static JAR: once_cell::sync::Lazy<Arc<reqwest::cookie::Jar>> =
+    once_cell::sync::Lazy::new(|| Arc::new(reqwest::cookie::Jar::default()));
+
+/// Origin of the last request a Cloudflare challenge blocked.
+static CHALLENGE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Adds `name=value` cookies collected by a web view for `url`.
+pub fn add_web_cookies(url: &str, cookies: &[(String, String)]) {
+    let Ok(url) = url::Url::parse(url) else {
+        return;
+    };
+    for (name, value) in cookies {
+        JAR.add_cookie_str(&format!("{name}={value}; Path=/"), &url);
+    }
+}
+
+/// Takes the origin that most recently needed browser verification.
+pub fn take_web_challenge() -> Option<String> {
+    CHALLENGE.lock().ok()?.take()
+}
+
+fn is_challenge(status: u16, headers: &[(String, String)], body: &[u8]) -> bool {
+    if !matches!(status, 403 | 429 | 503) {
+        return false;
+    }
+    let header = |name: &str| {
+        headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.to_ascii_lowercase())
+    };
+    if header("cf-mitigated").is_some_and(|v| v.contains("challenge")) {
+        return true;
+    }
+    let text = String::from_utf8_lossy(&body[..body.len().min(64 * 1024)]);
+    header("server").is_some_and(|v| v.contains("cloudflare"))
+        && (text.contains("challenge-platform") || text.contains("Just a moment"))
+}
+
 /// Default browser-like user agent used by the Mangayomi Dart stack for source
 /// scraping. Sources receive the same value unless the caller overrides it.
 pub const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Linux; Android 13; 22081212UG Build/TKQ1.220829.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/114.0.5735.131 Mobile Safari/537.36";
@@ -124,7 +165,7 @@ impl NativeHttp {
         let client = Client::builder()
             .user_agent(user_agent)
             .tls_backend_preconfigured(build_tls_config()?)
-            .cookie_store(true)
+            .cookie_provider(JAR.clone())
             .redirect(reqwest::redirect::Policy::limited(10))
             .connect_timeout(Duration::from_secs(20))
             .build()
@@ -187,7 +228,7 @@ impl NativeHttp {
         let response = builder.send().map_err(|e| describe_transport_error(&e))?;
         let status_code = response.status().as_u16();
         let final_url = Some(response.url().to_string());
-        let headers = response
+        let headers: Vec<(String, String)> = response
             .headers()
             .iter()
             .map(|(name, value)| {
@@ -207,6 +248,14 @@ impl NativeHttp {
                 "response body exceeds the {} byte limit",
                 self.max_body_bytes
             ));
+        }
+
+        if is_challenge(status_code, &headers, &body) {
+            if let (Ok(mut slot), Some(url)) = (CHALLENGE.lock(), final_url.as_deref()) {
+                if let Ok(url) = url::Url::parse(url) {
+                    *slot = Some(url.origin().ascii_serialization());
+                }
+            }
         }
 
         Ok(NetResponseData {
@@ -239,6 +288,16 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
+
+    #[test]
+    fn detects_cloudflare_challenges_only() {
+        let cf = vec![("Server".to_string(), "cloudflare".to_string())];
+        assert!(is_challenge(403, &cf, b"<title>Just a moment...</title>"));
+        assert!(is_challenge(503, &[("cf-mitigated".into(), "challenge".into())], b""));
+        assert!(!is_challenge(200, &cf, b"Just a moment"));
+        assert!(!is_challenge(404, &cf, b"not found"));
+        assert!(!is_challenge(403, &cf, b"forbidden"));
+    }
 
     #[test]
     fn preserves_status_duplicate_headers_and_body() {

@@ -2,6 +2,7 @@ import Darwin
 import Foundation
 import UIKit
 import UniformTypeIdentifiers
+import WebKit
 
 /// Native half of the iOS import bridge.
 ///
@@ -536,6 +537,105 @@ private final class YejianDocumentBridge: NSObject, UIApplicationDelegate, UIDoc
     }
 }
 
+// MARK: - In-app browser (Cloudflare verification, web login)
+
+private let webLock = NSLock()
+private var webResults: [String] = []
+
+/// Full-screen web page; "完成" hands the page's cookies back to Rust.
+private final class YejianWebController: UIViewController, WKNavigationDelegate {
+    private let url: URL
+    private let agent: String
+    private let finish: (String) -> Void
+    private let webView: WKWebView
+    private var sent = false
+
+    init(url: URL, agent: String, finish: @escaping (String) -> Void) {
+        self.url = url
+        self.agent = agent
+        self.finish = finish
+        let configuration = WKWebViewConfiguration()
+        configuration.websiteDataStore = .default()
+        webView = WKWebView(frame: .zero, configuration: configuration)
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func loadView() {
+        view = webView
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        webView.customUserAgent = agent
+        webView.navigationDelegate = self
+        navigationItem.title = "完成验证或登录后点「完成」"
+        navigationItem.leftBarButtonItem = UIBarButtonItem(
+            barButtonSystemItem: .cancel, target: self, action: #selector(cancel))
+        navigationItem.rightBarButtonItem = UIBarButtonItem(
+            title: "完成", style: .done, target: self, action: #selector(done))
+        webView.load(URLRequest(url: url))
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        if let title = webView.title, !title.isEmpty {
+            navigationItem.title = title
+        }
+    }
+
+    @objc private func cancel() {
+        send(cookies: nil)
+    }
+
+    @objc private func done() {
+        let host = url.host ?? ""
+        webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { cookies in
+            let picked = cookies.filter { cookie in
+                let domain = cookie.domain.hasPrefix(".") ? String(cookie.domain.dropFirst()) : cookie.domain
+                return host == domain || host.hasSuffix("." + domain)
+            }
+            self.send(cookies: picked.map { ["name": $0.name, "value": $0.value] })
+        }
+    }
+
+    private func send(cookies: [[String: String]]?) {
+        guard !sent else { return }
+        sent = true
+        var payload: [String: Any] = ["url": url.absoluteString]
+        if let cookies { payload["cookies"] = cookies }
+        let data = (try? JSONSerialization.data(withJSONObject: payload)) ?? Data()
+        finish(String(data: data, encoding: .utf8) ?? "")
+        dismiss(animated: true)
+    }
+}
+
+extension YejianDocumentBridge {
+    /// Returns 0 when the page was presented, -1 without a presenter or URL.
+    func openWeb(url: String, agent: String) -> Int64 {
+        guard prepared, let target = URL(string: url) else { return -1 }
+        return onMain {
+            guard let presenter = self.topViewController() else { return -1 }
+            let page = YejianWebController(url: target, agent: agent) { json in
+                webLock.lock()
+                webResults.append(json)
+                webLock.unlock()
+                self.wake()
+            }
+            let navigation = UINavigationController(rootViewController: page)
+            navigation.modalPresentationStyle = .fullScreen
+            presenter.present(navigation, animated: true)
+            return 0
+        }
+    }
+
+    func pollWeb() -> String? {
+        webLock.lock()
+        defer { webLock.unlock() }
+        return webResults.isEmpty ? nil : webResults.removeFirst()
+    }
+}
+
 // MARK: - Rust ABI
 
 #if DEBUG
@@ -596,4 +696,18 @@ public func yejian_ios_safe_insets() -> UnsafeMutablePointer<CChar>? {
 
 private func duplicate(_ value: String) -> UnsafeMutablePointer<CChar>? {
     value.withCString { strdup($0) }
+}
+
+@_cdecl("yejian_ios_open_web")
+public func yejian_ios_open_web(
+    _ url: UnsafePointer<CChar>?, _ agent: UnsafePointer<CChar>?
+) -> Int64 {
+    guard let url, let agent else { return -1 }
+    return YejianDocumentBridge.shared.openWeb(url: String(cString: url), agent: String(cString: agent))
+}
+
+@_cdecl("yejian_ios_poll_web")
+public func yejian_ios_poll_web() -> UnsafeMutablePointer<CChar>? {
+    guard let json = YejianDocumentBridge.shared.pollWeb() else { return nil }
+    return duplicate(json)
 }
