@@ -81,7 +81,7 @@ pub(crate) fn set_setting_from_string(key: &str, value_type: i32, value: &str) {
     set_value(key, val);
 }
 
-fn get_value(namespace: &str, key: &str) -> Option<DefaultValue> {
+pub(crate) fn get_value(namespace: &str, key: &str) -> Option<DefaultValue> {
     let map = SETTINGS.lock().unwrap();
     map.get(&format!("{namespace}.{key}"))
         .or_else(|| map.get(key))

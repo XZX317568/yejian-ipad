@@ -24,6 +24,8 @@ extern "C" {
     fn yejian_ios_safe_insets() -> *mut c_char;
     fn yejian_ios_share_file(path: *const c_char) -> i64;
     fn yejian_ios_set_waker(callback: extern "C" fn());
+    fn yejian_ios_open_web(url: *const c_char, user_agent: *const c_char) -> i64;
+    fn yejian_ios_poll_web() -> *mut c_char;
 }
 
 static WAKER: Mutex<Option<Box<dyn Fn() + Send + Sync>>> = Mutex::new(None);
@@ -123,5 +125,22 @@ pub(crate) fn safe_insets() -> Result<Insets> {
     match take_string(unsafe { yejian_ios_safe_insets() }) {
         Some(text) if !text.is_empty() => parse_insets_csv(&text),
         _ => Err(PlatformError::NotReady("UIKit safe-area insets")),
+    }
+}
+
+pub(crate) fn open_web(url: &str, user_agent: &str) -> Result<()> {
+    let url = CString::new(url).map_err(|_| PlatformError::Io("URL contains a NUL byte".into()))?;
+    let agent = CString::new(user_agent)
+        .map_err(|_| PlatformError::Io("user agent contains a NUL byte".into()))?;
+    match unsafe { yejian_ios_open_web(url.as_ptr(), agent.as_ptr()) } {
+        0 => Ok(()),
+        _ => Err(PlatformError::NotReady("UIKit presenter for the in-app browser")),
+    }
+}
+
+pub(crate) fn poll_web() -> Result<Option<crate::WebResult>> {
+    match take_string(unsafe { yejian_ios_poll_web() }) {
+        Some(text) if !text.is_empty() => crate::parse_web_json(&text).map(Some),
+        _ => Ok(None),
     }
 }
