@@ -67,7 +67,8 @@ struct StreamBook {
     done: usize,
     stopped: Option<String>,
     signature: Option<String>,
-    to_end: bool,
+    /// Page to restore once the page count is known (`usize::MAX`: last).
+    resume: Option<usize>,
     waiting: HashSet<usize>,
 }
 
@@ -424,7 +425,12 @@ impl ReaderApp {
     fn open_stream(&mut self, chapter: StreamChapter) {
         let id = format!("{STREAM_PREFIX}{}", chapter.id);
         let state = self.sources.stream_state(&chapter.id).unwrap_or_default();
-        let to_end = chapter.from_end && state.total == 0;
+        let wanted = if chapter.from_end {
+            usize::MAX
+        } else {
+            state.page.unwrap_or(0)
+        };
+        let resume = (state.total == 0 && wanted > 0).then_some(wanted);
         let book = Book {
             id: id.clone(),
             title: format!(
@@ -435,11 +441,7 @@ impl ReaderApp {
             archive_path: PathBuf::new(),
             cover_path: None,
             page_count: state.total.max(1),
-            current_page: if chapter.from_end {
-                state.total.saturating_sub(1)
-            } else {
-                0
-            },
+            current_page: wanted.min(state.total.saturating_sub(1)),
             page_fraction: 0.,
             updated_at: 0,
             last_read_at: None,
@@ -452,7 +454,7 @@ impl ReaderApp {
             done: state.done,
             stopped: state.stopped,
             signature: state.signature,
-            to_end,
+            resume,
             waiting: HashSet::new(),
         });
         self.open_reader(&book);
@@ -526,9 +528,9 @@ impl ReaderApp {
             stream.stopped = state.stopped;
             stream.waiting.clear();
         }
-        if stream.to_end && state.total > 0 {
-            stream.to_end = false;
-            stream.book.current_page = state.total - 1;
+        if let Some(wanted) = stream.resume.filter(|_| state.total > 0) {
+            stream.resume = None;
+            stream.book.current_page = wanted.min(state.total - 1);
             stream.book.page_fraction = 0.;
             let book = stream.book.clone();
             self.open_reader(&book);
@@ -899,6 +901,10 @@ impl ReaderApp {
         if let Some(stream) = self.stream.as_mut().filter(|stream| stream.book.id == id) {
             stream.book.current_page = page;
             stream.book.page_fraction = fraction;
+            if stream.resume.is_none() {
+                let task = stream.task.clone();
+                self.sources.set_stream_page(&task, page);
+            }
             return;
         }
         self.send(Command::Progress {

@@ -312,6 +312,9 @@ struct DownloadTask {
     /// pages, keeping scanlators/date/thumbnail/locked etc. across restarts.
     #[serde(default)]
     chapter_snapshot: Option<Vec<u8>>,
+    /// Last page read online before the chapter joined the library.
+    #[serde(default)]
+    read_page: Option<usize>,
     status: DownloadStatus,
     #[serde(default)]
     error: Option<String>,
@@ -354,6 +357,7 @@ impl DownloadTask {
             chapter_language: chapter.language.clone(),
             manga_snapshot: None,
             chapter_snapshot: Some(chapter.to_postcard_bytes()),
+            read_page: None,
             status: DownloadStatus::Queued,
             error: None,
             pages_done: 0,
@@ -627,6 +631,8 @@ pub struct StreamState {
     pub stopped: Option<String>,
     /// Page-list signature; staged pages from another list are discarded.
     pub signature: Option<String>,
+    /// Where the user left off in this chapter, kept across app restarts.
+    pub page: Option<usize>,
 }
 
 /// Task ids are always the 16 lowercase hex digits produced by `identity_id`.
@@ -1847,7 +1853,22 @@ impl Sources {
             done: task.pages_done,
             stopped,
             signature: task.pages_signature.clone(),
+            page: task.read_page,
         })
+    }
+
+    /// Remembers the page of a chapter read online so it reopens there.
+    pub fn set_stream_page(&mut self, id: &str, page: usize) {
+        let Some(task) = self.tasks.iter_mut().find(|task| task.id == id) else {
+            return;
+        };
+        if task.read_page == Some(page) {
+            return;
+        }
+        task.read_page = Some(page);
+        if let Err(error) = self.persist() {
+            self.status = format!("阅读位置保存失败：{error:#}");
+        }
     }
 
     /// Runs this chapter's download next. A different running download is
@@ -4049,6 +4070,10 @@ mod tests {
         sources.resume_stream(&item.id);
         assert_eq!(sources.running.as_deref(), Some(item.id.as_str()));
         assert_eq!(sources.stream_state(&item.id).unwrap().stopped, None);
+        sources.set_stream_page(&item.id, 7);
+        assert_eq!(sources.stream_state(&item.id).unwrap().page, Some(7));
+        let saved = load_tasks(root.path()).unwrap().tasks;
+        assert_eq!(saved.iter().find(|task| task.id == item.id).unwrap().read_page, Some(7));
     }
 
     #[test]
