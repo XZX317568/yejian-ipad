@@ -257,6 +257,8 @@ pub struct DownloadedChapter {
     pub id: String,
     pub path: PathBuf,
     pub metadata: ChapterMetadata,
+    /// Page reached while reading online, carried into the library book.
+    pub read_page: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1235,7 +1237,8 @@ fn fetch_follow_cover(root: &Path, engine: &SourceEngine, manga: &Manga) -> anyh
 struct UpdateEvent {
     source: String,
     manga: String,
-    chapters: Result<Vec<String>, String>,
+    /// `None`: only the cover arrived, after the batch's chapter results.
+    chapters: Option<Result<Vec<String>, String>>,
 }
 
 impl Sources {
@@ -1479,23 +1482,33 @@ impl Sources {
                 while let Ok(batch) = up_cmd_rx.recv() {
                     // Reload each round so an updated source is picked up.
                     let mut engines = std::collections::HashMap::<String, SourceEngine>::new();
-                    for (source, manga) in batch {
+                    for (source, manga) in batch.iter().cloned() {
                         let chapters = (|| -> anyhow::Result<Vec<String>> {
                             if !engines.contains_key(&source) {
                                 engines.insert(source.clone(), SourceEngine::load(&catalog, &source)?);
                             }
-                            let engine = &engines[&source];
-                            let list = pollster::block_on(engine.chapters_with(manga.clone()))?;
-                            // A missing cover never fails the update check.
-                            let _ = fetch_follow_cover(&up_root, engine, &manga);
+                            let list =
+                                pollster::block_on(engines[&source].chapters_with(manga.clone()))?;
                             Ok(list.into_iter().map(|chapter| chapter.key).collect())
                         })()
                         .map_err(|error| format!("{error:#}"));
-                        let event = UpdateEvent { source, manga: manga.key, chapters };
+                        let event = UpdateEvent { source, manga: manga.key, chapters: Some(chapters) };
                         if up_event_tx.send(event).is_err() {
                             return;
                         }
                         up_ctx.request_repaint();
+                    }
+                    // Covers come last so a slow image host never delays
+                    // new-chapter results; a missing cover is not an error.
+                    for (source, manga) in batch {
+                        let Some(engine) = engines.get(&source) else { continue };
+                        if fetch_follow_cover(&up_root, engine, &manga).is_ok() {
+                            let event = UpdateEvent { source, manga: manga.key, chapters: None };
+                            if up_event_tx.send(event).is_err() {
+                                return;
+                            }
+                            up_ctx.request_repaint();
+                        }
                     }
                 }
             })
@@ -1680,6 +1693,7 @@ impl Sources {
                 id: task.id.clone(),
                 path,
                 metadata: task.metadata(),
+                read_page: task.read_page,
             });
         }
         None
@@ -1826,14 +1840,19 @@ impl Sources {
     }
 
     fn handle_update(&mut self, event: UpdateEvent) {
+        let Some(chapters) = event.chapters else {
+            if let Some(index) = self.follow_index(&event.source, &event.manga) {
+                let snapshot = self.follows[index].snapshot.clone();
+                if matches!(self.covers.get(&snapshot), Some(None)) {
+                    self.covers.remove(&snapshot);
+                }
+            }
+            return;
+        };
         self.checking = self.checking.saturating_sub(1);
         if let Some(index) = self.follow_index(&event.source, &event.manga) {
-            let snapshot = self.follows[index].snapshot.clone();
-            if matches!(self.covers.get(&snapshot), Some(None)) {
-                self.covers.remove(&snapshot);
-            }
             let follow = &mut self.follows[index];
-            match event.chapters {
+            match chapters {
                 Ok(keys) => {
                     follow.apply_check(&keys, follows::now());
                 }
@@ -4097,7 +4116,7 @@ mod tests {
         sources.handle_update(UpdateEvent {
             source: "source.a".into(),
             manga: "m".into(),
-            chapters: Ok(vec!["c1".into(), "c2".into(), "c3".into()]),
+            chapters: Some(Ok(vec!["c1".into(), "c2".into(), "c3".into()])),
         });
         assert_eq!(sources.checking, 0);
         assert_eq!(sources.fresh_follows(), 1);

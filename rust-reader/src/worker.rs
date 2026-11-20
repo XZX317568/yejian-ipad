@@ -18,6 +18,7 @@ pub enum Command {
         task_id: String,
         path: PathBuf,
         metadata: ChapterMetadata,
+        read_page: Option<usize>,
     },
     Image {
         id: String,
@@ -216,10 +217,14 @@ impl Worker {
                                 task_id,
                                 path,
                                 metadata,
+                                read_page,
                             } => {
                                 let result=(||->anyhow::Result<()> {
                                     let book=library.import(&path)?;
                                     library.link_chapter(&book.id,&metadata)?;
+                                    if let Some(page)=read_page.filter(|_| book.current_page==0) {
+                                        library.save_progress(&book.id,page.min(book.page_count.saturating_sub(1)),false)?;
+                                    }
                                     Ok(())
                                 })();
                                 if let Err(error)=result {
@@ -939,6 +944,7 @@ mod tests {
                 task_id: "failed".into(),
                 path: tmp.path().join("missing.cbz"),
                 metadata: metadata.clone(),
+                read_page: None,
             })
             .unwrap();
         assert!(
@@ -949,6 +955,7 @@ mod tests {
                 task_id: "finished".into(),
                 path: archive.clone(),
                 metadata,
+                read_page: None,
             })
             .unwrap();
         assert!(

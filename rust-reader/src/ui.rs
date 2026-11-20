@@ -901,7 +901,7 @@ impl ReaderApp {
         if let Some(stream) = self.stream.as_mut().filter(|stream| stream.book.id == id) {
             stream.book.current_page = page;
             stream.book.page_fraction = fraction;
-            if stream.resume.is_none() {
+            if stream.resume.is_none() && !self.private {
                 let task = stream.task.clone();
                 self.sources.set_stream_page(&task, page);
             }
@@ -1513,6 +1513,7 @@ impl ReaderApp {
                 task_id: chapter.id,
                 path: chapter.path,
                 metadata: chapter.metadata,
+                read_page: chapter.read_page,
             }) {
                 self.sources.import_failed(&id, &error);
                 self.error = Some(error);
