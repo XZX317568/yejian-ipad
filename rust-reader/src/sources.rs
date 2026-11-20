@@ -2623,9 +2623,7 @@ impl Sources {
                     self.filter_error = filter_error;
                     self.listing_error = listing_error;
                     self.metadata_loaded = true;
-                    if let Some(manga) = self.pending_open.take() {
-                        self.open_manga(manga);
-                    }
+                    let pending = self.pending_open.take();
                     // Source updates can remove options; a session must never
                     // submit an identifier absent from the current schema.
                     self.applied_filters = crate::source_filters::overrides(
@@ -2642,6 +2640,12 @@ impl Sources {
                             value: "adv".into(),
                         }];
                         self.start_search();
+                        continue;
+                    }
+                    // A followed manga opened from another source replaces the
+                    // default listing; both would share one request slot.
+                    if let Some(manga) = pending {
+                        self.open_manga(manga);
                         continue;
                     }
                     let listing = self
