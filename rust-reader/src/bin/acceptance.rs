@@ -1141,6 +1141,21 @@ fn filters_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
     h.size = [507, 1024];
     h.frames(5)?;
     h.frame(vec![], Some("source-detail-narrow"))?;
+    // Dark-theme sweep of the grid and detail pages.
+    library.set_setting("theme", "dark")?;
+    h.app = ReaderApp::new(library_root.into(), h.ctx.clone());
+    h.wait(ReaderApp::ready)?;
+    h.app.prepare_source_acceptance("browse")?;
+    h.wait(ReaderApp::source_browser_ready)?;
+    h.size = [1024, 1366];
+    h.frames(5)?;
+    h.frame(vec![], Some("source-grid-portrait-dark"))?;
+    h.click_text("热门-第1页")?;
+    h.wait(|app| app.source_browser_report()["busy"] == false)?;
+    h.size = [1366, 1024];
+    h.frames(5)?;
+    h.frame(vec![], Some("source-detail-wide-dark"))?;
+    library.set_setting("theme", "system")?;
     set_insets_override(None);
     println!(
         "PASS: source listing + pagination + real WASM filtered result + cancel/reset + iPad/200 percent filters"
@@ -1310,6 +1325,25 @@ fn ipad_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
         }
     }
     library.set_setting("font-scale", "1")?;
+    // Dark-theme sweep on the iPad 11 portrait profile.
+    library.set_setting("theme", "dark")?;
+    h.app = ReaderApp::new(library_root.into(), h.ctx.clone());
+    h.wait(ReaderApp::ready)?;
+    h.size = [834, 1194];
+    h.frames(8)?;
+    h.frame(vec![], Some("ipad-11-portrait-dark"))?;
+    for (tab, label) in [
+        ("search", "sources"),
+        ("settings", "settings"),
+        ("history", "history"),
+    ] {
+        h.click(&format!("nav-{tab}"))?;
+        h.frames(4)?;
+        h.frame(vec![], Some(&format!("ipad-11-portrait-dark-{label}")))?;
+    }
+    h.click("nav-library")?;
+    h.frames(4)?;
+    library.set_setting("theme", "system")?;
     set_insets_override(None);
     println!(
         "PASS: iPad profiles rendered with real UI at 1024x1366, 1366x1024, 1194x834, 744x1133, 507x1024 and 320x1024"

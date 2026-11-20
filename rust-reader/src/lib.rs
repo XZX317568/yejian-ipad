@@ -24,7 +24,7 @@ pub fn configure_fonts(ctx: &egui::Context) {
     for theme in [egui::Theme::Light, egui::Theme::Dark] {
         ctx.style_mut_of(theme, |style| {
             style.spacing.item_spacing = egui::vec2(10., 9.);
-            style.spacing.button_padding = egui::vec2(20., 8.);
+            style.spacing.button_padding = egui::vec2(12., 8.);
             style.spacing.interact_size = egui::vec2(44., 44.);
             style.spacing.icon_width = 22.;
             style.spacing.icon_width_inner = 12.;

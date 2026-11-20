@@ -68,8 +68,10 @@ pub(crate) fn visuals(dark: bool) -> Visuals {
     v.window_corner_radius = CornerRadius::same(20);
     v.window_shadow = card_shadow(dark);
     v.menu_corner_radius = CornerRadius::same(12);
-    v.selection.bg_fill = p.accent_soft;
-    v.selection.stroke = Stroke::new(1., p.accent);
+    // egui shares `selection` between selected text and selected widgets; the
+    // warm `soft` fill keeps selected chips/tabs ink-on-grey instead of pink.
+    v.selection.bg_fill = p.soft;
+    v.selection.stroke = Stroke::new(1., p.ink);
     v.hyperlink_color = p.accent;
     v.widgets.noninteractive.bg_stroke = Stroke::new(1., p.line);
     v.widgets.noninteractive.fg_stroke = Stroke::new(1., p.ink);
@@ -141,8 +143,7 @@ pub(crate) fn theme_choice(
     let height = 78. + text.size().y;
     let (rect, response) = ui.allocate_exact_size(vec2(width, height), Sense::click());
     response.widget_info(|| WidgetInfo::selected(Role::RadioButton, true, selected, name));
-    ui.painter()
-        .rect_filled(rect, 12., if selected { p.accent_soft } else { p.surface });
+    ui.painter().rect_filled(rect, 12., p.surface);
     ui.painter().rect_stroke(
         rect,
         12.,

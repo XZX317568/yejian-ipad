@@ -142,14 +142,10 @@ pub(crate) struct FilterEditor {
 
 fn choice<'a>(ui: &Ui, label: &'a str, selected: bool) -> Button<'a> {
     let palette = design::palette(ui.visuals().dark_mode);
-    Button::new(RichText::new(label).color(if selected {
-        palette.accent
-    } else {
-        palette.ink
-    }))
+    Button::new(RichText::new(label).color(palette.ink))
     .selected(selected)
     .fill(if selected {
-        palette.accent_soft
+        palette.soft
     } else {
         Color32::TRANSPARENT
     })
@@ -185,8 +181,6 @@ fn option<'a>(
     let palette = design::palette(ui.visuals().dark_mode);
     let color = if excluded {
         ui.visuals().error_fg_color
-    } else if selected {
-        palette.accent
     } else {
         palette.ink
     };

@@ -35,7 +35,9 @@ fn language_label(language: &str) -> &str {
     }
 }
 fn quiet_action(label: &str) -> Button<'_> {
-    Button::new(label).min_size(vec2(44., 44.)).wrap()
+    Button::new(label)
+        .min_size(vec2(44., 44.))
+        .wrap_mode(egui::TextWrapMode::Extend)
 }
 fn disclosure(ui: &mut Ui, label: &str, default_open: bool, body: impl FnOnce(&mut Ui)) {
     let mut state = collapsing_header::CollapsingState::load_with_default_open(
@@ -105,7 +107,7 @@ fn source_item(
     response.widget_info(|| WidgetInfo::labeled(Role::Button, enabled, title));
     let painter = ui.painter().with_clip_rect(ui.clip_rect().intersect(rect));
     if response.hovered() && enabled {
-        painter.rect_filled(rect, 8., palette.accent_soft);
+        painter.rect_filled(rect, 8., palette.soft);
     }
     if initial {
         let badge =
@@ -371,7 +373,7 @@ fn chapter_state_lines(
 
 /// result grid and the detail header. Both get a 1px `line` border so tiles
 
-/// stay visible on the page; the placeholder uses the tinted `accent_soft`
+/// stay visible on the page; the placeholder uses the tinted `soft`
 
 /// surface rather than blending into the background.
 
@@ -393,7 +395,7 @@ fn paint_cover(
             );
         }
         None => {
-            painter.rect_filled(rect, 8., palette.accent_soft);
+            painter.rect_filled(rect, 8., palette.soft);
             if let Some(initial) = title.chars().next() {
                 painter.text(
                     rect.center(),
@@ -5610,8 +5612,15 @@ impl Sources {
             if response.clicked() {
                 open = Some(chapter.clone());
             }
-            if response.hovered() || resume_key.as_deref() == Some(chapter.key.as_str()) {
-                painter.rect_filled(row_rect, 6., palette.accent_soft);
+            if response.hovered() {
+                painter.rect_filled(row_rect, 6., palette.soft);
+            }
+            if resume_key.as_deref() == Some(chapter.key.as_str()) {
+                painter.rect_filled(
+                    Rect::from_min_size(row_rect.min, vec2(3., row_rect.height())),
+                    1.5,
+                    palette.accent,
+                );
             }
             let text_top = row_rect.top() + (row_h - text_h) / 2.;
             painter.galley(
@@ -5757,7 +5766,7 @@ impl Sources {
                     None
                 };
                 if response.hovered() && !self.busy {
-                    ui.painter().rect_filled(cell, 8., palette.accent_soft);
+                    ui.painter().rect_filled(cell, 8., palette.soft);
                 }
                 let cover_rect = Rect::from_min_size(cell.min, vec2(cell_w, cover_h));
                 let painter = ui.painter().with_clip_rect(ui.clip_rect().intersect(cell));
