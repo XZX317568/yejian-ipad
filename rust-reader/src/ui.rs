@@ -4446,11 +4446,19 @@ impl ReaderApp {
                                 .layout(Layout::left_to_right(Align::Center)),
                             |ui| {
                                 ui.label("亮度");
+                                // The default rail is transparent on the dark
+                                // dialog surface; give it a visible neutral
+                                // and accent the filled portion.
+                                let palette = crate::design::palette(true);
+                                let visuals = ui.visuals_mut();
+                                visuals.widgets.inactive.weak_bg_fill = palette.soft;
+                                visuals.widgets.inactive.bg_fill = palette.accent;
                                 ui.spacing_mut().slider_width =
                                     (ui.available_width() - 120.).max(40.);
                                 ui.add(
                                     Slider::new(&mut self.brightness, 0.3..=1.)
-                                        .fixed_decimals(2),
+                                        .fixed_decimals(2)
+                                        .trailing_fill(true),
                                 )
                             },
                         );
