@@ -1205,6 +1205,119 @@ pub struct Sources {
     up_rx: mpsc::Receiver<UpdateEvent>,
     /// Decoded follow covers by snapshot key; `None` means not on disk yet.
     covers: std::collections::HashMap<String, Option<TextureHandle>>,
+    settings_open: bool,
+    settings_changed: bool,
+    /// User choices per source, persisted in `source-settings.json`.
+    source_settings: SettingsStore,
+    /// Sources whose loaded engines must restart to read changed settings.
+    stale_engines: Arc<std::sync::Mutex<HashSet<String>>>,
+}
+
+type SettingsStore =
+    std::collections::BTreeMap<String, std::collections::BTreeMap<String, SettingValue>>;
+
+const SETTINGS_FILE: &str = "source-settings.json";
+
+fn load_source_settings(root: &Path) -> SettingsStore {
+    std::fs::read(root.join(SETTINGS_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn save_source_settings(root: &Path, store: &SettingsStore) -> anyhow::Result<()> {
+    std::fs::create_dir_all(root)?;
+    let part = root.join(format!("{SETTINGS_FILE}.part"));
+    std::fs::write(&part, serde_json::to_vec_pretty(store)?)?;
+    std::fs::rename(&part, root.join(SETTINGS_FILE))?;
+    Ok(())
+}
+
+/// Draws one editable setting; returns the new value when the user changed it.
+fn setting_row(ui: &mut Ui, item: &SettingItem, current: Option<SettingValue>) -> Option<SettingValue> {
+    let mut changed = None;
+    let label = |ui: &mut Ui| {
+        ui.add(Label::new(RichText::new(&item.title).strong()).wrap());
+    };
+    match &item.kind {
+        SettingKind::Toggle => {
+            let mut on = matches!(current, Some(SettingValue::Bool(true)));
+            if ui.add(Checkbox::new(&mut on, &item.title)).changed() {
+                changed = Some(SettingValue::Bool(on));
+            }
+        }
+        SettingKind::Select { values, titles } => {
+            label(ui);
+            let selected = match &current {
+                Some(SettingValue::Str(value)) => Some(value.as_str()),
+                _ => None,
+            };
+            ui.horizontal_wrapped(|ui| {
+                for (value, title) in values.iter().zip(titles) {
+                    if ui.selectable_label(selected == Some(value.as_str()), title).clicked() {
+                        changed = Some(SettingValue::Str(value.clone()));
+                    }
+                }
+            });
+        }
+        SettingKind::MultiSelect { values, titles } => {
+            label(ui);
+            let mut chosen = match current {
+                Some(SettingValue::StrList(list)) => list,
+                _ => Vec::new(),
+            };
+            ui.horizontal_wrapped(|ui| {
+                for (value, title) in values.iter().zip(titles) {
+                    let on = chosen.contains(value);
+                    let shown = if item.key == "languages" { language_label(title).to_string() } else { title.clone() };
+                    if ui.selectable_label(on, shown).clicked() {
+                        if on {
+                            chosen.retain(|v| v != value);
+                        } else {
+                            chosen.push(value.clone());
+                        }
+                        changed = Some(SettingValue::StrList(chosen.clone()));
+                    }
+                }
+            });
+        }
+        SettingKind::Text { placeholder } => {
+            label(ui);
+            let mut text = match current {
+                Some(SettingValue::Str(text)) => text,
+                _ => String::new(),
+            };
+            let edit = TextEdit::singleline(&mut text)
+                .hint_text(placeholder.as_str())
+                .desired_width(ui.available_width());
+            if ui.add(edit).changed() {
+                changed = Some(SettingValue::Str(text));
+            }
+        }
+        SettingKind::Stepper { min, max, step } => {
+            let value = match current {
+                Some(SettingValue::Int(v)) => v as f64,
+                Some(SettingValue::Float(v)) => v as f64,
+                _ => *min,
+            };
+            let integral = step.fract() == 0.0 && min.fract() == 0.0;
+            ui.horizontal_wrapped(|ui| {
+                label(ui);
+                let mut next = None;
+                if ui.add_enabled(value > *min, Button::new("−").min_size(vec2(40., 36.))).clicked() {
+                    next = Some((value - step).max(*min));
+                }
+                ui.label(if integral { format!("{}", value as i64) } else { format!("{value:.2}") });
+                if ui.add_enabled(value < *max, Button::new("+").min_size(vec2(40., 36.))).clicked() {
+                    next = Some((value + step).min(*max));
+                }
+                changed = next.map(|v| {
+                    if integral { SettingValue::Int(v as i32) } else { SettingValue::Float(v as f32) }
+                });
+            });
+        }
+    }
+    changed
 }
 
 fn follow_cover_path(root: &Path, snapshot: &str) -> anyhow::Result<PathBuf> {
@@ -1331,12 +1444,23 @@ impl Sources {
         let meta_ctx = ctx.clone();
         let current_request = Arc::new(AtomicU64::new(0));
         let worker_request = current_request.clone();
+        let source_settings = load_source_settings(&root);
+        for (source, values) in &source_settings {
+            for (key, value) in values {
+                set_setting(source, key, value.clone());
+            }
+        }
+        let stale_engines = Arc::new(std::sync::Mutex::new(HashSet::<String>::new()));
+        let worker_stale = stale_engines.clone();
         thread::Builder::new()
             .name("yejian-sources".into())
             .spawn(move || {
                 let catalog = SourceCatalog::new(meta_root.join("sources"));
                 let mut engines = std::collections::HashMap::<String, SourceEngine>::new();
                 while let Ok((request_id, task)) = rx_task.recv() {
+                    for id in worker_stale.lock().unwrap().drain() {
+                        engines.remove(&id);
+                    }
                     // Skip queued reads already replaced by a newer user choice.
                     // An installation is an explicit mutation and must still finish.
                     if request_id != worker_request.load(Ordering::Relaxed)
@@ -1651,6 +1775,10 @@ impl Sources {
             up_tx,
             up_rx,
             covers: Default::default(),
+            settings_open: false,
+            settings_changed: false,
+            source_settings,
+            stale_engines,
         };
         let mut sources = sources;
         match follows::load(&sources.root) {
@@ -3011,6 +3139,12 @@ impl Sources {
                     .map(|source| source.manifest.name.as_str())
                     .unwrap_or("");
                 ui.add(Label::new(RichText::new(name).strong().color(palette.ink)).wrap());
+                if !self.selected_source.is_empty()
+                    && !self.current_settings().is_empty()
+                    && ui.add(quiet_action("书源设置")).clicked()
+                {
+                    self.settings_open = true;
+                }
             });
             if self.selected_source.is_empty() {
                 return;
@@ -3143,6 +3277,64 @@ impl Sources {
         });
         ui.separator();
         ui.add_space(18.);
+    }
+
+    fn current_settings(&self) -> Vec<SettingItem> {
+        self.installed
+            .iter()
+            .find(|source| source.manifest.id == self.selected_source)
+            .map(|source| source_settings(&source.manifest, source.settings_json().as_deref()))
+            .unwrap_or_default()
+    }
+
+    fn change_setting(&mut self, key: &str, value: SettingValue) {
+        let source = self.selected_source.clone();
+        set_setting(&source, key, value.clone());
+        self.source_settings
+            .entry(source.clone())
+            .or_default()
+            .insert(key.to_string(), value);
+        self.stale_engines.lock().unwrap().insert(source);
+        self.settings_changed = true;
+        if let Err(error) = save_source_settings(&self.root, &self.source_settings) {
+            self.status = format!("书源设置保存失败：{error:#}");
+        }
+    }
+
+    fn settings_page(&mut self, ui: &mut Ui) {
+        if ui.add(quiet_action("‹ 返回书源")).clicked() {
+            self.settings_open = false;
+            if std::mem::take(&mut self.settings_changed) {
+                // Reloads listings and results with the restarted engine.
+                let source = self.selected_source.clone();
+                self.select_source("");
+                self.select_source(&source);
+            }
+            return;
+        }
+        let items = self.current_settings();
+        let source = self.selected_source.clone();
+        ScrollArea::vertical()
+            .id_salt(("source-settings", &source))
+            .show(ui, |ui| {
+                ui.set_max_width(ui.available_width());
+                design::section(ui, "书源设置");
+                ui.label(RichText::new("修改后返回书源即生效。").small());
+                let mut group = String::new();
+                for item in items {
+                    if item.group != group {
+                        group = item.group.clone();
+                        if !group.is_empty() {
+                            design::section(ui, &group);
+                        }
+                    }
+                    let current = setting_value(&source, &item.key).or(item.default.clone());
+                    ui.add_space(6.);
+                    if let Some(value) = setting_row(ui, &item, current) {
+                        self.change_setting(&item.key, value);
+                    }
+                }
+            });
     }
 
     fn installed_ui(&mut self, ui: &mut Ui) {
@@ -3356,6 +3548,10 @@ impl Sources {
 
     pub fn ui(&mut self, ui: &mut Ui) {
         self.poll();
+        if self.settings_open {
+            self.settings_page(ui);
+            return;
+        }
         if self.filter_editor.is_some() {
             self.filter_page(ui);
             return;
@@ -4030,6 +4226,10 @@ mod tests {
             up_tx: mpsc::channel().0,
             up_rx: mpsc::channel().1,
             covers: Default::default(),
+            settings_open: false,
+            settings_changed: false,
+            source_settings: Default::default(),
+            stale_engines: Default::default(),
         }
     }
 
@@ -4097,6 +4297,18 @@ mod tests {
         let other = sources.tasks.iter().find(|task| task.id == other.id).unwrap();
         assert_eq!(other.status, DownloadStatus::Queued);
         assert_eq!(sources.running.as_deref(), Some(read.id.as_str()));
+    }
+
+    #[test]
+    fn source_settings_survive_a_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = SettingsStore::default();
+        store
+            .entry("demo.source".into())
+            .or_default()
+            .insert("quality".into(), SettingValue::Str("hd".into()));
+        save_source_settings(root.path(), &store).unwrap();
+        assert_eq!(load_source_settings(root.path()), store);
     }
 
     #[test]

@@ -25,6 +25,7 @@ mod error;
 mod filters;
 mod http;
 pub mod repo;
+mod settings;
 mod wasm;
 
 pub use catalog::{CatalogError, InstallError, InstalledSource, SourceCatalog, SourceManifest};
@@ -33,6 +34,9 @@ pub use error::SourceError;
 pub use filters::{default_filter_values, parse_filters_json};
 pub use http::{MAX_RESPONSE_BODY_BYTES, NativeHttp, NetRequestData, NetResponseData};
 pub use repo::{RepoError, RepositoryIndex, RepositorySource, SourceInstaller};
+pub use settings::{
+    SettingItem, SettingKind, SettingValue, set_setting, setting_value, source_settings,
+};
 pub use wasm::models::{
     Chapter, ContentRating, DeepLinkResult, Filter, FilterTypeConfig, FilterValue, ImageRequest,
     Listing, ListingKind, Manga, MangaPageResult, MultiSelectFilterCfg, Page, PageContent,

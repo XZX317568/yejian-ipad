@@ -615,7 +615,12 @@ impl WorkerState {
     fn find_listing(&mut self, listing_id: &str) -> Result<Listing, SourceError> {
         // A known static listing does not depend on fetching dynamic lists.
         // Keep it usable when that optional upstream request is unavailable.
-        if let Some(listing)=self.manifest.listings.iter().find(|listing|listing.id==listing_id) {
+        if let Some(listing) = self
+            .manifest
+            .listings
+            .iter()
+            .find(|listing| listing.id == listing_id)
+        {
             return Ok(listing.clone());
         }
         for listing in self.listings()? {
@@ -1366,18 +1371,31 @@ mod tests {
 
     #[test]
     fn static_listing_still_browses_when_dynamic_listing_export_fails() {
-        let payload=wat_escape(&page_result("static-still-works"));
-        let wasm=wat::parse_str(format!(r#"(module
+        let payload = wat_escape(&page_result("static-still-works"));
+        let wasm = wat::parse_str(format!(
+            r#"(module
             (memory (export "memory") 1)
             (data (i32.const 1024) "{payload}")
             (func (export "get_listings") (result i32) i32.const -1)
             (func (export "get_manga_list") (param i32 i32) (result i32) i32.const 1024)
-        )"#)).unwrap();
-        let engine=SourceEngine::load_wasm(manifest_with(vec![Listing{
-            id:"static".into(),name:"Static".into(),kind:ListingKind::Default,
-        }],false),wasm,EngineOptions::default()).unwrap();
+        )"#
+        ))
+        .unwrap();
+        let engine = SourceEngine::load_wasm(
+            manifest_with(
+                vec![Listing {
+                    id: "static".into(),
+                    name: "Static".into(),
+                    kind: ListingKind::Default,
+                }],
+                false,
+            ),
+            wasm,
+            EngineOptions::default(),
+        )
+        .unwrap();
         assert!(pollster::block_on(engine.listings()).is_err());
-        let page=pollster::block_on(engine.browse("static",1)).unwrap();
-        assert_eq!(page.entries[0].key,"static-still-works");
+        let page = pollster::block_on(engine.browse("static", 1)).unwrap();
+        assert_eq!(page.entries[0].key, "static-still-works");
     }
 }
