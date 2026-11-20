@@ -1825,6 +1825,18 @@ impl ReaderApp {
             );
             let clicked = self.icon(ui, &format!("nav-{kind}"), icon_rect, kind, label);
             self.hitboxes.insert(format!("nav-{kind}"), rect);
+            let fresh = if tab == Tab::Sources { self.sources.fresh_follows() } else { 0 };
+            if fresh > 0 {
+                let badge = Rect::from_center_size(icon_rect.right_top() + vec2(2., 2.), vec2(20., 18.));
+                ui.painter().rect_filled(badge, 9., Color32::from_rgb(214, 69, 65));
+                ui.painter().text(
+                    badge.center(),
+                    Align2::CENTER_CENTER,
+                    fresh.min(99).to_string(),
+                    FontId::proportional(11.),
+                    Color32::WHITE,
+                );
+            }
             ui.painter().text(
                 if expanded {
                     pos2(rect.left() + 55., rect.center().y)

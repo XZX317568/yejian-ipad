@@ -1,4 +1,5 @@
 mod design;
+mod follows;
 #[cfg(target_os = "ios")]
 mod ios_diagnostics;
 mod motion;

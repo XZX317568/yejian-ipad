@@ -1,4 +1,8 @@
-use crate::{design, source_filters::FilterEditor};
+use crate::{
+    design,
+    follows::{self, Follow},
+    source_filters::FilterEditor,
+};
 use anyhow::Context as _;
 use egui::*;
 use serde::{Deserialize, Serialize};
@@ -1184,7 +1188,22 @@ pub struct Sources {
     /// A download paused only so that a chapter being read can run first.
     /// It goes back to the queue instead of waiting for a manual "继续".
     preempted: Option<String>,
+    follows: Vec<Follow>,
+    /// A followed manga to open once its source has finished loading.
+    pending_open: Option<Manga>,
+    checking: usize,
+    auto_checked: bool,
+    up_tx: mpsc::Sender<Vec<(String, Manga)>>,
+    up_rx: mpsc::Receiver<UpdateEvent>,
 }
+
+/// Result of checking one followed manga for new chapters.
+struct UpdateEvent {
+    source: String,
+    manga: String,
+    chapters: Result<Vec<String>, String>,
+}
+
 impl Sources {
     #[cfg(debug_assertions)]
     pub(crate) fn preview_community(&mut self) {
@@ -1413,6 +1432,38 @@ impl Sources {
             })
             .expect("Unable to start source worker");
 
+        // Update checks get their own thread so a slow source never blocks
+        // browsing or downloads.
+        let (up_tx, up_cmd_rx) = mpsc::channel::<Vec<(String, Manga)>>();
+        let (up_event_tx, up_rx) = mpsc::channel();
+        let up_root = root.clone();
+        let up_ctx = ctx.clone();
+        thread::Builder::new()
+            .name("yejian-updates".into())
+            .spawn(move || {
+                let catalog = SourceCatalog::new(up_root.join("sources"));
+                while let Ok(batch) = up_cmd_rx.recv() {
+                    // Reload each round so an updated source is picked up.
+                    let mut engines = std::collections::HashMap::<String, SourceEngine>::new();
+                    for (source, manga) in batch {
+                        let chapters = (|| -> anyhow::Result<Vec<String>> {
+                            if !engines.contains_key(&source) {
+                                engines.insert(source.clone(), SourceEngine::load(&catalog, &source)?);
+                            }
+                            let list = pollster::block_on(engines[&source].chapters(&manga.key))?;
+                            Ok(list.into_iter().map(|chapter| chapter.key).collect())
+                        })()
+                        .map_err(|error| format!("{error:#}"));
+                        let event = UpdateEvent { source, manga: manga.key, chapters };
+                        if up_event_tx.send(event).is_err() {
+                            return;
+                        }
+                        up_ctx.request_repaint();
+                    }
+                }
+            })
+            .expect("Unable to start update worker");
+
         // Downloads live on their own thread and run one task at a time, so a
         // slow image server never blocks search, chapter loading or the UI.
         let (dl_tx, dl_cmd_rx) = mpsc::channel::<DlCmd>();
@@ -1543,7 +1594,18 @@ impl Sources {
             dl_stop,
             stream_request: None,
             preempted: None,
+            follows: Vec::new(),
+            pending_open: None,
+            checking: 0,
+            auto_checked: false,
+            up_tx,
+            up_rx,
         };
+        let mut sources = sources;
+        match follows::load(&sources.root) {
+            Ok(list) => sources.follows = list,
+            Err(error) => sources.status = format!("{error:#}"),
+        }
         // Never overwrite a file that startup could not fully parse.
         if load_warning.is_none() {
             let mut sources = sources;
@@ -1590,6 +1652,178 @@ impl Sources {
     /// page as the reader's return destination.
     pub fn take_open_chapter(&mut self) -> Option<ChapterMetadata> {
         self.open_chapter.take()
+    }
+
+    // -- follows -------------------------------------------------------------
+
+    /// Followed manga with chapters the user has not opened yet.
+    pub fn fresh_follows(&self) -> usize {
+        self.follows.iter().filter(|follow| !follow.fresh.is_empty()).count()
+    }
+
+    fn follow_index(&self, source: &str, manga: &str) -> Option<usize> {
+        self.follows
+            .iter()
+            .position(|follow| follow.source_id == source && follow.manga_id == manga)
+    }
+
+    fn save_follows(&mut self) {
+        if let Err(error) = follows::save(&self.root, &self.follows) {
+            self.status = format!("追更列表保存失败：{error:#}");
+        }
+    }
+
+    fn toggle_follow(&mut self, manga: &Manga) {
+        let source = self.source_for(manga);
+        if let Some(index) = self.follow_index(&source, &manga.key) {
+            self.follows.remove(index);
+            self.status = "已取消追更".into();
+            self.save_follows();
+            return;
+        }
+        let mut snapshot_manga = manga.clone();
+        snapshot_manga.source_key = source.clone();
+        let snapshot = match save_manga_snapshot(&self.root, &snapshot_manga) {
+            Ok(key) => key,
+            Err(error) => {
+                self.status = format!("无法保存漫画信息，未加入追更：{error:#}");
+                return;
+            }
+        };
+        let mut follow = Follow {
+            source_id: source,
+            manga_id: manga.key.clone(),
+            title: manga.title.clone(),
+            snapshot,
+            ..Default::default()
+        };
+        let keys: Vec<String> = self.chapters.iter().map(|chapter| chapter.key.clone()).collect();
+        follow.mark_seen(&keys);
+        follow.checked_at = Some(follows::now());
+        self.follows.insert(0, follow);
+        self.status = "已加入追更，有新章节会在书源页顶部提示".into();
+        self.save_follows();
+    }
+
+    fn follow_manga(&self, follow: &Follow) -> anyhow::Result<Manga> {
+        let bytes = std::fs::read(manga_snapshot_path(&self.root, &follow.snapshot)?)?;
+        let mut manga = Manga::from_postcard_bytes(&bytes)
+            .map_err(|error| anyhow::anyhow!("漫画快照已损坏：{error}"))?;
+        manga.source_key = follow.source_id.clone();
+        Ok(manga)
+    }
+
+    fn open_follow(&mut self, index: usize) {
+        let Some(follow) = self.follows.get(index).cloned() else {
+            return;
+        };
+        if !self.installed.iter().any(|source| source.manifest.id == follow.source_id) {
+            self.status = format!("书源 {} 未安装，无法打开《{}》", follow.source_id, follow.title);
+            return;
+        }
+        let manga = match self.follow_manga(&follow) {
+            Ok(manga) => manga,
+            Err(error) => {
+                self.status = format!("无法打开《{}》：{error:#}", follow.title);
+                return;
+            }
+        };
+        if self.selected_source == follow.source_id {
+            self.open_manga(manga);
+        } else {
+            self.select_source(&follow.source_id);
+            self.pending_open = Some(manga);
+        }
+    }
+
+    /// Asks every followed manga's source for its current chapter list.
+    pub fn check_updates(&mut self) {
+        if self.checking > 0 {
+            return;
+        }
+        let mut batch = Vec::new();
+        for follow in &self.follows {
+            match self.follow_manga(follow) {
+                Ok(manga) => batch.push((follow.source_id.clone(), manga)),
+                Err(error) => self.status = format!("《{}》无法检查更新：{error:#}", follow.title),
+            }
+        }
+        if batch.is_empty() {
+            return;
+        }
+        let count = batch.len();
+        if self.up_tx.send(batch).is_ok() {
+            self.checking = count;
+        } else {
+            self.status = "更新检查线程已停止，请重新打开应用".into();
+        }
+    }
+
+    fn handle_update(&mut self, event: UpdateEvent) {
+        self.checking = self.checking.saturating_sub(1);
+        if let Some(index) = self.follow_index(&event.source, &event.manga) {
+            let follow = &mut self.follows[index];
+            match event.chapters {
+                Ok(keys) => {
+                    follow.apply_check(&keys, follows::now());
+                }
+                Err(error) => {
+                    follow.error = Some(error);
+                    follow.checked_at = Some(follows::now());
+                }
+            }
+        }
+        if self.checking == 0 {
+            let fresh = self.fresh_follows();
+            self.status = if fresh > 0 {
+                format!("{fresh} 部追更有新章节")
+            } else {
+                "追更已是最新".into()
+            };
+            self.save_follows();
+        }
+    }
+
+    fn follows_ui(&mut self, ui: &mut Ui) {
+        if self.follows.is_empty() {
+            return;
+        }
+        design::section(ui, &format!("我的追更 · {}", self.follows.len()));
+        let checking = self.checking > 0;
+        if ui
+            .add_enabled(
+                !checking,
+                quiet_action(if checking { "正在检查更新…" } else { "检查更新" }),
+            )
+            .clicked()
+        {
+            self.check_updates();
+        }
+        let mut order: Vec<usize> = (0..self.follows.len()).collect();
+        order.sort_by_key(|&index| std::cmp::Reverse(self.follows[index].fresh.len()));
+        let mut open = None;
+        for index in order {
+            let follow = &self.follows[index];
+            let source = self
+                .installed
+                .iter()
+                .find(|source| source.manifest.id == follow.source_id)
+                .map_or_else(|| follow.source_id.clone(), |source| source.manifest.name.clone());
+            let detail = if let Some(error) = &follow.error {
+                format!("{source} · 检查失败：{error}")
+            } else if !follow.fresh.is_empty() {
+                format!("{source} · {} 话更新", follow.fresh.len())
+            } else {
+                format!("{source} · 共 {} 话", follow.total)
+            };
+            if source_item(ui, ("follow", index), &follow.title, &detail, true, true) {
+                open = Some(index);
+            }
+        }
+        if let Some(index) = open {
+            self.open_follow(index);
+        }
+        ui.add_space(20.);
     }
 
     /// Pops a chapter the user started reading online.
@@ -1851,6 +2085,7 @@ impl Sources {
         if self.selected_source == id {
             return;
         }
+        self.pending_open = None;
         if !self.selected_source.is_empty() {
             self.sessions.insert(
                 self.selected_source.clone(),
@@ -2355,6 +2590,9 @@ impl Sources {
                         _ => format!("加载失败：{error}"),
                     };
                     self.failed = completed;
+                    if let Some(manga) = self.pending_open.take() {
+                        self.open_manga(manga);
+                    }
                     continue;
                 }
             };
@@ -2385,6 +2623,9 @@ impl Sources {
                     self.filter_error = filter_error;
                     self.listing_error = listing_error;
                     self.metadata_loaded = true;
+                    if let Some(manga) = self.pending_open.take() {
+                        self.open_manga(manga);
+                    }
                     // Source updates can remove options; a session must never
                     // submit an identifier absent from the current schema.
                     self.applied_filters = crate::source_filters::overrides(
@@ -2452,6 +2693,13 @@ impl Sources {
                 }
                 Reply::Chapters(source, manga, list) => {
                     if source == self.selected_source {
+                        if let Some(index) = self.follow_index(&source, &manga.key) {
+                            let keys: Vec<String> =
+                                list.iter().map(|chapter| chapter.key.clone()).collect();
+                            self.follows[index].mark_seen(&keys);
+                            self.follows[index].title = manga.title.clone();
+                            self.save_follows();
+                        }
                         self.selected_manga = Some(manga);
                         self.chapters = list;
                         self.status.clear();
@@ -2461,6 +2709,13 @@ impl Sources {
         }
         while let Ok(event) = self.dl_rx.try_recv() {
             self.handle_download_event(event);
+        }
+        while let Ok(event) = self.up_rx.try_recv() {
+            self.handle_update(event);
+        }
+        if !self.auto_checked && !self.installed.is_empty() {
+            self.auto_checked = true;
+            self.check_updates();
         }
     }
 
@@ -3019,6 +3274,7 @@ impl Sources {
                         ui.add_space(8.);
                     }
                     if self.selected_source.is_empty() {
+                        self.follows_ui(ui);
                         self.repository_ui(ui);
                     }
                     if !self.results.entries.is_empty() {
@@ -3088,6 +3344,14 @@ impl Sources {
                     };
                     ui.add_space(12.);
                     ui.add(Label::new(RichText::new(&manga.title).heading().strong()).wrap());
+                    let followed = self.follow_index(&source, &manga.key).is_some();
+                    if if followed {
+                        ui.add(quiet_action("已追更 · 取消追更")).clicked()
+                    } else {
+                        ui.add(design::primary("追更", ui.visuals().dark_mode)).clicked()
+                    } {
+                        self.toggle_follow(&manga);
+                    }
                     if let Some(description) = &manga.description {
                         ui.add(Label::new(description).wrap());
                     }
@@ -3635,6 +3899,12 @@ mod tests {
             dl_stop: Arc::new(AtomicU8::new(STOP_NONE)),
             stream_request: None,
             preempted: None,
+            follows: Vec::new(),
+            pending_open: None,
+            checking: 0,
+            auto_checked: true,
+            up_tx: mpsc::channel().0,
+            up_rx: mpsc::channel().1,
         }
     }
 
@@ -3702,6 +3972,47 @@ mod tests {
         let other = sources.tasks.iter().find(|task| task.id == other.id).unwrap();
         assert_eq!(other.status, DownloadStatus::Queued);
         assert_eq!(sources.running.as_deref(), Some(read.id.as_str()));
+    }
+
+    #[test]
+    fn followed_manga_counts_new_chapters_until_opened() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sources = test_sources(root.path());
+        sources.selected_source = "source.a".into();
+        let book = manga("source.a", "m");
+        let chapter = |key: &str| Chapter { key: key.into(), ..Default::default() };
+        sources.chapters = vec![chapter("c1"), chapter("c2")];
+        sources.toggle_follow(&book);
+        assert_eq!(sources.follows.len(), 1);
+        assert_eq!(follows::load(root.path()).unwrap().len(), 1, "saved immediately");
+        assert_eq!(sources.follow_manga(&sources.follows[0]).unwrap().key, "m");
+
+        sources.checking = 1;
+        sources.handle_update(UpdateEvent {
+            source: "source.a".into(),
+            manga: "m".into(),
+            chapters: Ok(vec!["c1".into(), "c2".into(), "c3".into()]),
+        });
+        assert_eq!(sources.checking, 0);
+        assert_eq!(sources.fresh_follows(), 1);
+        assert_eq!(follows::load(root.path()).unwrap()[0].fresh, vec!["c3".to_string()]);
+
+        sources.request_id = 7;
+        sources.current_request.store(7, Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel();
+        sources.rx = rx;
+        tx.send((7, Ok(Reply::Chapters(
+            "source.a".into(),
+            book.clone(),
+            vec![chapter("c1"), chapter("c2"), chapter("c3")],
+        ))))
+        .unwrap();
+        sources.poll();
+        assert_eq!(sources.fresh_follows(), 0, "opening the manga marks chapters seen");
+
+        sources.toggle_follow(&book);
+        assert!(sources.follows.is_empty());
+        assert!(follows::load(root.path()).unwrap().is_empty());
     }
 
     #[test]
