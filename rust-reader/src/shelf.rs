@@ -436,29 +436,29 @@ pub fn paint_volume(
         vertical: Vec2::Y * scale,
     };
     let ink = if dark {
-        Color32::from_gray(238)
+        Color32::from_rgb(237, 231, 222)
     } else {
-        Color32::from_rgb(33, 44, 50)
+        Color32::from_rgb(31, 27, 23)
     };
     let muted = if dark {
-        Color32::from_gray(168)
+        Color32::from_rgb(161, 152, 142)
     } else {
-        Color32::from_rgb(99, 111, 119)
+        Color32::from_rgb(120, 113, 106)
     };
     let paper = if dark {
-        Color32::from_gray(36)
+        Color32::from_rgb(40, 37, 33)
     } else {
-        Color32::from_rgb(254, 253, 248)
+        Color32::from_rgb(255, 253, 249)
     };
     let spine = if dark {
-        Color32::from_gray(45)
+        Color32::from_rgb(48, 43, 38)
     } else {
-        Color32::from_rgb(242, 240, 233)
+        Color32::from_rgb(244, 240, 231)
     };
     // A hairline edge along the slanted paper and spine planes lets egui's
     // anti-aliased stroke hide the pixel stairs `Stroke::NONE` left behind.
     let edge_line = if dark {
-        Color32::from_gray(88).gamma_multiply(0.55)
+        Color32::from_rgb(90, 83, 75).gamma_multiply(0.55)
     } else {
         Color32::from_rgb(198, 190, 172).gamma_multiply(0.9)
     };
@@ -524,7 +524,7 @@ pub fn paint_volume(
         );
     }
     let edge = if dark {
-        Color32::from_gray(60)
+        Color32::from_rgb(62, 56, 50)
     } else {
         Color32::from_rgb(227, 223, 211)
     };
@@ -576,11 +576,7 @@ pub fn paint_volume(
         p.circle_filled(
             volume.front.point(0.5, 0.94),
             3.,
-            if dark {
-                Color32::from_rgb(156, 199, 177)
-            } else {
-                Color32::from_rgb(44, 90, 70)
-            },
+            crate::design::palette(dark).accent,
         );
     }
 }
@@ -621,9 +617,9 @@ pub fn paint_flight(
         p,
         mesh,
         if dark {
-            Color32::from_gray(36)
+            Color32::from_rgb(40, 37, 33)
         } else {
-            Color32::from_rgb(254, 253, 248)
+            Color32::from_rgb(255, 253, 249)
         },
     );
 }

@@ -35,10 +35,7 @@ fn language_label(language: &str) -> &str {
     }
 }
 fn quiet_action(label: &str) -> Button<'_> {
-    Button::new(label)
-        .frame_when_inactive(false)
-        .min_size(vec2(44., 44.))
-        .wrap()
+    Button::new(label).min_size(vec2(44., 44.)).wrap()
 }
 fn disclosure(ui: &mut Ui, label: &str, default_open: bool, body: impl FnOnce(&mut Ui)) {
     let mut state = collapsing_header::CollapsingState::load_with_default_open(
@@ -4938,7 +4935,7 @@ impl Sources {
                         } => {
                             let palette = design::palette(ui.visuals().dark_mode);
                             let label = RichText::new(&item.title).color(if *destructive {
-                                Color32::from_rgb(190, 64, 55)
+                                palette.danger
                             } else {
                                 palette.ink
                             });

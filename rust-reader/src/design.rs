@@ -12,32 +12,41 @@ pub(crate) struct Palette {
     pub accent: Color32,
     pub accent_soft: Color32,
     pub on_accent: Color32,
+    pub primary: Color32,
+    pub on_primary: Color32,
+    pub danger: Color32,
 }
 
 pub(crate) fn palette(dark: bool) -> Palette {
     if dark {
         Palette {
-            paper: Color32::from_rgb(24, 29, 28),
-            surface: Color32::from_rgb(32, 39, 37),
-            soft: Color32::from_rgb(39, 47, 44),
-            ink: Color32::from_rgb(233, 235, 226),
-            muted: Color32::from_rgb(161, 174, 165),
-            line: Color32::from_rgb(54, 65, 59),
-            accent: Color32::from_rgb(155, 201, 177),
-            accent_soft: Color32::from_rgb(43, 65, 54),
-            on_accent: Color32::from_rgb(23, 47, 37),
+            paper: Color32::from_rgb(20, 18, 16),
+            surface: Color32::from_rgb(28, 25, 22),
+            soft: Color32::from_rgb(37, 33, 29),
+            ink: Color32::from_rgb(237, 231, 222),
+            muted: Color32::from_rgb(161, 152, 142),
+            line: Color32::from_rgb(52, 48, 42),
+            accent: Color32::from_rgb(224, 123, 96),
+            accent_soft: Color32::from_rgb(58, 38, 32),
+            on_accent: Color32::from_rgb(28, 25, 22),
+            primary: Color32::from_rgb(237, 231, 222),
+            on_primary: Color32::from_rgb(28, 25, 22),
+            danger: Color32::from_rgb(242, 184, 181),
         }
     } else {
         Palette {
-            paper: Color32::from_rgb(250, 249, 246),
-            surface: Color32::from_rgb(255, 255, 252),
-            soft: Color32::from_rgb(240, 239, 234),
-            ink: Color32::from_rgb(35, 43, 38),
-            muted: Color32::from_rgb(105, 117, 108),
-            line: Color32::from_rgb(222, 225, 214),
-            accent: Color32::from_rgb(45, 91, 71),
-            accent_soft: Color32::from_rgb(228, 236, 224),
-            on_accent: Color32::from_rgb(255, 254, 246),
+            paper: Color32::from_rgb(247, 244, 238),
+            surface: Color32::from_rgb(255, 253, 249),
+            soft: Color32::from_rgb(239, 235, 227),
+            ink: Color32::from_rgb(31, 27, 23),
+            muted: Color32::from_rgb(120, 113, 106),
+            line: Color32::from_rgb(229, 223, 213),
+            accent: Color32::from_rgb(184, 69, 47),
+            accent_soft: Color32::from_rgb(246, 231, 224),
+            on_accent: Color32::from_rgb(255, 253, 249),
+            primary: Color32::from_rgb(31, 27, 23),
+            on_primary: Color32::from_rgb(255, 253, 249),
+            danger: Color32::from_rgb(179, 38, 30),
         }
     }
 }
@@ -55,8 +64,9 @@ pub(crate) fn visuals(dark: bool) -> Visuals {
     v.window_fill = p.surface;
     v.extreme_bg_color = p.surface;
     v.faint_bg_color = p.soft;
-    v.window_stroke = Stroke::new(1., p.line);
+    v.window_stroke = Stroke::new(if dark { 1. } else { 0. }, p.line);
     v.window_corner_radius = CornerRadius::same(20);
+    v.window_shadow = card_shadow(dark);
     v.menu_corner_radius = CornerRadius::same(12);
     v.selection.bg_fill = p.accent_soft;
     v.selection.stroke = Stroke::new(1., p.accent);
@@ -76,21 +86,45 @@ pub(crate) fn visuals(dark: bool) -> Visuals {
         widget.corner_radius = CornerRadius::same(10);
         widget.expansion = 0.;
     }
-    v.widgets.hovered.bg_fill = p.accent_soft;
-    v.widgets.hovered.weak_bg_fill = p.accent_soft;
-    v.widgets.active.bg_fill = p.accent_soft;
-    v.widgets.active.weak_bg_fill = p.accent_soft;
-    v.widgets.active.fg_stroke.color = p.accent;
+    v.widgets.hovered.bg_fill = p.soft;
+    v.widgets.hovered.weak_bg_fill = p.soft;
+    v.widgets.active.bg_fill = p.soft;
+    v.widgets.active.weak_bg_fill = p.soft;
     v
 }
 
+/// Cards and modals float on a soft shadow in light mode and keep a 1px
+/// outline in dark mode where a shadow would be invisible.
+pub(crate) fn card_shadow(dark: bool) -> Shadow {
+    if dark {
+        Shadow::NONE
+    } else {
+        Shadow {
+            offset: [0, 2],
+            blur: 12,
+            spread: 0,
+            color: Color32::from_black_alpha(20),
+        }
+    }
+}
+
+pub(crate) fn card_stroke(dark: bool) -> Stroke {
+    if dark {
+        Stroke::new(1., palette(dark).line)
+    } else {
+        Stroke::NONE
+    }
+}
+
 pub(crate) fn surface(ui: &Ui) -> Frame {
-    let p = palette(ui.visuals().dark_mode);
+    let dark = ui.visuals().dark_mode;
+    let p = palette(dark);
     Frame::new()
         .fill(p.surface)
-        .corner_radius(14)
+        .corner_radius(16)
         .inner_margin(20)
-        .stroke(Stroke::new(1., p.line.gamma_multiply(0.55)))
+        .stroke(card_stroke(dark))
+        .shadow(card_shadow(dark))
 }
 
 /// A theme choice shows what the page will look like before it is selected.
@@ -123,22 +157,17 @@ pub(crate) fn theme_choice(
         pos2(rect.right() - 12., rect.top() + 59.),
     );
     let preview_dark = kind == "dark";
-    let bg = if preview_dark {
-        Color32::from_rgb(32, 38, 34)
-    } else {
-        Color32::from_rgb(244, 242, 234)
-    };
-    ui.painter().rect_filled(preview, 5., bg);
+    let pv = palette(preview_dark);
+    ui.painter().rect_filled(preview, 5., pv.paper);
     if kind == "system" {
         ui.painter().rect_filled(
             Rect::from_min_max(pos2(preview.center().x, preview.top()), preview.max),
             5.,
-            Color32::from_rgb(32, 38, 34),
+            palette(true).paper,
         );
     }
     let book = Rect::from_min_size(preview.min + vec2(8., 7.), vec2(22., 34.));
-    ui.painter()
-        .rect_filled(book, 2., Color32::from_rgb(135, 151, 123));
+    ui.painter().rect_filled(book, 2., pv.accent);
     for (offset, fraction) in [(12., 0.60), (21., 0.42), (31., 0.50)] {
         ui.painter().line_segment(
             [
@@ -148,14 +177,7 @@ pub(crate) fn theme_choice(
                     preview.top() + offset,
                 ),
             ],
-            Stroke::new(
-                2.,
-                if preview_dark {
-                    Color32::from_gray(140)
-                } else {
-                    Color32::from_gray(158)
-                },
-            ),
+            Stroke::new(2., pv.muted),
         );
     }
     ui.painter().galley(
@@ -168,10 +190,11 @@ pub(crate) fn theme_choice(
 
 pub(crate) fn section(ui: &mut Ui, title: &str) {
     let p = palette(ui.visuals().dark_mode);
+    ui.add_space(4.);
     ui.add(
         Label::new(
             RichText::new(title)
-                .size(ui.text_style_height(&TextStyle::Body))
+                .size(ui.text_style_height(&TextStyle::Body) * 17. / 15.)
                 .strong()
                 .color(p.ink),
         )
@@ -182,10 +205,10 @@ pub(crate) fn section(ui: &mut Ui, title: &str) {
 
 pub(crate) fn primary(label: &str, dark: bool) -> Button<'_> {
     let p = palette(dark);
-    Button::new(RichText::new(label).color(p.on_accent))
-        .fill(p.accent)
+    Button::new(RichText::new(label).color(p.on_primary))
+        .fill(p.primary)
         .corner_radius(12)
-        .min_size(vec2(44., 48.))
+        .min_size(vec2(88., 48.))
         .wrap()
 }
 
@@ -225,10 +248,7 @@ pub(crate) fn toggle(ui: &mut Ui, value: &mut bool, title: &str, description: &s
     } else {
         track.left() + 14.
     };
-    ui.painter().circle_filled(
-        pos2(x, track.center().y),
-        10.,
-        if *value { p.on_accent } else { p.surface },
-    );
+    ui.painter()
+        .circle_filled(pos2(x, track.center().y), 10., p.surface);
     response.clicked()
 }

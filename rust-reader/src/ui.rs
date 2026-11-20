@@ -1789,14 +1789,14 @@ impl ReaderApp {
         let palette = crate::design::palette(self.dark);
         let fill = if primary {
             if response.hovered() {
-                palette.accent.gamma_multiply(0.88)
+                palette.primary.gamma_multiply(0.88)
             } else {
-                palette.accent
+                palette.primary
             }
         } else if response.hovered() {
-            palette.accent_soft
-        } else {
             palette.soft
+        } else {
+            palette.surface
         };
         ui.painter().rect_filled(rect, 10., fill);
         if !primary {
@@ -1804,7 +1804,7 @@ impl ReaderApp {
                 .rect_stroke(rect, 10., Stroke::new(1., palette.line), StrokeKind::Inside);
         }
         let text_color = if primary {
-            palette.on_accent
+            palette.on_primary
         } else {
             palette.ink
         };
@@ -1836,7 +1836,7 @@ impl ReaderApp {
         let color = if is_reader {
             Color32::from_gray(232)
         } else if active {
-            palette.accent
+            palette.ink
         } else {
             palette.muted
         };
@@ -1846,7 +1846,7 @@ impl ReaderApp {
                 rect,
                 12.,
                 if response.hovered() {
-                    palette.accent_soft
+                    palette.soft
                 } else {
                     // `soft` sits one step above the shelf stage so the pager
                     // buttons stay legible in dark mode without a heavy frame.
@@ -2402,7 +2402,7 @@ impl ReaderApp {
                 Align2::CENTER_CENTER,
                 "页间",
                 crate::typography::display(23.),
-                palette.accent,
+                palette.ink,
             );
         }
         for (i, (tab, label, kind)) in tabs.into_iter().enumerate() {
@@ -2426,8 +2426,16 @@ impl ReaderApp {
                 )
             };
             if tab == self.tab {
-                ui.painter()
-                    .rect_filled(rect.shrink2(vec2(5., 5.)), 16., palette.accent_soft);
+                // Selected item keeps ink ink + a small accent indicator
+                // instead of a tinted pill.
+                ui.painter().rect_filled(
+                    Rect::from_center_size(
+                        pos2(rect.center().x, rect.bottom() - 4.),
+                        vec2(18., 2.5),
+                    ),
+                    1.2,
+                    palette.accent,
+                );
             }
             // The whole item is the tap target: the glyph alone is only
             // 32x29 pt, below the 44 pt Apple asks for.
@@ -2447,13 +2455,13 @@ impl ReaderApp {
             let fresh = if tab == Tab::Sources { self.sources.fresh_follows() } else { 0 };
             if fresh > 0 {
                 let badge = Rect::from_center_size(icon_rect.right_top() + vec2(2., 2.), vec2(20., 18.));
-                ui.painter().rect_filled(badge, 9., Color32::from_rgb(214, 69, 65));
+                ui.painter().rect_filled(badge, 9., palette.accent);
                 ui.painter().text(
                     badge.center(),
                     Align2::CENTER_CENTER,
                     fresh.min(99).to_string(),
                     FontId::proportional(11.),
-                    Color32::WHITE,
+                    palette.on_accent,
                 );
             }
             ui.painter().text(
@@ -2470,7 +2478,7 @@ impl ReaderApp {
                 label,
                 FontId::proportional(if expanded { 16. } else { 12. }),
                 if tab == self.tab {
-                    palette.accent
+                    palette.ink
                 } else {
                     palette.muted
                 },
@@ -2666,12 +2674,7 @@ impl ReaderApp {
         let layout = self.shelf_layout(area);
         let shelf_area = layout.books;
         let palette = crate::design::palette(self.dark);
-        let stage_color = if self.dark {
-            Color32::from_rgb(40, 43, 39)
-        } else {
-            Color32::from_rgb(235, 233, 223)
-        };
-        ui.painter().rect_filled(layout.stage, 22., stage_color);
+        ui.painter().rect_filled(layout.stage, 22., palette.soft);
         if layout.side_by_side {
             ui.painter().line_segment(
                 [
@@ -2717,7 +2720,7 @@ impl ReaderApp {
         // The row is an endless shelf, so spines must dissolve into the page
         // instead of ending on a hard clip line.
         {
-            let background = stage_color;
+            let background = palette.soft;
             let clear =
                 Color32::from_rgba_unmultiplied(background.r(), background.g(), background.b(), 0);
             let fade = 30.;
@@ -2927,15 +2930,8 @@ impl ReaderApp {
                 pos2(area.left() + 24., area.bottom() - 122.),
                 vec2(area.width() - 48., 48.),
             );
-            ui.painter().rect_filled(
-                rect,
-                8.,
-                if self.dark {
-                    Color32::from_gray(46)
-                } else {
-                    Color32::WHITE
-                },
-            );
+            ui.painter()
+                .rect_filled(rect, 8., crate::design::palette(self.dark).surface);
             self.label(
                 ui.painter(),
                 rect.min + vec2(10., 14.),
@@ -3362,7 +3358,7 @@ impl ReaderApp {
         };
         let ctx = ui.ctx().clone();
         ui.painter()
-            .rect_filled(area, 0., Color32::from_rgb(18, 20, 22));
+            .rect_filled(area, 0., Color32::from_rgb(18, 17, 16));
         self.ask_page(id, self.page);
         let step = if self.spread && !self.vertical && area.width() > 700. {
             if self.spread_offset && self.page == 0 {
@@ -4800,7 +4796,7 @@ impl ReaderApp {
                     Frame::popup(&ctx.style_of(Theme::Dark))
                         .fill(crate::design::palette(true).surface)
                         .inner_margin(18)
-                        .corner_radius(16),
+                        .corner_radius(20),
                 )
                 .show(ctx, |ui| {
                     ui.set_width((ctx.content_rect().width() - 56.).clamp(200., 440.));
