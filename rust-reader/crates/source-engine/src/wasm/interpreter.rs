@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use wasmi::{Config, Engine, Instance, Linker, Memory, Module, Store, TrapCode, Val};
+use image::ImageEncoder;
 
 use crate::error::SourceError;
 use crate::http::{NetRequestData, NetResponseData};
@@ -45,8 +46,12 @@ pub(crate) struct DetectedFeatures {
     pub dynamic_settings: bool,
     pub dynamic_listings: bool,
     pub processes_pages: bool,
+    pub processes_covers: bool,
     pub provides_image_requests: bool,
+    pub provides_page_descriptions: bool,
+    pub provides_alternate_covers: bool,
     pub provides_base_url: bool,
+    pub handles_notifications: bool,
     pub handles_deep_links: bool,
     pub handles_basic_login: bool,
     pub handles_web_login: bool,
@@ -62,13 +67,16 @@ impl From<DetectedFeatures> for SourceFeatures {
             dynamic_settings: f.dynamic_settings,
             dynamic_listings: f.dynamic_listings,
             processes_pages: f.processes_pages,
+            processes_covers: f.processes_covers,
             provides_image_requests: f.provides_image_requests,
+            provides_page_descriptions: f.provides_page_descriptions,
+            provides_alternate_covers: f.provides_alternate_covers,
             provides_base_url: f.provides_base_url,
+            handles_notifications: f.handles_notifications,
             handles_deep_links: f.handles_deep_links,
             handles_basic_login: f.handles_basic_login,
             handles_web_login: f.handles_web_login,
             handles_migration: f.handles_migration,
-            ..Default::default()
         }
     }
 }
@@ -147,8 +155,12 @@ impl AidokuInterpreter {
             dynamic_settings: has("get_settings"),
             dynamic_listings: has("get_listings"),
             processes_pages: has("process_page_image"),
+            processes_covers: has("process_cover_image"),
             provides_image_requests: has("get_image_request"),
+            provides_page_descriptions: has("get_page_description"),
+            provides_alternate_covers: has("get_alternate_covers"),
             provides_base_url: has("get_base_url"),
+            handles_notifications: has("handle_notification"),
             handles_deep_links: has("handle_deep_link"),
             handles_basic_login: has("handle_basic_login"),
             handles_web_login: has("handle_web_login"),
@@ -560,6 +572,131 @@ impl AidokuInterpreter {
             Err(e) => Err(e),
         };
         self.guard(result, |value| value.is_none())
+    }
+
+    /// Runs one downloaded page image through the source's
+    /// `process_page_image` export, used by obfuscated-image sources.
+    ///
+    /// `bytes` is the raw response body; `context` is the page's optional
+    /// `PageContext` (the Aidoku ABI passes the postcard map as the second
+    /// argument, `-1` when absent). The returned [`AidokuResponse`] hands the
+    /// module a `StoredValue::Image` descriptor to work on, and the result
+    /// descriptor decodes back to a `PlatformImage` — re-encoded here as PNG
+    /// bytes ready for the page store.
+    pub fn process_page_image(
+        &mut self,
+        bytes: &[u8],
+        context: Option<&[(String, String)]>,
+    ) -> IResult<Vec<u8>> {
+        self.process_image("process_page_image", bytes, context)
+    }
+
+    /// Cover variant of [`Self::process_page_image`]; the export takes the
+    /// response only, with no page context argument.
+    pub fn process_cover_image(&mut self, bytes: &[u8]) -> IResult<Vec<u8>> {
+        self.process_image("process_cover_image", bytes, None)
+    }
+
+    fn process_image(
+        &mut self,
+        export: &str,
+        bytes: &[u8],
+        context: Option<&[(String, String)]>,
+    ) -> IResult<Vec<u8>> {
+        self.begin_call();
+        let decoded = image::load_from_memory(bytes)
+            .map_err(|e| SourceError::Deserialize(format!("page image is not decodable: {e}")))?
+            .to_rgba8();
+        let image_ref = self.store.data_mut().store.store(StoredValue::Image(decoded));
+
+        let response = AidokuResponse {
+            code: 200,
+            headers: Vec::new(),
+            request: AidokuRequest {
+                url: None,
+                headers: Vec::new(),
+            },
+            image: image_ref,
+        };
+        let mut w = PostcardWriter::new();
+        response.to_postcard(&mut w);
+        let response_desc = self.store_bytes(w.into_bytes());
+
+        let context_desc = if export == "process_page_image" {
+            match context {
+                Some(pairs) => {
+                    let mut w = PostcardWriter::new();
+                    w.write_map(pairs, |w, k| w.write_string(k), |w, v| w.write_string(v));
+                    self.store_bytes(w.into_bytes())
+                }
+                None => -1,
+            }
+        } else {
+            -1
+        };
+
+        let args = if export == "process_page_image" {
+            &[response_desc, context_desc][..]
+        } else {
+            &[response_desc][..]
+        };
+        let result = self.call_raw(export, args);
+        self.destroy(response_desc);
+        if context_desc >= 0 {
+            self.destroy(context_desc);
+        }
+
+        let result = result.and_then(|code| {
+            self.handle_result(code).and_then(|data| {
+                let mut r = PostcardReader::new(&data);
+                let result_ref = r
+                    .read_i32()
+                    .map_err(|e| SourceError::Deserialize(e.to_string()))?;
+                let image = match self.store.data().store.get(result_ref) {
+                    Some(StoredValue::Image(image)) => image.clone(),
+                    Some(StoredValue::Bytes(bytes)) => image::load_from_memory(bytes)
+                        .map_err(|e| {
+                            SourceError::Deserialize(format!(
+                                "{export} returned undecodable image bytes: {e}"
+                            ))
+                        })?
+                        .to_rgba8(),
+                    _ => {
+                        self.store.data_mut().store.remove(image_ref);
+                        return Err(SourceError::Deserialize(format!(
+                            "{export} did not return a stored image (ref {result_ref})"
+                        )));
+                    }
+                };
+                if result_ref != image_ref {
+                    self.store.data_mut().store.remove(result_ref);
+                }
+                self.store.data_mut().store.remove(image_ref);
+                let mut encoded = std::io::Cursor::new(Vec::new());
+                image::codecs::png::PngEncoder::new(&mut encoded)
+                    .write_image(
+                        image.as_raw(),
+                        image.width(),
+                        image.height(),
+                        image::ExtendedColorType::Rgba8,
+                    )
+                    .map_err(|e| {
+                        SourceError::Deserialize(format!("encoding processed page image: {e}"))
+                    })?;
+                Ok(encoded.into_inner())
+            })
+        });
+        self.guard(result, |bytes| bytes.is_empty())
+    }
+
+    /// Delivers a `settings.json` `notification` string to the source's
+    /// `handle_notification` export (button taps, page refreshes).
+    pub fn handle_notification(&mut self, notification: &str) -> IResult<()> {
+        self.begin_call();
+        let desc = self.store_bytes(notification.as_bytes().to_vec());
+        let result = self.call_raw("handle_notification", &[desc]);
+        self.destroy(desc);
+        result.map(|_| ())
     }
 
     pub fn dispose(&mut self) {

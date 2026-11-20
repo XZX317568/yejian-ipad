@@ -32,7 +32,11 @@ pub use catalog::{CatalogError, InstallError, InstalledSource, SourceCatalog, So
 pub use engine::{BoxFuture, DEFAULT_FUEL_PER_CALL, EngineOptions, RequestHandler, SourceEngine};
 pub use error::SourceError;
 pub use filters::{default_filter_values, parse_filters_json};
-pub use http::{DEFAULT_USER_AGENT, MAX_RESPONSE_BODY_BYTES, add_web_cookies, clear_site_cookies, take_web_challenge, NativeHttp, NetRequestData, NetResponseData};
+pub use http::{
+    DEFAULT_USER_AGENT, MAX_RESPONSE_BODY_BYTES, NativeHttp, NetRequestData, NetResponseData,
+    add_web_cookies, clear_site_cookies, send_isolated, set_site_user_agent, site_user_agent,
+    take_web_challenge,
+};
 pub use repo::{RepoError, RepositoryIndex, RepositorySource, SourceInstaller};
 pub use settings::{
     SettingItem, SettingKind, SettingValue, set_setting, setting_value, source_settings,

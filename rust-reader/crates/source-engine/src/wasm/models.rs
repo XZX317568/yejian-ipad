@@ -1088,6 +1088,7 @@ pub struct SourceFeatures {
     pub dynamic_settings: bool,
     pub dynamic_listings: bool,
     pub processes_pages: bool,
+    pub processes_covers: bool,
     pub provides_image_requests: bool,
     pub provides_page_descriptions: bool,
     pub provides_alternate_covers: bool,

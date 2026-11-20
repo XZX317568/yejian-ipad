@@ -26,6 +26,7 @@ extern "C" {
     fn yejian_ios_set_waker(callback: extern "C" fn());
     fn yejian_ios_open_web(url: *const c_char, user_agent: *const c_char) -> i64;
     fn yejian_ios_poll_web() -> *mut c_char;
+    fn yejian_ios_open_external_url(url: *const c_char) -> i64;
 }
 
 static WAKER: Mutex<Option<Box<dyn Fn() + Send + Sync>>> = Mutex::new(None);
@@ -142,5 +143,13 @@ pub(crate) fn poll_web() -> Result<Option<crate::WebResult>> {
     match take_string(unsafe { yejian_ios_poll_web() }) {
         Some(text) if !text.is_empty() => crate::parse_web_json(&text).map(Some),
         _ => Ok(None),
+    }
+}
+
+pub(crate) fn open_external_url(url: &str) -> Result<()> {
+    let url = CString::new(url).map_err(|_| PlatformError::Io("URL contains a NUL byte".into()))?;
+    match unsafe { yejian_ios_open_external_url(url.as_ptr()) } {
+        0 => Ok(()),
+        _ => Err(PlatformError::Io("系统无法打开该链接".into())),
     }
 }

@@ -223,6 +223,12 @@ pub struct ReaderApp {
     sources: crate::sources::Sources,
     stream: Option<StreamBook>,
     sync: crate::sync::ProgressSync,
+    trackers: crate::trackers::Trackers,
+    tracker_anilist_token: String,
+    tracker_kitsu_user: String,
+    tracker_kitsu_pass: String,
+    track_panel: Option<String>,
+    track_query: String,
     pub hitboxes: BTreeMap<String, Rect>,
     pub rendered_book_nodes: usize,
     pub frame_is_animating: bool,
@@ -236,6 +242,12 @@ impl ReaderApp {
         Self {
             worker: Worker::start(root.clone(), ctx.clone()),
             sync: crate::sync::ProgressSync::new(root.clone(), ctx.clone()),
+            trackers: crate::trackers::Trackers::new(root.clone(), ctx.clone()),
+            tracker_anilist_token: String::new(),
+            tracker_kitsu_user: String::new(),
+            tracker_kitsu_pass: String::new(),
+            track_panel: None,
+            track_query: String::new(),
             sources: crate::sources::Sources::new(root.clone(), ctx),
             root,
             stream: None,
@@ -1205,6 +1217,12 @@ impl ReaderApp {
                             "font-scale" => {
                                 self.font_scale = value.parse::<f32>().unwrap_or(1.).clamp(1., 2.)
                             }
+                            "follow-interval" => {
+                                let minutes: u64 = value
+                                    .parse()
+                                    .unwrap_or(crate::sources::DEFAULT_FOLLOW_INTERVAL_MIN);
+                                self.sources.set_follow_interval(minutes);
+                            }
                             _ => {}
                         }
                     }
@@ -1357,6 +1375,34 @@ impl ReaderApp {
             return;
         }
         self.saved_position = Some((id.to_string(), page, fraction));
+        // Auto-sync: a non-private reader that reached the last page (or a
+        // chapter seam) pushes the remote progress forward. `chapter_done`
+        // itself enforces the auto flag and the monotone floor.
+        if !self.private {
+            let last = self
+                .reader_book(id)
+                .map(|book| book.page_count.saturating_sub(1))
+                .unwrap_or(usize::MAX);
+            if page >= last {
+                if let Some(metadata) = self.reading_metadata(id) {
+                    let key = crate::trackers::binding_key(
+                        Some((&metadata.source_id, &metadata.manga_id)),
+                        None,
+                    );
+                    let chapter = metadata
+                        .chapter_number
+                        .filter(|n| n.is_finite() && *n >= 1.)
+                        .map(|n| n.floor() as i64)
+                        .or_else(|| crate::trackers::chapter_number(&metadata.chapter_title));
+                    if let Some(chapter) = chapter {
+                        self.trackers.chapter_done(&key, chapter);
+                    }
+                } else {
+                    let key = crate::trackers::binding_key(None, Some(id));
+                    self.trackers.chapter_done(&key, 0);
+                }
+            }
+        }
         if let Some(stream) = self.stream.as_mut().filter(|stream| stream.book.id == id) {
             stream.book.current_page = page;
             stream.book.page_fraction = fraction;
@@ -1802,8 +1848,16 @@ impl ReaderApp {
                 if response.hovered() {
                     palette.accent_soft
                 } else {
-                    palette.surface
+                    // `soft` sits one step above the shelf stage so the pager
+                    // buttons stay legible in dark mode without a heavy frame.
+                    palette.soft
                 },
+            );
+            p.rect_stroke(
+                rect,
+                12.,
+                Stroke::new(1., palette.line),
+                StrokeKind::Inside,
             );
         }
         let c = rect.center();
@@ -2031,6 +2085,9 @@ impl ReaderApp {
             }
         }
         self.sources.poll();
+        if let Some(notice) = self.sources.follow_notice.take() {
+            self.pending_notice = Some(notice);
+        }
         if let Some(chapter) = self.sources.take_stream() {
             self.open_stream(chapter);
         }
@@ -2057,6 +2114,10 @@ impl ReaderApp {
         if self.sync.changed {
             self.sync.changed = false;
             self.send(Command::Refresh);
+        }
+        self.trackers.poll();
+        for notice in self.trackers.notices.drain(..) {
+            self.pending_notice = Some(notice);
         }
         while let Some(chapter) = self.sources.take_downloaded() {
             let id = chapter.id.clone();
@@ -2950,7 +3011,9 @@ impl ReaderApp {
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     let total = vec2(
-                        (books.len() as f32 * cell_width).max(canvas.width()),
+                        // Symmetric tail padding keeps the last cover off the
+                        // clip edge instead of hard-cropping at the canvas.
+                        (books.len() as f32 * cell_width + 8.).max(canvas.width()),
                         cell_height,
                     );
                     let (row, _) = ui.allocate_exact_size(total, Sense::hover());
@@ -2979,11 +3042,19 @@ impl ReaderApp {
                         );
                         if index == selected || response.hovered() {
                             ui.painter()
-                                .rect_filled(cover.expand(4.), 9., palette.accent_soft);
+                                .rect_filled(cover.expand(5.), 10., palette.accent_soft);
+                            // Two hairlines — one flush with the art, one at
+                            // the halo — read as a single calm selection ring.
                             ui.painter().rect_stroke(
-                                cover.expand(4.),
-                                9.,
+                                cover.expand(5.),
+                                10.,
                                 Stroke::new(1., palette.accent),
+                                StrokeKind::Inside,
+                            );
+                            ui.painter().rect_stroke(
+                                cover.expand(1.5),
+                                6.,
+                                Stroke::new(1., palette.accent.gamma_multiply(0.7)),
                                 StrokeKind::Inside,
                             );
                         }
@@ -2999,6 +3070,30 @@ impl ReaderApp {
                             );
                         } else {
                             ui.painter().rect_filled(cover, 5., palette.soft);
+                        }
+                        // Partially read books get a quiet progress tick along
+                        // the inside of the cover's bottom edge.
+                        let pages = book.page_count;
+                        let read = book.current_page;
+                        if pages > 0 && read > 0 && read < pages {
+                            let rail = Rect::from_min_max(
+                                pos2(cover.left() + 5., cover.bottom() - 5.),
+                                pos2(cover.right() - 5., cover.bottom() - 3.),
+                            );
+                            ui.painter().rect_filled(
+                                rail,
+                                1.,
+                                palette.muted.gamma_multiply(0.30),
+                            );
+                            let fill = Rect::from_min_max(
+                                rail.min,
+                                pos2(
+                                    rail.left()
+                                        + rail.width() * (read as f32 / pages as f32),
+                                    rail.max.y,
+                                ),
+                            );
+                            ui.painter().rect_filled(fill, 1., palette.accent);
                         }
                         let mut title = egui::text::LayoutJob::simple(
                             book.title.clone(),
@@ -3203,9 +3298,27 @@ impl ReaderApp {
                 self.chapter_dialog = Some(id.to_string());
             }
         }
+        let key = if let Some(chapter) = self.chapter(id) {
+            crate::trackers::binding_key(
+                Some((&chapter.source_id, &chapter.manga_id)),
+                None,
+            )
+        } else {
+            crate::trackers::binding_key(None, Some(id))
+        };
+        if !key.is_empty() {
+            let (rect, _) = ui.allocate_exact_size(vec2(width, 46.), Sense::hover());
+            if self.button(ui, "detail-tracking", rect, "进度跟踪", false) {
+                self.track_panel = Some(key);
+                self.track_query.clear();
+            }
+        }
     }
     fn reader_input_blocked(&self) -> bool {
-        self.reader_options || self.chapter_dialog.is_some() || self.error.is_some()
+        self.reader_options
+            || self.chapter_dialog.is_some()
+            || self.track_panel.is_some()
+            || self.error.is_some()
     }
     fn set_reading_mode(&mut self, mode: &str) {
         if self.vertical == (mode == "vertical") && self.spread == (mode == "spread") {
@@ -4193,6 +4306,96 @@ impl ReaderApp {
                         .inner_margin(Margin::symmetric(2, 16))
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
+                            crate::design::section(ui, "追更");
+                            ui.label(
+                                RichText::new("自动检查新章节").color(palette.muted).small(),
+                            );
+                            let interval = self.sources.follow_interval();
+                            let mut chosen = interval;
+                            let width = if ui.available_width() < 340. {
+                                ((ui.available_width() - 10.) / 2.).floor() - 1.
+                            } else {
+                                ((ui.available_width() - 40.) / 5.).floor() - 1.
+                            };
+                            ui.horizontal_wrapped(|ui| {
+                                for (minutes, name) in crate::sources::FOLLOW_INTERVAL_CHOICES {
+                                    if ui
+                                        .add(
+                                            Button::new(*name)
+                                                .selected(chosen == *minutes)
+                                                .min_size(vec2(width, 44.))
+                                                .wrap(),
+                                        )
+                                        .clicked()
+                                    {
+                                        chosen = *minutes;
+                                    }
+                                }
+                            });
+                            if chosen != interval {
+                                self.sources.set_follow_interval(chosen);
+                                self.setting("follow-interval", chosen.to_string());
+                            }
+                        });
+                    ui.add_space(10.);
+                    ui.separator();
+                    Frame::new()
+                        .inner_margin(Margin::symmetric(2, 16))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            crate::design::section(ui, "进度跟踪（AniList / Kitsu）");
+                            let mut sync = self.trackers.auto_sync();
+                            if crate::design::toggle(
+                                ui,
+                                &mut sync,
+                                "自动同步章节进度",
+                                "读完一章就把远端进度推进到已读（私密阅读时不上传）",
+                            ) {
+                                self.trackers
+                                    .submit(crate::trackers::TrackCommand::SetAutoSync(sync));
+                            }
+                            if let Some(error) = self.trackers.error.clone() {
+                                ui.add_space(6.);
+                                ui.label(RichText::new(error).color(palette.muted).small());
+                            }
+                            for tracker in [
+                                crate::trackers::TrackerKind::Anilist,
+                                crate::trackers::TrackerKind::Kitsu,
+                            ] {
+                                ui.add_space(10.);
+                                let name = tracker.label();
+                                let account = self.trackers.account(tracker).cloned();
+                                if let Some(account) = account {
+                                    ui.horizontal(|ui| {
+                                        ui.label(format!("{name} · {}", account.name));
+                                        if ui
+                                            .add_enabled(
+                                                self.trackers.idle(),
+                                                Button::new("退出登录").min_size(vec2(88., 40.)),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.trackers.submit(
+                                                crate::trackers::TrackCommand::Logout(tracker),
+                                            );
+                                        }
+                                    });
+                                } else {
+                                    ui.label(
+                                        RichText::new(format!("{name} · 未登录"))
+                                            .color(palette.muted)
+                                            .small(),
+                                    );
+                                    self.tracker_login_row(ui, tracker);
+                                }
+                            }
+                        });
+                    ui.add_space(10.);
+                    ui.separator();
+                    Frame::new()
+                        .inner_margin(Margin::symmetric(2, 16))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
                             crate::design::section(ui, "书库与备份");
                             ui.horizontal_wrapped(|ui| {
                                 if ui.button("选择漫画文件").clicked() {
@@ -4275,6 +4478,260 @@ impl ReaderApp {
                     });
                 });
         });
+    }
+    fn tracker_login_row(&mut self, ui: &mut Ui, tracker: crate::trackers::TrackerKind) {
+        let idle = self.trackers.idle();
+        match tracker {
+            crate::trackers::TrackerKind::Anilist => {
+                ui.add(
+                    TextEdit::singleline(&mut self.tracker_anilist_token)
+                        .desired_width(ui.available_width())
+                        .hint_text("粘贴 AniList Access Token"),
+                );
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(idle, Button::new("浏览器授权登录").min_size(vec2(0., 44.)))
+                        .clicked()
+                    {
+                        self.trackers
+                            .submit(crate::trackers::TrackCommand::AnilistOAuth);
+                    }
+                    let token = self.tracker_anilist_token.trim().to_string();
+                    if ui
+                        .add_enabled(
+                            idle && !token.is_empty(),
+                            Button::new("用粘贴的令牌登录").min_size(vec2(0., 44.)),
+                        )
+                        .clicked()
+                    {
+                        self.trackers
+                            .submit(crate::trackers::TrackCommand::AnilistToken(token));
+                        self.tracker_anilist_token.clear();
+                    }
+                });
+                #[cfg(any(target_os = "android", target_os = "ios"))]
+                {
+                    let token = self.tracker_anilist_token.trim().to_string();
+                    if ui
+                        .add_enabled(
+                            idle && !token.is_empty(),
+                            Button::new("用粘贴的令牌登录").min_size(vec2(0., 44.)),
+                        )
+                        .clicked()
+                    {
+                        self.trackers
+                            .submit(crate::trackers::TrackCommand::AnilistToken(token));
+                        self.tracker_anilist_token.clear();
+                    }
+                }
+            }
+            crate::trackers::TrackerKind::Kitsu => {
+                ui.add(
+                    TextEdit::singleline(&mut self.tracker_kitsu_user)
+                        .desired_width(ui.available_width())
+                        .hint_text("Kitsu 邮箱或用户名"),
+                );
+                ui.add(
+                    TextEdit::singleline(&mut self.tracker_kitsu_pass)
+                        .desired_width(ui.available_width())
+                        .password(true)
+                        .hint_text("Kitsu 密码"),
+                );
+                let user = self.tracker_kitsu_user.trim().to_string();
+                let pass = self.tracker_kitsu_pass.clone();
+                if ui
+                    .add_enabled(
+                        idle && !user.is_empty() && !pass.is_empty(),
+                        Button::new("登录 Kitsu").min_size(vec2(0., 44.)),
+                    )
+                    .clicked()
+                {
+                    self.trackers
+                        .submit(crate::trackers::TrackCommand::KitsuLogin(user, pass));
+                    self.tracker_kitsu_pass.clear();
+                }
+            }
+        }
+    }
+    fn track_panel_ui(&mut self, ui: &mut Ui, key: &str) {
+        use crate::trackers::{TrackCommand, TrackStatus, TrackerKind};
+        ui.heading("进度跟踪");
+        let palette = crate::design::palette(self.dark);
+        let bound = self.trackers.binding(key).cloned();
+        if let Some(binding) = &bound {
+            let tracker = if binding.tracker == "kitsu" {
+                TrackerKind::Kitsu
+            } else {
+                TrackerKind::Anilist
+            };
+            ui.label(format!(
+                "已绑定 {} · {}",
+                tracker.label(),
+                binding.title
+            ));
+            ui.label(
+                RichText::new(format!(
+                    "状态 {} · 进度 {}",
+                    binding.status.label(),
+                    binding.progress
+                ))
+                .color(palette.muted)
+                .small(),
+            );
+            if let Some(entry) = self.trackers.entries.get(key).and_then(|e| e.as_ref()) {
+                ui.label(
+                    RichText::new(format!(
+                        "远端：{} · 第 {} 章{}",
+                        entry.status.label(),
+                        entry.progress,
+                        if entry.total_chapters > 0 {
+                            format!("/{}", entry.total_chapters)
+                        } else {
+                            String::new()
+                        }
+                    ))
+                    .color(palette.muted)
+                    .small(),
+                );
+            }
+            let mut status = binding.status;
+            ui.horizontal_wrapped(|ui| {
+                for candidate in [
+                    TrackStatus::Reading,
+                    TrackStatus::Completed,
+                    TrackStatus::Planned,
+                    TrackStatus::OnHold,
+                    TrackStatus::Dropped,
+                    TrackStatus::ReReading,
+                ] {
+                    if ui
+                        .selectable_label(status == candidate, candidate.label())
+                        .clicked()
+                    {
+                        status = candidate;
+                    }
+                }
+            });
+            let mut progress = binding.progress.max(0);
+            ui.horizontal(|ui| {
+                ui.label("已读章节");
+                if ui.button("−").clicked() {
+                    progress = (progress - 1).max(0);
+                }
+                ui.label(format!("{progress}"));
+                if ui.button("+").clicked() {
+                    progress += 1;
+                }
+            });
+            let idle = self.trackers.idle();
+            if ui
+                .add_enabled(
+                    idle && (status != binding.status || progress != binding.progress),
+                    Button::new("保存并同步").min_size(vec2(0., 44.)),
+                )
+                .clicked()
+            {
+                self.trackers.submit(TrackCommand::Update {
+                    key: key.to_string(),
+                    status,
+                    progress,
+                });
+            }
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(idle, Button::new("刷新远端").min_size(vec2(0., 44.)))
+                    .clicked()
+                {
+                    self.trackers.submit(TrackCommand::Refresh(key.to_string()));
+                }
+                if ui
+                    .add_enabled(idle, Button::new("解除绑定").min_size(vec2(0., 44.)))
+                    .clicked()
+                {
+                    self.trackers.submit(TrackCommand::Unbind(key.to_string()));
+                }
+            });
+        } else {
+            ui.label(RichText::new("未绑定远端条目").color(palette.muted).small());
+            ui.add(
+                TextEdit::singleline(&mut self.track_query)
+                    .desired_width(ui.available_width())
+                    .hint_text("搜索要绑定的作品"),
+            );
+            let idle = self.trackers.idle();
+            ui.horizontal(|ui| {
+                for tracker in [TrackerKind::Anilist, TrackerKind::Kitsu] {
+                    let logged = self.trackers.account(tracker).is_some();
+                    if ui
+                        .add_enabled(
+                            idle && logged && !self.track_query.trim().is_empty(),
+                            Button::new(format!("搜 {}", tracker.label()))
+                                .min_size(vec2(0., 44.)),
+                        )
+                        .clicked()
+                    {
+                        self.trackers.submit(TrackCommand::Search {
+                            tracker,
+                            key: key.to_string(),
+                            query: self.track_query.trim().to_string(),
+                        });
+                    }
+                }
+            });
+            if self.trackers.account(TrackerKind::Anilist).is_none()
+                && self.trackers.account(TrackerKind::Kitsu).is_none()
+            {
+                ui.label(
+                    RichText::new("先到 设置 → 进度跟踪 登录 AniList 或 Kitsu")
+                        .color(palette.muted)
+                        .small(),
+                );
+            }
+            if let Some(list) = self.trackers.searches.get(key).cloned() {
+                ScrollArea::vertical().max_height(240.).show(ui, |ui| {
+                    for item in list {
+                        let text = format!(
+                            "{}{}{}",
+                            item.title,
+                            if item.total_chapters > 0 {
+                                format!(" · {} 章", item.total_chapters)
+                            } else {
+                                String::new()
+                            },
+                            if item.status.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" · {}", item.status)
+                            }
+                        );
+                        if ui
+                            .add(Button::new(text).min_size(vec2(ui.available_width(), 44.)).wrap())
+                            .clicked()
+                        {
+                            self.trackers.submit(TrackCommand::Bind {
+                                tracker: if self
+                                    .trackers
+                                    .account(TrackerKind::Anilist)
+                                    .is_some()
+                                {
+                                    TrackerKind::Anilist
+                                } else {
+                                    TrackerKind::Kitsu
+                                },
+                                key: key.to_string(),
+                                pick: item,
+                                progress: 0,
+                            });
+                        }
+                    }
+                });
+            }
+        }
+        ui.add_space(8.);
+        if ui.button("关闭").clicked() {
+            self.track_panel = None;
+        }
     }
     fn sources_ui(&mut self, ui: &mut Ui, area: Rect) {
         let mut column = Self::page_column(area, 88., 88.);
@@ -4599,6 +5056,16 @@ impl ReaderApp {
                     });
                 });
         }
+        if let Some(key) = self.track_panel.clone() {
+            let response = Modal::new(Id::unique("track-panel")).show(ctx, |ui| {
+                ui.set_width((ctx.content_rect().width() - 48.).clamp(220., 460.));
+                self.track_panel_ui(ui, &key);
+            });
+            if response.should_close() {
+                self.track_panel = None;
+            }
+        }
+        self.sources.web_dialog(ctx);
     }
     pub fn ready(&self) -> bool {
         self.ready

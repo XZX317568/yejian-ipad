@@ -449,6 +449,67 @@ pub struct WebResult {
     pub cookies: Option<Vec<(String, String)>>,
 }
 
+/// True when the shell can show an in-app web page (Android WebView dialog,
+/// iOS WKWebView). Desktop platforms have no in-app browser; the UI must
+/// fall back to [`open_external_url`] plus a paste-cookies dialog.
+pub fn has_in_app_web() -> bool {
+    cfg!(any(target_os = "ios", target_os = "android"))
+}
+
+/// Opens `url` with the system browser/handler using an argument array —
+/// never a shell string.
+#[cfg(target_os = "android")]
+pub fn open_external_url(url: &str) -> Result<()> {
+    checked_url(url)?;
+    android::open_external_url(url)
+}
+
+/// Opens `url` with `UIApplication.open`.
+#[cfg(target_os = "ios")]
+pub fn open_external_url(url: &str) -> Result<()> {
+    checked_url(url)?;
+    ios::open_external_url(url)
+}
+
+/// Opens `url` with `rundll32 url.dll,FileProtocolHandler` on Windows and
+/// `open`/`xdg-open` elsewhere — always as argv, never through a shell.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn open_external_url(url: &str) -> Result<()> {
+    checked_url(url)?;
+    let (program, args): (&str, Vec<&str>) = if cfg!(target_os = "windows") {
+        ("rundll32.exe", vec!["url.dll,FileProtocolHandler", url])
+    } else if cfg!(target_os = "macos") {
+        ("open", vec![url])
+    } else {
+        ("xdg-open", vec![url])
+    };
+    std::process::Command::new(program)
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| PlatformError::Io(format!("无法打开外部链接：{error}")))
+}
+
+/// Shared scheme/control-character validation for every `open_external_url`.
+fn checked_url(url: &str) -> Result<()> {
+    let trimmed = url.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if !(lower.starts_with("https://") || lower.starts_with("http://")) {
+        return Err(PlatformError::Protocol(format!(
+            "仅允许 http/https 链接：{trimmed}"
+        )));
+    }
+    if trimmed.chars().any(|c| c.is_control() || c == ' ') {
+        return Err(PlatformError::Protocol(
+            "链接包含控制字符或空白，已拒绝".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Opens `url` in an in-app browser using `user_agent`; finishing hands its
 /// cookies back through [`poll_web`].
 #[cfg(target_os = "ios")]
@@ -456,8 +517,14 @@ pub fn open_web(url: &str, user_agent: &str) -> Result<()> {
     ios::open_web(url, user_agent)
 }
 
-/// Only the iOS shell has an in-app browser so far.
-#[cfg(not(target_os = "ios"))]
+/// Opens `url` in the in-app WebView dialog.
+#[cfg(target_os = "android")]
+pub fn open_web(url: &str, user_agent: &str) -> Result<()> {
+    android::open_web(url, user_agent)
+}
+
+/// Only the mobile shells have an in-app browser.
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 pub fn open_web(url: &str, user_agent: &str) -> Result<()> {
     let _ = (url, user_agent);
     Err(PlatformError::Unsupported("in-app browser"))
@@ -469,12 +536,18 @@ pub fn poll_web() -> Result<Option<WebResult>> {
     ios::poll_web()
 }
 
-#[cfg(not(target_os = "ios"))]
+/// Next finished web page, if any.
+#[cfg(target_os = "android")]
+pub fn poll_web() -> Result<Option<WebResult>> {
+    android::poll_web()
+}
+
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 pub fn poll_web() -> Result<Option<WebResult>> {
     Ok(None)
 }
 
-#[cfg_attr(not(target_os = "ios"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "ios", target_os = "android")), allow(dead_code))]
 pub(crate) fn parse_web_json(json: &str) -> Result<WebResult> {
     let value: serde_json::Value = serde_json::from_str(json)
         .map_err(|error| PlatformError::Protocol(format!("invalid web JSON: {error}")))?;
@@ -499,6 +572,7 @@ pub(crate) fn parse_web_json(json: &str) -> Result<WebResult> {
 
 /// Parse the JSON contract produced by `RustActivity.pollImport()` and
 /// `yejian_ios_poll_import()`.
+#[cfg(any(target_os = "android", target_os = "ios", test))]
 pub(crate) fn parse_import_json(json: &str) -> Result<ImportBatch> {
     let value: serde_json::Value = serde_json::from_str(json)
         .map_err(|error| PlatformError::Protocol(format!("invalid import JSON: {error}")))?;
@@ -602,6 +676,7 @@ pub(crate) fn parse_import_json(json: &str) -> Result<ImportBatch> {
 }
 
 /// Parse `"left,top,right,bottom"` as physical pixels.
+#[cfg(any(target_os = "android", target_os = "ios", test))]
 pub(crate) fn parse_insets_csv(csv: &str) -> Result<Insets> {
     let mut parts = csv.split(',');
     let mut next = || -> Result<i32> {

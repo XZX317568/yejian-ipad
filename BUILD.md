@@ -2,9 +2,11 @@
 
 ## Rust 客户端（当前迁移入口）
 
+2026-11-20 build 7 本地全量收口产物在 `artifacts/rust/build7-20261120/`：Android `android/Yejian-0.1.1-build7-rust-arm64-debug.apk`（40,201,618 字节，versionCode 7）、Windows `windows/Yejian.exe`（106,881,024 字节，附 `打开新版预览.cmd` / `打开页间.cmd` / `licenses/`）。本地重打 Android：`.\tools\build-rust-android.ps1`（内部 `cargo ndk` 单任务 + Gradle `--max-workers=1 --no-daemon`，`Cargo.lock` 不变）；本轮修复 `RustActivity.java` WebView 桥 `userAgent` 变量后 `assembleDebug` 通过，未安装真机。
+
 2026-11-20第二版界面预览在 `artifacts/rust/ui-redesign-v2-20261120/windows/`，双击 `打开新版预览.cmd` 可直接体验带原创样书的新界面，数据存于独立的 `preview-data/`。`打开页间.cmd` 使用旁边的 `data/`，供导入自己的漫画或恢复备份。第一轮预览保留在 `ui-redesign-20261120/`。
 
-既有0.1.1交付在 `artifacts/rust/v0.1.1/delivery/`，Android包为 `Yejian-0.1.1-rust-arm64-debug.apk`。本轮仅生成Windows界面预览，未更新移动端安装包。从旧Windows版迁入书库时，先在旧版设置中创建完整备份，再到新版恢复。
+历史 0.1.1（code 4）基线保留在 `artifacts/rust/v0.1.1/delivery/`（`Yejian-0.1.1-rust-arm64-debug.apk`）；最新 Android 与 Windows 交付包均已更新至上方 `artifacts/rust/build7-20261120/`。从旧 Windows 版迁入书库时，先在旧版设置中创建完整备份，再到新版恢复。
 
 ```powershell
 cd D:\Documents\aidoku\rust-reader
@@ -72,7 +74,7 @@ cd D:\Documents\aidoku
 .\tools\build-rust-android.ps1
 ```
 
-Rust 客户端沿用自己的标识 `app.yejian.reader.rust`。已交付 Android 0.1.1 的 versionCode 为 4，与 Flutter 对照版分开安装；本轮 iPad 修复未重新打包 Android。
+Rust 客户端沿用自己的标识 `app.yejian.reader.rust`，与 Flutter 对照版分开安装。最新 Android 0.1.1 包已升级至 `versionCode 7`（`artifacts/rust/build7-20261120/android/Yejian-0.1.1-build7-rust-arm64-debug.apk`，40,201,618 字节）；旧 code 4 基线保留在 `artifacts/rust/v0.1.1/delivery/`。
 
 有 Mac 时可运行 `bash tools/build-rust-ios.sh --device --release --ipa`。IPA 未签名，需使用已配置的侧载工具；当前没有用户 iPad 上的安装成功证据。步骤见 `rust-reader/platform/ios/README.md`。
 

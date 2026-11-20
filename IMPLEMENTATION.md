@@ -4,6 +4,40 @@
 
 页间 / Yejian 面向 iPad 和安卓手机。用户于 2026-11-17 选择 Rust，11 月 18 日确认界面可按阅读体验改进。`rust-reader/` 用 egui / wgpu 绘制 Wenku8 Flutter **v0.5.6** 风格的物理书架和纸张开合。选书、看详情、直接续读是三个独立动作。原 Flutter 版本位于 `app/`。
 
+## 2026-11-20（build 7 本地全量收口）
+
+本轮由指定辅助模型（SWE-2 / high）分三批完成 build 6 交接清单全部七项，并执行全套离屏 GPU 验收与双端本地重打包。全部产物与证据在 `artifacts/rust/build7-20261120/` 与 `.tools/fusion-20261120/`。
+
+### 七项功能
+
+1. **图片后处理书源（`process_page_image`）**：`crates/source-engine` 对照上游 AidokuRunner 实现 `process_page_image(response_desc, context_desc)` 宿主 ABI 并检测 WASM 导出；`src/sources.rs` 的 `page_bytes` 下载管线在并发 HTTP 完成后，对具备该能力的书源经引擎串行送入页面图片字节与上下文，取回处理后的 PNG 再做解码与 `.part` 原子改名；未导出书源零开销直通。`crates/source-engine/tests/process_page_image.rs` 新增真实 `wat` 夹具验证像素改写、上下文透传与错误传播。
+2. **书源设置 `button` / `link`**：`settings.rs` 补齐两类解析，`sources.rs`/`ui.rs` 渲染 ≥44pt 控件；`button` 带 `notification` 时调用书源 `handle_notification` 并刷新状态；`link` 校验 `http(s)://` 后经 `yejian_platform` 打开。
+3. **追更封面并入 `source-covers/`**：追更列表复用 `fnv(源,url)` 缓存键、原子落盘与 LRU 纹理管线；旧 `follow-covers/` 仅作兼容读取、不再写入新文件，已有封面不丢。
+4. **后台定时追更**：`follows.rs` + 设置持久化提供 关闭/30分钟/1/2/6小时（默认1小时）；仅按到期 `request_repaint_after`，静置零持续重绘，未破坏停帧断言；与手动检查互斥去重，新章节在导航红点之外给出顶部摘要提醒并唤醒 UI。
+5. **Android WebView 桥 + Windows 网页验证闭环**：`yejian_platform` 新增 `has_in_app_web()` / `open_external_url()`（Android `Intent.ACTION_VIEW`、iOS `UIApplication.open`、Windows `rundll32 url.dll,FileProtocolHandler`、macOS/Linux `open`/`xdg-open`，无 `cmd /c` 拼接）；`RustActivity.java` 新增 `openWeb`/`pollWeb` 全屏 WebView 弹窗（JS/DOM/第三方 Cookie、自定义 UA、独立 `webResults` 队列，完成时导 Cookie JSON）。桌面端经系统浏览器 + 应用内「网页验证与登录」对话框，支持 `name=value`、`Cookie:` 整行、Netscape `cookies.txt`、JSON 数组四种粘贴格式与站点 UA 覆盖（`http.rs` `set_site_user_agent`，`web-cookies.json` 向后兼容升级）。
+6. **AniList + Kitsu 跟踪（`src/trackers.rs`）**：`yejian-sources` 暴露不挂书源 JAR 的 `send_isolated` HTTPS（复用 webpki 根），Token 与爬虫隔离。AniList GraphQL 支持 Viewer/搜索/条目读写、桌面 `127.0.0.1:43824` 有界环回 OAuth 与全端粘贴 Token；Kitsu 密码授权 + `library-entries` 查/建/改。`trackers.json` 原子持久化，私密模式硬拦截，自动同步只增不减（`max(远端,当前)`），设置页「进度跟踪」分组与详情页绑定面板 ≥44pt。
+7. **书架与观感打磨**：`shelf.rs` 书封/书脊加 0.8px 柔和描边 + 书沟折线消除斜边锯齿；选中圆点改青绿（`2C5A46`/`9CC7B1`）；`scale<0.72` 微字改短装饰线；深色 `< 01/05 >` 切书按钮提升对比；藏书一览卡片加细进度条与青绿双层选中描边，右侧留对称内边距。Rust 编译告警清零。
+
+### 产物与证据
+
+- **Android**：`artifacts/rust/build7-20261120/android/Yejian-0.1.1-build7-rust-arm64-debug.apk`，**40,201,618 字节**，`versionCode 7`（`versionName "0.1.1"`、`app.yejian.reader.rust` 不变，覆盖升级保留数据）。ZIP 内含 `lib/arm64-v8a/libyejian.so` 与 `classes*.dex`。构建日志 `.tools/fusion-20261120/final-android-build.log`。
+- **Windows**：`artifacts/rust/build7-20261120/windows/Yejian.exe`，**106,881,024 字节**，附 `打开新版预览.cmd` / `打开页间.cmd` / `licenses/`。有界启动冒烟通过（独立 `smoke-data` 目录建库成功后正常关闭），`windows-smoke.json`。
+- **单测**：`cargo test --locked --workspace -j 1 -- --test-threads=1` → **213 项通过、0 失败**（`.tools/fusion-20261120/final-unit-test.log`）。
+- **四套离屏 GPU 验收全 PASS**（RTX 5060，NVIDIA 离屏适配器）：
+  - design：16 张实际截图与交互通过（`final-design.log`，`build7-20261120/design/`）；
+  - ipad：八组 iPad 尺寸 + 安全区 + 44pt 热区通过（`final-ipad.log`，`build7-20261120/ipad/`）；
+  - filters：WASM 列表/分页/筛选/取消/重置通过（`final-filters.log`，`build7-20261120/filters/`）；
+  - regression：导入、开合、拖动中断、单/双页/连续、队列恢复、**静置停帧**通过（`final-regression.log`，`build7-20261120/regression/`）。
+- `Cargo.lock` 未变更（保持 untracked、单任务 `--locked -j 1`）。
+
+### build 6 IPA 体积增大核实
+
+已实测核对 ZIP 条目：改造前 build 5 IPA `13,791,557` 字节 → 引入第二版界面的 reader-round1 IPA `28,625,017` 字节（+14.83 MB）→ build 6 IPA `28,691,499` 字节（`Payload/Yejian.app/Yejian` 未压缩 `59,521,736` / 压缩 `28,630,828`）。增量完全来自 `assets/YejianReadingSans-Regular.ttf`（`10,250,668`）与 `assets/YejianReadingSerif-Semibold.ttf`（`14,404,192`）两份全 BMP 覆盖静态阅读字体（原始合计 `24,654,860`，Deflate 约 14.5 MB），为保证简繁日与罕见书名不缺字，按 `licenses/ReadingFonts.md` 保留完整 BMP + `DroidSansFallback.ttf` 后备。
+
+### 待实机/外部验证边界
+
+iPad 新版 IPA 需推送公开仓库运行 macOS 模拟器与打包工作流（本轮未推送外部仓库）；LiveContainer 侧载、实机触控手势、系统文件选择/分享、真机功耗帧率，以及拷贝漫画/香香腐宅真人过盾仍需实机验证。
+
 ## 交付与交接（2026-11-20，build 6）
 
 PR #2（reader-round1：阅读器第一轮）与 PR #3（sources-round2：书源浏览与详情第二轮）已合并进 `main`（`1a4af1d`）。最新交付 **0.1.1 / build 6** 由 run `44700355317` 的 sim + package 产出：`Yejian-0.1.1-6-ipad-unsigned.ipa`（28,691,499 字节，未签名，体积较 build 5 增大，主因待核实，疑似第二版界面嵌入字体）。模拟器 14 画面验收通过；本地 workspace 测试 193 项通过；设计 / iPad 八组尺寸 / 筛选 / 日常离屏验收均通过。实机触控、真实书源封面加载、功耗与帧率仍未验证。
