@@ -23,6 +23,10 @@ pub enum SettingKind {
         values: Vec<String>,
         titles: Vec<String>,
     },
+    /// Aidoku segments store the chosen index as a number.
+    Segment {
+        titles: Vec<String>,
+    },
     MultiSelect {
         values: Vec<String>,
         titles: Vec<String>,
@@ -132,7 +136,8 @@ fn collect(value: &Value, group: &str, out: &mut Vec<SettingItem>) {
             let ty = map.get("type").and_then(Value::as_str).unwrap_or("group");
             let default = map.get("default");
             let values = strings(map.get("values"));
-            let mut titles = strings(map.get("titles"));
+            let raw_titles = strings(map.get("titles"));
+            let mut titles = raw_titles.clone();
             if titles.len() != values.len() {
                 titles = values.clone();
             }
@@ -144,7 +149,17 @@ fn collect(value: &Value, group: &str, out: &mut Vec<SettingItem>) {
                     SettingKind::Toggle,
                     default.and_then(Value::as_bool).map(SettingValue::Bool),
                 ),
-                "select" | "picker" | "segment" if !values.is_empty() => (
+                "segment" => {
+                    let titles = if raw_titles.is_empty() { strings(map.get("options")) } else { raw_titles };
+                    if titles.is_empty() {
+                        return;
+                    }
+                    (
+                        SettingKind::Segment { titles },
+                        default.and_then(Value::as_f64).map(|n| SettingValue::Int(n as i32)),
+                    )
+                }
+                "select" | "picker" if !values.is_empty() => (
                     SettingKind::Select { values, titles },
                     default
                         .and_then(Value::as_str)
@@ -220,6 +235,7 @@ mod tests {
         let json = r#"[{"type":"group","title":"阅读","items":[
             {"type":"select","key":"quality","title":"画质","values":["hd","sd"],"titles":["高清","标清"],"default":"sd"},
             {"type":"switch","key":"nsfw","title":"显示成人内容","default":false},
+            {"type":"segment","key":"mode","title":"模式","titles":["A","B"],"default":1},
             {"type":"button","key":"logout","title":"退出"}]}]"#;
         let manifest = SourceManifest {
             id: "test.settings".into(),
@@ -234,7 +250,9 @@ mod tests {
             hides_filters_while_searching: false,
         };
         let items = source_settings(&manifest, Some(json));
-        assert_eq!(items.len(), 2);
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[2].default, Some(SettingValue::Int(1)));
+        assert!(matches!(&items[2].kind, SettingKind::Segment { titles } if titles.len() == 2));
         assert_eq!(items[0].group, "阅读");
         assert_eq!(items[0].default, Some(SettingValue::Str("sd".into())));
         assert!(

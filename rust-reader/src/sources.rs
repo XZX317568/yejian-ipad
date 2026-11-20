@@ -1260,6 +1260,21 @@ fn setting_row(ui: &mut Ui, item: &SettingItem, current: Option<SettingValue>) -
                 }
             });
         }
+        SettingKind::Segment { titles } => {
+            label(ui);
+            let selected = match current {
+                Some(SettingValue::Int(index)) => index,
+                Some(SettingValue::Float(index)) => index as i32,
+                _ => -1,
+            };
+            ui.horizontal_wrapped(|ui| {
+                for (index, title) in titles.iter().enumerate() {
+                    if ui.selectable_label(selected == index as i32, title).clicked() {
+                        changed = Some(SettingValue::Int(index as i32));
+                    }
+                }
+            });
+        }
         SettingKind::MultiSelect { values, titles } => {
             label(ui);
             let mut chosen = match current {
@@ -3110,6 +3125,10 @@ impl Sources {
     }
 
     pub(crate) fn back(&mut self) -> bool {
+        if self.settings_open {
+            self.close_settings();
+            return true;
+        }
         if self.filter_editor.take().is_some() {
             return true;
         }
@@ -3301,15 +3320,19 @@ impl Sources {
         }
     }
 
+    fn close_settings(&mut self) {
+        self.settings_open = false;
+        if std::mem::take(&mut self.settings_changed) {
+            // Reloads listings and results with the restarted engine.
+            let source = self.selected_source.clone();
+            self.select_source("");
+            self.select_source(&source);
+        }
+    }
+
     fn settings_page(&mut self, ui: &mut Ui) {
         if ui.add(quiet_action("‹ 返回书源")).clicked() {
-            self.settings_open = false;
-            if std::mem::take(&mut self.settings_changed) {
-                // Reloads listings and results with the restarted engine.
-                let source = self.selected_source.clone();
-                self.select_source("");
-                self.select_source(&source);
-            }
+            self.close_settings();
             return;
         }
         let items = self.current_settings();
