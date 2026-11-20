@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU8, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -871,14 +871,20 @@ fn cached_inline_page_matches(dir: &Path, number: usize, page: &Page) -> anyhow:
     Ok(std::fs::read(path)? == *expected)
 }
 
+/// Pages are fetched on this many workers at once, handed out in ascending
+/// order so the page the reader waits for arrives first.
+const PAGE_CONCURRENCY: usize = 4;
+
 /// Downloads only the pages that are not yet stored. Each page is validated by
 /// its real image header, written to `page-NNNN.part`, synced and renamed, so
 /// a page file existing means it was fully written. A stop request between
-/// pages leaves every completed page reusable.
+/// pages lets in-flight pages finish and leaves every completed page
+/// reusable. The first error stops new pages from starting and is returned
+/// once the workers drain.
 fn fetch_missing_pages(
     dir: &Path,
     pages: &[Page],
-    mut fetch: impl FnMut(&Page) -> anyhow::Result<Vec<u8>>,
+    fetch: impl Fn(&Page) -> anyhow::Result<Vec<u8>> + Sync,
     mut progress: impl FnMut(usize, usize),
     stop: &AtomicU8,
 ) -> anyhow::Result<FetchSummary> {
@@ -886,14 +892,9 @@ fn fetch_missing_pages(
     let mut stored = existing_pages(dir);
     let total = pages.len();
     let mut done = stored.iter().filter(|number| **number <= total).count();
+    let mut missing = Vec::new();
     for (index, page) in pages.iter().enumerate() {
         let number = index + 1;
-        if stop.load(Ordering::SeqCst) != STOP_NONE {
-            return Ok(FetchSummary {
-                done,
-                aborted: true,
-            });
-        }
         if stored.contains(&number) {
             if cached_inline_page_matches(dir, number, page)? {
                 continue;
@@ -904,39 +905,89 @@ fn fetch_missing_pages(
             stored.remove(&number);
             done = done.saturating_sub(1);
         }
-        let bytes = fetch(page)?;
-        let reader = crate::worker::image_reader(&bytes)?;
-        let extension = match reader.format() {
-            Some(image::ImageFormat::Jpeg) => "jpg",
-            Some(image::ImageFormat::Png) => "png",
-            Some(image::ImageFormat::WebP) => "webp",
-            _ => anyhow::bail!("第 {number} 页图像格式暂不支持"),
-        };
-        // A server can return a truncated image with a valid signature.
-        // Decode one page with the reader's limits before marking it complete.
-        drop(
-            reader
-                .decode()
-                .with_context(|| format!("第 {number} 页图片不完整或无法解码"))?,
-        );
-        let part = dir.join(format!("page-{number:04}.part"));
-        let target = dir.join(format!("page-{number:04}.{extension}"));
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&part)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&part, &target)?;
-        stored.insert(number);
-        done += 1;
-        progress(done, total);
+        missing.push(index);
+    }
+    let next = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    let (tx, rx) = mpsc::channel::<anyhow::Result<()>>();
+    let mut first_error = None;
+    let missing = &missing;
+    let next = &next;
+    let failed = &failed;
+    let fetch = &fetch;
+    std::thread::scope(|scope| {
+        for _ in 0..PAGE_CONCURRENCY.min(missing.len().max(1)) {
+            let tx = tx.clone();
+            scope.spawn(move || {
+                loop {
+                    if failed.load(Ordering::SeqCst)
+                        || stop.load(Ordering::SeqCst) != STOP_NONE
+                    {
+                        return;
+                    }
+                    let Some(&index) = missing.get(next.fetch_add(1, Ordering::SeqCst)) else {
+                        return;
+                    };
+                    let number = index + 1;
+                    let result = (|| -> anyhow::Result<()> {
+                        let bytes = fetch(&pages[index])?;
+                        let reader = crate::worker::image_reader(&bytes)?;
+                        let extension = match reader.format() {
+                            Some(image::ImageFormat::Jpeg) => "jpg",
+                            Some(image::ImageFormat::Png) => "png",
+                            Some(image::ImageFormat::WebP) => "webp",
+                            _ => anyhow::bail!("第 {number} 页图像格式暂不支持"),
+                        };
+                        // A server can return a truncated image with a valid
+                        // signature. Decode with the reader's limits before
+                        // marking the page complete.
+                        drop(reader.decode().with_context(|| {
+                            format!("第 {number} 页图片不完整或无法解码")
+                        })?);
+                        let part = dir.join(format!("page-{number:04}.part"));
+                        let target = dir.join(format!("page-{number:04}.{extension}"));
+                        let mut file = std::fs::OpenOptions::new()
+                            .write(true)
+                            .create(true)
+                            .truncate(true)
+                            .open(&part)?;
+                        file.write_all(&bytes)?;
+                        file.sync_all()?;
+                        drop(file);
+                        std::fs::rename(&part, &target)?;
+                        Ok(())
+                    })();
+                    if result.is_err() {
+                        failed.store(true, Ordering::SeqCst);
+                    }
+                    let failed_page = result.is_err();
+                    if tx.send(result).is_err() || failed_page {
+                        return;
+                    }
+                }
+            });
+        }
+        drop(tx);
+        for result in rx {
+            match result {
+                Ok(()) => {
+                    done += 1;
+                    progress(done, total);
+                }
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+    });
+    if let Some(error) = first_error {
+        return Err(error);
     }
     Ok(FetchSummary {
         done,
-        aborted: false,
+        aborted: stop.load(Ordering::SeqCst) != STOP_NONE,
     })
 }
 
@@ -1379,9 +1430,10 @@ fn fetch_follow_cover(root: &Path, engine: &SourceEngine, manga: &Manga) -> anyh
     if path.is_file() {
         return Ok(());
     }
+    let handler = engine.request_handler();
     let bytes = match pollster::block_on(engine.image_request(url, None))? {
-        Some(req) => request(engine, req.url, req.headers, req.body)?,
-        None => request(engine, url.to_string(), vec![], None)?,
+        Some(req) => request(&handler, req.url, req.headers, req.body)?,
+        None => request(&handler, url.to_string(), vec![], None)?,
     };
     image::load_from_memory(&bytes)?;
     std::fs::create_dir_all(path.parent().unwrap())?;
@@ -4123,19 +4175,22 @@ enum Outcome {
     Aborted { how: u8 },
 }
 
+/// Performs the HTTP on the calling thread through the source's own
+/// transport (shared cookies and headers), so page downloads do not queue on
+/// the single WASM worker.
 fn request(
-    engine: &SourceEngine,
+    handler: &RequestHandler,
     url: String,
     headers: Vec<(String, String)>,
     body: Option<Vec<u8>>,
 ) -> anyhow::Result<Vec<u8>> {
-    let response = pollster::block_on(engine.http_request(NetRequestData {
+    let response = handler(NetRequestData {
         method: if body.is_some() { "POST" } else { "GET" }.into(),
         url,
         headers,
         body,
         timeout_ms: 60000,
-    }))?;
+    });
     if let Some(error) = response.error {
         anyhow::bail!("{error}");
     }
@@ -4151,13 +4206,14 @@ fn request(
     Ok(response.body)
 }
 fn page_bytes(engine: &SourceEngine, page: &Page) -> anyhow::Result<Vec<u8>> {
+    let handler = engine.request_handler();
     match &page.content {
         PageContent::Url { url, context } => {
             let modified = pollster::block_on(engine.image_request(url, context.clone()))?;
             if let Some(req) = modified {
-                request(engine, req.url, req.headers, req.body)
+                request(&handler, req.url, req.headers, req.body)
             } else {
-                request(engine, url.clone(), vec![], None)
+                request(&handler, url.clone(), vec![], None)
             }
         }
         PageContent::Image {
@@ -4165,7 +4221,7 @@ fn page_bytes(engine: &SourceEngine, page: &Page) -> anyhow::Result<Vec<u8>> {
             ..
         } => Ok(bytes.clone()),
         PageContent::ZipFile { url, file_path } => {
-            let bytes = request(engine, url.clone(), vec![], None)?;
+            let bytes = request(&handler, url.clone(), vec![], None)?;
             let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes))?;
             let mut entry = zip.by_name(file_path)?;
             anyhow::ensure!(entry.size() <= 64 * 1024 * 1024, "单页图片超过 64 MB");
@@ -4188,7 +4244,7 @@ fn execute_task(
     task: &DownloadTask,
     pages: Vec<Page>,
     stop: &AtomicU8,
-    mut fetch: impl FnMut(&Page) -> anyhow::Result<Vec<u8>>,
+    fetch: impl Fn(&Page) -> anyhow::Result<Vec<u8>> + Sync,
     mut report: impl FnMut(usize, usize, Option<String>),
 ) -> anyhow::Result<Outcome> {
     anyhow::ensure!(!pages.is_empty(), "这一章没有可读页面");
@@ -4232,7 +4288,7 @@ fn execute_task(
     let summary = fetch_missing_pages(
         &dir,
         &pages,
-        &mut fetch,
+        fetch,
         |done, total| report(done, total, None),
         stop,
     )?;
@@ -5059,13 +5115,13 @@ mod tests {
         assert!(error.to_string().contains("500"));
         assert!(stored_page(&work, 1).is_some());
         assert!(stored_page(&work, 2).is_none());
-        let mut fetched = Vec::new();
+        let fetched = std::sync::Mutex::new(Vec::new());
         let summary = fetch_missing_pages(
             &work,
             &pages,
             |page| {
                 if let PageContent::Url { url, .. } = &page.content {
-                    fetched.push(url.clone());
+                    fetched.lock().unwrap().push(url.clone());
                 }
                 Ok(png())
             },
@@ -5073,7 +5129,7 @@ mod tests {
             &stop,
         )
         .unwrap();
-        assert_eq!(fetched, vec!["p2"]);
+        assert_eq!(*fetched.lock().unwrap(), vec!["p2"]);
         assert_eq!(summary.done, 2);
         assert!(stored_page(&work, 2).is_some());
     }
@@ -5207,12 +5263,12 @@ mod tests {
             description: None,
         };
         let stop = AtomicU8::new(STOP_NONE);
-        let mut fetched = 0;
+        let fetched = AtomicUsize::new(0);
         let summary = fetch_missing_pages(
             &work,
             &[page],
             |_| {
-                fetched += 1;
+                fetched.fetch_add(1, Ordering::SeqCst);
                 Ok(new.clone())
             },
             |_, _| {},
@@ -5220,7 +5276,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            fetched, 1,
+            fetched.load(Ordering::SeqCst), 1,
             "equal-length inline bytes must not be trusted from the signature"
         );
         assert_eq!(summary.done, 1);
@@ -5243,6 +5299,103 @@ mod tests {
         assert!(summary.aborted);
         assert_eq!(summary.done, 0);
         assert!(existing_pages(&dir.path().join("task")).is_empty());
+    }
+
+    #[test]
+    fn missing_pages_download_in_parallel_in_page_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("task");
+        let pages: Vec<_> = (0..8)
+            .map(|index| url_page(&format!("p{index}")))
+            .collect();
+        let stop = AtomicU8::new(STOP_NONE);
+        let in_flight = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let order = std::sync::Mutex::new(Vec::new());
+        let summary = fetch_missing_pages(
+            &work,
+            &pages,
+            |page| {
+                if let PageContent::Url { url, .. } = &page.content {
+                    order.lock().unwrap().push(url.clone());
+                }
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(40));
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                Ok(png())
+            },
+            |_, _| {},
+            &stop,
+        )
+        .unwrap();
+        assert_eq!(summary.done, 8);
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(
+            (2..=PAGE_CONCURRENCY).contains(&peak),
+            "pages did not overlap as expected: peak {peak}"
+        );
+        let started = order.lock().unwrap().clone();
+        let first_batch = &started[..PAGE_CONCURRENCY.min(started.len())];
+        assert!(
+            first_batch.iter().all(|url| url.starts_with('p')
+                && url[1..].parse::<usize>().unwrap() < PAGE_CONCURRENCY),
+            "first pages were not handed out in ascending order: {started:?}"
+        );
+        for number in 1..=8 {
+            assert!(stored_page(&work, number).is_some());
+        }
+    }
+
+    #[test]
+    fn a_failed_page_keeps_completed_siblings_and_resumes_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("task");
+        let pages: Vec<_> = (0..6)
+            .map(|index| url_page(&format!("p{index}")))
+            .collect();
+        let stop = AtomicU8::new(STOP_NONE);
+        let error = fetch_missing_pages(
+            &work,
+            &pages,
+            |page| {
+                if matches!(&page.content, PageContent::Url { url, .. } if url == "p2") {
+                    anyhow::bail!("第 3 页上游返回 500")
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(30));
+                    Ok(png())
+                }
+            },
+            |_, _| {},
+            &stop,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("500"));
+        let stored = existing_pages(&work);
+        assert!(
+            stored.len() >= 2,
+            "in-flight siblings of the failed page stay reusable: {stored:?}"
+        );
+        assert!(!stored.contains(&3));
+        assert!(
+            !stored.contains(&5) && !stored.contains(&6),
+            "pages after the failure must not have started: {stored:?}"
+        );
+
+        let fetched = AtomicUsize::new(0);
+        let summary = fetch_missing_pages(
+            &work,
+            &pages,
+            |_| {
+                fetched.fetch_add(1, Ordering::SeqCst);
+                Ok(png())
+            },
+            |_, _| {},
+            &stop,
+        )
+        .unwrap();
+        assert_eq!(summary.done, 6);
+        assert_eq!(fetched.load(Ordering::SeqCst), 6 - stored.len());
     }
 
     #[test]
@@ -5324,7 +5477,7 @@ mod tests {
         let reopened = loaded.tasks[0].clone();
         assert!(reopened.pages_signature.is_some());
 
-        let mut fetched = Vec::new();
+        let fetched = std::sync::Mutex::new(Vec::new());
         let outcome = execute_task(
             root.path(),
             &reopened,
@@ -5332,7 +5485,7 @@ mod tests {
             &stop,
             |page| {
                 if let PageContent::Url { url, .. } = &page.content {
-                    fetched.push(url.clone());
+                    fetched.lock().unwrap().push(url.clone());
                 }
                 Ok(png())
             },
@@ -5340,7 +5493,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            fetched,
+            *fetched.lock().unwrap(),
             vec!["p2"],
             "the complete first page must not be fetched again"
         );
@@ -5492,14 +5645,14 @@ mod tests {
         assert!(matches!(&pages[0].content,PageContent::Url{url,..} if url==&urls[0]));
 
         let stop = AtomicU8::new(STOP_NONE);
-        let mut fetched = 0;
+        let fetched = AtomicUsize::new(0);
         let outcome = execute_task(
             root.path(),
             &item,
             pages,
             &stop,
             |page| {
-                fetched += 1;
+                fetched.fetch_add(1, Ordering::SeqCst);
                 page_bytes(&engine, page)
             },
             |_, _, _| {},
@@ -5508,7 +5661,7 @@ mod tests {
         let Outcome::Done { path } = outcome else {
             panic!("download did not finish")
         };
-        assert_eq!(fetched, 2);
+        assert_eq!(fetched.load(Ordering::SeqCst), 2);
 
         let mut sources = test_sources(root.path());
         sources.tasks = vec![item.clone()];
