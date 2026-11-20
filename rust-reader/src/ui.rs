@@ -4328,7 +4328,23 @@ impl ReaderApp {
                     ui.horizontal(|ui| {
                         ui.heading("阅读设置");
                     });
-                    let height = (ctx.content_rect().height() - 180.).max(120.);
+                    let mut safe = ctx.content_rect();
+                    if let Ok(insets) = yejian_platform::safe_insets() {
+                        let scale = ctx.pixels_per_point();
+                        safe = safe.intersect(Rect::from_min_max(
+                            safe.min
+                                + vec2(
+                                    insets.left as f32 / scale,
+                                    insets.top as f32 / scale,
+                                ),
+                            safe.max
+                                - vec2(
+                                    insets.right as f32 / scale,
+                                    insets.bottom as f32 / scale,
+                                ),
+                        ));
+                    }
+                    let height = (safe.height() - 180.).max(120.);
                     ScrollArea::vertical().max_height(height).show(ui, |ui| {
                         ui.label("阅读方式");
                         let mode = if self.vertical {
@@ -4392,15 +4408,31 @@ impl ReaderApp {
                                 self.save_reader_prefs();
                             }
                         }
-                        let brightness = ui.add_sized(
-                            [ui.available_width(), 48.],
-                            Slider::new(&mut self.brightness, 0.3..=1.)
-                                .text("亮度")
-                                .fixed_decimals(2),
+                        // `Slider` places its rail, drag value and text in a
+                        // horizontal row that is laid out at its desired width
+                        // even inside `add_sized`, so the rail must be shrunk
+                        // to the space that actually remains or the whole modal
+                        // grows past the viewport at large font scales.
+                        let brightness = ui.scope_builder(
+                            UiBuilder::new()
+                                .max_rect(Rect::from_min_size(
+                                    ui.cursor().min,
+                                    vec2(ui.available_width(), 48.),
+                                ))
+                                .layout(Layout::left_to_right(Align::Center)),
+                            |ui| {
+                                ui.label("亮度");
+                                ui.spacing_mut().slider_width =
+                                    (ui.available_width() - 120.).max(40.);
+                                ui.add(
+                                    Slider::new(&mut self.brightness, 0.3..=1.)
+                                        .fixed_decimals(2),
+                                )
+                            },
                         );
                         self.hitboxes
-                            .insert("reader-brightness".into(), brightness.rect);
-                        if brightness.changed() {
+                            .insert("reader-brightness".into(), brightness.response.rect);
+                        if brightness.inner.changed() {
                             self.brightness = self.brightness.clamp(0.3, 1.);
                             self.save_reader_prefs();
                         }
@@ -4956,6 +4988,54 @@ mod tests {
             app.vertical_ui(ui, content, &id, count, 1.0, &gesture);
         })
         .drop_without_applying_deltas();
+    }
+    #[test]
+    fn reader_options_stay_on_screen_at_large_text() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = Context::default();
+        crate::configure_fonts(&ctx);
+        let size = [320., 1024.];
+        yejian_platform::set_insets_override(Some(yejian_platform::Insets {
+            left: 0,
+            top: 24,
+            right: 0,
+            bottom: 20,
+        }));
+        let mut app = ReaderApp::new(root.path().into(), ctx.clone());
+        app.books = vec![book("one")];
+        app.font_scale = 2.;
+        app.open_reader(&app.books[0].clone());
+        app.reader_options = true;
+        for _ in 0..6 {
+            ctx.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size.into())),
+                    ..Default::default()
+                },
+                |ui| app.draw(ui),
+            )
+            .drop_without_applying_deltas();
+        }
+        yejian_platform::set_insets_override(None);
+        let screen = ctx
+            .content_rect()
+            .intersect(Rect::from_min_max(pos2(0., 24.), pos2(320., 1004.)));
+        for id in [
+            "reader-mode-paged",
+            "reader-mode-spread",
+            "reader-mode-vertical",
+            "reader-direction",
+            "reader-options-close",
+        ] {
+            let rect = app
+                .hitboxes
+                .get(id)
+                .unwrap_or_else(|| panic!("missing hitbox: {id}"));
+            assert!(
+                screen.contains_rect(*rect),
+                "{id} escaped the screen: {rect:?} vs {screen:?}"
+            );
+        }
     }
     #[test]
     fn vertical_strip_flows_into_the_next_chapter_without_a_jump() {
