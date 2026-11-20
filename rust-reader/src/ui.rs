@@ -810,8 +810,10 @@ impl ReaderApp {
         let global = self.vertical_reader.page;
         let local = global - prev_count - old_count;
         if let Some(task) = old_id.strip_prefix(STREAM_PREFIX) {
-            self.sources
-                .set_stream_page(task, old_count.saturating_sub(1));
+            if !self.private {
+                self.sources
+                    .set_stream_page(task, old_count.saturating_sub(1));
+            }
         } else {
             self.record_position(old_id, old_count.saturating_sub(1), 0.);
         }
@@ -830,7 +832,9 @@ impl ReaderApp {
         if id.starts_with(STREAM_PREFIX)
             && !self.stream.as_ref().is_some_and(|s| s.book.id == id)
         {
-            self.sources.set_stream_page(&id[STREAM_PREFIX.len()..], local);
+            if !self.private {
+                self.sources.set_stream_page(&id[STREAM_PREFIX.len()..], local);
+            }
         } else {
             self.record_position(id, local, fraction);
         }
