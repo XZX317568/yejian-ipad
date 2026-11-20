@@ -3455,30 +3455,28 @@ impl Sources {
         }
     }
 
-    /// Drops this source's saved web cookies and every live cookie, then
-    /// re-adds the other sources' saved web cookies.
+    /// Expires this source's cookies and drops its saved web cookies.
     fn forget_source_cookies(&mut self) {
-        let hosts: Vec<String> = self
+        let urls: Vec<String> = self
             .installed
             .iter()
             .find(|source| source.manifest.id == self.selected_source)
-            .map(|source| {
-                source
-                    .manifest
-                    .urls
-                    .iter()
-                    .map(|url| url_host(url))
-                    .collect()
-            })
+            .map(|source| source.manifest.urls.clone())
             .unwrap_or_default();
-        self.web_cookies.retain(|url, _| {
-            let host = url_host(url);
-            !hosts.iter().any(|known| host == *known || host.ends_with(&format!(".{known}")) || known.ends_with(&format!(".{host}")))
-        });
-        clear_cookies();
-        for (url, cookies) in &self.web_cookies {
-            add_web_cookies(url, cookies);
+        let hosts: Vec<String> = urls.iter().map(|url| url_host(url)).collect();
+        let matches = |host: &str| {
+            hosts.iter().any(|known| {
+                host == known
+                    || host.ends_with(&format!(".{known}"))
+                    || known.ends_with(&format!(".{host}"))
+            })
+        };
+        let mut forget: Vec<String> = urls;
+        forget.extend(self.web_cookies.keys().filter(|url| matches(&url_host(url))).cloned());
+        for url in &forget {
+            clear_site_cookies(url);
         }
+        self.web_cookies.retain(|url, _| !matches(&url_host(url)));
         if let Err(error) = self.save_web_cookies() {
             self.status = format!("网页登录信息清除失败：{error:#}");
         }

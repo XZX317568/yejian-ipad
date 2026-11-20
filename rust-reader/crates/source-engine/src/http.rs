@@ -47,9 +47,30 @@ impl reqwest::cookie::CookieStore for SharedJar {
     }
 }
 
-/// Forgets every cookie, from servers and from web views alike.
-pub fn clear_cookies() {
-    *JAR.0.write().unwrap() = reqwest::cookie::Jar::default();
+/// Expires every cookie sent to `url`, whether a server or a web view set
+/// it; other sites keep theirs.
+pub fn clear_site_cookies(url: &str) {
+    use reqwest::cookie::CookieStore;
+    let Ok(url) = url::Url::parse(url) else {
+        return;
+    };
+    let host = url.host_str().unwrap_or_default().to_string();
+    let jar = JAR.0.read().unwrap();
+    let Some(header) = jar.cookies(&url) else {
+        return;
+    };
+    let header = String::from_utf8_lossy(header.as_bytes()).into_owned();
+    for name in header.split(';').filter_map(|pair| pair.split('=').next()) {
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let gone = format!("{name}=; Max-Age=0; Path=/");
+        jar.add_cookie_str(&gone, &url);
+        jar.add_cookie_str(&format!("{gone}; Secure"), &url);
+        jar.add_cookie_str(&format!("{gone}; Domain={host}"), &url);
+        jar.add_cookie_str(&format!("{gone}; Domain={host}; Secure"), &url);
+    }
 }
 
 /// Origin of the last request a Cloudflare challenge blocked.
@@ -312,6 +333,17 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
+
+    #[test]
+    fn clearing_one_site_keeps_other_sites_cookies() {
+        add_web_cookies("https://a.clear.test/", &[("s".into(), "1".into())]);
+        add_web_cookies("https://b.clear.test/", &[("t".into(), "2".into())]);
+        clear_site_cookies("https://a.clear.test/");
+        let jar = JAR.0.read().unwrap();
+        use reqwest::cookie::CookieStore;
+        assert!(jar.cookies(&"https://a.clear.test/".parse().unwrap()).is_none());
+        assert!(jar.cookies(&"https://b.clear.test/".parse().unwrap()).is_some());
+    }
 
     #[test]
     fn detects_cloudflare_challenges_only() {
