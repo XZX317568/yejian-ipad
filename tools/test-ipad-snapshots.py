@@ -84,6 +84,24 @@ class IpadGateTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "WASM"):
             gate.verify(self.root)
 
+    def browse_results(self, results):
+        self.change("browse", source_browser={
+            "source": "local.filter-acceptance", "loaded": True, "busy": False,
+            "filter_count": 7, "listing_count": 2, "filter_editor": False,
+            "results": results,
+        })
+
+    def test_browse_accepts_auto_loaded_listing_pages(self):
+        self.browse_results(["热门-第1页", "热门-第2页"])
+        self.assertEqual(gate.verify(self.root)["result"], "passed")
+
+    def test_browse_rejects_results_from_another_listing(self):
+        for results in ([], ["热门-第2页"], ["热门-第1页", "未筛选结果"]):
+            with self.subTest(results=results):
+                self.browse_results(results)
+                with self.assertRaisesRegex(ValueError, "WASM"):
+                    gate.verify(self.root)
+
     def test_missing_landscape_report_blocks_delivery(self):
         # Reproduces the old green run: screenshots/XCTest pass but no JSON.
         (self.root / "shelf-landscape.json").unlink()

@@ -91,8 +91,14 @@ def verify(directory):
             require(browser["source"] == "local.filter-acceptance" and browser["loaded"]
                     and not browser["busy"] and browser["filter_count"] == 7
                     and browser["listing_count"] == 2, f"{name}: incomplete source metadata")
-            expected = "筛选:冒险题材" if screen == "filtered" else "热门-第1页"
-            require(browser["results"] == [expected], f"{name}: WASM filter/listing result not loaded")
+            results = browser["results"]
+            if screen == "browse":
+                # Reaching the grid's last row auto-loads further listing pages.
+                ok = (bool(results) and results[0] == "热门-第1页"
+                      and all(r.startswith("热门-第") for r in results))
+            else:
+                ok = results == ["筛选:冒险题材" if screen == "filtered" else "热门-第1页"]
+            require(ok, f"{name}: WASM filter/listing result not loaded")
             require(browser["filter_editor"] == (screen == "filters"), f"{name}: wrong filter view")
         left, top, right, bottom = report["safe_area"]
         require(all(isinstance(n, (int, float)) and math.isfinite(n)

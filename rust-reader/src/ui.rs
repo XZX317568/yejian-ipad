@@ -4281,10 +4281,30 @@ impl ReaderApp {
         let width = (area.width() - 48.).min(1040.);
         column.min.x = area.center().x - width / 2.;
         column.max.x = area.center().x + width / 2.;
+        // Feed library reading progress into the source detail page so
+        // 继续阅读 picks the freshest chapter and rows show 已读/读到状态.
+        let mut progress = std::collections::HashMap::new();
+        for link in &self.chapters {
+            let Some(book) = self.books.iter().find(|book| book.id == link.book_id)
+            else {
+                continue;
+            };
+            progress.insert(
+                crate::sources::identity_id(
+                    &link.metadata.source_id,
+                    &link.metadata.manga_id,
+                    &link.metadata.chapter_id,
+                ),
+                (book.current_page, book.page_count, book.last_read_at),
+            );
+        }
+        self.sources.set_chapter_progress(progress);
         ui.scope_builder(UiBuilder::new().max_rect(column), |ui| {
             ui.style_mut().wrap_mode = Some(TextWrapMode::Wrap);
             self.sources.ui(ui);
         });
+        self.hitboxes
+            .extend(self.sources.hitboxes.iter().map(|(id, rect)| (id.clone(), *rect)));
     }
     fn pick_import(&mut self) {
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -4426,11 +4446,19 @@ impl ReaderApp {
                                 .layout(Layout::left_to_right(Align::Center)),
                             |ui| {
                                 ui.label("亮度");
+                                // The default rail is transparent on the dark
+                                // dialog surface; give it a visible neutral
+                                // and accent the filled portion.
+                                let palette = crate::design::palette(true);
+                                let visuals = ui.visuals_mut();
+                                visuals.widgets.inactive.weak_bg_fill = palette.soft;
+                                visuals.widgets.inactive.bg_fill = palette.accent;
                                 ui.spacing_mut().slider_width =
                                     (ui.available_width() - 120.).max(40.);
                                 ui.add(
                                     Slider::new(&mut self.brightness, 0.3..=1.)
-                                        .fixed_decimals(2),
+                                        .fixed_decimals(2)
+                                        .trailing_fill(true),
                                 )
                             },
                         );

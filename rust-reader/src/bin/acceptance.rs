@@ -454,6 +454,29 @@ fn design_label_visible(h: &Harness, label: &str) -> bool {
     })
 }
 
+/// Wheels the pointer over the scrollable page so checks can reach controls
+/// above or below the fold (the online detail header is taller than a phone
+/// or landscape viewport).
+fn scroll_page(h: &mut Harness, delta: f32) -> Result<()> {
+    for _ in 0..6 {
+        h.frame(
+            vec![
+                Event::PointerMoved(pos2(600., 400.)),
+                Event::MouseWheel {
+                    unit: MouseWheelUnit::Point,
+                    delta: vec2(0., delta),
+                    source: MouseWheelSource::Wheel,
+                    modifiers: Modifiers::NONE,
+                    phase: TouchPhase::Move,
+                },
+            ],
+            None,
+        )?;
+        h.frames(3)?;
+    }
+    Ok(())
+}
+
 fn design_touch(h: &Harness, id: &str, label: Option<&str>) -> Result<()> {
     let rect = *h
         .app
@@ -952,7 +975,8 @@ fn filters_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
         h.texts.iter().any(|(text, _)| text == "热门-第1页"),
         "default listing was not executed"
     );
-    h.click_text("加载下一页（第 2 页）")?;
+    // Once the last grid row is visible the next page loads on its own; the
+    // button below remains as the manual path when it does not trigger.
     h.wait(|app| {
         app.source_browser_report()["results"]
             .as_array()
@@ -1090,7 +1114,33 @@ fn filters_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
             );
         }
     }
+    // The result grid still fits a narrow split at 200 percent text.
+    h.click_text("取消")?;
+    h.size = [320, 1024];
+    h.frames(5)?;
+    h.frame(vec![], Some("source-grid-320-large-text"))?;
+    // Recreate at 100 percent for the cover grid and detail captures.
     library.set_setting("font-scale", "1")?;
+    h.app = ReaderApp::new(library_root.into(), h.ctx.clone());
+    h.wait(ReaderApp::ready)?;
+    h.app.prepare_source_acceptance("browse")?;
+    h.wait(ReaderApp::source_browser_ready)?;
+    for (size, name) in [
+        ([1366, 1024], "source-grid-landscape"),
+        ([1024, 1366], "source-grid-portrait"),
+    ] {
+        h.size = size;
+        h.frames(5)?;
+        h.frame(vec![], Some(name))?;
+    }
+    h.click_text("热门-第1页")?;
+    h.wait(|app| app.source_browser_report()["busy"] == false)?;
+    h.size = [1366, 1024];
+    h.frames(5)?;
+    h.frame(vec![], Some("source-detail-wide"))?;
+    h.size = [507, 1024];
+    h.frames(5)?;
+    h.frame(vec![], Some("source-detail-narrow"))?;
     set_insets_override(None);
     println!(
         "PASS: source listing + pagination + real WASM filtered result + cancel/reset + iPad/200 percent filters"
@@ -1620,14 +1670,21 @@ fn daily_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
     h.click_text("热门-第1页")?;
     h.wait(|app| app.source_browser_report()["busy"] == false)?;
     h.frames(5)?;
-    let first_read = "第 1 话    阅读";
-    let second_read = "第 2 话    阅读";
+    h.frame(vec![], Some("daily-source-detail"))?;
+    // The detail header is tall; scroll the chapter rows fully into view.
+    scroll_page(h, -320.)?;
+    let first_read = "第 1 话";
+    let second_read = "第 2 话";
     for label in [first_read, second_read] {
         anyhow::ensure!(
             design_label_visible(h, label),
             "daily: source detail did not recognize the locally linked chapter: {label}"
         );
     }
+    anyhow::ensure!(
+        h.texts.iter().filter(|(text, _)| text == "已下载").count() >= 2,
+        "daily: locally linked chapters did not show their downloaded state"
+    );
     let chapter_y = |h: &Harness, label: &str| -> Result<f32> {
         h.texts
             .iter()
@@ -1676,15 +1733,27 @@ fn daily_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
     h.frames(5)?;
     anyhow::ensure!(
         h.app.screen_name() == "library"
-            && h.app.source_browser_report()["source"] == "local.filter-acceptance"
-            && design_label_visible(h, "返回搜索结果")
-            && design_label_visible(h, second_read)
+            && h.app.source_browser_report()["source"] == "local.filter-acceptance",
+        "daily: source reading did not return to the source detail"
+    );
+    // Scroll position survived the round trip; verify both ends of the page.
+    scroll_page(h, 320.)?;
+    anyhow::ensure!(
+        design_label_visible(h, "返回搜索结果")
+            && h.texts.iter().any(|(text, _)| text == "第 2"),
+        "daily: source reading lost the detail page or chapter search"
+    );
+    scroll_page(h, -320.)?;
+    anyhow::ensure!(
+        design_label_visible(h, second_read)
             && !h.texts.iter().any(|(text, _)| text == first_read),
-        "daily: source reading did not return to the same detail and chapter search"
+        "daily: source reading did not return to the same filtered chapter list"
     );
     design_capture(h, "daily-source-reader-return", &mut captures)?;
     h.click_text("清除查找")?;
     h.frames(3)?;
+    // Restoring two rows grew the page; scroll so both names are on screen.
+    scroll_page(h, -320.)?;
     anyhow::ensure!(
         chapter_y(h, second_read)? < chapter_y(h, first_read)?,
         "daily: returning from source reading lost the chapter sort choice"

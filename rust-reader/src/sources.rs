@@ -226,6 +226,30 @@ fn chapter_name(chapter: &Chapter) -> String {
 
 /// Use one comparable volume group for chapters without explicit volumes,
 /// matching the library's reading order (including decimal extra chapters).
+/// Result-grid columns: as many `min_cell` covers as the row fits, never
+/// fewer than one and never overflowing horizontally.
+fn grid_columns(width: f32) -> usize {
+    let min_cell = if width >= 600. { 150. } else { 112. };
+    (((width + 16.) / (min_cell + 16.)).floor() as usize).max(1)
+}
+
+/// Retains queued covers that are still wanted, appends new wants in order
+/// and drops the oldest entries once the queue exceeds `COVER_QUEUE_CAP`.
+/// `skip` holds keys already in flight or known failed, so they never queue.
+fn plan_covers(queue: &mut VecDeque<CoverReq>, want: Vec<CoverReq>, skip: &HashSet<String>) {
+    let wanted: HashSet<&str> = want.iter().map(|req| req.key.as_str()).collect();
+    queue.retain(|req| wanted.contains(req.key.as_str()));
+    for req in want {
+        if skip.contains(&req.key) || queue.iter().any(|queued| queued.key == req.key) {
+            continue;
+        }
+        queue.push_back(req);
+    }
+    while queue.len() > COVER_QUEUE_CAP {
+        queue.pop_front();
+    }
+}
+
 fn chapter_list(chapters: &[Chapter], query: &str, newest_first: bool) -> Vec<Chapter> {
     let first_volume = chapters.iter()
         .filter_map(|chapter| chapter.volume_number.filter(|number| number.is_finite()))
@@ -259,6 +283,103 @@ fn chapter_list(chapters: &[Chapter], query: &str, newest_first: bool) -> Vec<Ch
         visible.reverse();
     }
     visible.into_iter().map(|(chapter, _, _, _)| chapter.clone()).collect()
+}
+
+/// `YYYY-MM-DD` for a unix timestamp, so chapter rows can show an upload date
+/// without pulling in a calendar dependency.
+fn format_epoch_date(epoch: i64) -> String {
+    let z = epoch.div_euclid(86_400) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year}-{month:02}-{day:02}")
+}
+
+/// Right-column state lines for one chapter row: reading progress first, then
+/// download state. Kept pure so the exact strings are testable.
+fn chapter_state_lines(
+    locked: bool,
+    downloaded: bool,
+    can_import: bool,
+    progress: Option<(usize, usize)>,
+    task: Option<&ChapterQueueState>,
+) -> Vec<String> {
+    if locked {
+        return vec!["暂不可阅读".into()];
+    }
+    let mut lines = Vec::new();
+    let finished = progress.is_some_and(|(page, count)| count > 0 && page + 1 >= count)
+        || task.is_some_and(|task| {
+            task.total > 0 && task.read_page.is_some_and(|page| page + 1 >= task.total)
+        });
+    if finished {
+        lines.push("已读".into());
+    } else if let Some((page, count)) =
+        progress.filter(|(_, count)| *count > 0)
+    {
+        lines.push(format!("读到 {}/{}", page + 1, count));
+    } else if let Some(task) = task.filter(|task| {
+        task.total > 0 && task.read_page.is_some_and(|page| page + 1 < task.total)
+    }) {
+        lines.push(format!("读到 {}/{}", task.read_page.unwrap() + 1, task.total));
+    }
+    if downloaded {
+        lines.push("已下载".into());
+    } else if can_import {
+        lines.push("待加入书架".into());
+    } else if let Some(task) = task {
+        match task.status {
+            DownloadStatus::Failed => lines.push("失败 · 重试".into()),
+            DownloadStatus::Done => lines.push("已下载".into()),
+            _ if task.total > 0 => {
+                lines.push(format!("下载中 {}/{}", task.done, task.total));
+            }
+            _ => lines.push(task.status.label().into()),
+        }
+    }
+    lines
+}
+
+/// Paints a cover texture or the placeholder tile into `rect`, shared by the
+/// result grid and the detail header. Both get a 1px `line` border so tiles
+/// stay visible on the page; the placeholder uses the tinted `accent_soft`
+/// surface rather than blending into the background.
+fn paint_cover(
+    painter: &Painter,
+    rect: Rect,
+    texture: Option<&TextureHandle>,
+    title: &str,
+    font: FontId,
+    palette: &crate::design::Palette,
+) {
+    match texture {
+        Some(texture) => {
+            painter.image(
+                texture.id(),
+                rect,
+                Rect::from_min_max(pos2(0., 0.), pos2(1., 1.)),
+                Color32::WHITE,
+            );
+        }
+        None => {
+            painter.rect_filled(rect, 8., palette.accent_soft);
+            if let Some(initial) = title.chars().next() {
+                painter.text(
+                    rect.center(),
+                    Align2::CENTER_CENTER,
+                    initial.to_string(),
+                    font,
+                    palette.muted,
+                );
+            }
+        }
+    }
+    painter.rect_stroke(rect, 8., Stroke::new(1., palette.line), StrokeKind::Inside);
 }
 
 /// One finished chapter ready for `Command::ImportChapter`.
@@ -329,6 +450,10 @@ struct DownloadTask {
     /// Last page read online before the chapter joined the library.
     #[serde(default)]
     read_page: Option<usize>,
+    /// When `read_page` last moved; lets 继续阅读 pick the most recently read
+    /// chapter across library books and online streams.
+    #[serde(default)]
+    read_at: Option<i64>,
     status: DownloadStatus,
     #[serde(default)]
     error: Option<String>,
@@ -372,6 +497,7 @@ impl DownloadTask {
             manga_snapshot: None,
             chapter_snapshot: Some(chapter.to_postcard_bytes()),
             read_page: None,
+            read_at: None,
             status: DownloadStatus::Queued,
             error: None,
             pages_done: 0,
@@ -468,6 +594,41 @@ struct TaskStore {
 struct ChapterQueueState {
     status: DownloadStatus,
     has_archive: bool,
+    done: usize,
+    total: usize,
+    read_page: Option<usize>,
+    read_at: Option<i64>,
+}
+
+const COVER_QUEUE_CAP: usize = 24;
+const COVER_INFLIGHT_CAP: usize = 8;
+const COVER_TEXTURE_CAP: usize = 120;
+const COVER_MAX_HEIGHT: u32 = 360;
+
+/// One cover the results grid wants on screen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CoverReq {
+    key: String,
+    source: String,
+    url: String,
+}
+
+/// `CoverReq` resolved through the source's interpreter, ready for raw HTTP on
+/// any of the pool workers. The handler shares the source's cookie jar.
+struct CoverHttpJob {
+    key: String,
+    root: PathBuf,
+    handler: RequestHandler,
+    url: String,
+    headers: Vec<(String, String)>,
+    body: Option<Vec<u8>>,
+}
+
+/// Decoded cover delivered to the UI; `None` marks the URL as failed for the
+/// session so a placeholder is drawn instead of retrying every frame.
+struct CoverDone {
+    key: String,
+    image: Option<ColorImage>,
 }
 
 enum DlCmd {
@@ -1268,6 +1429,31 @@ pub struct Sources {
     up_rx: mpsc::Receiver<UpdateEvent>,
     /// Decoded follow covers by snapshot key; `None` means not on disk yet.
     covers: std::collections::HashMap<String, Option<TextureHandle>>,
+    /// Result-grid covers. `cover_queue` only holds cells near the viewport;
+    /// `cover_inflight` dedupes sent-but-unfinished requests and
+    /// `cover_outstanding` bounds how many are with the workers at once.
+    cover_req_tx: mpsc::Sender<CoverReq>,
+    cover_done_rx: mpsc::Receiver<CoverDone>,
+    cover_queue: VecDeque<CoverReq>,
+    cover_inflight: HashSet<String>,
+    cover_outstanding: usize,
+    /// URLs that failed once this session; placeholders render instead of
+    /// hammering a dead image host every frame.
+    cover_failed: HashSet<String>,
+    cover_ready: std::collections::HashMap<String, Option<ColorImage>>,
+    cover_missing_disk: HashSet<String>,
+    cover_textures: std::collections::HashMap<String, TextureHandle>,
+    cover_lru: VecDeque<String>,
+    /// Page already auto-loaded when its last grid row scrolled into view, so
+    /// the marker cannot fire the same request again on the next frame.
+    auto_next_page: Option<i32>,
+    /// Reading progress per `identity_id` chapter, fed by the host each frame
+    /// so the detail page can offer 继续阅读 and row read states.
+    chapter_progress: std::collections::HashMap<String, (usize, usize, Option<i64>)>,
+    description_expanded: bool,
+    /// Clickable rects registered this frame, merged into the app's hitboxes
+    /// so acceptance and automation can find grid cells and detail actions.
+    pub(crate) hitboxes: std::collections::BTreeMap<String, Rect>,
     settings_open: bool,
     settings_changed: bool,
     /// User choices per source, persisted in `source-settings.json`.
@@ -1419,6 +1605,70 @@ fn url_host(url: &str) -> String {
 fn follow_cover_path(root: &Path, snapshot: &str) -> anyhow::Result<PathBuf> {
     anyhow::ensure!(valid_task_id(snapshot), "非法的封面 id：{snapshot:?}");
     Ok(root.join("follow-covers").join(format!("{snapshot}.img")))
+}
+
+/// Result-grid covers are keyed by the exact URL they came from so the same
+/// image shared by two manga is fetched and cached once.
+fn cover_key(source: &str, url: &str) -> String {
+    identity_id(source, url, "cover")
+}
+
+fn source_cover_path(root: &Path, key: &str) -> anyhow::Result<PathBuf> {
+    anyhow::ensure!(valid_task_id(key), "非法的封面 id：{key:?}");
+    Ok(root.join("source-covers").join(format!("{key}.img")))
+}
+
+/// Downscales to the grid's display size; small covers are kept as-is rather
+/// than upscaled into a blur.
+fn shrink_cover(image: image::DynamicImage) -> image::DynamicImage {
+    if image.width() > 240 || image.height() > COVER_MAX_HEIGHT {
+        image.thumbnail(240, COVER_MAX_HEIGHT)
+    } else {
+        image
+    }
+}
+
+/// Writes a downscaled cover into the disk cache and returns the decoded
+/// image. The `.part` + rename pattern matches the rest of the cache so a
+/// crash mid-write never leaves a half file behind.
+fn store_source_cover(path: &Path, image: &image::DynamicImage) -> anyhow::Result<ColorImage> {
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    image.write_to(&mut encoded, image::ImageFormat::Png)?;
+    let part = path.with_extension("part");
+    std::fs::write(&part, encoded.get_ref())?;
+    std::fs::rename(&part, path)?;
+    let rgba = image.to_rgba8();
+    Ok(ColorImage::from_rgba_unmultiplied(
+        [rgba.width() as usize, rgba.height() as usize],
+        rgba.as_raw(),
+    ))
+}
+
+/// Downloads one cover through the source's own request handler, keeps the
+/// downscaled image in the disk cache and decodes it for the UI. The disk
+/// copy skips the network entirely on later launches.
+#[cfg(test)]
+fn fetch_source_cover(
+    root: &Path,
+    engine: &SourceEngine,
+    source: &str,
+    url: &str,
+) -> anyhow::Result<ColorImage> {
+    let key = cover_key(source, url);
+    let path = source_cover_path(root, &key)?;
+    if let Ok(bytes) = std::fs::read(&path) {
+        if let Ok(image) = image::load_from_memory(&bytes) {
+            return store_source_cover(&path, &image);
+        }
+    }
+    let handler = engine.request_handler();
+    let bytes = match pollster::block_on(engine.image_request(url, None))? {
+        Some(req) => request(&handler, req.url, req.headers, req.body)?,
+        None => request(&handler, url.to_string(), vec![], None)?,
+    };
+    let image = shrink_cover(image::load_from_memory(&bytes)?);
+    store_source_cover(&path, &image)
 }
 
 /// Downloads a follow's cover once, through the source's image request hook.
@@ -1766,6 +2016,107 @@ impl Sources {
             })
             .expect("Unable to start update worker");
 
+        // Result covers resolve through each source's interpreter on a single
+        // thread, then fetch bytes on a small HTTP pool so a slow image host
+        // never blocks browsing. Both stages share the source's cookie jar.
+        let (cover_req_tx, cover_req_rx) = mpsc::channel::<CoverReq>();
+        let (cover_done_tx, cover_done_rx) = mpsc::channel::<CoverDone>();
+        let cover_jobs: Arc<(std::sync::Mutex<VecDeque<CoverHttpJob>>, std::sync::Condvar)> =
+            Arc::new((std::sync::Mutex::new(VecDeque::new()), std::sync::Condvar::new()));
+        {
+            let cover_root = root.clone();
+            let cover_ctx = ctx.clone();
+            let queue = cover_jobs.clone();
+            let done_tx = cover_done_tx.clone();
+            let stale = stale_engines.clone();
+            thread::Builder::new()
+                .name("yejian-covers".into())
+                .spawn(move || {
+                    let catalog = SourceCatalog::new(cover_root.join("sources"));
+                    let mut engines = std::collections::HashMap::<String, SourceEngine>::new();
+                    while let Ok(req) = cover_req_rx.recv() {
+                        for id in stale.lock().unwrap().drain() {
+                            engines.remove(&id);
+                        }
+                        let job = (|| -> anyhow::Result<CoverHttpJob> {
+                            if !engines.contains_key(&req.source) {
+                                engines.insert(
+                                    req.source.clone(),
+                                    SourceEngine::load(&catalog, &req.source)?,
+                                );
+                            }
+                            let engine = &engines[&req.source];
+                            let (url, headers, body) =
+                                match pollster::block_on(engine.image_request(&req.url, None))? {
+                                    Some(image) => (image.url, image.headers, image.body),
+                                    None => (req.url.clone(), Vec::new(), None),
+                                };
+                            Ok(CoverHttpJob {
+                                key: req.key.clone(),
+                                root: cover_root.clone(),
+                                handler: engine.request_handler(),
+                                url,
+                                headers,
+                                body,
+                            })
+                        })();
+                        match job {
+                            Ok(job) => {
+                                let (lock, cvar) = &*queue;
+                                lock.lock().unwrap().push_back(job);
+                                cvar.notify_one();
+                            }
+                            Err(_) => {
+                                if done_tx.send(CoverDone { key: req.key, image: None }).is_err() {
+                                    return;
+                                }
+                                cover_ctx.request_repaint();
+                            }
+                        }
+                    }
+                })
+                .expect("Unable to start cover worker");
+        }
+        for _ in 0..4 {
+            let queue = cover_jobs.clone();
+            let done_tx = cover_done_tx.clone();
+            let ctx = ctx.clone();
+            thread::Builder::new()
+                .name("yejian-cover-http".into())
+                .spawn(move || {
+                    let (lock, cvar) = &*queue;
+                    loop {
+                        let job = {
+                            let mut guard = lock.lock().unwrap();
+                            loop {
+                                if let Some(job) = guard.pop_front() {
+                                    break job;
+                                }
+                                guard = cvar.wait(guard).unwrap();
+                            }
+                        };
+                        let image = request(&job.handler, job.url, job.headers, job.body)
+                            .and_then(|bytes| {
+                                let image = shrink_cover(image::load_from_memory(&bytes)?);
+                                let path = source_cover_path(&job.root, &job.key)?;
+                                store_source_cover(&path, &image)
+                            })
+                            .ok();
+                        if done_tx
+                            .send(CoverDone {
+                                key: job.key,
+                                image,
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                        ctx.request_repaint();
+                    }
+                })
+                .expect("Unable to start cover http worker");
+        }
+
         // Downloads live on their own thread and run one task at a time, so a
         // slow image server never blocks search, chapter loading or the UI.
         let (dl_tx, dl_cmd_rx) = mpsc::channel::<DlCmd>();
@@ -1862,7 +2213,7 @@ impl Sources {
             results: ResultsState::default(),
             chapters: Vec::new(),
             chapter_query: String::new(),
-            chapters_newest_first: false,
+            chapters_newest_first: true,
             open_chapter: None,
             library_chapters: Default::default(),
             selected_source: String::new(),
@@ -1903,6 +2254,20 @@ impl Sources {
             up_tx,
             up_rx,
             covers: Default::default(),
+            cover_req_tx,
+            cover_done_rx,
+            cover_queue: VecDeque::new(),
+            cover_inflight: HashSet::new(),
+            cover_outstanding: 0,
+            cover_failed: HashSet::new(),
+            cover_ready: Default::default(),
+            cover_missing_disk: HashSet::new(),
+            cover_textures: Default::default(),
+            cover_lru: VecDeque::new(),
+            auto_next_page: None,
+            chapter_progress: Default::default(),
+            description_expanded: false,
+            hitboxes: Default::default(),
             settings_open: false,
             settings_changed: false,
             source_settings,
@@ -2072,7 +2437,145 @@ impl Sources {
         texture
     }
 
-    /// Asks every followed manga's source for its current chapter list.
+    /// Returns the texture for a result-grid cover, or `None` while it is
+    /// still missing (the caller then queues a fetch). Freshly delivered
+    /// images are textured on first paint; the disk cache is probed once per
+    /// URL so a cold start never hits the filesystem twice for the same key.
+    fn cover_image(&mut self, ctx: &Context, source: &str, url: &str) -> Option<TextureHandle> {
+        if url.is_empty() {
+            return None;
+        }
+        let key = cover_key(source, url);
+        if let Some(texture) = self.cover_textures.get(&key) {
+            let texture = texture.clone();
+            self.cover_lru.retain(|entry| entry != &key);
+            self.cover_lru.push_back(key);
+            return Some(texture);
+        }
+        let image = match self.cover_ready.remove(&key) {
+            Some(image) => image.clone(),
+            None if self.cover_missing_disk.contains(&key) => None,
+            None => {
+                let image = source_cover_path(&self.root, &key)
+                    .ok()
+                    .and_then(|path| std::fs::read(path).ok())
+                    .and_then(|bytes| image::load_from_memory(&bytes).ok())
+                    .map(|image| {
+                        let rgba = image.to_rgba8();
+                        ColorImage::from_rgba_unmultiplied(
+                            [rgba.width() as usize, rgba.height() as usize],
+                            rgba.as_raw(),
+                        )
+                    });
+                if image.is_none() {
+                    self.cover_missing_disk.insert(key.clone());
+                }
+                image
+            }
+        }?;
+        let texture = ctx.load_texture(
+            format!("source-cover-{key}"),
+            image,
+            TextureOptions::LINEAR,
+        );
+        self.cover_textures.insert(key.clone(), texture.clone());
+        self.cover_lru.push_back(key);
+        while self.cover_textures.len() > COVER_TEXTURE_CAP {
+            match self.cover_lru.pop_front() {
+                Some(evicted) => {
+                    self.cover_textures.remove(&evicted);
+                }
+                None => break,
+            }
+        }
+        Some(texture)
+    }
+
+    /// Keeps the cover queue to what is nearly visible: cells that scrolled
+    /// away drop out, new wants append in order, and the queue never exceeds
+    /// `COVER_QUEUE_CAP` (the oldest requests are dropped first).
+    fn plan_covers(&mut self, want: Vec<CoverReq>) {
+        let skip: HashSet<String> = self
+            .cover_inflight
+            .iter()
+            .chain(self.cover_failed.iter())
+            .cloned()
+            .collect();
+        plan_covers(&mut self.cover_queue, want, &skip);
+        while self.cover_outstanding < COVER_INFLIGHT_CAP {
+            let Some(req) = self.cover_queue.pop_back() else {
+                break;
+            };
+            if self.cover_req_tx.send(req.clone()).is_err() {
+                break;
+            }
+            self.cover_inflight.insert(req.key);
+            self.cover_outstanding += 1;
+        }
+    }
+
+    /// Reading progress the host knows about, by `identity_id` chapter key.
+    /// Called once per sources frame so 继续阅读 and row states stay current.
+    pub fn set_chapter_progress(&mut self, map: std::collections::HashMap<String, (usize, usize, Option<i64>)>) {
+        self.chapter_progress = map;
+    }
+
+    /// The chapter 继续阅读 should open: the one touched most recently across
+    /// library progress and online streams; when it is finished, the next
+    /// unlocked chapter in reading order. Unread works start at the first
+    /// unlocked chapter. The flag reports whether any progress existed.
+    fn resume_chapter(
+        &self,
+        source: &str,
+        manga: &Manga,
+        ordered: &[Chapter],
+        states: &std::collections::HashMap<String, ChapterQueueState>,
+    ) -> (Option<Chapter>, bool) {
+        let mut best: Option<(usize, i64)> = None;
+        for (index, chapter) in ordered.iter().enumerate() {
+            let id = identity_id(source, &manga.key, &chapter.key);
+            let read_at = [
+                self.chapter_progress.get(&id).and_then(|(_, _, at)| *at),
+                states.get(&chapter.key).and_then(|state| state.read_at),
+            ]
+            .into_iter()
+            .flatten()
+            .max();
+            if let Some(at) = read_at {
+                if best.is_none_or(|(_, stamp)| at > stamp) {
+                    best = Some((index, at));
+                }
+            }
+        }
+        match best {
+            Some((index, _)) => {
+                let chapter = &ordered[index];
+                let id = identity_id(source, &manga.key, &chapter.key);
+                let finished = self
+                    .chapter_progress
+                    .get(&id)
+                    .is_some_and(|&(page, count, _)| count > 0 && page + 1 >= count)
+                    || states.get(&chapter.key).is_some_and(|state| {
+                        state.total > 0
+                            && state.read_page.is_some_and(|page| page + 1 >= state.total)
+                    });
+                if finished {
+                    let next = ordered[index + 1..].iter().find(|item| !item.locked);
+                    (next.or(Some(chapter)).cloned(), true)
+                } else {
+                    (Some(chapter.clone()), true)
+                }
+            }
+            None => (
+                ordered
+                    .iter()
+                    .find(|chapter| !chapter.locked)
+                    .or_else(|| ordered.first())
+                    .cloned(),
+                false,
+            ),
+        }
+    }
     pub fn check_updates(&mut self) {
         if self.checking > 0 {
             return;
@@ -2226,6 +2729,7 @@ impl Sources {
             return;
         }
         task.read_page = Some(page);
+        task.read_at = Some(follows::now() as i64);
         if let Err(error) = self.persist() {
             self.status = format!("阅读位置保存失败：{error:#}");
         }
@@ -2685,6 +3189,7 @@ impl Sources {
         self.selected_manga = None;
         self.chapters.clear();
         self.chapter_query.clear();
+        self.description_expanded = false;
         self.submit(Task::Chapters(source, manga));
     }
 
@@ -3031,6 +3536,14 @@ impl Sources {
     }
 
     pub fn poll(&mut self) {
+        while let Ok(done) = self.cover_done_rx.try_recv() {
+            self.cover_outstanding = self.cover_outstanding.saturating_sub(1);
+            self.cover_inflight.remove(&done.key);
+            if done.image.is_none() {
+                self.cover_failed.insert(done.key.clone());
+            }
+            self.cover_ready.insert(done.key, done.image);
+        }
         if let Some(origin) = take_web_challenge() {
             self.challenge = Some(origin);
         }
@@ -3929,7 +4442,588 @@ impl Sources {
         }
     }
 
+    /// Search and listing results as a cover grid: cover on top, a two-line
+    /// title and one muted metadata line below, the whole cell a single tap
+    /// target. Covers are requested only for cells near the viewport and the
+    /// next page auto-loads when the last row scrolls into view.
+    /// Manga detail: cover + metadata header, resume/follow/download actions,
+    /// a collapsible description, then the touch-friendly chapter list. Rows
+    /// are painted like the result grid so long names wrap instead of pushing
+    /// the page wide.
+    fn detail_ui(&mut self, ui: &mut Ui) {
+        let dark = ui.visuals().dark_mode;
+        let palette = design::palette(dark);
+        let Some(manga) = self.selected_manga.clone() else {
+            return;
+        };
+        let source = self.source_for(&manga);
+        let width = ui.available_width();
+
+        let back = ui.add(quiet_action("返回搜索结果").min_size(vec2(88., 44.)));
+        self.hitboxes.insert("source-detail-back".into(), back.rect);
+        if back.clicked() {
+            self.selected_manga = None;
+            self.chapters.clear();
+            return;
+        }
+        ui.add_space(8.);
+
+        let states: std::collections::HashMap<String, ChapterQueueState> = self
+            .tasks
+            .iter()
+            .filter(|task| task.source_id == source && task.manga_id == manga.key)
+            .map(|task| {
+                (
+                    task.chapter_id.clone(),
+                    ChapterQueueState {
+                        status: task.status,
+                        has_archive: task.cbz.is_some(),
+                        done: task.pages_done,
+                        total: task.pages_total,
+                        read_page: task.read_page,
+                        read_at: task.read_at,
+                    },
+                )
+            })
+            .collect();
+        let ordered = chapter_list(&self.chapters, "", false);
+        let (resume, started) = self.resume_chapter(&source, &manga, &ordered, &states);
+        let resume_key = resume.as_ref().map(|chapter| chapter.key.clone());
+        let followed = self.follow_index(&source, &manga.key).is_some();
+        let missing = self
+            .chapters
+            .iter()
+            .filter(|chapter| {
+                !chapter.locked
+                    && !self.library_chapters.contains_key(&identity_id(
+                        &source,
+                        &manga.key,
+                        &chapter.key,
+                    ))
+                    && states
+                        .get(&chapter.key)
+                        .is_none_or(|state| state.status == DownloadStatus::Failed)
+            })
+            .count();
+
+        // Header: cover beside the meta column on wide layouts, centered above
+        // it on narrow ones.
+        let cover_url = manga.cover.clone().unwrap_or_default();
+        let texture = self.cover_image(ui.ctx(), &source, &cover_url);
+        let mut want = Vec::new();
+        if texture.is_none() && !cover_url.is_empty() {
+            want.push(CoverReq {
+                key: cover_key(&source, &cover_url),
+                source: source.clone(),
+                url: cover_url,
+            });
+        }
+        let wide = width >= 700.;
+        let cover_size = if wide { vec2(200., 300.) } else { vec2(140., 210.) };
+        let heading = TextStyle::Heading.resolve(ui.style());
+        let mut read = false;
+        let mut follow = false;
+        let mut download_missing = false;
+        let mut meta = |ui: &mut Ui, this: &mut Self| {
+            ui.add(Label::new(RichText::new(&manga.title).heading().strong()).wrap());
+            if let Some(authors) = manga.authors.as_ref().filter(|list| !list.is_empty()) {
+                ui.label(RichText::new(authors.join(" / ")).color(palette.muted));
+            }
+            let mut chips: Vec<String> = match manga.status {
+                PublishingStatus::Ongoing => vec!["连载中".into()],
+                PublishingStatus::Completed => vec!["已完结".into()],
+                PublishingStatus::Cancelled => vec!["已停更".into()],
+                PublishingStatus::Hiatus => vec!["休刊中".into()],
+                PublishingStatus::Unknown => Vec::new(),
+            };
+            chips.extend(
+                manga
+                    .tags
+                    .iter()
+                    .flatten()
+                    .take(6usize.saturating_sub(chips.len()))
+                    .cloned(),
+            );
+            if !chips.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    for chip in chips {
+                        Frame::new()
+                            .fill(palette.soft)
+                            .corner_radius(10.)
+                            .inner_margin(vec2(8., 3.))
+                            .show(ui, |ui| {
+                                ui.label(RichText::new(chip).small().color(palette.muted));
+                            });
+                    }
+                });
+            }
+            ui.add_space(4.);
+            ui.horizontal_wrapped(|ui| {
+                let label = if started {
+                    format!(
+                        "继续阅读 · {}",
+                        resume.as_ref().map_or("".into(), |chapter| chapter_name(chapter))
+                    )
+                } else {
+                    "开始阅读".into()
+                };
+                let button = ui.add_enabled(
+                    resume.is_some(),
+                    design::primary(&label, dark),
+                );
+                this.hitboxes.insert("source-detail-read".into(), button.rect);
+                if button.clicked() {
+                    read = true;
+                }
+                let button = if followed {
+                    ui.add(quiet_action("已追更 · 取消追更").min_size(vec2(0., 48.)))
+                } else {
+                    ui.add(quiet_action("追更").min_size(vec2(0., 48.)))
+                };
+                this.hitboxes.insert("source-detail-follow".into(), button.rect);
+                if button.clicked() {
+                    follow = true;
+                }
+                let button = ui.add_enabled(
+                    missing > 0 && !this.busy,
+                    quiet_action(&format!("下载全部未下载（{missing}）"))
+                        .min_size(vec2(0., 48.)),
+                );
+                this.hitboxes.insert("source-detail-missing".into(), button.rect);
+                if button.clicked() {
+                    download_missing = true;
+                }
+            });
+        };
+        if wide {
+            ui.horizontal(|ui| {
+                let (cover_rect, _) =
+                    ui.allocate_exact_size(cover_size, Sense::hover());
+                paint_cover(
+                    ui.painter(),
+                    cover_rect,
+                    texture.as_ref(),
+                    &manga.title,
+                    heading.clone(),
+                    &palette,
+                );
+                ui.add_space(16.);
+                ui.vertical(|ui| {
+                    ui.set_max_width(ui.available_width());
+                    meta(ui, self);
+                });
+            });
+        } else {
+            ui.vertical_centered(|ui| {
+                let (cover_rect, _) =
+                    ui.allocate_exact_size(cover_size, Sense::hover());
+                paint_cover(
+                    ui.painter(),
+                    cover_rect,
+                    texture.as_ref(),
+                    &manga.title,
+                    heading.clone(),
+                    &palette,
+                );
+            });
+            ui.add_space(8.);
+            meta(ui, self);
+        }
+        self.plan_covers(want);
+        if read && let Some(chapter) = &resume {
+            self.read_detail_chapter(&manga, chapter, &states);
+        }
+        if follow {
+            self.toggle_follow(&manga);
+        }
+        if download_missing {
+            self.enqueue_missing(&manga);
+        }
+
+        // Description collapses to three lines; longer text offers 展开/收起.
+        if let Some(description) =
+            manga.description.as_ref().filter(|text| !text.trim().is_empty())
+        {
+            ui.add_space(10.);
+            let font = TextStyle::Body.resolve(ui.style());
+            let line = ui.text_style_height(&TextStyle::Body);
+            let painter = ui.painter().clone();
+            let full = painter.layout_job(egui::text::LayoutJob::simple(
+                description.clone(),
+                font.clone(),
+                palette.muted,
+                width,
+            ));
+            let clipped = !self.description_expanded && full.size().y > line * 3.5;
+            let galley = if clipped {
+                let mut job = egui::text::LayoutJob::simple(
+                    description.clone(),
+                    font,
+                    palette.muted,
+                    width,
+                );
+                job.wrap.max_rows = 3;
+                painter.layout_job(job)
+            } else {
+                full.clone()
+            };
+            let (text_rect, _) =
+                ui.allocate_exact_size(vec2(width, galley.size().y), Sense::hover());
+            painter.galley(text_rect.min, galley, palette.muted);
+            if clipped || (self.description_expanded && full.size().y > line * 3.5) {
+                let toggle = ui.add(quiet_action(if self.description_expanded {
+                    "收起"
+                } else {
+                    "展开"
+                }));
+                self.hitboxes.insert("source-detail-description".into(), toggle.rect);
+                if toggle.clicked() {
+                    self.description_expanded = !self.description_expanded;
+                }
+            }
+        }
+        ui.add_space(12.);
+
+        // Tasks for chapters the source no longer lists still need a place to
+        // retry; everything else is represented by row state.
+        let listed: HashSet<&str> =
+            self.chapters.iter().map(|chapter| chapter.key.as_str()).collect();
+        let orphans: Vec<DownloadTask> = self
+            .tasks
+            .iter()
+            .filter(|task| {
+                task.source_id == source
+                    && task.manga_id == manga.key
+                    && !listed.contains(task.chapter_id.as_str())
+                    && (task.status != DownloadStatus::Done || !task.linked)
+            })
+            .cloned()
+            .collect();
+        if !orphans.is_empty() {
+            disclosure(ui, &format!("其他下载任务（{}）", orphans.len()), false, |ui| {
+                for task in &orphans {
+                    self.download_row(ui, task);
+                }
+            });
+        }
+
+        design::section(ui, &format!("章节 · {}", self.chapters.len()));
+        ui.add(
+            TextEdit::singleline(&mut self.chapter_query)
+                .hint_text("查找章节名称或编号")
+                .desired_width(ui.available_width()),
+        );
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(&mut self.chapters_newest_first, false, "从头开始");
+            ui.selectable_value(&mut self.chapters_newest_first, true, "最新在前");
+            if !self.chapter_query.is_empty() && ui.add(quiet_action("清除查找")).clicked() {
+                self.chapter_query.clear();
+            }
+        });
+        let chapters = chapter_list(&self.chapters, &self.chapter_query, self.chapters_newest_first);
+        if chapters.is_empty() {
+            ui.label(if self.chapters.is_empty() {
+                "书源尚未提供章节。"
+            } else {
+                "没有匹配的章节，试试其他名称或编号。"
+            });
+        }
+        let body = TextStyle::Body.resolve(ui.style());
+        let small = TextStyle::Small.resolve(ui.style());
+        let small_h = ui.text_style_height(&TextStyle::Small);
+        let mut open: Option<Chapter> = None;
+        let mut enqueue: Option<Chapter> = None;
+        for (index, chapter) in chapters.iter().enumerate() {
+            let name = chapter_name(chapter);
+            let id = identity_id(&source, &manga.key, &chapter.key);
+            let state = states.get(&chapter.key);
+            let downloaded = self.library_chapters.get(&id).cloned();
+            let can_import = downloaded.is_none()
+                && state.is_some_and(|state| {
+                    state.status == DownloadStatus::Done && state.has_archive
+                })
+                && !self.import_attempts.contains(&id)
+                && !self.ready.iter().any(|queued| queued == &id);
+            let failed =
+                state.is_some_and(|state| state.status == DownloadStatus::Failed);
+            let show_download = downloaded.is_none()
+                && !can_import
+                && !chapter.locked
+                && (state.is_none() || failed);
+            let progress = self
+                .chapter_progress
+                .get(&id)
+                .map(|&(page, count, _)| (page, count));
+            let lines = chapter_state_lines(
+                chapter.locked,
+                downloaded.is_some(),
+                can_import,
+                progress,
+                state,
+            );
+            let sub = chapter
+                .date_uploaded
+                .map(format_epoch_date)
+                .or_else(|| {
+                    chapter.scanlators.as_ref().and_then(|list| list.first().cloned())
+                });
+
+            // Layout: name + sub line left, state lines right-aligned, an
+            // optional 仅下载 button at the far right edge.
+            let state_w = 104.;
+            let button_w = if show_download { 76. } else { 0. };
+            let left_w = (width - state_w - button_w - 24.).max(60.);
+            let painter = ui.painter().clone();
+            let mut name_job = egui::text::LayoutJob::simple(
+                name.clone(),
+                body.clone(),
+                if chapter.locked { palette.muted } else { palette.ink },
+                left_w,
+            );
+            name_job.wrap.max_rows = 2;
+            let name_galley = painter.layout_job(name_job);
+            let sub_galley = sub.as_ref().map(|text| {
+                let mut job = egui::text::LayoutJob::simple(
+                    text.clone(),
+                    small.clone(),
+                    palette.muted,
+                    left_w,
+                );
+                job.wrap.max_rows = 1;
+                painter.layout_job(job)
+            });
+            let state_galleys: Vec<Arc<Galley>> = lines
+                .iter()
+                .map(|line| {
+                    painter.layout_job(egui::text::LayoutJob::simple(
+                        line.clone(),
+                        small.clone(),
+                        palette.muted,
+                        state_w,
+                    ))
+                })
+                .collect();
+            let text_h = name_galley.size().y
+                + sub_galley
+                    .as_ref()
+                    .map_or(0., |galley| galley.size().y + 2.);
+            let row_h = (text_h + 24.).max(56.);
+            let (row_rect, _) =
+                ui.allocate_exact_size(vec2(width, row_h), Sense::hover());
+            let click_rect = if show_download {
+                Rect::from_min_max(row_rect.min, pos2(row_rect.right() - button_w - 8., row_rect.bottom()))
+            } else {
+                row_rect
+            };
+            let response = ui.interact(
+                click_rect,
+                ui.scope_id().with(("source-chapter", index)),
+                if chapter.locked { Sense::hover() } else { Sense::click() },
+            );
+            response.widget_info(|| {
+                WidgetInfo::labeled(Role::Button, !chapter.locked, &name)
+            });
+            self.hitboxes.insert(format!("source-chapter-{index}"), click_rect);
+            if response.clicked() {
+                open = Some(chapter.clone());
+            }
+            if response.hovered() || resume_key.as_deref() == Some(chapter.key.as_str()) {
+                painter.rect_filled(row_rect, 6., palette.accent_soft);
+            }
+            let text_top = row_rect.top() + (row_h - text_h) / 2.;
+            painter.galley(pos2(row_rect.left() + 4., text_top), name_galley, palette.ink);
+            if let Some(galley) = sub_galley {
+                painter.galley(
+                    pos2(row_rect.left() + 4., row_rect.bottom() - 12. - galley.size().y),
+                    galley,
+                    palette.muted,
+                );
+            }
+            let lines_h = state_galleys.len() as f32 * (small_h + 2.) - 2.;
+            for (row, galley) in state_galleys.iter().enumerate() {
+                painter.galley(
+                    pos2(
+                        row_rect.right() - button_w - 8. - galley.size().x,
+                        row_rect.top() + (row_h - lines_h.max(0.)) / 2.
+                            + row as f32 * (small_h + 2.),
+                    ),
+                    galley.clone(),
+                    palette.muted,
+                );
+            }
+            if show_download {
+                let button_rect = Rect::from_center_size(
+                    pos2(row_rect.right() - button_w / 2. - 4., row_rect.center().y),
+                    vec2(button_w, 44.),
+                );
+                let label = if failed { "重试下载" } else { "仅下载" };
+                let button = ui.put(
+                    button_rect,
+                    quiet_action(label).min_size(button_rect.size()),
+                );
+                self.hitboxes.insert(format!("source-chapter-dl-{index}"), button.rect);
+                if button.clicked() {
+                    enqueue = Some(chapter.clone());
+                }
+            }
+            painter.line_segment(
+                [
+                    pos2(row_rect.left() + 4., row_rect.bottom()),
+                    pos2(row_rect.right() - 4., row_rect.bottom()),
+                ],
+                Stroke::new(1., palette.line),
+            );
+        }
+        if let Some(chapter) = open {
+            self.read_detail_chapter(&manga, &chapter, &states);
+        }
+        if let Some(chapter) = enqueue {
+            self.enqueue_chapter(&manga, &chapter);
+        }
+    }
+
+    /// The read action shared by the resume button and chapter rows: library
+    /// copy when linked, import when the download only waits for the shelf,
+    /// otherwise online streaming.
+    fn read_detail_chapter(
+        &mut self,
+        manga: &Manga,
+        chapter: &Chapter,
+        states: &std::collections::HashMap<String, ChapterQueueState>,
+    ) {
+        let source = self.source_for(manga);
+        let id = identity_id(&source, &manga.key, &chapter.key);
+        if let Some(metadata) = self.library_chapters.get(&id) {
+            self.open_chapter = Some(metadata.clone());
+        } else if states.get(&chapter.key).is_some_and(|state| {
+            state.status == DownloadStatus::Done && state.has_archive
+        }) && !self.import_attempts.contains(&id)
+            && !self.ready.iter().any(|queued| queued == &id)
+        {
+            self.add_downloaded_to_library(&id);
+        } else {
+            self.read_online(manga, chapter, false);
+        }
+    }
+
+    fn results_grid(&mut self, ui: &mut Ui) {
+        let palette = design::palette(ui.visuals().dark_mode);
+        let width = ui.available_width();
+        let gap = 16.;
+        let cols = grid_columns(width);
+        let cell_w = (width - gap * cols.saturating_sub(1) as f32) / cols as f32;
+        let cover_h = cell_w * 1.5;
+        let body = TextStyle::Body.resolve(ui.style());
+        let body_h = ui.text_style_height(&TextStyle::Body);
+        let small_h = ui.text_style_height(&TextStyle::Small);
+        let cell_h = cover_h + 6. + body_h * 2. + 2. + small_h + 6.;
+        let expanded = ui.clip_rect().expand(cell_h + gap);
+        let entries = self.results.entries.clone();
+        let mut want = Vec::new();
+        let mut last_row = None;
+        let mut open = None;
+        for (row, chunk) in entries.chunks(cols).enumerate() {
+            let (rect, _) = ui.allocate_exact_size(vec2(width, cell_h), Sense::hover());
+            last_row = Some(rect);
+            for (offset, manga) in chunk.iter().enumerate() {
+                let index = row * cols + offset;
+                let cell = Rect::from_min_size(
+                    pos2(rect.left() + offset as f32 * (cell_w + gap), rect.top()),
+                    vec2(cell_w, cell_h),
+                );
+                let response = ui.interact(
+                    cell,
+                    ui.scope_id().with(("source-result", index)),
+                    if self.busy { Sense::hover() } else { Sense::click() },
+                );
+                response.widget_info(|| {
+                    WidgetInfo::labeled(Role::Button, !self.busy, &manga.title)
+                });
+                self.hitboxes.insert(format!("source-result-{index}"), cell);
+                if response.clicked() {
+                    open = Some(manga.clone());
+                }
+                let source = self.source_for(manga);
+                let url = manga.cover.clone().unwrap_or_default();
+                let texture = if expanded.intersects(cell) {
+                    let texture = self.cover_image(ui.ctx(), &source, &url);
+                    if texture.is_none() && !url.is_empty() {
+                        want.push(CoverReq {
+                            key: cover_key(&source, &url),
+                            source,
+                            url,
+                        });
+                    }
+                    texture
+                } else {
+                    None
+                };
+                if response.hovered() && !self.busy {
+                    ui.painter().rect_filled(cell, 8., palette.accent_soft);
+                }
+                let cover_rect = Rect::from_min_size(cell.min, vec2(cell_w, cover_h));
+                let painter = ui.painter().with_clip_rect(ui.clip_rect().intersect(cell));
+                paint_cover(
+                    &painter,
+                    cover_rect,
+                    texture.as_ref(),
+                    &manga.title,
+                    TextStyle::Heading.resolve(ui.style()),
+                    &palette,
+                );
+                let mut title_job = egui::text::LayoutJob::simple(
+                    manga.title.clone(),
+                    body.clone(),
+                    palette.ink,
+                    cell_w,
+                );
+                title_job.wrap.max_rows = 2;
+                let title_galley = painter.layout_job(title_job);
+                painter.galley(
+                    pos2(cell.left(), cover_rect.bottom() + 6.),
+                    title_galley,
+                    palette.ink,
+                );
+                let meta = manga
+                    .authors
+                    .as_ref()
+                    .filter(|values| !values.is_empty())
+                    .map(|values| values.join(" / "))
+                    .or_else(|| {
+                        manga.tags.as_ref().and_then(|values| values.first().cloned())
+                    })
+                    .unwrap_or_default();
+                let mut meta_job = egui::text::LayoutJob::simple(
+                    meta,
+                    TextStyle::Small.resolve(ui.style()),
+                    palette.muted,
+                    cell_w,
+                );
+                meta_job.wrap.max_rows = 1;
+                let meta_galley = painter.layout_job(meta_job);
+                painter.galley(
+                    pos2(cell.left(), cover_rect.bottom() + 6. + body_h * 2. + 2.),
+                    meta_galley,
+                    palette.muted,
+                );
+            }
+        }
+        if self.results.has_more
+            && !self.busy
+            && self.auto_next_page != Some(self.results.page + 1)
+            && last_row.is_some_and(|rect| rect.intersects(ui.clip_rect().expand(2.)))
+        {
+            self.auto_next_page = Some(self.results.page + 1);
+            self.load_next_page();
+        }
+        self.plan_covers(want);
+        if let Some(manga) = open {
+            self.open_manga(manga);
+        }
+    }
+
     pub fn ui(&mut self, ui: &mut Ui) {
+        self.hitboxes.clear();
         self.poll();
         if let Some(origin) = self.challenge.clone() {
             ui.horizontal_wrapped(|ui| {
@@ -4001,34 +5095,7 @@ impl Sources {
                             .unwrap_or_else(|| "搜索结果".into());
                         design::section(ui, &format!("{label} · {}", self.results.entries.len()));
                     }
-                    for manga in self.results.entries.clone() {
-                        let metadata = manga
-                            .authors
-                            .as_ref()
-                            .filter(|values| !values.is_empty())
-                            .map(|values| values.join(" / "))
-                            .or_else(|| {
-                                manga.tags.as_ref().map(|values| {
-                                    values
-                                        .iter()
-                                        .take(3)
-                                        .cloned()
-                                        .collect::<Vec<_>>()
-                                        .join(" · ")
-                                })
-                            })
-                            .unwrap_or_default();
-                        if source_item(
-                            ui,
-                            ("manga", &manga.key),
-                            &manga.title,
-                            &metadata,
-                            false,
-                            !self.busy,
-                        ) {
-                            self.open_manga(manga);
-                        }
-                    }
+                    self.results_grid(ui);
                     if self.results.has_more {
                         let next = self.results.page + 1;
                         ui.add_space(8.);
@@ -4046,163 +5113,7 @@ impl Sources {
                         }
                     }
                 } else {
-                    if ui.add(quiet_action("返回搜索结果")).clicked() {
-                        self.selected_manga = None;
-                        self.chapters.clear();
-                        return;
-                    }
-                    let manga = self.selected_manga.clone().unwrap();
-                    let source = if manga.source_key.is_empty() {
-                        self.selected_source.clone()
-                    } else {
-                        manga.source_key.clone()
-                    };
-                    ui.add_space(12.);
-                    ui.add(Label::new(RichText::new(&manga.title).heading().strong()).wrap());
-                    let followed = self.follow_index(&source, &manga.key).is_some();
-                    if if followed {
-                        ui.add(quiet_action("已追更 · 取消追更")).clicked()
-                    } else {
-                        ui.add(design::primary("追更", ui.visuals().dark_mode)).clicked()
-                    } {
-                        self.toggle_follow(&manga);
-                    }
-                    if let Some(description) = &manga.description {
-                        ui.add(Label::new(description).wrap());
-                    }
-                    ui.add_space(12.);
-                    let states: std::collections::HashMap<_, _> = self.tasks.iter()
-                        .filter(|task| task.source_id == source && task.manga_id == manga.key)
-                        .map(|task| (task.chapter_id.clone(), ChapterQueueState {
-                            status: task.status,
-                            has_archive: task.cbz.is_some(),
-                        }))
-                        .collect();
-                    let missing = self
-                        .chapters
-                        .iter()
-                        .filter(|chapter| {
-                            !chapter.locked
-                                && !self.library_chapters.contains_key(
-                                    &identity_id(&source, &manga.key, &chapter.key),
-                                )
-                                && states.get(&chapter.key).is_none_or(|task| {
-                                    task.status == DownloadStatus::Failed
-                                })
-                        })
-                        .count();
-                    if ui
-                        .add_enabled(
-                            missing > 0 && !self.busy,
-                            design::primary(
-                                &format!("加入未下载章节（{missing}）"),
-                                ui.visuals().dark_mode,
-                            ),
-                        )
-                        .clicked()
-                    {
-                        self.enqueue_missing(&manga);
-                    }
-                    let queue: Vec<DownloadTask> = self
-                        .tasks
-                        .iter()
-                        .filter(|task| task.source_id == source && task.manga_id == manga.key
-                            && (task.status != DownloadStatus::Done || !task.linked))
-                        .cloned()
-                        .collect();
-                    if !queue.is_empty() {
-                        ui.add_space(8.);
-                        disclosure(ui, &format!("本书下载任务（{}）", queue.len()), false, |ui| {
-                            for task in &queue {
-                                self.download_row(ui, task);
-                            }
-                        });
-                    }
-                    ui.add_space(12.);
-                    design::section(ui, &format!("章节 · {}", self.chapters.len()));
-                    ui.add(
-                        TextEdit::singleline(&mut self.chapter_query)
-                            .hint_text("查找章节名称或编号")
-                            .desired_width(ui.available_width()),
-                    );
-                    ui.horizontal_wrapped(|ui| {
-                        ui.selectable_value(&mut self.chapters_newest_first, false, "从头开始");
-                        ui.selectable_value(&mut self.chapters_newest_first, true, "最新在前");
-                        if !self.chapter_query.is_empty()
-                            && ui.add(quiet_action("清除查找")).clicked()
-                        {
-                            self.chapter_query.clear();
-                        }
-                    });
-                    let chapters = chapter_list(
-                        &self.chapters, &self.chapter_query, self.chapters_newest_first,
-                    );
-                    if chapters.is_empty() {
-                        ui.label(if self.chapters.is_empty() {
-                            "书源尚未提供章节。"
-                        } else {
-                            "没有匹配的章节，试试其他名称或编号。"
-                        });
-                    }
-                    for chapter in chapters {
-                        let name = chapter_name(&chapter);
-                        let task = states.get(&chapter.key);
-                        let id = identity_id(&source, &manga.key, &chapter.key);
-                        let downloaded = self.library_chapters.get(&id).cloned();
-                        let readable = downloaded.is_some();
-                        let can_import = !readable && task.is_some_and(|task| {
-                            task.status == DownloadStatus::Done
-                                && task.has_archive
-                        }) && !self.import_attempts.contains(&id)
-                            && !self.ready.iter().any(|queued| queued == &id);
-                        let failed = task.is_some_and(|task| task.status == DownloadStatus::Failed);
-                        let downloading = task.is_some_and(|task| task.status != DownloadStatus::Done);
-                        let enabled = readable || can_import || !chapter.locked;
-                        let action = if readable { "阅读" }
-                            else if can_import { "加入书架" }
-                            else if chapter.locked { "暂不可阅读" }
-                            else if downloading && !failed { "边下边读" }
-                            else { "在线阅读" };
-                        let label = format!("{name}    {action}");
-                        ui.push_id(("chapter", &chapter.key), |ui| {
-                            if ui
-                                .add_enabled(
-                                    enabled,
-                                    Button::new(label)
-                                        .frame_when_inactive(false)
-                                        .wrap()
-                                        .min_size(vec2(ui.available_width(), 44.)),
-                                )
-                                .clicked()
-                            {
-                                if let Some(metadata) = downloaded {
-                                    self.open_chapter = Some(metadata);
-                                } else if can_import {
-                                    self.add_downloaded_to_library(&id);
-                                } else {
-                                    self.read_online(&manga, &chapter, false);
-                                }
-                            }
-                            if !readable && !can_import && !chapter.locked
-                                && (task.is_none() || failed)
-                                && ui.add_enabled(!self.busy, quiet_action(
-                                    if failed { "重试下载" } else { "仅下载" },
-                                )).clicked()
-                            {
-                                self.enqueue_chapter(&manga, &chapter);
-                            }
-                            if readable {
-                                ui.label(RichText::new("已在书架，可离线阅读")
-                                    .color(design::palette(ui.visuals().dark_mode).muted));
-                            } else if let Some(task) = task {
-                                let state = if task.status == DownloadStatus::Done { "待加入书架" }
-                                    else { task.status.label() };
-                                ui.label(RichText::new(state)
-                                    .color(design::palette(ui.visuals().dark_mode).muted));
-                            }
-                            ui.separator();
-                        });
-                    }
+                    self.detail_ui(ui);
                 }
                 if self.selected_manga.is_none() {
                     let pending: Vec<(String, String, String)> = self
@@ -4584,7 +5495,7 @@ mod tests {
             results: ResultsState::default(),
             chapters: Vec::new(),
             chapter_query: String::new(),
-            chapters_newest_first: false,
+            chapters_newest_first: true,
             open_chapter: None,
             library_chapters: Default::default(),
             selected_source: String::new(),
@@ -4625,6 +5536,20 @@ mod tests {
             up_tx: mpsc::channel().0,
             up_rx: mpsc::channel().1,
             covers: Default::default(),
+            cover_req_tx: mpsc::channel().0,
+            cover_done_rx: mpsc::channel().1,
+            cover_queue: VecDeque::new(),
+            cover_inflight: HashSet::new(),
+            cover_outstanding: 0,
+            cover_failed: HashSet::new(),
+            cover_ready: Default::default(),
+            cover_missing_disk: HashSet::new(),
+            cover_textures: Default::default(),
+            cover_lru: VecDeque::new(),
+            auto_next_page: None,
+            chapter_progress: Default::default(),
+            description_expanded: false,
+            hitboxes: Default::default(),
             settings_open: false,
             settings_changed: false,
             source_settings: Default::default(),
@@ -6294,5 +7219,240 @@ mod tests {
             .manga_for(root.path())
             .expect("re-join writes a readable snapshot");
         assert_eq!(rebuilt.authors, Some(vec!["New Author".into()]));
+    }
+
+    #[test]
+    fn result_grid_columns_never_underflow_or_overflow() {
+        let expect = [
+            (320., 2),
+            (507., 4),
+            (744., 4),
+            (834., 5),
+            (1024., 6),
+            (1366., 8),
+        ];
+        for (width, cols) in expect {
+            assert_eq!(grid_columns(width), cols, "width {width}");
+        }
+        // Even at 200% type the math is font-independent: one column minimum
+        // and every cell stays at least its minimum width inside the row.
+        for width in [200., 320., 507.] {
+            let cols = grid_columns(width);
+            assert!(cols >= 1);
+            let min_cell = if width >= 600. { 150. } else { 112. };
+            let cell_w = (width - 16. * cols.saturating_sub(1) as f32) / cols as f32;
+            assert!(cell_w >= min_cell, "width {width} cell {cell_w}");
+        }
+    }
+
+    #[test]
+    fn cover_queue_tracks_only_the_visible_window() {
+        let req = |key: &str| CoverReq {
+            key: key.into(),
+            source: "s".into(),
+            url: format!("https://img/{key}"),
+        };
+        let keys = |queue: &VecDeque<CoverReq>| {
+            queue.iter().map(|req| req.key.clone()).collect::<Vec<_>>()
+        };
+        let skip = HashSet::from(["in-flight".to_string(), "failed".to_string()]);
+        let mut queue = VecDeque::new();
+        plan_covers(
+            &mut queue,
+            vec![req("a"), req("b"), req("in-flight"), req("failed")],
+            &skip,
+        );
+        assert_eq!(keys(&queue), ["a", "b"], "sent and failed covers never queue");
+        plan_covers(&mut queue, vec![req("a"), req("c"), req("d")], &skip);
+        assert_eq!(keys(&queue), ["a", "c", "d"], "scrolled-away cells drop out");
+        let many: Vec<CoverReq> = (0..30).map(|i| req(&format!("k{i}"))).collect();
+        plan_covers(&mut queue, many, &skip);
+        assert_eq!(queue.len(), COVER_QUEUE_CAP);
+        assert_eq!(queue.back().unwrap().key, "k29", "newest requests win");
+        assert!(!queue.iter().any(|req| req.key == "a"), "oldest drops first");
+    }
+
+    #[test]
+    fn cover_key_is_stable_and_scoped() {
+        assert_eq!(cover_key("s", "u"), cover_key("s", "u"));
+        assert_ne!(cover_key("a", "u"), cover_key("b", "u"));
+        assert_ne!(cover_key("s", "u1"), cover_key("s", "u2"));
+        assert!(source_cover_path(Path::new("root"), &cover_key("s", "u")).is_ok());
+    }
+
+    #[test]
+    fn source_cover_store_writes_atomically_and_reads_back() {
+        let root = tempfile::tempdir().unwrap();
+        let path = source_cover_path(root.path(), &cover_key("s", "u")).unwrap();
+        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            8,
+            8,
+            image::Rgba([1, 2, 3, 255]),
+        ));
+        let decoded = store_source_cover(&path, &image).unwrap();
+        assert_eq!(decoded.size, [8, 8]);
+        assert!(path.is_file());
+        assert!(!path.with_extension("part").exists());
+        assert!(image::load_from_memory(&std::fs::read(&path).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn cover_fetch_runs_end_to_end_and_caches_on_disk() {
+        let root = tempfile::tempdir().unwrap();
+        let (base, server) = serve_png(1);
+        let engine = SourceEngine::load_wasm(
+            source_manifest(),
+            pages_wasm(&[]),
+            EngineOptions::default(),
+        )
+        .unwrap();
+        let url = format!("{base}/cover.png");
+        let image = fetch_source_cover(root.path(), &engine, "test.source", &url).unwrap();
+        assert_eq!(image.size, [4, 4]);
+        server.join().unwrap();
+        let path = source_cover_path(root.path(), &cover_key("test.source", &url)).unwrap();
+        assert!(path.is_file());
+        // The second fetch must come from disk: the server only answered once.
+        let cached = fetch_source_cover(root.path(), &engine, "test.source", &url).unwrap();
+        assert_eq!(cached.size, image.size);
+    }
+
+    fn detail_chapter(key: &str, number: f32) -> Chapter {
+        Chapter {
+            key: key.into(),
+            title: Some(key.into()),
+            chapter_number: Some(number),
+            ..Default::default()
+        }
+    }
+
+    fn queue_state(
+        status: DownloadStatus,
+        read_page: Option<usize>,
+        read_at: Option<i64>,
+    ) -> ChapterQueueState {
+        ChapterQueueState {
+            status,
+            has_archive: status == DownloadStatus::Done,
+            done: 10,
+            total: 10,
+            read_page,
+            read_at,
+        }
+    }
+
+    #[test]
+    fn format_epoch_date_prints_civil_dates() {
+        assert_eq!(format_epoch_date(1_690_000_000), "2023-07-22");
+        assert_eq!(format_epoch_date(0), "1970-01-01");
+        assert_eq!(format_epoch_date(-86_400), "1969-12-31");
+    }
+
+    #[test]
+    fn chapter_state_lines_map_progress_and_queue() {
+        // Locked wins outright; finished progress beats partial reads; download
+        // state appears below the reading state.
+        assert_eq!(
+            chapter_state_lines(true, false, false, None, None),
+            vec!["暂不可阅读"]
+        );
+        assert_eq!(
+            chapter_state_lines(false, true, false, Some((9, 10)), None),
+            vec!["已读", "已下载"]
+        );
+        assert_eq!(
+            chapter_state_lines(false, false, false, Some((2, 10)), None),
+            vec!["读到 3/10"]
+        );
+        let running = queue_state(DownloadStatus::Running, None, None);
+        let mut partial = running.clone();
+        partial.done = 4;
+        partial.total = 30;
+        assert_eq!(
+            chapter_state_lines(false, false, false, None, Some(&partial)),
+            vec!["下载中 4/30"]
+        );
+        let failed = queue_state(DownloadStatus::Failed, None, None);
+        assert_eq!(
+            chapter_state_lines(false, false, false, None, Some(&failed)),
+            vec!["失败 · 重试"]
+        );
+        let done = queue_state(DownloadStatus::Done, Some(4), Some(9));
+        assert_eq!(
+            chapter_state_lines(false, false, true, None, Some(&done)),
+            vec!["读到 5/10", "待加入书架"]
+        );
+    }
+
+    #[test]
+    fn resume_chapter_picks_the_freshest_and_steps_past_finished() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sources = test_sources(root.path());
+        let book = manga("source.a", "m");
+        let ordered = vec![
+            detail_chapter("c1", 1.),
+            detail_chapter("c2", 2.),
+            detail_chapter("c3", 3.),
+        ];
+        let mut states = std::collections::HashMap::new();
+        states.insert("c2".into(), queue_state(DownloadStatus::Done, Some(9), Some(200)));
+        sources.chapter_progress.insert(
+            identity_id("source.a", "m", "c1"),
+            (2, 10, Some(100)),
+        );
+        // The stream read of c2 is newer but finished, so resume lands on c3.
+        let (resume, started) =
+            sources.resume_chapter("source.a", &book, &ordered, &states);
+        assert!(started && resume.unwrap().key == "c3");
+
+        // A newer partial library read wins over the finished stream.
+        sources.chapter_progress.insert(
+            identity_id("source.a", "m", "c1"),
+            (2, 10, Some(300)),
+        );
+        let (resume, started) =
+            sources.resume_chapter("source.a", &book, &ordered, &states);
+        assert!(started && resume.unwrap().key == "c1");
+
+        // Finishing the last chapter keeps it as the resume target.
+        sources.chapter_progress.clear();
+        states.insert("c3".into(), queue_state(DownloadStatus::Done, Some(9), Some(400)));
+        states.remove("c2");
+        let (resume, started) =
+            sources.resume_chapter("source.a", &book, &ordered, &states);
+        assert!(started && resume.unwrap().key == "c3");
+
+        // Nothing read starts at the first unlocked chapter.
+        let (resume, started) =
+            sources.resume_chapter("source.a", &book, &ordered, &Default::default());
+        assert!(!started && resume.unwrap().key == "c1");
+    }
+
+    #[test]
+    fn resume_chapter_skips_locked_when_starting_fresh() {
+        let root = tempfile::tempdir().unwrap();
+        let sources = test_sources(root.path());
+        let book = manga("source.a", "m");
+        let mut locked = detail_chapter("c0", 0.);
+        locked.locked = true;
+        let ordered = vec![locked, detail_chapter("c1", 1.)];
+        let (resume, started) =
+            sources.resume_chapter("source.a", &book, &ordered, &Default::default());
+        assert!(!started && resume.unwrap().key == "c1");
+    }
+
+    #[test]
+    fn set_stream_page_records_the_read_timestamp() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sources = test_sources(root.path());
+        let mut item = task("source.a", "m", "c1");
+        item.status = DownloadStatus::Running;
+        item.pages_total = 30;
+        sources.tasks.push(item);
+        let id = identity_id("source.a", "m", "c1");
+        sources.set_stream_page(&id, 7);
+        let task = sources.tasks.iter().find(|task| task.id == id).unwrap();
+        assert_eq!(task.read_page, Some(7));
+        assert!(task.read_at.is_some());
     }
 }
