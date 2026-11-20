@@ -91,6 +91,9 @@ pub const PAGE_NOT_READY: &str = "page-not-ready";
 pub struct DecodedPage {
     pub tiles: Vec<ColorImage>,
     pub size: [usize; 2],
+    /// Normalized `[left, top, right, bottom]` of the drawn content inside
+    /// the page once uniform white/black margins are ignored.
+    pub content: [f32; 4],
 }
 struct ImageRequest {
     id: String,
@@ -536,6 +539,10 @@ fn read_settings(library: &Library) -> anyhow::Result<Vec<(String, String)>> {
         "private",
         "reading-mode",
         "font-scale",
+        "reader-crop",
+        "reader-fit",
+        "reader-brightness",
+        "reader-spread-offset",
     ] {
         if let Some(value) = library.get_setting(key)? {
             settings.push((key.to_string(), value));
@@ -568,6 +575,11 @@ pub fn decode(bytes: &[u8], cover: bool) -> anyhow::Result<DecodedPage> {
     }
     let image = image.into_rgba8();
     let size = [image.width() as usize, image.height() as usize];
+    let content = if cover {
+        [0., 0., 1., 1.]
+    } else {
+        content_bounds(&image)
+    };
     let mut tiles = Vec::new();
     for top in (0..image.height()).step_by(2048) {
         let height = (image.height() - top).min(2048);
@@ -579,7 +591,74 @@ pub fn decode(bytes: &[u8], cover: bool) -> anyhow::Result<DecodedPage> {
             &image.as_raw()[start..end],
         ));
     }
-    Ok(DecodedPage { tiles, size })
+    Ok(DecodedPage {
+        tiles,
+        size,
+        content,
+    })
+}
+
+/// Bounds of the drawn area when the page is wrapped in a near-uniform white
+/// or black border. Rows and columns are sampled on a coarse grid; a side
+/// keeps shrinking while every sampled pixel sits within 12 luminance of the
+/// border color, but never removes more than a quarter of the dimension.
+pub(super) fn content_bounds(image: &image::RgbaImage) -> [f32; 4] {
+    let full = [0., 0., 1., 1.];
+    let (w, h) = (image.width() as usize, image.height() as usize);
+    if w < 8 || h < 8 {
+        return full;
+    }
+    let step = (w.max(h) / 96).max(1);
+    let luminance = |x: usize, y: usize| -> i32 {
+        let p = image.get_pixel(x as u32, y as u32).0;
+        (p[0] as i32 * 299 + p[1] as i32 * 587 + p[2] as i32 * 114 + 500) / 1000
+    };
+    let mut corners = [
+        luminance(0, 0),
+        luminance(w - 1, 0),
+        luminance(0, h - 1),
+        luminance(w - 1, h - 1),
+    ];
+    corners.sort_unstable();
+    let border = (corners[1] + corners[2]) / 2;
+    if !(border <= 24 || border >= 231) {
+        return full;
+    }
+    let border_row = |y: usize| {
+        (0..w)
+            .step_by(step)
+            .all(|x| (luminance(x, y) - border).abs() <= 12)
+    };
+    let border_column = |x: usize| {
+        (0..h)
+            .step_by(step)
+            .all(|y| (luminance(x, y) - border).abs() <= 12)
+    };
+    let mut top = 0;
+    while top < h / 4 && border_row(top) {
+        top += 1;
+    }
+    let mut bottom = h;
+    while bottom > h - h / 4 && bottom > top && border_row(bottom - 1) {
+        bottom -= 1;
+    }
+    let mut left = 0;
+    while left < w / 4 && border_column(left) {
+        left += 1;
+    }
+    let mut right = w;
+    while right > w - w / 4 && right > left && border_column(right - 1) {
+        right -= 1;
+    }
+    if top == 0 && bottom == h && left == 0 && right == w {
+        return full;
+    }
+    [
+        left as f32 / w as f32,
+        top as f32 / h as f32,
+        right as f32 / w as f32,
+        bottom as f32 / h as f32,
+    ]
 }
 
 #[cfg(test)]
@@ -1023,5 +1102,45 @@ mod tests {
             }
             top += tile.size[1];
         }
+    }
+
+    fn bordered_image(border: u8, border_px: u32) -> image::RgbaImage {
+        image::RgbaImage::from_fn(200, 160, |x, y| {
+            let inside = x >= border_px
+                && x < 200 - border_px
+                && y >= border_px
+                && y < 160 - border_px;
+            if inside {
+                image::Rgba([40, 60, 80, 255])
+            } else {
+                image::Rgba([border, border, border, 255])
+            }
+        })
+    }
+
+    #[test]
+    fn content_bounds_find_uniform_borders_and_respect_the_cap() {
+        for border in [0u8, 12, 250, 255] {
+            let bounds = super::content_bounds(&bordered_image(border, 24));
+            assert!(
+                (bounds[0] - 24. / 200.).abs() < 0.02
+                    && (bounds[1] - 24. / 160.).abs() < 0.02
+                    && (bounds[2] - 176. / 200.).abs() < 0.02
+                    && (bounds[3] - 136. / 160.).abs() < 0.02,
+                "border {border} cropped wrong: {bounds:?}"
+            );
+        }
+        // Nothing to crop stays untouched.
+        let flat = image::RgbaImage::from_pixel(120, 90, image::Rgba([128, 40, 60, 255]));
+        assert_eq!(super::content_bounds(&flat), [0., 0., 1., 1.]);
+        // Coloured or noisy borders are never removed.
+        let noise = image::RgbaImage::from_fn(140, 100, |x, y| {
+            image::Rgba([((x * 31 + y * 17) % 256) as u8, 90, 40, 255])
+        });
+        assert_eq!(super::content_bounds(&noise), [0., 0., 1., 1.]);
+        // A page that is all margin is capped at a quarter per side.
+        let blank = image::RgbaImage::from_pixel(200, 160, image::Rgba([255, 255, 255, 255]));
+        let bounds = super::content_bounds(&blank);
+        assert_eq!(bounds, [0.25, 0.25, 0.75, 0.75]);
     }
 }

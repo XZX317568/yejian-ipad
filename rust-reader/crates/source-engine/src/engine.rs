@@ -80,6 +80,7 @@ pub struct SourceEngine {
     fuel_per_call: Arc<AtomicU64>,
     manifest: Arc<SourceManifest>,
     features: SourceFeatures,
+    request_handler: RequestHandler,
 }
 
 impl fmt::Debug for SourceEngine {
@@ -176,6 +177,7 @@ impl SourceEngine {
         let worker_manifest = manifest.clone();
         let print_handler = options.print_handler.clone();
         let partial_handler = options.partial_result_handler.clone();
+        let engine_handler = request_handler.clone();
         let (tx, rx) = mpsc::channel::<Job>();
         let (init_tx, init_rx) = mpsc::sync_channel::<Result<SourceFeatures, SourceError>>(1);
         let poisoned = Arc::new(AtomicBool::new(false));
@@ -238,6 +240,7 @@ impl SourceEngine {
             fuel_per_call,
             manifest: Arc::new(manifest),
             features,
+            request_handler: engine_handler,
         })
     }
 
@@ -509,6 +512,13 @@ impl SourceEngine {
         request: NetRequestData,
     ) -> BoxFuture<Result<NetResponseData, SourceError>> {
         self.submit(move |state| Ok(state.interpreter.request(request)))
+    }
+
+    /// The HTTP transport the interpreter was built with. Calling it on any
+    /// thread performs the request there while sharing the source's cookie
+    /// jar and headers, so parallel page fetches do not queue on the worker.
+    pub fn request_handler(&self) -> RequestHandler {
+        self.request_handler.clone()
     }
 }
 

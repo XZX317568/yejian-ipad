@@ -38,23 +38,82 @@ struct Flight {
 struct PageTexture {
     tiles: Vec<TextureHandle>,
     size: Vec2,
+    /// Drawn content inside the full image, normalized to 0..1.
+    content: Rect,
 }
 impl PageTexture {
-    fn paint(&self, painter: &Painter, rect: Rect) {
-        let mut top = rect.top();
-        for tile in &self.tiles {
-            let height = tile.size()[1] as f32 / self.size.y * rect.height();
-            let target = Rect::from_min_size(pos2(rect.left(), top), vec2(rect.width(), height));
-            if target.intersects(painter.clip_rect()) {
-                painter.image(
-                    tile.id(),
-                    target,
-                    Rect::from_min_max(Pos2::ZERO, pos2(1., 1.)),
-                    Color32::WHITE,
-                );
-            }
-            top += height;
+    /// Pixels the layout should measure when white/black margins are cropped.
+    fn shown_size(&self, crop: bool) -> Vec2 {
+        if crop {
+            vec2(
+                self.size.x * self.content.width(),
+                self.size.y * self.content.height(),
+            )
+        } else {
+            self.size
         }
+    }
+    /// Paints the page; with `crop` only the content sub-rect is drawn,
+    /// stretched to fill `rect`. Tiles still slice vertically.
+    fn paint(&self, painter: &Painter, rect: Rect, crop: bool) {
+        let content = if crop {
+            self.content
+        } else {
+            Rect::from_min_max(Pos2::ZERO, pos2(1., 1.))
+        };
+        let mut top = 0.;
+        for tile in &self.tiles {
+            let tile_height = tile.size()[1] as f32 / self.size.y;
+            let (tile_top, tile_bottom) = (top, top + tile_height);
+            top = tile_bottom;
+            let (visible_top, visible_bottom) = (
+                tile_top.max(content.top()),
+                tile_bottom.min(content.bottom()),
+            );
+            if visible_bottom <= visible_top {
+                continue;
+            }
+            let uv = Rect::from_min_max(
+                pos2(content.left(), (visible_top - tile_top) / tile_height),
+                pos2(content.right(), (visible_bottom - tile_top) / tile_height),
+            );
+            let target = Rect::from_min_size(
+                pos2(
+                    rect.left(),
+                    rect.top()
+                        + (visible_top - content.top()) / content.height() * rect.height(),
+                ),
+                vec2(
+                    rect.width(),
+                    (visible_bottom - visible_top) / content.height() * rect.height(),
+                ),
+            );
+            if target.intersects(painter.clip_rect()) {
+                painter.image(tile.id(), target, uv, Color32::WHITE);
+            }
+        }
+    }
+}
+
+/// What follows the current chapter in the vertical strip.
+enum Peek {
+    /// No next chapter.
+    Missing,
+    /// A next chapter exists but its page count is not known yet.
+    Loading,
+    /// `(segment id, page count, stream metadata when it is an online task)`.
+    Ready(String, usize, Option<ChapterMetadata>),
+}
+
+/// The pair shown in two-page mode: with `spread_offset` page 0 stands
+/// alone and the following spreads start on odd pages.
+fn spread_pair(page: usize, spread_offset: bool) -> (usize, Option<usize>) {
+    if spread_offset && page == 0 {
+        (0, None)
+    } else if spread_offset && page % 2 == 0 {
+        (page - 1, Some(page))
+    } else {
+        (page, Some(page + 1))
     }
 }
 
@@ -123,6 +182,12 @@ pub struct ReaderApp {
     page: usize,
     page_generation: u64,
     vertical_reader: crate::vertical::VerticalReader,
+    /// Strip segment before/after the current chapter as `(book or
+    /// `stream:` id, page count)`. `prev` exists only after the anchor
+    /// crossed a seam; `next` only once its page count is known.
+    vertical_prev: Option<(String, usize)>,
+    vertical_next: Option<(String, usize)>,
+    next_stream: Option<StreamBook>,
     saved_position: Option<(String, usize, f32)>,
     persisted_position: Option<(String, usize, f32)>,
     failed_position: Option<(String, usize, f32, bool)>,
@@ -132,10 +197,18 @@ pub struct ReaderApp {
     pan: Vec2,
     controls: bool,
     reader_drag: f32,
+    reader_drag_y: f32,
+    reader_fit_limit: f32,
     private: bool,
     rtl: bool,
     vertical: bool,
     spread: bool,
+    crop: bool,
+    fit_width: bool,
+    brightness: f32,
+    spread_offset: bool,
+    reader_globals: crate::reader_prefs::ReaderPrefs,
+    reader_prefs: HashMap<String, crate::reader_prefs::ReaderPrefs>,
     dark: bool,
     reduced: bool,
     theme: String,
@@ -159,6 +232,7 @@ pub struct ReaderApp {
 impl ReaderApp {
     pub fn new(root: PathBuf, ctx: Context) -> Self {
         let backup_path = root.join("backup.yejian.zip").to_string_lossy().to_string();
+        let reader_prefs = crate::reader_prefs::load(&root).unwrap_or_default();
         Self {
             worker: Worker::start(root.clone(), ctx.clone()),
             sync: crate::sync::ProgressSync::new(root.clone(), ctx.clone()),
@@ -203,6 +277,9 @@ impl ReaderApp {
             page: 0,
             page_generation: 0,
             vertical_reader: crate::vertical::VerticalReader::default(),
+            vertical_prev: None,
+            vertical_next: None,
+            next_stream: None,
             saved_position: None,
             persisted_position: None,
             failed_position: None,
@@ -212,10 +289,18 @@ impl ReaderApp {
             pan: Vec2::ZERO,
             controls: true,
             reader_drag: 0.,
+            reader_drag_y: 0.,
+            reader_fit_limit: 0.,
             private: false,
             rtl: false,
             vertical: false,
             spread: false,
+            crop: false,
+            fit_width: false,
+            brightness: 1.,
+            spread_offset: false,
+            reader_globals: crate::reader_prefs::ReaderPrefs::default(),
+            reader_prefs,
             dark: false,
             reduced: false,
             theme: "system".into(),
@@ -411,16 +496,17 @@ impl ReaderApp {
         self.books
             .iter()
             .find(|b| b.id == id)
-            .or_else(|| self.stream.as_ref().map(|s| &s.book).filter(|b| b.id == id))
+            .or_else(|| self.stream_for(id).map(|s| &s.book).filter(|b| b.id == id))
             .cloned()
     }
     fn reading_metadata(&self, id: &str) -> Option<ChapterMetadata> {
-        self.chapter(id).cloned().or_else(|| {
-            self.stream
-                .as_ref()
-                .filter(|stream| stream.book.id == id)
-                .map(|stream| stream.metadata.clone())
-        })
+        self.chapter(id)
+            .cloned()
+            .or_else(|| self.stream_for(id).map(|stream| stream.metadata.clone()))
+            .or_else(|| {
+                id.strip_prefix(STREAM_PREFIX)
+                    .and_then(|task| self.sources.stream_metadata(task))
+            })
     }
     fn open_stream(&mut self, chapter: StreamChapter) {
         let id = format!("{STREAM_PREFIX}{}", chapter.id);
@@ -461,18 +547,203 @@ impl ReaderApp {
     }
     /// Follows the online chapter's download, and hands the reader over to
     /// the library copy (same page) once it has been imported.
-    fn update_stream(&mut self) {
-        let Some(stream) = self.stream.as_ref() else {
-            return;
-        };
-        let id = stream.book.id.clone();
-        if !matches!(&self.screen, Screen::Reader(current) if current == &id) {
-            self.stream = None;
-            return;
+    /// The vertical strip's segments in order: the still-loaded previous
+    /// chapter (kept for scrolling back), the current one, and the next one
+    /// once its page count is known.
+    fn strip_segments(&self) -> Vec<(String, usize)> {
+        let mut segments = Vec::with_capacity(3);
+        if let Some(prev) = &self.vertical_prev {
+            segments.push(prev.clone());
         }
-        let metadata = stream.metadata.clone();
-        let imported = self
-            .chapters
+        if let Screen::Reader(id) = &self.screen {
+            let count = self
+                .reader_book(id)
+                .map(|book| book.page_count)
+                .unwrap_or(0);
+            segments.push((id.clone(), count));
+        }
+        if let Some(next) = &self.vertical_next {
+            segments.push(next.clone());
+        }
+        segments
+    }
+    /// Resolves a global strip index to `(segment id, local page)`.
+    fn locate<'a>(segments: &'a [(String, usize)], global: usize) -> Option<(&'a str, usize)> {
+        let mut base = 0;
+        for (id, count) in segments {
+            if global < base + count {
+                return Some((id.as_str(), global - base));
+            }
+            base += count;
+        }
+        None
+    }
+    /// Rendered heights for all loaded strip pages, keyed by global index.
+    fn strip_heights(&self, segments: &[(String, usize)], width: f32) -> HashMap<usize, f32> {
+        let mut heights = HashMap::new();
+        let mut base = 0;
+        for (id, count) in segments {
+            for ((_, page), image) in self.pages.iter().filter(|((key, _), _)| key == id) {
+                let size = image.shown_size(self.crop);
+                heights.insert(base + *page, size.y / size.x * width);
+            }
+            base += count;
+        }
+        heights
+    }
+    /// An `(id, page)` key's global strip index, or `usize::MAX` when the
+    /// page is not part of the strip any more.
+    fn global_page_index(&self, id: &str, page: usize) -> usize {
+        let mut base = 0;
+        for (seg_id, count) in self.strip_segments() {
+            if seg_id == id {
+                return if page < count { base + page } else { usize::MAX };
+            }
+            base += count;
+        }
+        usize::MAX
+    }
+    /// Whether an arriving page texture belongs in the reader's working set.
+    fn wants_page(&self, id: &str, page: usize) -> bool {
+        if !self.vertical {
+            return matches!(&self.screen, Screen::Reader(current) if current == id)
+                && page.abs_diff(self.page) <= 2;
+        }
+        let global = self.global_page_index(id, page);
+        global != usize::MAX && global.abs_diff(self.vertical_reader.page) <= 3
+    }
+    /// `(near, essential)` page keys: `near` is the keep window around the
+    /// anchor across segments, `essential` the pages the current view may
+    /// show, which eviction never removes.
+    fn page_keep_sets(&self) -> (HashSet<(String, usize)>, HashSet<(String, usize)>) {
+        let mut near = HashSet::new();
+        let mut essential = HashSet::new();
+        let Screen::Reader(id) = &self.screen else {
+            return (near, essential);
+        };
+        if self.vertical {
+            let segments = self.strip_segments();
+            let anchor = self.vertical_reader.page;
+            for global in anchor.saturating_sub(2)..=anchor + 2 {
+                if let Some((seg, local)) = Self::locate(&segments, global) {
+                    near.insert((seg.to_string(), local));
+                }
+            }
+            for global in anchor.saturating_sub(1)..=anchor + 1 {
+                if let Some((seg, local)) = Self::locate(&segments, global) {
+                    essential.insert((seg.to_string(), local));
+                }
+            }
+        } else {
+            for page in self.page.saturating_sub(2)..=self.page + 2 {
+                near.insert((id.clone(), page));
+            }
+            essential.insert((id.clone(), self.page));
+            if self.spread {
+                let (base, second) = spread_pair(self.page, self.spread_offset);
+                essential.insert((id.clone(), base));
+                if let Some(second) = second {
+                    essential.insert((id.clone(), second));
+                }
+            }
+        }
+        (near, essential)
+    }
+    /// Distance of a page key from the reader's anchor; used for eviction.
+    fn page_distance(&self, id: &str, page: usize) -> usize {
+        if self.vertical {
+            self.global_page_index(id, page)
+                .abs_diff(self.vertical_reader.page)
+        } else {
+            page.abs_diff(self.page)
+        }
+    }
+    /// Whether a chapter exists before/after `id` (library or online).
+    fn has_neighbor(&self, id: &str, delta: i32) -> bool {
+        if let Some(metadata) = self.reading_metadata(id)
+            && let Some(key) = self.sources.adjacent_online_key(&metadata, delta)
+        {
+            let local = self.chapters.iter().any(|link| {
+                link.metadata.source_id == metadata.source_id
+                    && link.metadata.manga_id == metadata.manga_id
+                    && link.metadata.chapter_id == key
+                    && self.books.iter().any(|book| book.id == link.book_id)
+            });
+            return local || self.sources.has_adjacent_online(&metadata, delta);
+        }
+        self.adjacent_chapter(id, delta).is_some()
+    }
+    /// Looks up the chapter that follows `id`, queuing its online download
+    /// when `enqueue` is set (the anchor is within the last pages). The
+    /// segment becomes `Ready` only once its page count is known.
+    fn peek_next(&mut self, id: &str, enqueue: bool) -> Peek {
+        if let Some(metadata) = self.reading_metadata(id)
+            && let Some(key) = self.sources.adjacent_online_key(&metadata, 1)
+        {
+            let local = self
+                .chapters
+                .iter()
+                .find(|link| {
+                    link.metadata.source_id == metadata.source_id
+                        && link.metadata.manga_id == metadata.manga_id
+                        && link.metadata.chapter_id == key
+                })
+                .and_then(|link| self.books.iter().find(|book| book.id == link.book_id))
+                .cloned();
+            if let Some(book) = local {
+                return Peek::Ready(book.id, book.page_count, None);
+            }
+            if !self.sources.has_adjacent_online(&metadata, 1) {
+                return Peek::Missing;
+            }
+            if enqueue
+                && let Some((task, task_meta)) = self.sources.prepare_next(&metadata)
+                && let Some(state) = self.sources.stream_state(&task)
+                && state.total > 0
+            {
+                return Peek::Ready(
+                    format!("{STREAM_PREFIX}{task}"),
+                    state.total,
+                    Some(task_meta),
+                );
+            }
+            return Peek::Loading;
+        }
+        match self.adjacent_chapter(id, 1) {
+            Some(book) => Peek::Ready(book.id, book.page_count, None),
+            None => Peek::Missing,
+        }
+    }
+    /// Stream bookkeeping for a `stream:` strip segment.
+    fn stream_segment_book(&self, seg_id: &str, metadata: &ChapterMetadata) -> Option<StreamBook> {
+        let task = seg_id.strip_prefix(STREAM_PREFIX)?;
+        let state = self.sources.stream_state(task).unwrap_or_default();
+        Some(StreamBook {
+            book: Book {
+                id: seg_id.to_string(),
+                title: format!("{} · {}", metadata.manga_title, metadata.chapter_title),
+                author: String::new(),
+                archive_path: PathBuf::new(),
+                cover_path: None,
+                page_count: state.total.max(1),
+                current_page: 0,
+                page_fraction: 0.,
+                updated_at: 0,
+                last_read_at: None,
+                category: String::new(),
+            },
+            task: task.to_string(),
+            metadata: metadata.clone(),
+            done: state.done,
+            stopped: state.stopped,
+            signature: state.signature,
+            resume: None,
+            waiting: HashSet::new(),
+        })
+    }
+    /// The library book a downloaded task's metadata resolved to.
+    fn imported_book(&self, metadata: &ChapterMetadata) -> Option<Book> {
+        self.chapters
             .iter()
             .find(|link| {
                 link.metadata.source_id == metadata.source_id
@@ -480,60 +751,203 @@ impl ReaderApp {
                     && link.metadata.chapter_id == metadata.chapter_id
             })
             .and_then(|link| self.books.iter().find(|book| book.id == link.book_id))
-            .cloned();
-        if let Some(mut book) = imported {
-            book.current_page = self.page.min(book.page_count.saturating_sub(1));
-            book.page_fraction = if self.vertical {
-                self.vertical_reader.fraction
+            .cloned()
+    }
+    /// Moves every page-scoped map entry from a `stream:` id to its imported
+    /// library book id, keeping decoded textures across the handover.
+    fn remap_page_keys(&mut self, from: &str, to: &str) {
+        for key in self
+            .pages
+            .keys()
+            .filter(|(id, _)| id == from)
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            if let Some(texture) = self.pages.remove(&key) {
+                self.pages.insert((to.to_string(), key.1), texture);
+            }
+        }
+        for key in self
+            .page_errors
+            .keys()
+            .filter(|(id, _)| id == from)
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            if let Some(error) = self.page_errors.remove(&key) {
+                self.page_errors.insert((to.to_string(), key.1), error);
+            }
+        }
+        for key in self
+            .page_pending
+            .iter()
+            .filter(|(id, _)| id == from)
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            self.page_pending.remove(&key);
+            self.page_pending.insert((to.to_string(), key.1));
+        }
+        for key in self
+            .prefetch_blocked
+            .iter()
+            .filter(|(id, _)| id == from)
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            self.prefetch_blocked.remove(&key);
+            self.prefetch_blocked.insert((to.to_string(), key.1));
+        }
+    }
+    /// The vertical anchor entered the following segment: that chapter
+    /// becomes the reader's book, keeping textures and the exact scroll
+    /// offset. Returns the new current `(id, page count)`.
+    fn cross_vertical(&mut self, old_id: &str, old_count: usize) -> (String, usize) {
+        let prev_count = self.vertical_prev.as_ref().map(|(_, c)| *c).unwrap_or(0);
+        let Some((next_id, next_count)) = self.vertical_next.take() else {
+            return (old_id.to_string(), old_count);
+        };
+        let global = self.vertical_reader.page;
+        let local = global - prev_count - old_count;
+        if let Some(task) = old_id.strip_prefix(STREAM_PREFIX) {
+            if !self.private {
+                self.sources
+                    .set_stream_page(task, old_count.saturating_sub(1));
+            }
+        } else {
+            self.record_position(old_id, old_count.saturating_sub(1), 0.);
+        }
+        self.vertical_prev = Some((old_id.to_string(), old_count));
+        self.stream = self.next_stream.take();
+        self.screen = Screen::Reader(next_id.clone());
+        self.page = local;
+        self.vertical_reader.page = global - prev_count;
+        self.prefetch_blocked.clear();
+        self.record_position(&next_id, local, self.vertical_reader.fraction);
+        (next_id, next_count)
+    }
+    /// Saves the strip anchor's position for whichever chapter holds it.
+    fn record_anchor(&mut self, id: &str, local: usize) {
+        let fraction = self.vertical_reader.fraction;
+        if id.starts_with(STREAM_PREFIX)
+            && !self.stream.as_ref().is_some_and(|s| s.book.id == id)
+        {
+            if !self.private {
+                self.sources.set_stream_page(&id[STREAM_PREFIX.len()..], local);
+            }
+        } else {
+            self.record_position(id, local, fraction);
+        }
+    }
+    fn update_stream(&mut self) {
+        if let Some(stream) = self.stream.as_ref() {
+            let id = stream.book.id.clone();
+            if !matches!(&self.screen, Screen::Reader(current) if current == &id) {
+                self.stream = None;
+            } else if let Some(book) = self.imported_book(&stream.metadata) {
+                self.remap_page_keys(&id, &book.id);
+                self.stream = None;
+                if self.vertical {
+                    // In the strip only the id behind the segment changes;
+                    // textures, offset and the strip itself stay put.
+                    self.screen = Screen::Reader(book.id);
+                } else {
+                    let mut book = book;
+                    book.current_page = self.page.min(book.page_count.saturating_sub(1));
+                    book.page_fraction = 0.;
+                    self.open_reader(&book);
+                }
             } else {
-                0.
-            };
-            let pages: Vec<_> = self.pages.keys().filter(|(key, _)| key == &id).cloned().collect();
-            for key in pages {
-                if let Some(texture) = self.pages.remove(&key) {
-                    self.pages.insert((book.id.clone(), key.1), texture);
+                let task = stream.task.clone();
+                if let Some(state) = self.sources.stream_state(&task) {
+                    let Some(stream) = self.stream.as_mut() else {
+                        return;
+                    };
+                    if state.total > 0 {
+                        stream.book.page_count = state.total;
+                    }
+                    if state.signature != stream.signature {
+                        stream.signature = state.signature.clone();
+                        stream.waiting.clear();
+                        self.pages.retain(|(key, _), _| key != &id);
+                        self.page_errors.retain(|(key, _), _| key != &id);
+                        self.page_pending.retain(|(key, _)| key != &id);
+                        self.prefetch_blocked.retain(|(key, _)| key != &id);
+                        self.page_generation += 1;
+                        self.worker
+                            .generation
+                            .store(self.page_generation, Ordering::Relaxed);
+                    }
+                    let Some(stream) = self.stream.as_mut() else {
+                        return;
+                    };
+                    if state.done != stream.done || state.stopped != stream.stopped {
+                        stream.done = state.done;
+                        stream.stopped = state.stopped;
+                        stream.waiting.clear();
+                    }
+                    if let Some(wanted) = stream.resume.filter(|_| state.total > 0) {
+                        stream.resume = None;
+                        stream.book.current_page = wanted.min(state.total - 1);
+                        stream.book.page_fraction = 0.;
+                        let book = stream.book.clone();
+                        self.open_reader(&book);
+                        return;
+                    }
                 }
             }
-            self.stream = None;
-            self.open_reader(&book);
-            return;
         }
-        let task = stream.task.clone();
-        let Some(state) = self.sources.stream_state(&task) else {
-            return;
-        };
-        let Some(stream) = self.stream.as_mut() else {
-            return;
-        };
-        if state.total > 0 {
-            stream.book.page_count = state.total;
+        // The following segment's stream hands over to its library copy the
+        // same way once its task is imported.
+        if let Some((stream_id, book)) = self.next_stream.as_ref().and_then(|next| {
+            self.imported_book(&next.metadata)
+                .map(|book| (next.book.id.clone(), book))
+        }) {
+            self.remap_page_keys(&stream_id, &book.id);
+            if self
+                .vertical_next
+                .as_ref()
+                .is_some_and(|(seg, _)| seg == &stream_id)
+            {
+                self.vertical_next = Some((book.id, book.page_count));
+            }
+            self.next_stream = None;
         }
-        if state.signature != stream.signature {
-            stream.signature = state.signature.clone();
-            stream.waiting.clear();
-            self.pages.retain(|(key, _), _| key != &id);
-            self.page_errors.retain(|(key, _), _| key != &id);
-            self.page_pending.retain(|(key, _)| key != &id);
-            self.prefetch_blocked.retain(|(key, _)| key != &id);
-            self.page_generation += 1;
-            self.worker
-                .generation
-                .store(self.page_generation, Ordering::Relaxed);
+        if let Some(next) = self.next_stream.as_mut()
+            && let Some(state) = self.sources.stream_state(&next.task)
+        {
+            if state.total > 0 {
+                next.book.page_count = state.total;
+                if let Some(seg) = self.vertical_next.as_mut()
+                    && seg.0 == next.book.id
+                {
+                    seg.1 = state.total;
+                }
+            }
+            if state.signature != next.signature {
+                next.signature = state.signature.clone();
+                next.waiting.clear();
+                let id = next.book.id.clone();
+                self.pages.retain(|(key, _), _| key != &id);
+                self.page_errors.retain(|(key, _), _| key != &id);
+                self.page_pending.retain(|(key, _)| key != &id);
+                self.prefetch_blocked.retain(|(key, _)| key != &id);
+            }
+            if state.done != next.done || state.stopped != next.stopped {
+                next.done = state.done;
+                next.stopped = state.stopped;
+                next.waiting.clear();
+            }
         }
-        let Some(stream) = self.stream.as_mut() else {
-            return;
-        };
-        if state.done != stream.done || state.stopped != stream.stopped {
-            stream.done = state.done;
-            stream.stopped = state.stopped;
-            stream.waiting.clear();
-        }
-        if let Some(wanted) = stream.resume.filter(|_| state.total > 0) {
-            stream.resume = None;
-            stream.book.current_page = wanted.min(state.total - 1);
-            stream.book.page_fraction = 0.;
-            let book = stream.book.clone();
-            self.open_reader(&book);
+        // A finished previous chapter swaps its stream id for the book id so
+        // its still-loaded pages keep resolving.
+        if let Some((prev_id, prev_count)) = self.vertical_prev.clone()
+            && let Some(task) = prev_id.strip_prefix(STREAM_PREFIX)
+            && let Some(metadata) = self.sources.stream_metadata(task)
+            && let Some(book) = self.imported_book(&metadata)
+        {
+            self.remap_page_keys(&prev_id, &book.id);
+            self.vertical_prev = Some((book.id, prev_count.min(book.page_count)));
         }
     }
     /// Opens the previous/next chapter in the source's order when that list
@@ -575,8 +989,23 @@ impl ReaderApp {
         }
         false
     }
+    fn stream_for(&self, id: &str) -> Option<&StreamBook> {
+        self.stream
+            .as_ref()
+            .filter(|stream| stream.book.id == id)
+            .or(self
+                .next_stream
+                .as_ref()
+                .filter(|stream| stream.book.id == id))
+    }
+    fn stream_for_mut(&mut self, id: &str) -> Option<&mut StreamBook> {
+        if self.stream.as_mut().is_some_and(|s| s.book.id == id) {
+            return self.stream.as_mut();
+        }
+        self.next_stream.as_mut().filter(|s| s.book.id == id)
+    }
     fn stream_waiting_text(&self, id: &str, page: usize) -> Option<String> {
-        let stream = self.stream.as_ref().filter(|stream| stream.book.id == id)?;
+        let stream = self.stream_for(id)?;
         if !stream.waiting.contains(&page) {
             return None;
         }
@@ -742,11 +1171,36 @@ impl ReaderApp {
                         match key.as_str() {
                             "theme" => self.theme = value,
                             "reduce-motion" => self.reduced = value == "true",
-                            "reading-direction" => self.rtl = value == "rtl",
+                            "reading-direction" => {
+                                self.reader_globals.rtl = value == "rtl";
+                                self.rtl = self.reader_globals.rtl;
+                            }
                             "private" => self.private = value == "true",
                             "reading-mode" => {
+                                self.reader_globals.mode = match value.as_str() {
+                                    "vertical" => crate::reader_prefs::Mode::Vertical,
+                                    "spread" => crate::reader_prefs::Mode::Spread,
+                                    _ => crate::reader_prefs::Mode::Paged,
+                                };
                                 self.vertical = value == "vertical";
                                 self.spread = value == "spread";
+                            }
+                            "reader-crop" => {
+                                self.reader_globals.crop = value == "true";
+                                self.crop = self.reader_globals.crop;
+                            }
+                            "reader-fit" => {
+                                self.reader_globals.fit_width = value == "true";
+                                self.fit_width = self.reader_globals.fit_width;
+                            }
+                            "reader-brightness" => {
+                                self.reader_globals.brightness =
+                                    value.parse::<f32>().unwrap_or(1.);
+                                self.brightness = self.reader_globals.brightness();
+                            }
+                            "reader-spread-offset" => {
+                                self.reader_globals.spread_offset = value == "true";
+                                self.spread_offset = self.reader_globals.spread_offset;
                             }
                             "font-scale" => {
                                 self.font_scale = value.parse::<f32>().unwrap_or(1.).clamp(1., 2.)
@@ -792,16 +1246,12 @@ impl ReaderApp {
                         }
                         self.page_pending.remove(&(id.clone(), page));
                         if result.as_ref().is_err_and(|error| error == PAGE_NOT_READY) {
-                            if let Some(stream) =
-                                self.stream.as_mut().filter(|stream| stream.book.id == id)
-                            {
+                            if let Some(stream) = self.stream_for_mut(&id) {
                                 stream.waiting.insert(page);
                             }
                             continue;
                         }
-                        if !matches!(&self.screen,Screen::Reader(current) if current==&id)
-                            || page.abs_diff(self.page) > 2
-                        {
+                        if !self.wants_page(&id, page) {
                             continue;
                         }
                         match result {
@@ -819,9 +1269,18 @@ impl ReaderApp {
                                         )
                                     })
                                     .collect();
-                                self.pages
-                                    .insert((id.clone(), page), PageTexture { tiles, size });
-                                self.trim_pages(&id);
+                                self.pages.insert(
+                                    (id.clone(), page),
+                                    PageTexture {
+                                        tiles,
+                                        size,
+                                        content: Rect::from_min_max(
+                                            pos2(image.content[0], image.content[1]),
+                                            pos2(image.content[2], image.content[3]),
+                                        ),
+                                    },
+                                );
+                                self.trim_pages();
                                 if matches!(&self.screen,Screen::Reader(current) if current==&id)
                                     && self.page == page
                                 {
@@ -968,9 +1427,8 @@ impl ReaderApp {
             return;
         }
         if self
-            .stream
-            .as_ref()
-            .is_some_and(|stream| stream.book.id == id && stream.waiting.contains(&page))
+            .stream_for(id)
+            .is_some_and(|stream| stream.waiting.contains(&page))
         {
             return;
         }
@@ -986,9 +1444,10 @@ impl ReaderApp {
             });
         }
     }
-    fn trim_pages(&mut self, id: &str) {
+    fn trim_pages(&mut self) {
+        let (near, essential) = self.page_keep_sets();
         self.pages
-            .retain(|(key, page), _| key == id && page.abs_diff(self.page) <= 2);
+            .retain(|key, _| near.contains(key) || essential.contains(key));
         while self
             .pages
             .values()
@@ -999,10 +1458,8 @@ impl ReaderApp {
             let Some(key) = self
                 .pages
                 .keys()
-                .filter(|(_, page)| {
-                    *page != self.page && !(self.spread && !self.vertical && *page == self.page + 1)
-                })
-                .max_by_key(|(_, page)| page.abs_diff(self.page))
+                .filter(|key| !essential.contains(*key))
+                .max_by_key(|(id, page)| self.page_distance(id, *page))
                 .cloned()
             else {
                 break;
@@ -1011,14 +1468,104 @@ impl ReaderApp {
             self.prefetch_blocked.insert(key);
         }
     }
+    /// The effective reader settings of one book: a saved per-work entry
+    /// wins, then the source's viewer hint, then the global defaults.
+    fn apply_reader_prefs(&mut self, book: &Book) {
+        let metadata = self.reading_metadata(&book.id);
+        let key = crate::reader_prefs::key_for(metadata.as_ref(), &book.id);
+        let mut prefs = self.reader_prefs.get(&key).cloned().unwrap_or_else(|| {
+            let mut prefs = self.reader_globals.clone();
+            if let Some(viewer) = metadata.and_then(|metadata| {
+                self.sources
+                    .viewer_hint(&metadata.source_id, &metadata.manga_id)
+            }) {
+                match viewer {
+                    yejian_sources::Viewer::RightToLeft => {
+                        prefs.mode = crate::reader_prefs::Mode::Paged;
+                        prefs.rtl = true;
+                    }
+                    yejian_sources::Viewer::LeftToRight => {
+                        prefs.mode = crate::reader_prefs::Mode::Paged;
+                        prefs.rtl = false;
+                    }
+                    yejian_sources::Viewer::Vertical | yejian_sources::Viewer::Webtoon => {
+                        prefs.mode = crate::reader_prefs::Mode::Vertical;
+                    }
+                    yejian_sources::Viewer::Unknown => {}
+                }
+            }
+            prefs
+        });
+        prefs.brightness = prefs.brightness();
+        self.vertical = prefs.mode == crate::reader_prefs::Mode::Vertical;
+        self.spread = prefs.mode == crate::reader_prefs::Mode::Spread;
+        self.rtl = prefs.rtl;
+        self.crop = prefs.crop;
+        self.fit_width = prefs.fit_width;
+        self.brightness = prefs.brightness;
+        self.spread_offset = prefs.spread_offset;
+    }
+    fn current_prefs(&self) -> crate::reader_prefs::ReaderPrefs {
+        crate::reader_prefs::ReaderPrefs {
+            mode: if self.vertical {
+                crate::reader_prefs::Mode::Vertical
+            } else if self.spread {
+                crate::reader_prefs::Mode::Spread
+            } else {
+                crate::reader_prefs::Mode::Paged
+            },
+            rtl: self.rtl,
+            crop: self.crop,
+            fit_width: self.fit_width,
+            brightness: self.brightness,
+            spread_offset: self.spread_offset,
+        }
+    }
+    /// Changes made inside the reader always land on the current work.
+    fn save_reader_prefs(&mut self) {
+        let Screen::Reader(id) = self.screen.clone() else {
+            return;
+        };
+        let key = crate::reader_prefs::key_for(self.reading_metadata(&id).as_ref(), &id);
+        self.reader_prefs.insert(key, self.current_prefs());
+        if let Err(error) = crate::reader_prefs::save(&self.root, &self.reader_prefs) {
+            self.error = Some(format!("阅读设置保存失败：{error:#}"));
+        }
+    }
+    /// The "default for every work" action copies the live settings into the
+    /// global keys works without their own entry resolve from.
+    fn save_reader_globals(&mut self) {
+        self.reader_globals = self.current_prefs();
+        self.setting(
+            "reading-mode",
+            match self.reader_globals.mode {
+                crate::reader_prefs::Mode::Vertical => "vertical",
+                crate::reader_prefs::Mode::Spread => "spread",
+                crate::reader_prefs::Mode::Paged => "paged",
+            }
+            .into(),
+        );
+        self.setting(
+            "reading-direction",
+            if self.rtl { "rtl" } else { "ltr" }.into(),
+        );
+        self.setting("reader-crop", self.crop.to_string());
+        self.setting("reader-fit", self.fit_width.to_string());
+        self.setting("reader-brightness", self.brightness.to_string());
+        self.setting("reader-spread-offset", self.spread_offset.to_string());
+    }
     fn open_reader(&mut self, book: &Book) {
         self.flush_position();
+        self.apply_reader_prefs(book);
         if !matches!(self.screen, Screen::Reader(_)) {
             self.reader_return = self.screen.clone();
         }
         self.page = book.current_page.min(book.page_count.saturating_sub(1));
         self.screen = Screen::Reader(book.id.clone());
         self.vertical_reader.reset(self.page, book.page_fraction);
+        self.vertical_prev = None;
+        self.vertical_next = None;
+        self.next_stream = None;
         self.saved_position = None;
         self.chapter_dialog = None;
         self.reader_options = false;
@@ -1061,7 +1608,8 @@ impl ReaderApp {
             return;
         }
         self.page = page;
-        self.vertical_reader.reset(page, 0.);
+        let base = self.vertical_prev.as_ref().map(|(_, c)| *c).unwrap_or(0);
+        self.vertical_reader.reset(base + page, 0.);
         self.pan = Vec2::ZERO;
         self.page_generation += 1;
         self.worker
@@ -1083,6 +1631,9 @@ impl ReaderApp {
             Screen::Reader(_) => {
                 self.flush_position();
                 self.vertical_reader.stop();
+                self.vertical_prev = None;
+                self.vertical_next = None;
+                self.next_stream = None;
                 self.page_generation += 1;
                 self.worker
                     .generation
@@ -2664,10 +3215,24 @@ impl ReaderApp {
         self.vertical = mode == "vertical";
         self.spread = mode == "spread";
         self.vertical_reader.reset(self.page, 0.);
+        self.vertical_prev = None;
+        self.vertical_next = None;
+        self.next_stream = None;
         self.zoom = 1.;
         self.pan = Vec2::ZERO;
         self.pending_reader_tap = None;
-        self.setting("reading-mode", mode.into());
+        if matches!(self.screen, Screen::Reader(_)) {
+            self.save_reader_prefs();
+        } else {
+            self.reader_globals.mode = if self.vertical {
+                crate::reader_prefs::Mode::Vertical
+            } else if self.spread {
+                crate::reader_prefs::Mode::Spread
+            } else {
+                crate::reader_prefs::Mode::Paged
+            };
+            self.setting("reading-mode", mode.into());
+        }
     }
     fn reader_tap(&mut self, id: &str, relative: f32, step: i32) {
         if self.vertical || self.zoom > 1. || (0.27..=0.73).contains(&relative) {
@@ -2687,12 +3252,20 @@ impl ReaderApp {
             .rect_filled(area, 0., Color32::from_rgb(18, 20, 22));
         self.ask_page(id, self.page);
         let step = if self.spread && !self.vertical && area.width() > 700. {
-            2
+            if self.spread_offset && self.page == 0 {
+                1
+            } else {
+                2
+            }
         } else {
             1
         };
-        if self.page + 1 < book.page_count {
-            self.ask_page(id, self.page + 1);
+        let (pair_base, _) = spread_pair(self.page, self.spread_offset && step != 1);
+        if pair_base + 1 < book.page_count {
+            self.ask_page(id, pair_base + 1);
+        }
+        if pair_base != self.page {
+            self.ask_page(id, pair_base);
         }
         let content = area.shrink2(vec2(8., if self.controls { 64. } else { 0. }));
         let input_blocked = self.reader_input_blocked();
@@ -2720,23 +3293,31 @@ impl ReaderApp {
         }
         if gesture.drag_started() {
             self.reader_drag = 0.;
+            self.reader_drag_y = 0.;
             self.vertical_reader.stop();
             self.pending_reader_tap = None;
         }
         if gesture.dragged() {
-            self.reader_drag += ui.input(|i| i.pointer.delta().x);
+            let delta = ui.input(|i| i.pointer.delta());
+            self.reader_drag += delta.x;
+            self.reader_drag_y += delta.y;
         }
-        if gesture.dragged() && self.zoom > 1. {
+        let fit_single = self.fit_width && !self.vertical && step == 1;
+        if gesture.dragged() && (self.zoom > 1. || fit_single) {
             let delta = ui.input(|i| i.pointer.delta());
             self.pan += if self.vertical {
                 vec2(delta.x, 0.)
-            } else {
+            } else if self.zoom > 1. {
                 delta
+            } else {
+                vec2(0., delta.y)
             };
         }
         if gesture.drag_stopped() && self.zoom <= 1. && !self.vertical {
             let distance = self.reader_drag;
+            let distance_y = self.reader_drag_y;
             self.reader_drag = 0.;
+            self.reader_drag_y = 0.;
             if distance.abs() > 45. {
                 self.next_page(
                     id,
@@ -2746,6 +3327,14 @@ impl ReaderApp {
                         -step
                     },
                 );
+            } else if fit_single && distance_y.abs() > 45. {
+                // Once the fitted page cannot pan any further, a vertical
+                // swipe turns like the usual next/previous controls.
+                if distance_y < 0. && self.pan.y <= -self.reader_fit_limit + 1. {
+                    self.next_page(id, step);
+                } else if distance_y > 0. && self.pan.y >= self.reader_fit_limit - 1. {
+                    self.next_page(id, -step);
+                }
             }
         }
         if input_blocked {
@@ -2832,8 +3421,14 @@ impl ReaderApp {
                 self.ask_page(id, self.page);
             }
         } else if let Some(texture) = self.pages.get(&(id.into(), self.page)) {
-            let first_on_right = step == 2 && self.rtl;
-            let available = if step == 2 {
+            let pair = step == 2;
+            let (base, partner) = if pair {
+                spread_pair(self.page, self.spread_offset)
+            } else {
+                (self.page, None)
+            };
+            let first_on_right = pair && self.rtl;
+            let available = if pair {
                 Rect::from_min_size(
                     content.min
                         + vec2(
@@ -2849,18 +3444,47 @@ impl ReaderApp {
             } else {
                 content
             };
-            let size = texture.size;
-            let scale = (available.width() / size.x).min(available.height() / size.y);
-            let size = size * scale * self.zoom;
-            let limit = ((size - available.size()) * 0.5).max(Vec2::ZERO);
-            self.pan.x = self.pan.x.clamp(-limit.x, limit.x);
-            self.pan.y = self.pan.y.clamp(-limit.y, limit.y);
-            let center = available.center();
-            let image_rect = Rect::from_center_size(center + self.pan, size);
-            self.hitboxes.insert("reader-image".into(), image_rect);
-            texture.paint(&ui.painter().with_clip_rect(content), image_rect);
-            self.rendered_page_nodes = 1;
-            if step == 2 {
+            let painter = ui.painter().with_clip_rect(content);
+            let crop = self.crop;
+            let slot = |texture: &PageTexture, center: Pos2, pan: Vec2, zoom: f32| {
+                let size = texture.shown_size(crop);
+                let scale = (available.width() / size.x).min(available.height() / size.y);
+                let target = Rect::from_center_size(center + pan, size * scale * zoom);
+                texture.paint(&painter, target, crop);
+                target
+            };
+            if base == self.page {
+                let size = texture.shown_size(self.crop);
+                let scale = if fit_single {
+                    available.width() / size.x
+                } else {
+                    (available.width() / size.x).min(available.height() / size.y)
+                };
+                let size = size * scale * self.zoom;
+                let limit = ((size - available.size()) * 0.5).max(Vec2::ZERO);
+                self.reader_fit_limit = if pair { 0. } else { limit.y };
+                self.pan.x = self.pan.x.clamp(-limit.x, limit.x);
+                self.pan.y = self.pan.y.clamp(-limit.y, limit.y);
+                let image_rect = Rect::from_center_size(available.center() + self.pan, size);
+                self.hitboxes.insert("reader-image".into(), image_rect);
+                texture.paint(&painter, image_rect, self.crop);
+                self.rendered_page_nodes += 1;
+            } else {
+                self.reader_fit_limit = 0.;
+                if let Some(first) = self.pages.get(&(id.into(), base)) {
+                    slot(first, available.center(), self.pan, self.zoom);
+                    self.rendered_page_nodes += 1;
+                } else {
+                    painter.text(
+                        available.center(),
+                        Align2::CENTER_CENTER,
+                        "正在打开这一页…",
+                        FontId::proportional(15.),
+                        Color32::LIGHT_GRAY,
+                    );
+                }
+            }
+            if let Some(partner) = partner {
                 let second_center = available.center()
                     + vec2(
                         if first_on_right {
@@ -2870,38 +3494,25 @@ impl ReaderApp {
                         },
                         0.,
                     );
-                if let Some(second) = self.pages.get(&(id.into(), self.page + 1)) {
-                    let size = second.size;
-                    let scale = (available.width() / size.x).min(available.height() / size.y);
-                    let target = Rect::from_center_size(
-                        available.center()
-                            + vec2(
-                                if first_on_right {
-                                    -available.width()
-                                } else {
-                                    available.width()
-                                },
-                                0.,
-                            )
-                            + self.pan,
-                        size * scale * self.zoom,
-                    );
-                    second.paint(&ui.painter().with_clip_rect(content), target);
+                if let Some(texture) = self.pages.get(&(id.into(), partner)) {
+                    let target = slot(texture, second_center, self.pan, self.zoom);
+                    if partner == self.page {
+                        self.hitboxes.insert("reader-image".into(), target);
+                    }
                     self.rendered_page_nodes += 1;
-                } else if self.page + 1 < book.page_count {
+                } else if partner < book.page_count {
                     if let Some(error) = self
                         .page_errors
-                        .get(&(id.to_string(), self.page + 1))
+                        .get(&(id.to_string(), partner))
                         .cloned()
                     {
-                        let page = self.page + 1;
                         ui.put(
                             Rect::from_center_size(
                                 second_center,
                                 vec2(available.width() - 28., 130.),
                             ),
                             Label::new(
-                                RichText::new(format!("第 {} 页无法打开\n{error}", page + 1))
+                                RichText::new(format!("第 {} 页无法打开\n{error}", partner + 1))
                                     .color(Color32::WHITE),
                             )
                             .wrap(),
@@ -2913,9 +3524,9 @@ impl ReaderApp {
                             "重试这一页",
                             false,
                         ) {
-                            self.page_errors.remove(&(id.to_string(), page));
-                            self.prefetch_blocked.remove(&(id.to_string(), page));
-                            self.ask_page(id, page);
+                            self.page_errors.remove(&(id.to_string(), partner));
+                            self.prefetch_blocked.remove(&(id.to_string(), partner));
+                            self.ask_page(id, partner);
                         }
                     } else {
                         ui.painter().text(
@@ -2935,6 +3546,13 @@ impl ReaderApp {
             ui.put(
                 Rect::from_center_size(content.center(), vec2(content.width() - 40., 120.)),
                 Label::new(RichText::new(text).size(15.).color(Color32::LIGHT_GRAY)).wrap(),
+            );
+        }
+        if self.brightness < 1. {
+            ui.painter().rect_filled(
+                content,
+                0.,
+                Color32::from_black_alpha(((1. - self.brightness) * 255.).round() as u8),
             );
         }
         if !matches!(&self.screen, Screen::Reader(current) if current == id) {
@@ -3134,39 +3752,79 @@ impl ReaderApp {
             -(width - content.width()) / 2.,
             (width - content.width()) / 2.,
         );
-        let heights: HashMap<usize, f32> = self
-            .pages
-            .iter()
-            .filter(|((key, _), _)| key == id)
-            .map(|((_, page), image)| (*page, image.size.y / image.size.x * width))
-            .collect();
-        let next_chapter = self.adjacent_chapter(id, 1);
-        let next_online = next_chapter.is_none()
-            && self
-                .reading_metadata(id)
-                .is_some_and(|metadata| self.sources.has_adjacent_online(&metadata, 1));
-        let footer = if next_chapter.is_some() || next_online { 68. } else { 0. };
-        self.vertical_reader
-            .settle(count, content.height() - footer, |page| {
-                heights.get(&page).copied()
-            });
-        if self.page != self.vertical_reader.page {
-            self.page = self.vertical_reader.page;
+        // The strip is the current chapter plus at most one following
+        // segment; global indices run across both. The next chapter is
+        // queued once the anchor reaches its last pages, and joins the
+        // strip as soon as its page count is known — until then a thin
+        // band below the last page stands in for it.
+        let prev_count = self.vertical_prev.as_ref().map(|(_, c)| *c).unwrap_or(0);
+        let near_end = self.vertical_reader.page.saturating_sub(prev_count) + 3 >= count;
+        let peek = self.peek_next(id, near_end);
+        let loading_next = matches!(peek, Peek::Loading);
+        match peek {
+            Peek::Ready(seg_id, seg_count, seg_meta) => {
+                if self
+                    .vertical_next
+                    .as_ref()
+                    .is_none_or(|(old, _)| old != &seg_id)
+                {
+                    self.next_stream =
+                        seg_meta.and_then(|meta| self.stream_segment_book(&seg_id, &meta));
+                }
+                self.vertical_next = Some((seg_id, seg_count));
+            }
+            Peek::Loading => {}
+            Peek::Missing => {
+                self.vertical_next = None;
+                self.next_stream = None;
+            }
+        }
+        let footer = if loading_next { 56. } else { 0. };
+        let mut segments = self.strip_segments();
+        let mut total: usize = segments.iter().map(|(_, c)| *c).sum();
+        let mut heights = self.strip_heights(&segments, width);
+        self.vertical_reader.settle(total, content.height() - footer, |g| {
+            heights.get(&g).copied()
+        });
+        // The anchor entered the following segment: that chapter becomes
+        // the reader's book, keeping the exact scroll offset.
+        let cur_id = if self.vertical_reader.page >= prev_count + count
+            && self.vertical_next.is_some()
+        {
+            let (new_id, _) = self.cross_vertical(id, count);
+            segments = self.strip_segments();
+            total = segments.iter().map(|(_, c)| *c).sum();
+            heights = self.strip_heights(&segments, width);
+            new_id
+        } else {
+            id.to_string()
+        };
+        let g = self.vertical_reader.page;
+        if let Some((seg, local)) = Self::locate(&segments, g)
+            && seg == cur_id
+            && self.page != local
+        {
+            self.page = local;
             self.prefetch_blocked.clear();
-            self.trim_pages(id);
         }
-        for page in self.page.saturating_sub(1)..=(self.page + 2).min(count.saturating_sub(1)) {
-            self.ask_page(id, page);
+        self.trim_pages();
+        for global in g.saturating_sub(1)..=(g + 2).min(total.saturating_sub(1)) {
+            if let Some((seg, local)) = Self::locate(&segments, global) {
+                self.ask_page(seg, local);
+            }
         }
-        let height = heights.get(&self.page).copied().unwrap_or(content.height());
+        let height = heights.get(&g).copied().unwrap_or(content.height());
         let mut top = content.top() - self.vertical_reader.top_offset(height);
-        let start = self.page.saturating_sub(1);
-        if start < self.page {
+        let start = g.saturating_sub(1);
+        if start < g {
             top -= heights.get(&start).copied().unwrap_or(content.height());
         }
         let painter = ui.painter().with_clip_rect(content);
-        for page in start..=(self.page + 2).min(count.saturating_sub(1)) {
-            let height = heights.get(&page).copied().unwrap_or(content.height());
+        for global in start..=(g + 2).min(total.saturating_sub(1)) {
+            let Some((seg, local)) = Self::locate(&segments, global) else {
+                continue;
+            };
+            let height = heights.get(&global).copied().unwrap_or(content.height());
             let target = Rect::from_min_size(
                 pos2(content.center().x - width / 2. + self.pan.x, top),
                 vec2(width, height),
@@ -3176,33 +3834,37 @@ impl ReaderApp {
                 continue;
             }
             self.hitboxes
-                .insert(format!("vertical-page-{page}"), target);
-            if let Some(texture) = self.pages.get(&(id.to_string(), page)) {
-                texture.paint(&painter, target);
+                .insert(format!("vertical-page-{global}"), target);
+            if let Some(texture) = self.pages.get(&(seg.to_string(), local)) {
+                texture.paint(&painter, target, self.crop);
                 self.rendered_page_nodes += 1;
-            } else if let Some(error) = self.page_errors.get(&(id.to_string(), page)).cloned() {
+            } else if let Some(error) = self
+                .page_errors
+                .get(&(seg.to_string(), local))
+                .cloned()
+            {
                 let center = target.intersect(content).center();
                 ui.put(
                     Rect::from_center_size(center, vec2(content.width() - 40., 120.)),
                     Label::new(
-                        RichText::new(format!("第 {} 页无法打开\n{error}", page + 1))
+                        RichText::new(format!("第 {} 页无法打开\n{error}", local + 1))
                             .color(Color32::WHITE),
                     )
                     .wrap(),
                 );
                 if self.button(
                     ui,
-                    &format!("retry-page-{page}"),
+                    &format!("retry-page-{global}"),
                     Rect::from_center_size(center + vec2(0., 82.), vec2(144., 44.)),
                     "重试这一页",
                     false,
                 ) {
-                    self.page_errors.remove(&(id.to_string(), page));
-                    self.ask_page(id, page);
+                    self.page_errors.remove(&(seg.to_string(), local));
+                    self.ask_page(seg, local);
                 }
             } else {
                 let text = self
-                    .stream_waiting_text(id, page)
+                    .stream_waiting_text(seg, local)
                     .unwrap_or_else(|| "正在打开这一页…".into());
                 painter.text(
                     target.intersect(content).center(),
@@ -3213,30 +3875,49 @@ impl ReaderApp {
                 );
             }
         }
-        if self.pages.contains_key(&(id.to_string(), self.page))
+        if let Some((seg, local)) = Self::locate(&segments, g)
+            && self.pages.contains_key(&(seg.to_string(), local))
             && (now - self.last_position_save >= 0.25
                 || (!gesture.dragged() && !self.vertical_reader.active() && scroll.abs() < 0.1))
         {
-            self.record_page(id, self.page);
+            self.record_anchor(seg, local);
             self.last_position_save = now;
         }
-        if (next_chapter.is_some() || next_online)
+        if loading_next
             && let Some(last) = self
                 .hitboxes
-                .get(&format!("vertical-page-{}", count.saturating_sub(1)))
+                .get(&format!("vertical-page-{}", total.saturating_sub(1)))
                 .copied()
         {
-            let button = Rect::from_min_size(
+            let band = Rect::from_min_size(
                 pos2(
                     content.center().x - (content.width() - 24.).min(420.) / 2.,
-                    last.bottom() + 12.,
+                    last.bottom() + 8.,
                 ),
-                vec2((content.width() - 24.).min(420.), 48.),
+                vec2((content.width() - 24.).min(420.), 40.),
             );
-            if content.contains_rect(button)
-                && self.button(ui, "reader-next-chapter", button, "下一章", true)
-            {
-                self.open_neighbor(id, 1);
+            if band.intersects(content) {
+                ui.painter().rect_filled(band, 10., Color32::from_black_alpha(150));
+                ui.painter().text(
+                    band.center(),
+                    Align2::CENTER_CENTER,
+                    "正在加载下一章…",
+                    FontId::proportional(14.),
+                    Color32::LIGHT_GRAY,
+                );
+            }
+        }
+        let first_id = segments
+            .first()
+            .map(|(seg, _)| seg.as_str())
+            .unwrap_or(cur_id.as_str());
+        if g == 0 && self.has_neighbor(first_id, -1) {
+            let button = Rect::from_center_size(
+                pos2(content.center().x, content.top() + 30.),
+                vec2((content.width() - 24.).min(300.), 44.),
+            );
+            if self.button(ui, "reader-prev-chapter", button, "上一章", true) {
+                self.open_neighbor(first_id, -1);
             }
         }
     }
@@ -3489,6 +4170,7 @@ impl ReaderApp {
                                 "从右向左翻页",
                                 "适合日式漫画的阅读顺序",
                             ) {
+                                self.reader_globals.rtl = self.rtl;
                                 self.setting(
                                     "reading-direction",
                                     if self.rtl { "rtl" } else { "ltr" }.into(),
@@ -3650,7 +4332,23 @@ impl ReaderApp {
                     ui.horizontal(|ui| {
                         ui.heading("阅读设置");
                     });
-                    let height = (ctx.content_rect().height() - 180.).max(120.);
+                    let mut safe = ctx.content_rect();
+                    if let Ok(insets) = yejian_platform::safe_insets() {
+                        let scale = ctx.pixels_per_point();
+                        safe = safe.intersect(Rect::from_min_max(
+                            safe.min
+                                + vec2(
+                                    insets.left as f32 / scale,
+                                    insets.top as f32 / scale,
+                                ),
+                            safe.max
+                                - vec2(
+                                    insets.right as f32 / scale,
+                                    insets.bottom as f32 / scale,
+                                ),
+                        ));
+                    }
+                    let height = (safe.height() - 180.).max(120.);
                     ScrollArea::vertical().max_height(height).show(ui, |ui| {
                         ui.label("阅读方式");
                         let mode = if self.vertical {
@@ -3689,10 +4387,67 @@ impl ReaderApp {
                             .insert("reader-direction".into(), direction.rect);
                         if direction.clicked() {
                             self.rtl = !self.rtl;
-                            self.setting(
-                                "reading-direction",
-                                if self.rtl { "rtl" } else { "ltr" }.into(),
+                            self.save_reader_prefs();
+                        }
+                        for (name, hitbox, on) in [
+                            ("裁剪白边", "reader-crop", self.crop),
+                            ("适应宽度", "reader-fit", self.fit_width),
+                            ("双页首页单独", "reader-spread-offset", self.spread_offset),
+                        ] {
+                            let toggle = ui.add_sized(
+                                [ui.available_width(), 48.],
+                                Button::new(format!(
+                                    "{name}：{}",
+                                    if on { "开" } else { "关" }
+                                ))
+                                .wrap(),
                             );
+                            self.hitboxes.insert(hitbox.into(), toggle.rect);
+                            if toggle.clicked() {
+                                match hitbox {
+                                    "reader-crop" => self.crop = !self.crop,
+                                    "reader-fit" => self.fit_width = !self.fit_width,
+                                    _ => self.spread_offset = !self.spread_offset,
+                                }
+                                self.save_reader_prefs();
+                            }
+                        }
+                        // `Slider` places its rail, drag value and text in a
+                        // horizontal row that is laid out at its desired width
+                        // even inside `add_sized`, so the rail must be shrunk
+                        // to the space that actually remains or the whole modal
+                        // grows past the viewport at large font scales.
+                        let brightness = ui.scope_builder(
+                            UiBuilder::new()
+                                .max_rect(Rect::from_min_size(
+                                    ui.cursor().min,
+                                    vec2(ui.available_width(), 48.),
+                                ))
+                                .layout(Layout::left_to_right(Align::Center)),
+                            |ui| {
+                                ui.label("亮度");
+                                ui.spacing_mut().slider_width =
+                                    (ui.available_width() - 120.).max(40.);
+                                ui.add(
+                                    Slider::new(&mut self.brightness, 0.3..=1.)
+                                        .fixed_decimals(2),
+                                )
+                            },
+                        );
+                        self.hitboxes
+                            .insert("reader-brightness".into(), brightness.response.rect);
+                        if brightness.inner.changed() {
+                            self.brightness = self.brightness.clamp(0.3, 1.);
+                            self.save_reader_prefs();
+                        }
+                        let defaults = ui.add_sized(
+                            [ui.available_width(), 48.],
+                            Button::new("设为所有作品的默认").wrap(),
+                        );
+                        self.hitboxes
+                            .insert("reader-save-default".into(), defaults.rect);
+                        if defaults.clicked() {
+                            self.save_reader_globals();
                         }
                         let reset = ui.add_sized(
                             [ui.available_width(), 48.],
@@ -3914,6 +4669,7 @@ mod tests {
                 TextureOptions::LINEAR,
             )],
             size: vec2(2., 2.),
+            content: Rect::from_min_max(Pos2::ZERO, pos2(1., 1.)),
         }
     }
     #[test]
@@ -4115,20 +4871,309 @@ mod tests {
         assert!(!selected.contains(&"foreign".into()));
     }
     #[test]
+    fn reader_prefs_save_per_work_and_beat_the_viewer_hint() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = Context::default();
+        let mut app = ReaderApp::new(root.path().into(), ctx.clone());
+        app.books = vec![book("one"), book("two"), book("other")];
+        let metadata = |chapter: &str| ChapterMetadata {
+            source_id: "source.a".into(),
+            manga_id: "story".into(),
+            manga_title: "Story".into(),
+            chapter_id: chapter.into(),
+            chapter_title: chapter.into(),
+            chapter_number: None,
+            volume_number: None,
+        };
+        app.replace_links(vec![
+            ChapterLink {
+                book_id: "one".into(),
+                metadata: metadata("c1"),
+            },
+            ChapterLink {
+                book_id: "two".into(),
+                metadata: metadata("c2"),
+            },
+        ]);
+        let mut stored = yejian_sources::Manga {
+            source_key: "source.a".into(),
+            key: "story".into(),
+            viewer: yejian_sources::Viewer::Vertical,
+            ..Default::default()
+        };
+        crate::sources::save_manga_snapshot(root.path(), &stored).unwrap();
+
+        // No saved entry: the source hint chooses vertical.
+        app.open_reader(&book("one"));
+        assert!(app.vertical, "viewer hint should apply");
+
+        // A reader-side change lands on the work and beats the hint.
+        app.set_reading_mode("paged");
+        assert!(!app.vertical);
+        app.open_reader(&book("two"));
+        assert!(!app.vertical, "chapters of one work share settings");
+        stored.viewer = yejian_sources::Viewer::Unknown;
+        app.open_reader(&book("other"));
+        assert!(!app.vertical && !app.spread, "no link means global defaults");
+        assert!(root.path().join("reader-prefs.json").is_file());
+
+        // A fresh instance reloads the same per-work entry.
+        let mut reopened = ReaderApp::new(root.path().into(), ctx);
+        reopened.books = vec![book("one")];
+        reopened.replace_links(vec![ChapterLink {
+            book_id: "one".into(),
+            metadata: metadata("c1"),
+        }]);
+        reopened.open_reader(&book("one"));
+        assert!(!reopened.vertical && !reopened.spread);
+    }
+
+    #[test]
+    fn spread_offset_shows_page_zero_alone_then_odd_pairs() {
+        assert_eq!(spread_pair(0, true), (0, None));
+        assert_eq!(spread_pair(1, true), (1, Some(2)));
+        assert_eq!(spread_pair(2, true), (1, Some(2)));
+        assert_eq!(spread_pair(3, true), (3, Some(4)));
+        assert_eq!(spread_pair(4, true), (3, Some(4)));
+        assert_eq!(spread_pair(0, false), (0, Some(1)));
+        assert_eq!(spread_pair(2, false), (2, Some(3)));
+    }
+
+    #[test]
     fn page_cache_never_evicts_the_visible_spread_partner() {
         let root = tempfile::tempdir().unwrap();
         let ctx = Context::default();
         let mut app = ReaderApp::new(root.path().into(), ctx.clone());
         app.spread = true;
+        app.screen = Screen::Reader("book".into());
         for index in 0..3 {
             let mut texture = page(&ctx);
             texture.size = vec2(3000., 9000.);
             app.pages.insert(("book".into(), index), texture);
         }
-        app.trim_pages("book");
+        app.trim_pages();
         assert!(app.pages.contains_key(&("book".into(), 0)));
         assert!(app.pages.contains_key(&("book".into(), 1)));
         assert!(!app.pages.contains_key(&("book".into(), 2)));
         assert!(app.prefetch_blocked.contains(&("book".into(), 2)));
+    }
+
+    fn linked(book_id: &str, chapter: &str) -> ChapterLink {
+        ChapterLink {
+            book_id: book_id.into(),
+            metadata: ChapterMetadata {
+                source_id: "source.a".into(),
+                manga_id: "story".into(),
+                manga_title: "Story".into(),
+                chapter_id: chapter.into(),
+                chapter_title: chapter.into(),
+                chapter_number: None,
+                volume_number: None,
+            },
+        }
+    }
+    fn vertical_frame(ctx: &Context, app: &mut ReaderApp) {
+        ctx.run_ui(RawInput::default(), |ui| {
+            let content = Rect::from_min_size(Pos2::ZERO, vec2(800., 600.));
+            let gesture = ui.interact(
+                content,
+                egui::Id::unique("vertical-gesture"),
+                egui::Sense::click_and_drag(),
+            );
+            let (id, count) = match &app.screen {
+                Screen::Reader(id) => (
+                    id.clone(),
+                    app.reader_book(id)
+                        .map(|book| book.page_count)
+                        .unwrap_or(0),
+                ),
+                _ => (String::new(), 0),
+            };
+            app.vertical_ui(ui, content, &id, count, 1.0, &gesture);
+        })
+        .drop_without_applying_deltas();
+    }
+    #[test]
+    fn reader_options_stay_on_screen_at_large_text() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = Context::default();
+        crate::configure_fonts(&ctx);
+        let size = [320., 1024.];
+        yejian_platform::set_insets_override(Some(yejian_platform::Insets {
+            left: 0,
+            top: 24,
+            right: 0,
+            bottom: 20,
+        }));
+        let mut app = ReaderApp::new(root.path().into(), ctx.clone());
+        app.books = vec![book("one")];
+        app.font_scale = 2.;
+        app.open_reader(&app.books[0].clone());
+        app.reader_options = true;
+        for _ in 0..6 {
+            ctx.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size.into())),
+                    ..Default::default()
+                },
+                |ui| app.draw(ui),
+            )
+            .drop_without_applying_deltas();
+        }
+        yejian_platform::set_insets_override(None);
+        let screen = ctx
+            .content_rect()
+            .intersect(Rect::from_min_max(pos2(0., 24.), pos2(320., 1004.)));
+        for id in [
+            "reader-mode-paged",
+            "reader-mode-spread",
+            "reader-mode-vertical",
+            "reader-direction",
+            "reader-options-close",
+        ] {
+            let rect = app
+                .hitboxes
+                .get(id)
+                .unwrap_or_else(|| panic!("missing hitbox: {id}"));
+            assert!(
+                screen.contains_rect(*rect),
+                "{id} escaped the screen: {rect:?} vs {screen:?}"
+            );
+        }
+    }
+    #[test]
+    fn vertical_strip_flows_into_the_next_chapter_without_a_jump() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = Context::default();
+        let mut app = ReaderApp::new(root.path().into(), ctx.clone());
+        let mut one = book("one");
+        one.page_count = 3;
+        let mut two = book("two");
+        two.page_count = 2;
+        app.books = vec![one.clone(), two.clone()];
+        app.replace_links(vec![linked("one", "c1"), linked("two", "c2")]);
+        app.reader_globals.mode = crate::reader_prefs::Mode::Vertical;
+        app.open_reader(&one.clone());
+        for index in 0..3 {
+            app.pages.insert(("one".into(), index), page(&ctx));
+        }
+        for index in 0..2 {
+            app.pages.insert(("two".into(), index), page(&ctx));
+        }
+        vertical_frame(&ctx, &mut app);
+        assert_eq!(app.vertical_next, Some(("two".into(), 2)));
+
+        // Reach the last page of chapter one like a real reader does; the
+        // keep window then holds the first pages of chapter two as well.
+        app.vertical_reader.scroll(1600.);
+        vertical_frame(&ctx, &mut app);
+        assert!(matches!(&app.screen, Screen::Reader(id) if id == "one"));
+        assert_eq!(app.vertical_reader.page, 2);
+        assert_eq!(app.page, 2);
+        // Stand-ins for the prefetched textures of chapter two.
+        for index in 0..2 {
+            app.pages.insert(("two".into(), index), page(&ctx));
+        }
+
+        // Scrolling past the last page of chapter one keeps the strip's
+        // position and hands over to chapter two: current book, per-chapter
+        // progress and still-loaded textures all move with it.
+        app.vertical_reader.scroll(10_000.);
+        vertical_frame(&ctx, &mut app);
+        assert!(matches!(&app.screen, Screen::Reader(id) if id == "two"));
+        assert_eq!(app.vertical_prev, Some(("one".into(), 3)));
+        assert_eq!(app.vertical_reader.page, 4, "global index across the seam");
+        assert_eq!(app.page, 1, "last page of chapter two");
+        assert_eq!(app.books[0].current_page, 2, "chapter one left at its end");
+        assert_eq!(app.books[1].current_page, 1);
+        assert!(app.pages.contains_key(&("one".into(), 2)));
+        assert!(app.pages.contains_key(&("two".into(), 0)));
+
+        // The previous chapter's still-loaded pages stay reachable by
+        // scrolling back; the current book itself does not switch back.
+        app.vertical_reader.scroll(-1600.);
+        vertical_frame(&ctx, &mut app);
+        assert!(matches!(&app.screen, Screen::Reader(id) if id == "two"));
+        assert_eq!(app.vertical_reader.page, 2, "anchor back in chapter one");
+        assert!(app.hitboxes.contains_key("vertical-page-2"));
+        assert_eq!(
+            app.saved_position
+                .as_ref()
+                .map(|(id, page, _)| (id.as_str(), *page)),
+            Some(("one", 2)),
+            "the anchor chapter's own position is saved"
+        );
+        assert_eq!(app.page, 1, "self.page still tracks the current chapter");
+    }
+    #[test]
+    fn vertical_strip_waits_for_the_next_online_chapters_page_count() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = Context::default();
+        let mut app = ReaderApp::new(root.path().into(), ctx.clone());
+        let mut one = book("one");
+        one.page_count = 2;
+        app.books = vec![one.clone()];
+        app.replace_links(vec![linked("one", "c1")]);
+        app.reader_globals.mode = crate::reader_prefs::Mode::Vertical;
+        app.sources.seed_online_detail(
+            yejian_sources::Manga {
+                source_key: "source.a".into(),
+                key: "story".into(),
+                title: "Story".into(),
+                ..Default::default()
+            },
+            vec![
+                yejian_sources::Chapter {
+                    key: "c1".into(),
+                    title: Some("第一话".into()),
+                    ..Default::default()
+                },
+                yejian_sources::Chapter {
+                    key: "c2".into(),
+                    title: Some("第二话".into()),
+                    ..Default::default()
+                },
+            ],
+        );
+        app.open_reader(&one.clone());
+        for index in 0..2 {
+            app.pages.insert(("one".into(), index), page(&ctx));
+        }
+        vertical_frame(&ctx, &mut app);
+        // The next chapter's page count is unknown: no segment yet.
+        assert!(app.vertical_next.is_none());
+
+        // Near the end the chapter gets queued; once the task reports its
+        // total the segment joins the strip as a stream book.
+        app.vertical_reader.scroll(10_000.);
+        vertical_frame(&ctx, &mut app);
+        assert!(app.vertical_next.is_none(), "still no known page count");
+        let task = crate::sources::identity_id("source.a", "story", "c2");
+        assert!(
+            app.sources.stream_state(&task).is_some(),
+            "the next chapter was queued behind the reader"
+        );
+        app.sources.force_pages(&task, 2, 0);
+        vertical_frame(&ctx, &mut app);
+        let seg = format!("{STREAM_PREFIX}{task}");
+        assert_eq!(app.vertical_next, Some((seg.clone(), 2)));
+        assert!(app.next_stream.is_some());
+
+        // Crossing into the stream segment switches both the screen book
+        // and the stream bookkeeping without resetting the offset.
+        for index in 0..2 {
+            app.pages.insert((seg.clone(), index), page(&ctx));
+        }
+        app.vertical_reader.scroll(10_000.);
+        vertical_frame(&ctx, &mut app);
+        assert!(matches!(&app.screen, Screen::Reader(id) if id == &seg));
+        assert_eq!(app.vertical_prev, Some(("one".into(), 2)));
+        assert_eq!(app.vertical_reader.page, 3);
+        assert!(
+            app.stream.as_ref().is_some_and(|s| s.book.id == seg),
+            "stream bookkeeping moved to the new chapter"
+        );
+        assert_eq!(app.page, 1);
+        assert_eq!(app.books[0].current_page, 1, "chapter one left at its end");
     }
 }
