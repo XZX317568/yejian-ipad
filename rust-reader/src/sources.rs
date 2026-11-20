@@ -1201,6 +1201,34 @@ pub struct Sources {
     auto_checked: bool,
     up_tx: mpsc::Sender<Vec<(String, Manga)>>,
     up_rx: mpsc::Receiver<UpdateEvent>,
+    /// Decoded follow covers by snapshot key; `None` means not on disk yet.
+    covers: std::collections::HashMap<String, Option<TextureHandle>>,
+}
+
+fn follow_cover_path(root: &Path, snapshot: &str) -> anyhow::Result<PathBuf> {
+    anyhow::ensure!(valid_task_id(snapshot), "非法的封面 id：{snapshot:?}");
+    Ok(root.join("follow-covers").join(format!("{snapshot}.img")))
+}
+
+/// Downloads a follow's cover once, through the source's image request hook.
+fn fetch_follow_cover(root: &Path, engine: &SourceEngine, manga: &Manga) -> anyhow::Result<()> {
+    let Some(url) = manga.cover.as_deref().filter(|url| !url.is_empty()) else {
+        return Ok(());
+    };
+    let path = follow_cover_path(root, &manga_snapshot_key(&manga.source_key, &manga.key))?;
+    if path.is_file() {
+        return Ok(());
+    }
+    let bytes = match pollster::block_on(engine.image_request(url, None))? {
+        Some(req) => request(engine, req.url, req.headers, req.body)?,
+        None => request(engine, url.to_string(), vec![], None)?,
+    };
+    image::load_from_memory(&bytes)?;
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    let part = path.with_extension("part");
+    std::fs::write(&part, &bytes)?;
+    std::fs::rename(&part, &path)?;
+    Ok(())
 }
 
 /// Result of checking one followed manga for new chapters.
@@ -1456,7 +1484,10 @@ impl Sources {
                             if !engines.contains_key(&source) {
                                 engines.insert(source.clone(), SourceEngine::load(&catalog, &source)?);
                             }
-                            let list = pollster::block_on(engines[&source].chapters_with(manga.clone()))?;
+                            let engine = &engines[&source];
+                            let list = pollster::block_on(engine.chapters_with(manga.clone()))?;
+                            // A missing cover never fails the update check.
+                            let _ = fetch_follow_cover(&up_root, engine, &manga);
                             Ok(list.into_iter().map(|chapter| chapter.key).collect())
                         })()
                         .map_err(|error| format!("{error:#}"));
@@ -1606,6 +1637,7 @@ impl Sources {
             auto_checked: false,
             up_tx,
             up_rx,
+            covers: Default::default(),
         };
         let mut sources = sources;
         match follows::load(&sources.root) {
@@ -1709,6 +1741,8 @@ impl Sources {
         self.follows.insert(0, follow);
         self.status = "已加入追更，有新章节会在书源页顶部提示".into();
         self.save_follows();
+        // Fetches the cover right away; the chapter list is already known.
+        self.check_follows(&[0]);
     }
 
     fn follow_manga(&self, follow: &Follow) -> anyhow::Result<Manga> {
@@ -1742,13 +1776,39 @@ impl Sources {
         }
     }
 
+    fn cover_texture(&mut self, ctx: &Context, snapshot: &str) -> Option<TextureHandle> {
+        if let Some(cached) = self.covers.get(snapshot) {
+            return cached.clone();
+        }
+        let texture = follow_cover_path(&self.root, snapshot)
+            .ok()
+            .and_then(|path| std::fs::read(path).ok())
+            .and_then(|bytes| image::load_from_memory(&bytes).ok())
+            .map(|image| {
+                let image = image.thumbnail(120, 160).to_rgba8();
+                let size = [image.width() as usize, image.height() as usize];
+                ctx.load_texture(
+                    format!("follow-cover-{snapshot}"),
+                    ColorImage::from_rgba_unmultiplied(size, image.as_raw()),
+                    TextureOptions::LINEAR,
+                )
+            });
+        self.covers.insert(snapshot.to_string(), texture.clone());
+        texture
+    }
+
     /// Asks every followed manga's source for its current chapter list.
     pub fn check_updates(&mut self) {
         if self.checking > 0 {
             return;
         }
+        let all: Vec<usize> = (0..self.follows.len()).collect();
+        self.check_follows(&all);
+    }
+
+    fn check_follows(&mut self, indices: &[usize]) {
         let mut batch = Vec::new();
-        for follow in &self.follows {
+        for follow in indices.iter().filter_map(|&index| self.follows.get(index)) {
             match self.follow_manga(follow) {
                 Ok(manga) => batch.push((follow.source_id.clone(), manga)),
                 Err(error) => self.status = format!("《{}》无法检查更新：{error:#}", follow.title),
@@ -1759,7 +1819,7 @@ impl Sources {
         }
         let count = batch.len();
         if self.up_tx.send(batch).is_ok() {
-            self.checking = count;
+            self.checking += count;
         } else {
             self.status = "更新检查线程已停止，请重新打开应用".into();
         }
@@ -1768,6 +1828,10 @@ impl Sources {
     fn handle_update(&mut self, event: UpdateEvent) {
         self.checking = self.checking.saturating_sub(1);
         if let Some(index) = self.follow_index(&event.source, &event.manga) {
+            let snapshot = self.follows[index].snapshot.clone();
+            if matches!(self.covers.get(&snapshot), Some(None)) {
+                self.covers.remove(&snapshot);
+            }
             let follow = &mut self.follows[index];
             match event.chapters {
                 Ok(keys) => {
@@ -1822,8 +1886,24 @@ impl Sources {
             } else {
                 format!("{source} · 共 {} 话", follow.total)
             };
+            let snapshot = follow.snapshot.clone();
+            let top = ui.cursor().top();
+            let left = ui.cursor().left();
             if source_item(ui, ("follow", index), &follow.title, &detail, true, true) {
                 open = Some(index);
+            }
+            let bottom = ui.min_rect().bottom();
+            if let Some(texture) = self.cover_texture(ui.ctx(), &snapshot) {
+                let cover = Rect::from_center_size(
+                    pos2(left + 18., (top + bottom) / 2.),
+                    vec2(40., 54.),
+                );
+                ui.painter().image(
+                    texture.id(),
+                    cover,
+                    Rect::from_min_max(pos2(0., 0.), pos2(1., 1.)),
+                    Color32::WHITE,
+                );
             }
         }
         if let Some(index) = open {
@@ -3930,6 +4010,7 @@ mod tests {
             auto_checked: true,
             up_tx: mpsc::channel().0,
             up_rx: mpsc::channel().1,
+            covers: Default::default(),
         }
     }
 
