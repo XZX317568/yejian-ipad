@@ -600,7 +600,7 @@ fn apply_source_change(
 
 /// Stable 64-bit FNV-1a over source/manga/chapter, so the same chapter always
 /// maps to one task id across restarts and concurrent enqueues.
-fn identity_id(source: &str, manga: &str, chapter: &str) -> String {
+pub(crate) fn identity_id(source: &str, manga: &str, chapter: &str) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for part in [source, manga, chapter] {
         for byte in part.as_bytes().iter().chain(std::iter::once(&0xffu8)) {
@@ -2322,6 +2322,79 @@ impl Sources {
     pub fn has_adjacent_online(&self, metadata: &ChapterMetadata, delta: i32) -> bool {
         self.adjacent_online(&metadata.source_id, &metadata.manga_id, &metadata.chapter_id, delta)
             .is_some_and(|chapter| !chapter.locked)
+    }
+
+    /// Queues the chapter after `metadata` for download without opening it,
+    /// so the reader can keep scrolling straight into it. Returns the stream
+    /// task id and its metadata once the chapter is tracked; `None` when the
+    /// chapter is unknown, locked, already imported, or cannot be queued
+    /// here (its manga detail is not loaded).
+    pub fn prepare_next(&mut self, metadata: &ChapterMetadata) -> Option<(String, ChapterMetadata)> {
+        let chapter = self.adjacent_online(
+            &metadata.source_id,
+            &metadata.manga_id,
+            &metadata.chapter_id,
+            1,
+        )?;
+        if chapter.locked {
+            return None;
+        }
+        let id = identity_id(&metadata.source_id, &metadata.manga_id, &chapter.key);
+        if self.library_chapters.contains_key(&id) {
+            return None;
+        }
+        if self.chapter_needs_download(&metadata.source_id, &metadata.manga_id, &chapter) {
+            let manga = self.selected_manga.clone().filter(|manga| {
+                self.source_for(manga) == metadata.source_id && manga.key == metadata.manga_id
+            })?;
+            let status = std::mem::take(&mut self.status);
+            self.enqueue_chapter(&manga, &chapter);
+            self.status = status;
+        }
+        let task = self.tasks.iter().find(|task| task.id == id)?;
+        let metadata = task.metadata();
+        match task.status {
+            // Its staged pages are already archived: push the finished file
+            // at the import queue so the segment becomes a library book.
+            DownloadStatus::Done => {
+                if !task.linked {
+                    self.add_downloaded_to_library(&id);
+                }
+                None
+            }
+            // A chapter paused earlier keeps downloading now that the reader
+            // approaches it; the preempted stream itself is left alone.
+            DownloadStatus::Paused | DownloadStatus::Failed
+                if self.preempted.as_deref() != Some(id.as_str()) =>
+            {
+                self.set_task_queued(&id);
+                Some((id, metadata))
+            }
+            _ => Some((id, metadata)),
+        }
+    }
+
+    /// Task metadata of a tracked download/stream chapter.
+    pub fn stream_metadata(&self, id: &str) -> Option<ChapterMetadata> {
+        self.tasks.iter().find(|task| task.id == id).map(|task| task.metadata())
+    }
+
+    /// Pretend a manga detail page is loaded so neighbour lookups work.
+    #[cfg(test)]
+    pub(crate) fn seed_online_detail(&mut self, manga: Manga, chapters: Vec<Chapter>) {
+        self.selected_source = manga.source_key.clone();
+        self.selected_manga = Some(manga);
+        self.chapters = chapters;
+    }
+
+    /// Marks a tracked task's page count as known, as its first progress
+    /// report would.
+    #[cfg(test)]
+    pub(crate) fn force_pages(&mut self, id: &str, total: usize, done: usize) {
+        if let Some(task) = self.tasks.iter_mut().find(|task| task.id == id) {
+            task.pages_total = total;
+            task.pages_done = done;
+        }
     }
 
     /// The source's preferred reading direction for this work, from the

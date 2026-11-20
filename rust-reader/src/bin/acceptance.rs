@@ -1209,6 +1209,27 @@ fn ipad_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
         h.wait(ReaderApp::page_loaded)?;
         h.frames(6)?;
         h.frame(vec![], Some(&format!("ipad-pro-129-{name}-reader")))?;
+        if name == "portrait" {
+            h.click("reader-settings")?;
+            h.frames(6)?;
+            h.frame(vec![], Some("ipad-pro-129-portrait-reader-settings"))?;
+            for control in [
+                "上下滚动",
+                "翻页方向",
+                "裁剪白边",
+                "适应宽度",
+                "亮度",
+                "双页首页单独",
+                "设为所有作品的默认",
+            ] {
+                anyhow::ensure!(
+                    h.texts.iter().any(|(text, _)| text.contains(control)),
+                    "portrait: reader settings control {control} is clipped"
+                );
+            }
+            h.click("reader-options-close")?;
+            h.frames(4)?;
+        }
         h.click("reader-back")?;
         h.frames(24)?;
         h.click("back")?;
@@ -1517,20 +1538,19 @@ fn daily_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
         "daily: next-page controls did not reach the final chapter page"
     );
     let canvas = h.app.hitboxes["reader-canvas"];
-    h.frame(wheel(canvas.center()), None)?;
-    h.frames(20)?;
-    anyhow::ensure!(
-        h.app.current_book_id() == Some(one.id.as_str()),
-        "daily: reaching a chapter boundary unexpectedly skipped the next-chapter action"
-    );
-    design_touch(h, "reader-next-chapter", None)?;
     design_capture(h, "daily-continuous-chapter-end", &mut captures)?;
-    h.click("reader-next-chapter")?;
-    h.wait(ReaderApp::page_loaded)?;
-    h.frames(4)?;
+    // Scrolling past the last page flows straight into the next chapter.
+    for _ in 0..10 {
+        if h.app.current_book_id() == Some(two.id.as_str()) {
+            break;
+        }
+        h.frame(wheel(canvas.center()), None)?;
+        h.wait(ReaderApp::page_loaded)?;
+        h.frames(4)?;
+    }
     anyhow::ensure!(
-        h.app.current_book_id() == Some(two.id.as_str()) && h.app.current_page() == 0,
-        "daily: chapter-end action did not open the next downloaded chapter"
+        h.app.current_book_id() == Some(two.id.as_str()),
+        "daily: scrolling past the chapter end did not continue into the next chapter"
     );
     design_capture(h, "daily-continuous-next-chapter", &mut captures)?;
     h.click("reader-back")?;
