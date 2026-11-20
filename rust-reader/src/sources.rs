@@ -345,16 +345,17 @@ fn chapter_state_lines(
     lines
 }
 
-/// Paints a cover texture or the placeholder tile (surface + first title
-/// char) into `rect`; shared by the result grid and the detail header.
+/// Paints a cover texture or the placeholder tile into `rect`, shared by the
+/// result grid and the detail header. Both get a 1px `line` border so tiles
+/// stay visible on the page; the placeholder uses the tinted `accent_soft`
+/// surface rather than blending into the background.
 fn paint_cover(
     painter: &Painter,
     rect: Rect,
     texture: Option<&TextureHandle>,
     title: &str,
     font: FontId,
-    surface: Color32,
-    muted: Color32,
+    palette: &crate::design::Palette,
 ) {
     match texture {
         Some(texture) => {
@@ -366,18 +367,19 @@ fn paint_cover(
             );
         }
         None => {
-            painter.rect_filled(rect, 8., surface);
+            painter.rect_filled(rect, 8., palette.accent_soft);
             if let Some(initial) = title.chars().next() {
                 painter.text(
                     rect.center(),
                     Align2::CENTER_CENTER,
                     initial.to_string(),
                     font,
-                    muted,
+                    palette.muted,
                 );
             }
         }
     }
+    painter.rect_stroke(rect, 8., Stroke::new(1., palette.line), StrokeKind::Inside);
 }
 
 /// One finished chapter ready for `Command::ImportChapter`.
@@ -4576,7 +4578,7 @@ impl Sources {
                 let button = if followed {
                     ui.add(quiet_action("已追更 · 取消追更").min_size(vec2(0., 48.)))
                 } else {
-                    ui.add(design::primary("追更", dark))
+                    ui.add(quiet_action("追更").min_size(vec2(0., 48.)))
                 };
                 this.hitboxes.insert("source-detail-follow".into(), button.rect);
                 if button.clicked() {
@@ -4603,8 +4605,7 @@ impl Sources {
                     texture.as_ref(),
                     &manga.title,
                     heading.clone(),
-                    palette.surface,
-                    palette.muted,
+                    &palette,
                 );
                 ui.add_space(16.);
                 ui.vertical(|ui| {
@@ -4622,8 +4623,7 @@ impl Sources {
                     texture.as_ref(),
                     &manga.title,
                     heading.clone(),
-                    palette.surface,
-                    palette.muted,
+                    &palette,
                 );
             });
             ui.add_space(8.);
@@ -4963,28 +4963,14 @@ impl Sources {
                 }
                 let cover_rect = Rect::from_min_size(cell.min, vec2(cell_w, cover_h));
                 let painter = ui.painter().with_clip_rect(ui.clip_rect().intersect(cell));
-                match texture {
-                    Some(texture) => {
-                        painter.image(
-                            texture.id(),
-                            cover_rect,
-                            Rect::from_min_max(pos2(0., 0.), pos2(1., 1.)),
-                            Color32::WHITE,
-                        );
-                    }
-                    None => {
-                        painter.rect_filled(cover_rect, 8., palette.surface);
-                        if let Some(initial) = manga.title.chars().next() {
-                            painter.text(
-                                cover_rect.center(),
-                                Align2::CENTER_CENTER,
-                                initial.to_string(),
-                                TextStyle::Heading.resolve(ui.style()),
-                                palette.muted,
-                            );
-                        }
-                    }
-                }
+                paint_cover(
+                    &painter,
+                    cover_rect,
+                    texture.as_ref(),
+                    &manga.title,
+                    TextStyle::Heading.resolve(ui.style()),
+                    &palette,
+                );
                 let mut title_job = egui::text::LayoutJob::simple(
                     manga.title.clone(),
                     body.clone(),
