@@ -1329,6 +1329,7 @@ fn ipad_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
     library.set_setting("theme", "dark")?;
     h.app = ReaderApp::new(library_root.into(), h.ctx.clone());
     h.wait(ReaderApp::ready)?;
+    h.wait(ReaderApp::covers_loaded)?;
     h.size = [834, 1194];
     h.frames(8)?;
     h.frame(vec![], Some("ipad-11-portrait-dark"))?;
