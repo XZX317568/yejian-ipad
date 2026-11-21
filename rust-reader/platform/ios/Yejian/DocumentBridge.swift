@@ -1,7 +1,9 @@
 import Darwin
 import Foundation
+import BackgroundTasks
 import LocalAuthentication
 import UIKit
+import UserNotifications
 import UniformTypeIdentifiers
 import WebKit
 
@@ -12,7 +14,7 @@ import WebKit
 /// one JSON payload per request. It mirrors the Android contract:
 ///
 /// `{"requestId":1,"status":"ok|partial|canceled|error","files":[{"name":"a.cbz","path":"/..."}],"failed":[{"name":"b.rar","reason":"..."}]}`
-private final class YejianDocumentBridge: NSObject, UIApplicationDelegate, UIDocumentPickerDelegate {
+private final class YejianDocumentBridge: NSObject, UIApplicationDelegate, UIDocumentPickerDelegate, UNUserNotificationCenterDelegate {
     static let shared = YejianDocumentBridge()
 
     private let lock = NSLock()
@@ -30,6 +32,17 @@ private final class YejianDocumentBridge: NSObject, UIApplicationDelegate, UIDoc
     private var scheduled = false
     private var authResults: [String] = []
     private var foregroundEvents: [String] = []
+    /// Notification permission results ("1"/"0") and open payloads.
+    private var notifyPermResults: [String] = []
+    private var notifyOpens: [String] = []
+    /// Seconds the next BGAppRefreshTaskRequest waits at least (default 1 h).
+    private var refreshIntervalSeconds: TimeInterval = 3600
+    /// Rust-owned background check plus its string free function.
+    private var bgRefreshHandler: (@convention(c) () -> UnsafeMutablePointer<CChar>?)?
+    private var bgRefreshFree: (@convention(c) (UnsafeMutablePointer<CChar>?) -> Void)?
+    private static let refreshTaskId = "app.yejian.reader.rust.refresh"
+    private var refreshRegistered = false
+
     private var shieldWanted = false
     private weak var shieldView: UIView?
     #if DEBUG
@@ -71,15 +84,15 @@ private final class YejianDocumentBridge: NSObject, UIApplicationDelegate, UIDoc
                 object: nil,
                 queue: .main
             ) { [weak self] _ in
-                self?.prepareNow()
+                self?.prepareNow(launching: true)
             }
         }
         DispatchQueue.main.async { [weak self] in
-            self?.prepareNow()
+            self?.prepareNow(launching: false)
         }
     }
 
-    private func prepareNow() {
+    private func prepareNow(launching: Bool) {
         guard !prepared else { return }
         prepared = true
         do {
@@ -113,6 +126,7 @@ private final class YejianDocumentBridge: NSObject, UIApplicationDelegate, UIDoc
             queue: .main
         ) { [weak self] _ in
             self?.enqueueForeground("b")
+            self?.scheduleBackgroundRefresh()
         }
         NotificationCenter.default.addObserver(
             forName: UIApplication.willEnterForegroundNotification,
@@ -134,6 +148,24 @@ private final class YejianDocumentBridge: NSObject, UIApplicationDelegate, UIDoc
             queue: .main
         ) { [weak self] _ in
             self?.hideShield()
+        }
+
+        // 新章节通知: the delegate routes taps to Rust, and the refresh task
+        // is registered while didFinishLaunching is still on the stack.
+        UNUserNotificationCenter.current().delegate = self
+        // Registering after launch has finished raises an exception, so the
+        // late fallback path skips background refresh entirely.
+        if launching {
+            refreshRegistered = BGTaskScheduler.shared.register(
+                forTaskWithIdentifier: Self.refreshTaskId,
+                using: nil
+            ) { [weak self] task in
+                if let task = task as? BGAppRefreshTask {
+                    self?.handleRefresh(task)
+                } else {
+                    task.setTaskCompleted(success: false)
+                }
+            }
         }
     }
 
@@ -756,6 +788,159 @@ extension YejianDocumentBridge {
             return 0
         }
     }
+
+    // MARK: - Notifications
+
+    /// UNUserNotificationCenter permission request; result queued as "1"/"0".
+    func requestNotificationPermission() {
+        UNUserNotificationCenter.current().requestAuthorization(
+            options: [.alert, .badge, .sound]
+        ) { [weak self] granted, _ in
+            self?.enqueueNotifyPerm(granted ? "1" : "0")
+        }
+    }
+
+    private func enqueueNotifyPerm(_ value: String) {
+        lock.lock()
+        notifyPermResults.append(value)
+        lock.unlock()
+        wake()
+    }
+
+    func pollNotificationPermission() -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return notifyPermResults.isEmpty ? nil : notifyPermResults.removeFirst()
+    }
+
+    /// Immediate UNNotificationRequest; the payload rides in userInfo.
+    func postNotification(id: Int64, title: String, body: String, payload: String) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        content.userInfo = ["payload": payload]
+        let request = UNNotificationRequest(
+            identifier: "yejian-chapters-\(id)",
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(request)
+    }
+
+    func takeNotificationOpen() -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return notifyOpens.isEmpty ? nil : notifyOpens.removeFirst()
+    }
+
+    /// Routes a notification tap to Rust. No banner while foregrounded — the
+    /// in-app notice already covers fresh chapters.
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        if let payload = response.notification.request.content.userInfo["payload"] as? String {
+            lock.lock()
+            notifyOpens.append(payload)
+            lock.unlock()
+            wake()
+        }
+        completionHandler()
+    }
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler:
+            @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([])
+    }
+
+    /// How long the next refresh request waits at least.
+    func setRefreshInterval(_ seconds: UInt64) {
+        lock.lock()
+        refreshIntervalSeconds = TimeInterval(max(60, seconds))
+        lock.unlock()
+    }
+
+    /// Rust's check function, wired through the handler setter below.
+    func setBackgroundRefreshHandler(
+        _ handler: (@convention(c) () -> UnsafeMutablePointer<CChar>?)?,
+        free: (@convention(c) (UnsafeMutablePointer<CChar>?) -> Void)?
+    ) {
+        lock.lock()
+        bgRefreshHandler = handler
+        bgRefreshFree = free
+        lock.unlock()
+    }
+
+    /// Schedules the next BGAppRefreshTask on entering background.
+    private func scheduleBackgroundRefresh() {
+        guard refreshRegistered else { return }
+        lock.lock()
+        let interval = refreshIntervalSeconds
+        lock.unlock()
+        let request = BGAppRefreshTaskRequest(identifier: Self.refreshTaskId)
+        request.earliestBeginDate = Date(timeIntervalSinceNow: interval)
+        try? BGTaskScheduler.shared.submit(request)
+    }
+
+    /// Runs Rust's check off the main queue, posts each notification it
+    /// returns, then schedules the next refresh.
+    private func handleRefresh(_ task: BGAppRefreshTask) {
+        scheduleBackgroundRefresh()
+        let finished = NSLock()
+        var completed = false
+        let complete: (Bool) -> Void = { success in
+            finished.lock()
+            defer { finished.unlock() }
+            guard !completed else { return }
+            completed = true
+            task.setTaskCompleted(success: success)
+        }
+        task.expirationHandler = {
+            complete(false)
+        }
+        DispatchQueue.global().async { [weak self] in
+            defer { complete(true) }
+            guard let self = self else { return }
+            self.lock.lock()
+            let handler = self.bgRefreshHandler
+            let free = self.bgRefreshFree
+            self.lock.unlock()
+            guard let handler, let pointer = handler() else { return }
+            let json = String(cString: pointer)
+            free?(pointer)
+            guard let data = json.data(using: .utf8),
+                  let notes = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
+            else {
+                return
+            }
+            let center = UNUserNotificationCenter.current()
+            for note in notes {
+                guard let id = note["id"] as? Int,
+                      let title = note["title"] as? String,
+                      let body = note["body"] as? String,
+                      let payload = note["payload"] as? String
+                else {
+                    continue
+                }
+                let content = UNMutableNotificationContent()
+                content.title = title
+                content.body = body
+                content.sound = .default
+                content.userInfo = ["payload": payload]
+                center.add(UNNotificationRequest(
+                    identifier: "yejian-chapters-\(id)",
+                    content: content,
+                    trigger: nil
+                ))
+            }
+        }
+    }
 }
 
 // MARK: - Rust ABI
@@ -888,4 +1073,55 @@ public func yejian_ios_poll_foreground() -> UnsafeMutablePointer<CChar>? {
 @_cdecl("yejian_ios_set_privacy_shield")
 public func yejian_ios_set_privacy_shield(_ on: Bool) {
     YejianDocumentBridge.shared.setPrivacyShield(on)
+}
+
+@_cdecl("yejian_ios_request_notification_permission")
+public func yejian_ios_request_notification_permission() {
+    YejianDocumentBridge.shared.requestNotificationPermission()
+}
+
+@_cdecl("yejian_ios_poll_notification_permission")
+public func yejian_ios_poll_notification_permission() -> UnsafeMutablePointer<CChar>? {
+    guard let value = YejianDocumentBridge.shared.pollNotificationPermission() else {
+        return nil
+    }
+    return duplicate(value)
+}
+
+@_cdecl("yejian_ios_post_notification")
+public func yejian_ios_post_notification(
+    _ id: Int64,
+    _ title: UnsafePointer<CChar>?,
+    _ body: UnsafePointer<CChar>?,
+    _ payload: UnsafePointer<CChar>?
+) -> Int64 {
+    guard let title, let body, let payload else { return -1 }
+    YejianDocumentBridge.shared.postNotification(
+        id: id,
+        title: String(cString: title),
+        body: String(cString: body),
+        payload: String(cString: payload)
+    )
+    return 0
+}
+
+@_cdecl("yejian_ios_take_notification_open")
+public func yejian_ios_take_notification_open() -> UnsafeMutablePointer<CChar>? {
+    guard let payload = YejianDocumentBridge.shared.takeNotificationOpen() else {
+        return nil
+    }
+    return duplicate(payload)
+}
+
+@_cdecl("yejian_ios_set_refresh_interval")
+public func yejian_ios_set_refresh_interval(_ seconds: UInt64) {
+    YejianDocumentBridge.shared.setRefreshInterval(seconds)
+}
+
+@_cdecl("yejian_ios_set_bg_refresh_handler")
+public func yejian_ios_set_bg_refresh_handler(
+    _ handler: (@convention(c) () -> UnsafeMutablePointer<CChar>?)?,
+    _ free: (@convention(c) (UnsafeMutablePointer<CChar>?) -> Void)?
+) {
+    YejianDocumentBridge.shared.setBackgroundRefreshHandler(handler, free: free)
 }

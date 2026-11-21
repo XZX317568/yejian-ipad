@@ -2,6 +2,7 @@ use crate::{
     design,
     follows::{self, Follow},
     source_filters::FilterEditor,
+    source_repos::{Lang, SourceRepos},
 };
 use anyhow::Context as _;
 use egui::*;
@@ -158,6 +159,10 @@ enum Task {
     List,
     Fetch(String),
     Install(RepositorySource),
+    /// Remove one source directory; follows/downloaded chapters are kept.
+    Uninstall(String),
+    /// Refresh every saved repository index for update badges.
+    FetchAllRepos(Vec<String>),
     Metadata(String),
     Search {
         source: String,
@@ -189,6 +194,8 @@ enum Reply {
         updated: Option<String>,
     },
     Repository(RepositoryIndex),
+    /// One result per requested repo URL; failures keep the old cache.
+    RepoAll(Vec<(String, Result<RepositoryIndex, String>)>),
     Login {
         key: String,
         user: String,
@@ -957,7 +964,7 @@ fn snapshot_root(root: &Path) -> PathBuf {
 fn manga_snapshot_key(source: &str, manga: &str) -> String {
     identity_id(source, manga, "manga-snapshot")
 }
-fn manga_snapshot_path(root: &Path, key: &str) -> anyhow::Result<PathBuf> {
+pub(crate) fn manga_snapshot_path(root: &Path, key: &str) -> anyhow::Result<PathBuf> {
     anyhow::ensure!(valid_task_id(key), "非法的漫画快照 id：{key:?}");
     Ok(snapshot_root(root).join(format!("{key}.manga")))
 }
@@ -1544,6 +1551,10 @@ pub struct Sources {
     preview_mode: Option<String>,
     busy: bool,
     status: String,
+    /// When the current status string was first observed by the UI. Success
+    /// notices fade out four seconds later; errors stay until the next
+    /// action replaces them.
+    status_seen: Option<(String, std::time::Instant)>,
     tasks: Vec<DownloadTask>,
     running: Option<String>,
     ready: VecDeque<String>,
@@ -1586,6 +1597,9 @@ pub struct Sources {
 
     /// `Instant` so a suspended frame clock cannot skip a whole interval.
     follow_next_due: Option<std::time::Instant>,
+    /// Fresh chapters collected by finished checks, waiting for the shell
+    /// to turn into system notifications (deduped in notify.rs).
+    notify_pending: Vec<crate::notify::FreshUpdate>,
     /// New-chapter summary surfaced to the app shell's notice bar once a
 
     /// background (scheduled) check finishes.
@@ -1657,7 +1671,40 @@ pub struct Sources {
     login_pass: String,
     /// Cookies from verification/login pages by URL, in `web-cookies.json`.
     web_cookies: std::collections::BTreeMap<String, WebSiteCookies>,
+    /// Saved repo URLs + cached indexes backing update badges (source_repos.rs).
+    repos: SourceRepos,
+    /// Language chip filter on the installable-sources list.
+    repo_lang: Lang,
+    /// A repo-index refresh (manual or the once-a-day auto check) is in flight.
+    repo_fetching: bool,
+    /// The daily auto check fires once per process, guarded by `checked_day`.
+    repo_auto_done: bool,
+    /// 测试 results per source id: "可用 · 820 ms" or a Chinese reason.
+    repo_test_results: std::collections::HashMap<String, String>,
+    /// Tests currently running (≤4), keyed by source id for the 15 s timeout.
+    repo_testing: std::collections::HashMap<String, std::time::Instant>,
+    /// Tests waiting for a slot.
+    repo_test_queue: VecDeque<String>,
+    test_tx: mpsc::Sender<(String, Result<u64, String>)>,
+    test_rx: mpsc::Receiver<(String, Result<u64, String>)>,
+    /// Pending 卸载 confirmation card.
+    uninstall: Option<InstalledSource>,
+    /// Setting writes (source-repos, source-repos-checked-at) the host owes
+    /// the settings store.
+    setting_writes: VecDeque<(String, String)>,
 }
+/// One online work's latest read chapter — a 阅读足迹 row.
+pub(crate) struct OnlineHistory {
+    pub source_id: String,
+    pub manga_id: String,
+    pub manga_title: String,
+    pub chapter_title: String,
+    pub chapter_number: Option<f64>,
+    pub read_page: usize,
+    pub pages_total: usize,
+    pub read_at: i64,
+}
+
 /// What one verification/login attempt is for and how it presents.
 struct WebSession {
     /// Source the session belongs to (engine reload/login target).
@@ -2507,6 +2554,7 @@ impl Clone for GlobalGroup {
 impl Sources {
     #[cfg(debug_assertions)]
     pub(crate) fn preview_community(&mut self) {
+        self.clear_status();
         self.url = COMMUNITY_INDEX.into();
         self.submit(Task::Fetch(COMMUNITY_INDEX.into()));
     }
@@ -2520,6 +2568,7 @@ impl Sources {
 
     #[cfg(debug_assertions)]
     pub(crate) fn preview_browser(&mut self, mode: &str) -> anyhow::Result<()> {
+        self.clear_status();
         // Only explicit debug snapshot/acceptance flags install this labelled,
 
         // local WASM fixture. Release apps never embed it.
@@ -2556,6 +2605,7 @@ impl Sources {
     /// search reports one success group and one failure group.
     #[cfg(debug_assertions)]
     pub(crate) fn preview_global_search(&mut self) -> anyhow::Result<()> {
+        self.clear_status();
         self.preview_browser("browse")?;
         let broken = self.root.join("sources/local.broken-acceptance");
         std::fs::create_dir_all(&broken)?;
@@ -2594,6 +2644,7 @@ impl Sources {
 
     #[cfg(debug_assertions)]
     pub(crate) fn preview_installed_source(&mut self, id: &str) -> anyhow::Result<()> {
+        self.clear_status();
         self.installed = SourceCatalog::new(self.root.join("sources")).list()?;
         anyhow::ensure!(
             self.installed.iter().any(|source| source.manifest.id == id),
@@ -2608,6 +2659,7 @@ impl Sources {
     /// so 我的追更 renders "自动下载中 N 章".
     #[cfg(debug_assertions)]
     pub(crate) fn preview_auto_download(&mut self) {
+        self.clear_status();
         // 我的追更 only renders on the sources root, not inside a source.
         self.selected_source.clear();
         self.selected_manga = None;
@@ -2657,14 +2709,149 @@ impl Sources {
         }
     }
 
+    /// Acceptance seed: one finished online chapter with a read position so
+    /// the 阅读足迹 page renders an 在线 row.
+    #[cfg(debug_assertions)]
+    pub(crate) fn preview_history(&mut self) {
+        self.clear_status();
+        let manga = Manga {
+            source_key: "local.filter-acceptance".into(),
+            key: "fx-history-1".into(),
+            title: "在线足迹示例".into(),
+            ..Default::default()
+        };
+        if self.tasks.iter().any(|task| task.manga_id == manga.key) {
+            return;
+        }
+        let chapter = Chapter {
+            key: "h7".into(),
+            title: Some("第 7 话".into()),
+            chapter_number: Some(7.),
+            ..Default::default()
+        };
+        let mut task = DownloadTask::from_chapter(&manga.source_key, &manga, &chapter);
+        task.status = DownloadStatus::Done;
+        task.read_at = Some(follows::now() as i64);
+        task.read_page = Some(3);
+        task.pages_total = 24;
+        self.tasks.push(task);
+    }
+
+    /// Acceptance seed: two fake installed sources — one with a cached repo
+    /// update badge and one with a finished 测试 result — plus a repository
+    /// index so the list and language chips render.
+    #[cfg(debug_assertions)]
+    pub(crate) fn preview_sources_manage(&mut self) {
+        self.clear_status();
+        self.selected_source.clear();
+        self.selected_manga = None;
+        for (id, name, version, languages) in [
+            (
+                "local.manage-a",
+                "纸间图源 · 中文",
+                1i64,
+                vec!["zh".to_string()],
+            ),
+            (
+                "local.manage-b",
+                "Mirror Garden EN",
+                5i64,
+                vec!["en".to_string()],
+            ),
+        ] {
+            if self
+                .installed
+                .iter()
+                .any(|source| source.manifest.id == id)
+            {
+                continue;
+            }
+            self.installed.push(InstalledSource {
+                manifest: SourceManifest {
+                    id: id.into(),
+                    name: name.into(),
+                    version,
+                    alt_names: Vec::new(),
+                    languages,
+                    urls: vec![format!("https://{id}.example")],
+                    content_rating: 0,
+                    listings: Vec::new(),
+                    allows_base_url_select: false,
+                    hides_filters_while_searching: false,
+                },
+                directory: self.root.join("sources").join(id),
+                wasm_path: self.root.join("sources").join(id).join("main.wasm"),
+                settings_path: None,
+                filters_path: None,
+                icon_path: None,
+            });
+        }
+        let repo_url = "https://preview.repo/index.json";
+        let index = RepositoryIndex {
+            name: Some("示例仓库".into()),
+            website: None,
+            index_url: repo_url.into(),
+            sources: vec![
+                RepositorySource {
+                    id: "local.manage-a".into(),
+                    name: "纸间图源 · 中文".into(),
+                    version: 3,
+                    download_url: format!("{repo_url}/a.aix"),
+                    icon_url: None,
+                    languages: vec!["zh".into()],
+                    content_rating: 0,
+                    base_url: None,
+                },
+                RepositorySource {
+                    id: "local.manage-b".into(),
+                    name: "Mirror Garden EN".into(),
+                    version: 5,
+                    download_url: format!("{repo_url}/b.aix"),
+                    icon_url: None,
+                    languages: vec!["en".into()],
+                    content_rating: 0,
+                    base_url: None,
+                },
+                RepositorySource {
+                    id: "local.preview-c".into(),
+                    name: "さくら文庫".into(),
+                    version: 2,
+                    download_url: format!("{repo_url}/c.aix"),
+                    icon_url: None,
+                    languages: vec!["ja".into()],
+                    content_rating: 0,
+                    base_url: None,
+                },
+            ],
+        };
+        self.repos.merge_index(repo_url, &index, follows::now());
+        if self.repos.record_repo(repo_url) {
+            self.write_setting("source-repos", self.repos.urls_setting());
+        }
+        self.repository = Some(index);
+        self.repo_test_results
+            .insert("local.manage-b".into(), "可用 · 820 ms".into());
+    }
+
+    /// Acceptance lookup for the uninstall-confirm seam.
+    #[cfg(debug_assertions)]
+    pub(crate) fn installed_source(&self, id: &str) -> Option<InstalledSource> {
+        self.installed
+            .iter()
+            .find(|source| source.manifest.id == id)
+            .cloned()
+    }
+
     /// Acceptance teardown: drop every preview follow/task so nothing the
     /// captures seeded leaks into the real saved follows/tasks on exit.
     #[cfg(debug_assertions)]
     pub(crate) fn clear_acceptance_previews(&mut self) {
-        const PREVIEW_SOURCES: [&str; 3] = [
+        const PREVIEW_SOURCES: [&str; 5] = [
             "local.filter-acceptance",
             "local.second-source",
             "local.mirror-b",
+            "local.manage-a",
+            "local.manage-b",
         ];
         let before = self.follows.len();
         self.follows
@@ -2677,12 +2864,32 @@ impl Sources {
         let _ = self.persist();
         self.migrate = None;
         self.migrate_post = None;
+        self.uninstall = None;
+        self.installed.retain(|source| {
+            !source.manifest.id.starts_with("local.manage-")
+        });
+        self.repo_test_results
+            .retain(|id, _| !id.starts_with("local.manage-"));
+        if self.repos.remove_repo("https://preview.repo/index.json") {
+            self.write_setting("source-repos", self.repos.urls_setting());
+        }
+        self.repos
+            .cache
+            .remove("https://preview.repo/index.json");
+        if self
+            .repository
+            .as_ref()
+            .is_some_and(|repo| repo.index_url == "https://preview.repo/index.json")
+        {
+            self.repository = None;
+        }
     }
 
     /// Acceptance seed: the 换源 panel at a chosen stage — candidates with
     /// one expanded row, the confirm card, or the finished new detail page.
     #[cfg(debug_assertions)]
     pub(crate) fn preview_migrate(&mut self, stage: &str) {
+        self.clear_status();
         let old = Manga {
             source_key: "local.filter-acceptance".into(),
             key: "fx-pop-1".into(),
@@ -2840,7 +3047,10 @@ impl Sources {
                     // An installation is an explicit mutation and must still finish.
 
                     if request_id != worker_request.load(Ordering::Relaxed)
-                        && !matches!(&task, Task::Install(_))
+                        && !matches!(
+                            &task,
+                            Task::Install(_) | Task::Uninstall(_) | Task::FetchAllRepos(_)
+                        )
                     {
                         continue;
                     }
@@ -2864,6 +3074,28 @@ impl Sources {
                                     list: catalog.list()?,
                                     updated: Some(entry.id),
                                 }
+                            }
+                            Task::Uninstall(id) => {
+                                catalog.remove(&id)?;
+                                engines.remove(&id);
+                                Reply::Installed {
+                                    list: catalog.list()?,
+                                    updated: None,
+                                }
+                            }
+                            Task::FetchAllRepos(urls) => {
+                                let installer =
+                                    SourceInstaller::new(SourceCatalog::new(catalog.root()))?;
+                                let results = urls
+                                    .into_iter()
+                                    .map(|url| {
+                                        let result = installer
+                                            .fetch_index(&url)
+                                            .map_err(|error| format!("{error}"));
+                                        (url, result)
+                                    })
+                                    .collect();
+                                Reply::RepoAll(results)
                             }
                             Task::Metadata(source) => {
                                 if !engines.contains_key(&source) {
@@ -3315,6 +3547,7 @@ impl Sources {
         }
 
         let (migrate_tx, migrate_rx) = mpsc::channel();
+        let (test_tx, test_rx) = mpsc::channel();
         let (tasks, load_warning) = load_queue(&root);
         let ready: VecDeque<String> = pending_imports(&tasks).into();
         let sources = Self {
@@ -3365,6 +3598,7 @@ impl Sources {
             preview_mode: None,
             busy: false,
             status: load_warning.clone().unwrap_or_default(),
+            status_seen: None,
             tasks,
             running: None,
             ready,
@@ -3386,6 +3620,7 @@ impl Sources {
             follow_interval_min: DEFAULT_FOLLOW_INTERVAL_MIN,
             follow_next_due: None,
             follow_notice: None,
+            notify_pending: Vec::new(),
             up_tx,
             up_rx,
             covers: Default::default(),
@@ -3418,8 +3653,20 @@ impl Sources {
             login_user: String::new(),
             login_pass: String::new(),
             web_cookies,
+            repos: SourceRepos::default(),
+            repo_lang: Lang::default(),
+            repo_fetching: false,
+            repo_auto_done: false,
+            repo_test_results: Default::default(),
+            repo_testing: Default::default(),
+            repo_test_queue: VecDeque::new(),
+            test_tx,
+            test_rx,
+            uninstall: None,
+            setting_writes: VecDeque::new(),
         };
         let mut sources = sources;
+        sources.repos.load_cache(&sources.root);
         match follows::load(&sources.root) {
             Ok(list) => sources.follows = list,
             Err(error) => sources.status = format!("{error:#}"),
@@ -3924,7 +4171,25 @@ impl Sources {
 
     fn check_follows(&mut self, indices: &[usize], background: bool) {
         let mut batch = Vec::new();
-        for follow in indices.iter().filter_map(|&index| self.follows.get(index)) {
+        for index in indices.iter().copied() {
+            let Some(follow) = self.follows.get(index) else {
+                continue;
+            };
+            let installed_now = self
+                .installed
+                .iter()
+                .any(|source| source.manifest.id == follow.source_id);
+            if installed_now {
+                if self.follows[index].source_removed {
+                    self.follows[index].source_removed = false;
+                    let _ = self.save_follows();
+                }
+            } else if follow.source_removed {
+                // A follow on an uninstalled source cannot load its engine;
+                // its row already says 书源已卸载 instead of erroring every round.
+                continue;
+            }
+            let follow = &self.follows[index];
             match self.follow_manga(follow) {
                 Ok(manga) => batch.push((follow.source_id.clone(), manga)),
                 Err(error) => {
@@ -3944,6 +4209,329 @@ impl Sources {
         } else {
             self.status = "更新检查线程已停止，请重新打开应用".into();
         }
+    }
+
+    // -- 书源管理: repos, update badges, tests, uninstall ------------------
+
+    /// `source-repos` setting restored at startup.
+    pub(crate) fn set_repos_setting(&mut self, json: &str) {
+        self.repos.apply_urls(json);
+    }
+
+    /// `source-repos-checked-at` setting restored at startup (epoch day).
+    pub(crate) fn set_repos_checked_day(&mut self, day: Option<i64>) {
+        self.repos.checked_day = day;
+    }
+
+    /// Setting writes the host persists (`source-repos`, `-checked-at`).
+    pub(crate) fn take_setting_writes(&mut self) -> Vec<(String, String)> {
+        self.setting_writes.drain(..).collect()
+    }
+
+    fn write_setting(&mut self, key: &str, value: String) {
+        self.setting_writes.push_back((key.to_string(), value));
+    }
+
+    /// Number of installed sources a cached index offers a newer build of.
+    pub(crate) fn updatable_count(&self) -> usize {
+        self.updatable().len()
+    }
+
+    fn updatable(&self) -> std::collections::BTreeMap<String, i64> {
+        self.repos.updates(
+            self.installed
+                .iter()
+                .map(|source| (source.manifest.id.as_str(), source.manifest.version)),
+        )
+    }
+
+    /// Manual or daily auto refresh of every saved repo index. Runs as a
+    /// background task (request id 0): it never shows the busy spinner and
+    /// its reply is accepted even when the user navigated elsewhere.
+    pub(crate) fn check_repo_updates(&mut self) {
+        if self.repo_fetching || self.repos.urls.is_empty() {
+            return;
+        }
+        self.repo_fetching = true;
+        let today = crate::source_repos::epoch_day(follows::now());
+        self.repos.checked_day = Some(today);
+        self.write_setting("source-repos-checked-at", today.to_string());
+        if self
+            .tx
+            .send((0, Task::FetchAllRepos(self.repos.urls.clone())))
+            .is_err()
+        {
+            self.repo_fetching = false;
+            self.status = "书源线程已停止，请重新打开应用".into();
+        }
+    }
+
+    /// Once per launch: refresh repo indexes when `source-repos-checked-at`
+    /// is not today. Check only — nothing installs itself.
+    fn maybe_auto_repo_check(&mut self) {
+        if self.repo_auto_done {
+            return;
+        }
+        self.repo_auto_done = true;
+        let today = crate::source_repos::epoch_day(follows::now());
+        if self.repos.checked_day != Some(today) {
+            self.check_repo_updates();
+        }
+    }
+
+    /// Merges a FetchAllRepos result: successful indexes refresh the cache,
+    /// failed repos keep their previous data.
+    fn apply_repo_all(&mut self, results: Vec<(String, Result<RepositoryIndex, String>)>) {
+        self.repo_fetching = false;
+        let now = follows::now();
+        let mut fetched = 0usize;
+        let mut failed = 0usize;
+        for (url, result) in results {
+            match result {
+                Ok(index) => {
+                    fetched += 1;
+                    if self.repos.record_repo(&url) {
+                        self.write_setting("source-repos", self.repos.urls_setting());
+                    }
+                    self.repos.merge_index(&url, &index, now);
+                }
+                Err(_) => failed += 1,
+            }
+        }
+        if fetched > 0
+            && let Err(error) = self.repos.save_cache(&self.root)
+        {
+            self.status = format!("书源仓库缓存保存失败：{error:#}");
+            return;
+        }
+        let updates = self.updatable_count();
+        self.status = if failed > 0 {
+            format!("{fetched} 个仓库已更新（{failed} 个读取失败），{updates} 个书源有新版本")
+        } else if updates > 0 {
+            format!("{updates} 个书源有新版本")
+        } else {
+            "书源全部是最新版本".into()
+        };
+    }
+
+    /// Install the newest repo build of one source.
+    pub(crate) fn update_source(&mut self, id: &str) {
+        if let Some(entry) = self.repos.update_entry(id) {
+            self.submit(Task::Install(entry));
+        }
+    }
+
+    /// 全部更新: install every source the cache says is behind.
+    fn update_all(&mut self) {
+        let updates = self.updatable();
+        for id in updates.keys() {
+            self.update_source(id);
+        }
+    }
+
+    /// 测试 one source: first listing page (or a search for "a"), ≤4
+    /// concurrently, 15 s budget enforced by `pump_repo_tests`.
+    pub(crate) fn test_source(&mut self, id: &str) {
+        if self.repo_testing.contains_key(id) || self.repo_test_queue.iter().any(|q| q == id) {
+            return;
+        }
+        self.repo_test_queue.push_back(id.to_string());
+        self.pump_repo_tests();
+    }
+
+    fn test_all(&mut self) {
+        for source in self.installed.clone() {
+            self.test_source(&source.manifest.id);
+        }
+    }
+
+    /// Starts queued tests while fewer than four run, marks timeouts.
+    fn pump_repo_tests(&mut self) {
+        let now = std::time::Instant::now();
+        let timed_out: Vec<String> = self
+            .repo_testing
+            .iter()
+            .filter(|(_, started)| started.elapsed() > std::time::Duration::from_secs(15))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in timed_out {
+            self.repo_testing.remove(&id);
+            self.repo_test_results
+                .insert(id, "测试超时（15 秒）".into());
+        }
+        let _ = now;
+        while self.repo_testing.len() < 4
+            && let Some(id) = self.repo_test_queue.pop_front()
+        {
+            let catalog = SourceCatalog::new(self.root.join("sources"));
+            let tx = self.test_tx.clone();
+            self.repo_testing
+                .insert(id.clone(), std::time::Instant::now());
+            thread::Builder::new()
+                .name(format!("yejian-source-test-{id}"))
+                .spawn(move || {
+                    let started = std::time::Instant::now();
+                    let result = (|| -> Result<u64, String> {
+                        let engine = SourceEngine::load(&catalog, &id)
+                            .map_err(|error| format!("书源无法加载：{error:#}"))?;
+                        let listings = pollster::block_on(engine.listings())
+                            .unwrap_or_else(|_| engine.manifest().listings.clone());
+                        if let Some(listing) = listings.first() {
+                            pollster::block_on(engine.browse(&listing.id, 1))
+                                .map_err(|error| format!("首页列表读取失败：{error:#}"))?;
+                        } else {
+                            pollster::block_on(engine.search_page("a", 1, Vec::new()))
+                                .map_err(|error| format!("搜索失败：{error:#}"))?;
+                        }
+                        Ok(started.elapsed().as_millis() as u64)
+                    })();
+                    let _ = tx.send((id, result));
+                })
+                .ok();
+        }
+    }
+
+    /// Finished test results land in `repo_test_results`.
+    fn drain_repo_tests(&mut self) {
+        while let Ok((id, result)) = self.test_rx.try_recv() {
+            if self.repo_testing.remove(&id).is_none() {
+                continue; // already timed out; drop the late answer
+            }
+            let text = match result {
+                Ok(ms) => format!("可用 · {ms} ms"),
+                Err(reason) => reason,
+            };
+            self.repo_test_results.insert(id, text);
+        }
+        self.pump_repo_tests();
+    }
+
+    /// 卸载 asks first; the card explains downloads stay and follows stop.
+    pub(crate) fn ask_uninstall(&mut self, source: InstalledSource) {
+        self.uninstall = Some(source);
+    }
+
+    /// Runs the removal: source dir via the worker, then settings/cookies,
+    /// the engine cache and any selection pointing at it.
+    pub(crate) fn confirm_uninstall(&mut self) {
+        let Some(source) = self.uninstall.take() else {
+            return;
+        };
+        let id = source.manifest.id.clone();
+        // Forget the engine everywhere so nothing re-loads the deleted dir.
+        self.stale_engines.lock().unwrap().insert(id.clone());
+        self.repo_test_results.remove(&id);
+        self.repo_testing.remove(&id);
+        self.repo_test_queue.retain(|queued| queued != &id);
+        // Per-source settings and web cookies go with the source.
+        self.source_settings.remove(&id);
+        if let Err(error) = save_source_settings(&self.root, &self.source_settings) {
+            self.status = format!("书源设置清理失败：{error:#}");
+        }
+        let hosts: HashSet<String> = source
+            .manifest
+            .urls
+            .iter()
+            .map(|url| url_host(url))
+            .filter(|host| !host.is_empty())
+            .collect();
+        if !hosts.is_empty() {
+            self.web_cookies
+                .retain(|url, _| !hosts.contains(&url_host(url)));
+            if let Err(error) = self.save_web_cookies() {
+                self.status = format!("网页登录信息清理失败：{error:#}");
+            }
+        }
+        if self.selected_source == id {
+            self.select_source("");
+        }
+        // Follows stay on the shelf but stop checking until the source returns.
+        let mut touched = false;
+        for follow in &mut self.follows {
+            if follow.source_id == id && !follow.source_removed {
+                follow.source_removed = true;
+                touched = true;
+            }
+        }
+        if touched {
+            self.save_follows();
+        }
+        self.submit(Task::Uninstall(id));
+    }
+
+    /// One history row per work read online: the most recently read chapter
+    /// of each (source, manga) pair that has a `read_at`.
+    pub(crate) fn reading_history(&self) -> Vec<OnlineHistory> {
+        let mut latest: std::collections::HashMap<(String, String), OnlineHistory> =
+            Default::default();
+        for task in &self.tasks {
+            let Some(read_at) = task.read_at else {
+                continue;
+            };
+            let key = (task.source_id.clone(), task.manga_id.clone());
+            let entry = OnlineHistory {
+                source_id: task.source_id.clone(),
+                manga_id: task.manga_id.clone(),
+                manga_title: task.manga_title.clone(),
+                chapter_title: task.chapter_title.clone(),
+                chapter_number: task.chapter_number,
+                read_page: task.read_page.unwrap_or(0),
+                pages_total: task.pages_total,
+                read_at,
+            };
+            match latest.get(&key) {
+                Some(existing) if existing.read_at >= read_at => {}
+                _ => {
+                    latest.insert(key, entry);
+                }
+            }
+        }
+        let mut entries: Vec<OnlineHistory> = latest.into_values().collect();
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.read_at));
+        entries
+    }
+
+    /// 阅读足迹 row tap: followed works resume through the shelf path;
+    /// unfollowed ones open their detail page from the task snapshot.
+    pub(crate) fn open_history_work(&mut self, source: &str, manga: &str) -> bool {
+        if !self
+            .installed
+            .iter()
+            .any(|installed| installed.manifest.id == source)
+        {
+            self.status = format!("书源 {source} 未安装，无法打开这部作品");
+            return false;
+        }
+        if self.follow_index(source, manga).is_some() {
+            return self.open_work(source, manga, true);
+        }
+        // Unfollowed work: rebuild the manga from the latest task's snapshot.
+        let task = self
+            .tasks
+            .iter()
+            .filter(|task| task.source_id == source && task.manga_id == manga)
+            .max_by_key(|task| task.read_at.unwrap_or(0));
+        let Some(task) = task else {
+            return false;
+        };
+        let snapshot = task
+            .manga_snapshot
+            .clone()
+            .unwrap_or_else(|| manga_snapshot_key(source, manga));
+        let Ok(bytes) = manga_snapshot_path(&self.root, &snapshot).and_then(|p| {
+            std::fs::read(&p).map_err(|error| anyhow::anyhow!("{error}"))
+        }) else {
+            self.status = "这部作品的网络详情已不在本地，请在书源中重新打开".into();
+            return false;
+        };
+        let Ok(mut manga) = Manga::from_postcard_bytes(&bytes) else {
+            self.status = "这部作品的网络详情已损坏".into();
+            return false;
+        };
+        manga.source_key = source.to_string();
+        self.select_source(source);
+        self.pending_open = Some(manga);
+        true
     }
 
     fn handle_update(&mut self, event: UpdateEvent) {
@@ -3978,6 +4566,14 @@ impl Sources {
                             .cloned()
                             .collect();
                         follow.apply_check(&keys, follows::now());
+                        if !added.is_empty() {
+                            self.notify_pending.push(crate::notify::FreshUpdate {
+                                source: follow.source_id.clone(),
+                                manga: follow.manga_id.clone(),
+                                title: follow.title.clone(),
+                                added: added.clone(),
+                            });
+                        }
                         ok_list = Some(list);
                     }
                     Err(error) => {
@@ -4045,7 +4641,13 @@ impl Sources {
                     || follow.source_id.clone(),
                     |source| source.manifest.name.clone(),
                 );
-            let mut detail = if let Some(error) = &follow.error {
+            let uninstalled = !self
+                .installed
+                .iter()
+                .any(|installed| installed.manifest.id == follow.source_id);
+            let mut detail = if uninstalled {
+                format!("{source} · 书源已卸载")
+            } else if let Some(error) = &follow.error {
                 format!("{source} · 检查失败：{error}")
             } else if !follow.fresh.is_empty() {
                 format!("{source} · {} 话更新", follow.fresh.len())
@@ -4194,6 +4796,7 @@ impl Sources {
     /// A paused online chapter with no staged pages — the acceptance
     /// share-disabled state needs bytes that never arrive.
     pub(crate) fn preview_share_stream(&mut self) -> Option<StreamChapter> {
+        self.clear_status();
         let manga = Manga {
             source_key: "acceptance".into(),
             key: "share-preview".into(),
@@ -5668,6 +6271,7 @@ impl Sources {
     }
 
     pub fn poll(&mut self) {
+        self.drain_repo_tests();
         while let Ok(done) = self.cover_done_rx.try_recv() {
             self.cover_outstanding = self.cover_outstanding.saturating_sub(1);
             self.cover_inflight.remove(&done.key);
@@ -5702,6 +6306,8 @@ impl Sources {
                 }) = result
                 {
                     self.installed = list;
+                } else if let Ok(Reply::RepoAll(results)) = result {
+                    self.apply_repo_all(results);
                 }
                 continue;
             }
@@ -5743,7 +6349,18 @@ impl Sources {
                 }
                 Reply::Repository(index) => {
                     self.status = format!("找到 {} 个书源", index.sources.len());
+                    // A fetched repo joins the saved list and its index
+                    // feeds the update badges right away.
+                    if self.repos.record_repo(&index.index_url) {
+                        self.write_setting("source-repos", self.repos.urls_setting());
+                    }
+                    self.repos
+                        .merge_index(&index.index_url, &index, follows::now());
+                    let _ = self.repos.save_cache(&self.root);
                     self.repository = Some(index);
+                }
+                Reply::RepoAll(results) => {
+                    self.apply_repo_all(results);
                 }
                 Reply::Metadata {
                     filters,
@@ -5969,6 +6586,7 @@ impl Sources {
             self.auto_checked = true;
             self.check_updates(false);
         }
+        self.maybe_auto_repo_check();
         self.poll_follow_schedule();
     }
     /// Task-id snapshot the storage worker classifies staging with:
@@ -6756,7 +7374,8 @@ impl Sources {
                 ui.set_max_width(ui.available_width());
                 design::section(ui, "书源设置");
                 ui.label(RichText::new("修改后返回书源即生效。").small());
-                if self.busy || !self.status.is_empty() {
+                let status_visible = self.status_fresh(ui.ctx());
+                if self.busy || status_visible {
                     ui.add(
                         Label::new(
                             RichText::new(&self.status)
@@ -6837,8 +7456,39 @@ impl Sources {
     }
 
     fn installed_ui(&mut self, ui: &mut Ui) {
-        design::section(ui, "我的书源");
+        let palette = design::palette(ui.visuals().dark_mode);
+        ui.horizontal_wrapped(|ui| {
+            design::section(ui, "我的书源");
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let updates = self.updatable();
+                let all = ui.add(quiet_action(&format!("全部更新 ({})", updates.len())));
+                self.hitboxes.insert("sources-update-all".into(), all.rect);
+                if all.clicked() {
+                    self.update_all();
+                }
+                let test = ui.add(quiet_action("全部测试"));
+                self.hitboxes.insert("sources-test-all".into(), test.rect);
+                if test.clicked() {
+                    self.test_all();
+                }
+                let check = ui.add_enabled(
+                    !self.repo_fetching,
+                    quiet_action(if self.repo_fetching {
+                        "检查中…"
+                    } else {
+                        "检查更新"
+                    }),
+                );
+                self.hitboxes.insert("sources-check-updates".into(), check.rect);
+                if check.clicked() {
+                    self.check_repo_updates();
+                }
+            });
+        });
+        let updates = self.updatable();
         for source in self.installed.clone() {
+            let id = source.manifest.id.clone();
+            let new_version = updates.get(&id).copied();
             let languages = source
                 .manifest
                 .languages
@@ -6846,22 +7496,137 @@ impl Sources {
                 .map(|lang| language_label(lang))
                 .collect::<Vec<_>>()
                 .join(" / ");
-            let metadata = if languages.is_empty() {
+            let mut metadata = if languages.is_empty() {
                 format!("v{}", source.manifest.version)
             } else {
                 format!("{languages} · v{}", source.manifest.version)
             };
-            if source_item(
-                ui,
-                ("installed", &source.manifest.id),
-                &source.manifest.name,
-                &metadata,
-                true,
-                true,
-            ) {
-                self.select_source(&source.manifest.id);
+            if let Some(version) = new_version {
+                metadata = format!("{metadata} · 有更新 v{version}");
+            }
+            if let Some(result) = self.repo_test_results.get(&id) {
+                metadata = format!("{metadata} · {result}");
+            }
+            // Fixed-width right-aligned action slots so every row lines up:
+            // 更新 | 测试 | 卸载 — unavailable actions stay visible, disabled.
+            let width = ui.available_width();
+            let narrow = width < 380.;
+            let response = ui.scope(|ui| {
+                ui.horizontal(|ui| {
+                    ui.set_min_height(56.);
+                    ui.vertical(|ui| {
+                        ui.add_space(4.);
+                        let mut title_job = egui::text::LayoutJob::simple(
+                            source.manifest.name.clone(),
+                            TextStyle::Body.resolve(ui.style()),
+                            palette.ink,
+                            width - 270.,
+                        );
+                        title_job.wrap.max_rows = 2;
+                        ui.add(Label::new(title_job).selectable(false));
+                        ui.add(
+                            Label::new(RichText::new(&metadata).small().color(palette.muted))
+                                .selectable(false),
+                        );
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let remove = ui.add_enabled(true, quiet_action("卸载"));
+                        self.hitboxes
+                            .insert(format!("source-uninstall-{id}"), remove.rect);
+                        if remove.clicked() {
+                            self.ask_uninstall(source.clone());
+                        }
+                        let testing = self.repo_testing.contains_key(&id);
+                        let test = ui.add_enabled(
+                            !testing,
+                            quiet_action(if testing { "测试中…" } else { "测试" }),
+                        );
+                        self.hitboxes
+                            .insert(format!("source-test-{id}"), test.rect);
+                        if test.clicked() {
+                            self.test_source(&id);
+                        }
+                        let update = ui.add_enabled(
+                            new_version.is_some() && !self.busy,
+                            quiet_action("更新"),
+                        );
+                        self.hitboxes
+                            .insert(format!("source-update-{id}"), update.rect);
+                        if update.clicked() {
+                            self.update_source(&id);
+                        }
+                    });
+                });
+                // Whole row (minus the action slots) opens the source.
+                let rect = ui.min_rect();
+                let open = ui
+                    .interact(
+                        Rect::from_min_max(
+                            rect.min,
+                            pos2(rect.right() - if narrow { 210. } else { 240. }, rect.max.y),
+                        ),
+                        ui.scope_id().with(("installed", &id)),
+                        Sense::click(),
+                    )
+                    .clicked();
+                ui.separator();
+                open
+            });
+            if response.inner {
+                self.select_source(&id);
             }
         }
+    }
+
+    /// Opaque 卸载 confirm: downloads are kept, follows stop updating.
+    fn uninstall_confirm_ui(&mut self, ctx: &Context) {
+        let Some(source) = self.uninstall.clone() else {
+            return;
+        };
+        let screen = ctx.content_rect();
+        let scrim = Area::new(egui::Id::unique("uninstall-scrim"))
+            .order(Order::Foreground)
+            .fade_in(false)
+            .interactable(true)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                ui.painter()
+                    .rect_filled(screen, 0., Color32::from_black_alpha(96));
+                ui.allocate_rect(screen, Sense::click())
+            });
+        if scrim.inner.clicked() {
+            self.uninstall = None;
+            return;
+        }
+        let mut card_rect = Rect::NOTHING;
+        Area::new(egui::Id::unique("uninstall-card"))
+            .order(Order::Foreground)
+            .fade_in(false)
+            .interactable(true)
+            .movable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                let frame = crate::design::surface(ui).show(ui, |ui| {
+                    ui.set_width((screen.width() - 56.).clamp(220., 440.));
+                    ui.heading(format!("卸载 {}", source.manifest.name));
+                    ui.label("已下载的章节保留；这个书源上的追更会停止更新，并标为「书源已卸载」。");
+                    ui.add_space(6.);
+                    ui.horizontal(|ui| {
+                        if ui.button("取消").clicked() {
+                            self.uninstall = None;
+                        }
+                        let confirm =
+                            ui.add(design::danger("卸载", ui.visuals().dark_mode));
+                        self.hitboxes
+                            .insert("source-uninstall-go".into(), confirm.rect);
+                        if confirm.clicked() {
+                            self.confirm_uninstall();
+                        }
+                    });
+                });
+                card_rect = frame.response.rect;
+            });
+        self.hitboxes.insert("source-uninstall-card".into(), card_rect);
     }
 
     fn repository_entry_ui(&mut self, ui: &mut Ui) {
@@ -6907,6 +7672,37 @@ impl Sources {
                     self.submit(Task::Fetch(self.url.trim().into()));
                 }
             });
+            // Saved repos: fetched indexes feed the 我的书源 update badges.
+            if self.repos.urls.len() > 1 {
+                ui.add_space(10.);
+                ui.label(RichText::new("已保存的仓库").color(palette.muted).small());
+                for url in self.repos.urls.clone() {
+                    if url == COMMUNITY_INDEX {
+                        continue;
+                    }
+                    ui.horizontal(|ui| {
+                        let name = self
+                            .repos
+                            .cache
+                            .get(&url)
+                            .and_then(|repo| repo.name.clone());
+                        ui.add(
+                            Label::new(
+                                RichText::new(name.unwrap_or_else(|| url.clone())).small(),
+                            )
+                            .wrap(),
+                        );
+                        let remove = ui.add(quiet_action("✕").min_size(vec2(44., 32.)));
+                        self.hitboxes
+                            .insert(format!("repo-remove-{}", url), remove.rect);
+                        if remove.clicked() {
+                            self.repos.remove_repo(&url);
+                            self.write_setting("source-repos", self.repos.urls_setting());
+                            let _ = self.repos.save_cache(&self.root);
+                        }
+                    });
+                }
+            }
         });
     }
 
@@ -6945,17 +7741,30 @@ impl Sources {
             title(ui);
             ui.add_enabled(!self.busy && !installed, action()).clicked()
         } else {
-            ui.horizontal(|ui| {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let clicked = ui.add_enabled(!self.busy && !installed, action()).clicked();
-                    ui.allocate_ui_with_layout(
-                        vec2(ui.available_width(), 0.),
-                        Layout::top_down(Align::Min),
-                        title,
-                    );
-                    clicked
-                })
-                .inner
+            // Manual two-slot row: title vertically centred on the left,
+            // ≥44pt action vertically centred on the right.
+            let line = ui.text_style_height(&TextStyle::Body);
+            let title_h =
+                (if metadata.is_empty() { line + 8. } else { line * 2. + 14. }).max(44.);
+            let (rect, _) = ui.allocate_exact_size(
+                vec2(ui.available_width(), title_h),
+                Sense::hover(),
+            );
+            let mut title_ui = ui.new_child(
+                UiBuilder::new()
+                    .max_rect(Rect::from_min_size(
+                        rect.min + vec2(0., (title_h - line * if metadata.is_empty() { 1. } else { 2. } - 8.) / 2.),
+                        vec2((rect.width() - 72.).max(40.), title_h),
+                    ))
+                    .layout(Layout::top_down(Align::Min)),
+            );
+            title(&mut title_ui);
+            let button = Rect::from_center_size(
+                pos2(rect.right() - 32., rect.center().y),
+                vec2(60., 44.),
+            );
+            ui.scope_builder(UiBuilder::new().max_rect(button), |ui| {
+                ui.add_enabled(!self.busy && !installed, action()).clicked()
             })
             .inner
         };
@@ -7006,11 +7815,21 @@ impl Sources {
                     .hint_text("查找书源名称或语言（如 zh）")
                     .desired_width(ui.available_width()),
             );
+            ui.add_space(6.);
+            // Language chips narrow the list on top of the name search.
+            ui.horizontal_wrapped(|ui| {
+                for (lang, label) in Lang::CHOICES {
+                    let chip = ui.selectable_value(&mut self.repo_lang, lang, label);
+                    self.hitboxes
+                        .insert(format!("repo-lang-{}", label), chip.rect);
+                }
+            });
             let needle = self.repository_search.trim().to_lowercase();
             ui.add_space(8.);
             let sources: Vec<&RepositorySource> = repo
                 .sources
                 .iter()
+                .filter(|source| self.repo_lang.accepts(&source.languages))
                 .filter(|source| {
                     format!(
                         "{} {} {}",
@@ -7986,6 +8805,58 @@ impl Sources {
         }
     }
 
+    /// How long a success notice stays on the status line before it fades.
+    const STATUS_TTL: std::time::Duration = std::time::Duration::from_secs(4);
+    /// Errors stay until the next action replaces them; everything else is
+    /// a transient success notice that fades after `STATUS_TTL`.
+    fn status_is_error(text: &str) -> bool {
+        [
+            "失败", "错误", "无法", "未安装", "已丢失", "已停止", "损坏", "过期", "被拒绝",
+            "超时", "请先", "暂不可", "不支持", "不正确",
+        ]
+        .iter()
+        .any(|mark| text.contains(mark))
+    }
+    /// True while the status line should render. Tracks when the current
+    /// string was first observed and schedules the repaint that fades it.
+    fn status_fresh(&mut self, ctx: &Context) -> bool {
+        if self.status.is_empty() {
+            self.status_seen = None;
+            return false;
+        }
+        let now = std::time::Instant::now();
+        if self.status_seen.as_ref().map(|(seen, _)| seen) != Some(&self.status) {
+            self.status_seen = Some((self.status.clone(), now));
+        }
+        if Self::status_is_error(&self.status) {
+            return true;
+        }
+        let elapsed = self
+            .status_seen
+            .as_ref()
+            .map(|(_, seen)| now.duration_since(*seen))
+            .unwrap_or_default();
+        if elapsed < Self::STATUS_TTL {
+            ctx.request_repaint_after(Self::STATUS_TTL - elapsed);
+            true
+        } else {
+            false
+        }
+    }
+    /// Leaving the sources tab drops transient success notices.
+    pub(crate) fn clear_transient_status(&mut self) {
+        if !Self::status_is_error(&self.status) {
+            self.status.clear();
+            self.status_seen = None;
+        }
+    }
+    /// A status string set by acceptance previews must not leak into the
+    /// next capture.
+    #[cfg(debug_assertions)]
+    pub(crate) fn clear_status(&mut self) {
+        self.status.clear();
+        self.status_seen = None;
+    }
     pub fn ui(&mut self, ui: &mut Ui) {
         self.hitboxes.clear();
         self.poll();
@@ -8023,8 +8894,9 @@ impl Sources {
         // clipping the last content line mid-glyph.
         // "正在加载…" is only honest while a request is in flight; a stale
         // copy left by a finished reply must not render a phantom footer.
-        let status_visible =
-            !self.status.is_empty() && (self.busy || self.status != "正在加载…");
+        let status_visible = self.status_fresh(ui.ctx())
+            && (self.busy || self.status != "正在加载…");
+
         let footer_height =
             if self.busy || self.failed.is_some() || status_visible {
                 40.
@@ -8044,9 +8916,12 @@ impl Sources {
             .show(ui, |ui| {
                 // Never let one long row stretch the page beyond the viewport; rows
 
-                // truncate or wrap inside this width instead.
+                // truncate or wrap inside this width instead. The floating
+                // scroll bar overlays the content — reserve a right gutter.
 
-                ui.set_max_width(ui.available_width());
+                ui.set_max_width(
+                    ui.available_width() - ui.spacing().scroll.bar_width - 8.,
+                );
                 if self.selected_manga.is_none() {
                     let unfinished: Vec<DownloadTask> = self
                         .tasks
@@ -8157,6 +9032,7 @@ impl Sources {
             });
         }
         self.history_confirm_ui(ui.ctx());
+        self.uninstall_confirm_ui(ui.ctx());
         self.migrate_ui(ui.ctx());
     }
 
@@ -8881,6 +9757,7 @@ mod tests {
             preview_mode: None,
             busy: false,
             status: String::new(),
+            status_seen: None,
             tasks: Vec::new(),
             running: None,
             ready: VecDeque::new(),
@@ -8902,6 +9779,7 @@ mod tests {
             follow_interval_min: DEFAULT_FOLLOW_INTERVAL_MIN,
             follow_next_due: None,
             follow_notice: None,
+            notify_pending: Vec::new(),
             // Keep the update receiver alive so `check_follows` batches do not
 
             // fail in tests that never drain `up_rx`.
@@ -8941,6 +9819,17 @@ mod tests {
             login_user: String::new(),
             login_pass: String::new(),
             web_cookies: Default::default(),
+            repos: SourceRepos::default(),
+            repo_lang: Lang::default(),
+            repo_fetching: false,
+            repo_auto_done: true,
+            repo_test_results: Default::default(),
+            repo_testing: Default::default(),
+            repo_test_queue: VecDeque::new(),
+            test_tx: mpsc::channel().0,
+            test_rx: mpsc::channel().1,
+            uninstall: None,
+            setting_writes: VecDeque::new(),
         }
     }
 
@@ -11798,5 +12687,338 @@ mod tests {
             sources.resume_chapter("source.a", &manga, &locked_tail, &Default::default());
         assert_eq!(resume.unwrap().key, "c2");
     }
+
+    fn installed(id: &str, version: i64) -> InstalledSource {
+        InstalledSource {
+            manifest: SourceManifest {
+                id: id.into(),
+                name: id.into(),
+                version,
+                alt_names: Vec::new(),
+                languages: vec!["zh".into()],
+                urls: vec![format!("https://{id}.example")],
+                content_rating: 0,
+                listings: Vec::new(),
+                allows_base_url_select: false,
+                hides_filters_while_searching: false,
+            },
+            directory: PathBuf::from(id),
+            wasm_path: PathBuf::from(id).join("main.wasm"),
+            settings_path: None,
+            filters_path: None,
+            icon_path: None,
+        }
+    }
+
+    #[test]
+    fn reading_history_merges_into_one_row_per_work_newest_first() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sources = test_sources(root.path());
+        // Two chapters of one work → one row, latest read wins.
+        let mut older = task("source.a", "m", "c1");
+        older.read_at = Some(10);
+        older.read_page = Some(0);
+        older.pages_total = 20;
+        let mut newer = task("source.a", "m", "c2");
+        newer.read_at = Some(20);
+        newer.read_page = Some(4);
+        newer.pages_total = 20;
+        let mut other = task("source.a", "other", "x");
+        other.read_at = Some(30);
+        // Unread tasks never produce rows.
+        sources.tasks.push(task("source.a", "m", "c3"));
+        sources.tasks.extend([older, newer, other]);
+        let history = sources.reading_history();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].manga_id, "other");
+        assert_eq!(history[0].read_at, 30);
+        assert_eq!(history[1].manga_id, "m");
+        assert_eq!(history[1].chapter_title, "c2");
+        assert_eq!(history[1].read_page, 4);
+        assert_eq!(history[1].pages_total, 20);
+    }
+
+    #[test]
+    fn follows_on_uninstalled_sources_are_not_checked() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sources = test_sources(root.path());
+        sources.follows.push(Follow {
+            source_id: "gone.source".into(),
+            manga_id: "m".into(),
+            title: "离线作品".into(),
+            source_removed: true,
+            ..Default::default()
+        });
+        sources.check_updates(false);
+        assert_eq!(sources.checking, 0, "no engine is ever loaded for it");
+        assert!(sources.status.is_empty() || !sources.status.contains("无法检查更新"));
+    }
+
+    #[test]
+    fn uninstall_clears_settings_cookies_engines_and_test_state_only() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sources = test_sources(root.path());
+        let source = installed("source.a", 1);
+        sources.installed = vec![source.clone()];
+        // Per-source settings + web cookies tied to its host.
+        sources.source_settings.insert(
+            "source.a".into(),
+            [("key".into(), SettingValue::Str("v".into()))].into_iter().collect(),
+        );
+        sources.web_cookies.insert(
+            "https://source.a.example/login".into(),
+            WebSiteCookies {
+                cookies: vec![("s".into(), "v".into())],
+                user_agent: None,
+            },
+        );
+        sources.web_cookies.insert(
+            "https://other.example".into(),
+            WebSiteCookies {
+                cookies: vec![("s".into(), "v".into())],
+                user_agent: None,
+            },
+        );
+        sources
+            .repo_test_results
+            .insert("source.a".into(), "可用 · 10 ms".into());
+        sources.repo_testing.insert(
+            "source.a".into(),
+            std::time::Instant::now(),
+        );
+        sources.repo_test_queue.push_back("source.a".into());
+        sources.follows.push(Follow {
+            source_id: "source.a".into(),
+            manga_id: "m".into(),
+            title: "保留的追更".into(),
+            ..Default::default()
+        });
+        sources.tasks.push(task("source.a", "m", "c1"));
+
+        sources.ask_uninstall(source);
+        assert!(sources.uninstall.is_some());
+        sources.confirm_uninstall();
+        assert!(sources.uninstall.is_none());
+        assert!(sources.source_settings.get("source.a").is_none());
+        assert!(
+            sources.web_cookies.get("https://source.a.example/login").is_none(),
+            "cookies tied to the source's hosts go with it"
+        );
+        assert!(sources.web_cookies.get("https://other.example").is_some());
+        assert!(
+            sources
+                .stale_engines
+                .lock()
+                .unwrap()
+                .contains("source.a"),
+            "the engine is unloaded on every worker"
+        );
+        assert!(sources.repo_test_results.is_empty());
+        assert!(sources.repo_testing.is_empty());
+        assert!(sources.repo_test_queue.is_empty());
+        // Downloads and follows survive the removal, marked 书源已卸载.
+        assert_eq!(sources.follows.len(), 1);
+        assert!(sources.follows[0].source_removed);
+        assert_eq!(sources.tasks.len(), 1);
+        // Settings and cookies were persisted, not just mutated in memory.
+        assert!(sources.source_settings.is_empty());
+        let saved: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.path().join("source-settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(!saved.to_string().contains("source.a"));
+    }
+
+    #[test]
+    fn repo_tests_queue_at_four_and_timeout_reports_chinese_reason() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sources = test_sources(root.path());
+        // Four running → the fifth queues.
+        for index in 0..4 {
+            sources
+                .repo_testing
+                .insert(format!("s{index}"), std::time::Instant::now());
+        }
+        sources.test_source("s4");
+        assert_eq!(sources.repo_testing.len(), 4);
+        assert_eq!(sources.repo_test_queue.front().map(String::as_str), Some("s4"));
+        // A finished test frees a slot and stores its result.
+        let (tx, rx) = mpsc::channel();
+        sources.test_tx = tx;
+        sources.test_rx = rx;
+        sources
+            .repo_testing
+            .insert("s4".into(), std::time::Instant::now());
+        sources.repo_test_queue.clear();
+        let send = sources.test_tx.clone();
+        send.send(("s0".into(), Ok(820u64))).unwrap();
+        sources.drain_repo_tests();
+        assert_eq!(
+            sources.repo_test_results.get("s0").map(String::as_str),
+            Some("可用 · 820 ms")
+        );
+        // A wedged test is marked timed out after 15 s and dropped.
+        sources.repo_testing.insert(
+            "wedged".into(),
+            std::time::Instant::now() - std::time::Duration::from_secs(20),
+        );
+        sources.pump_repo_tests();
+        assert_eq!(
+            sources.repo_test_results.get("wedged").map(String::as_str),
+            Some("测试超时（15 秒）")
+        );
+    }
+
+    #[test]
+    fn update_badges_and_update_all_use_the_highest_repo_version() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sources = test_sources(root.path());
+        sources.installed = vec![installed("s1", 1), installed("s2", 5)];
+        sources.repos.merge_index(
+            "https://repo",
+            &RepositoryIndex {
+                name: None,
+                website: None,
+                index_url: "https://repo".into(),
+                sources: vec![
+                    RepositorySource {
+                        id: "s1".into(),
+                        name: "S1".into(),
+                        version: 3,
+                        download_url: "https://repo/s1.aix".into(),
+                        icon_url: None,
+                        languages: vec!["zh".into()],
+                        content_rating: 0,
+                        base_url: None,
+                    },
+                    RepositorySource {
+                        id: "s2".into(),
+                        name: "S2".into(),
+                        version: 5,
+                        download_url: "https://repo/s2.aix".into(),
+                        icon_url: None,
+                        languages: vec!["en".into()],
+                        content_rating: 0,
+                        base_url: None,
+                    },
+                ],
+            },
+            1,
+        );
+        assert_eq!(sources.updatable_count(), 1);
+        assert_eq!(sources.updatable().get("s1"), Some(&3));
+        assert!(sources.updatable().get("s2").is_none());
+    }
 }
 
+
+impl Sources {
+    /// Fresh-chapter items collected since the last drain — the shell turns
+    /// them into system notifications (foregrounded frames only mark them).
+    pub(crate) fn take_notify_updates(&mut self) -> Vec<crate::notify::FreshUpdate> {
+        std::mem::take(&mut self.notify_pending)
+    }
+}
+
+/// Online chapter read state for cloud sync — one record per task that has a
+/// `read_at` (i.e. the user actually opened it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OnlineReadState {
+    pub source_id: String,
+    pub manga_id: String,
+    pub chapter_id: String,
+    pub read_page: usize,
+    pub total: usize,
+    pub read_at: i64,
+}
+
+impl Sources {
+    /// Every task's latest online read position — the cloud snapshot's
+    /// `online` group.
+    pub(crate) fn online_read_state(&self) -> Vec<OnlineReadState> {
+        self.tasks
+            .iter()
+            .filter_map(|task| {
+                Some(OnlineReadState {
+                    source_id: task.source_id.clone(),
+                    manga_id: task.manga_id.clone(),
+                    chapter_id: task.chapter_id.clone(),
+                    read_page: task.read_page?,
+                    total: task.pages_total,
+                    read_at: task.read_at?,
+                })
+            })
+            .collect()
+    }
+
+    /// Applies remote online read state onto matching tasks; returns how
+    /// many tasks were moved. `skip` excludes the work currently open in
+    /// the reader so sync never yanks a live position.
+    pub(crate) fn apply_online_state(
+        &mut self,
+        states: &[OnlineReadState],
+        skip: Option<(&str, &str)>,
+    ) -> usize {
+        let mut changed = 0;
+        for state in states {
+            if skip.is_some_and(|(s, m)| s == state.source_id && m == state.manga_id) {
+                continue;
+            }
+            let Some(task) = self.tasks.iter_mut().find(|task| {
+                task.source_id == state.source_id
+                    && task.manga_id == state.manga_id
+                    && task.chapter_id == state.chapter_id
+            }) else {
+                continue;
+            };
+            if state.read_at > task.read_at.unwrap_or(0) {
+                task.read_page = Some(state.read_page);
+                task.read_at = Some(state.read_at);
+                changed += 1;
+            }
+        }
+        if changed > 0 {
+            let _ = self.persist();
+        }
+        changed
+    }
+
+    /// Replaces the follows list wholesale after a cloud merge and persists.
+    pub(crate) fn apply_synced_follows(&mut self, follows: Vec<Follow>) {
+        self.follows = follows;
+        self.save_follows();
+    }
+
+    /// `(id, version)` per installed source — the cloud snapshot's `sources`
+    /// group, so another device can offer 一键安装.
+    pub(crate) fn installed_source_meta(&self) -> Vec<(String, i64)> {
+        self.installed
+            .iter()
+            .map(|source| (source.manifest.id.clone(), source.manifest.version))
+            .collect()
+    }
+
+    /// Repo-list urls for the cloud `sources` group entries.
+    pub(crate) fn repo_urls(&self) -> Vec<String> {
+        self.repos.urls.clone()
+    }
+
+    /// Install one remote device already had — resolves the source id in the
+    /// cached repository index and queues the normal install task. Returns
+    /// true when the id was found.
+    pub(crate) fn install_cloud_source(&mut self, id: &str) -> bool {
+        let Some(repo) = &self.repository else {
+            return false;
+        };
+        let Some(entry) = repo
+            .sources
+            .iter()
+            .find(|source| &source.id == id)
+            .cloned()
+        else {
+            return false;
+        };
+        self.submit(Task::Install(entry));
+        true
+    }
+}

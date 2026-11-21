@@ -311,6 +311,11 @@ impl NativeHttp {
             "PATCH" => Method::PATCH,
             "HEAD" => Method::HEAD,
             "DELETE" => Method::DELETE,
+            // WebDAV verbs used by the cloud sync transport.
+            "MKCOL" => Method::from_bytes(b"MKCOL")
+                .map_err(|e| format!("invalid HTTP method: {e}"))?,
+            "PROPFIND" => Method::from_bytes(b"PROPFIND")
+                .map_err(|e| format!("invalid HTTP method: {e}"))?,
             other => return Err(format!("unsupported HTTP method \"{other}\"")),
         };
 

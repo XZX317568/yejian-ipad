@@ -3,8 +3,13 @@ package app.yejian.reader;
 import android.app.KeyguardManager;
 import android.app.NativeActivity;
 import android.app.Dialog;
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.content.ClipData;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.database.Cursor;
 import android.graphics.Insets;
 import android.net.Uri;
@@ -68,6 +73,11 @@ public class RustActivity extends NativeActivity {
     private static final int REQUEST_OPEN_COMICS = 0x59454A31;
     private static final int REQUEST_CREATE_DOCUMENT = 0x59454A32;
     private static final int REQUEST_DEVICE_CREDENTIAL = 0x59454A33;
+    private static final int REQUEST_POST_NOTIFICATIONS = 0x59454A34;
+    /** Channel id/name for 新章节通知. */
+    private static final String NOTIFY_CHANNEL = "chapters";
+    /** Intent extra carrying the notification payload back to Rust. */
+    private static final String NOTIFY_EXTRA = "yejian.notify";
     /** Archive picker: cbz/cbr/cbt/zip/rar/tar/gz. */
     static final int MODE_COMICS = 0;
     /** Backup picker: zip/json only. */
@@ -126,6 +136,11 @@ public class RustActivity extends NativeActivity {
     private static final Object foregroundLock = new Object();
     private static final ArrayDeque<String> foregroundEvents = new ArrayDeque<>();
     private static final AtomicBoolean authInFlight = new AtomicBoolean(false);
+    /** Notification permission results ("1"/"0") and open payloads. */
+    private static final Object notifyPermLock = new Object();
+    private static final ArrayDeque<String> notifyPermResults = new ArrayDeque<>();
+    private static final Object notifyOpenLock = new Object();
+    private static final ArrayDeque<String> notifyOpens = new ArrayDeque<>();
     // The auth prompt itself pauses/resumes the activity; that synthetic
     // round trip must not count as a real backgrounding for the app lock.
     private static volatile boolean suppressLifecycleEvents = false;
@@ -158,8 +173,9 @@ public class RustActivity extends NativeActivity {
 
         registerBackHandling();
 
-        // Cold start from "open with 页间".
+        // Cold start from "open with 页间" or a notification tap.
         handleOpenIntent(getIntent());
+        handleNotificationIntent(getIntent());
     }
 
     @Override
@@ -194,6 +210,7 @@ public class RustActivity extends NativeActivity {
         }
         // Warm "open with" while the activity is alive (launchMode=singleTask).
         handleOpenIntent(intent);
+        handleNotificationIntent(intent);
     }
 
     @Override
@@ -1233,6 +1250,117 @@ public class RustActivity extends NativeActivity {
     public static String pollForeground() {
         synchronized (foregroundLock) {
             return foregroundEvents.pollFirst();
+        }
+    }
+
+    // -- 新章节通知 ---------------------------------------------------------
+
+    /**
+     * Requests POST_NOTIFICATIONS on API 33+; below it the permission is
+     * granted at install time, so "1" is queued immediately.
+     */
+    public static void requestNotificationPermission() {
+        RustActivity activity = instance;
+        if (activity == null) {
+            enqueueNotifyPerm("0");
+            return;
+        }
+        activity.runOnUiThread(() -> {
+            if (Build.VERSION.SDK_INT >= 33) {
+                activity.requestPermissions(
+                        new String[]{"android.permission.POST_NOTIFICATIONS"},
+                        REQUEST_POST_NOTIFICATIONS);
+            } else {
+                enqueueNotifyPerm("1");
+            }
+        });
+    }
+
+    /** Next finished permission request: "1"/"0", null while busy. */
+    public static String pollNotificationPermission() {
+        synchronized (notifyPermLock) {
+            return notifyPermResults.pollFirst();
+        }
+    }
+
+    private static void enqueueNotifyPerm(String value) {
+        synchronized (notifyPermLock) {
+            notifyPermResults.addLast(value);
+        }
+        nativeAppLockEvent();
+    }
+
+    /**
+     * Posts onto the 新章节 channel. The PendingIntent is immutable and
+     * carries the payload back through {@link #NOTIFY_EXTRA}. The small icon
+     * reuses the launcher icon resource; the system tints the silhouette.
+     */
+    public static void postNotification(
+            int id, final String title, final String body, final String payload) {
+        RustActivity activity = instance;
+        if (activity == null) {
+            return;
+        }
+        activity.runOnUiThread(() -> {
+            NotificationManager manager = activity.getSystemService(NotificationManager.class);
+            if (manager == null) {
+                return;
+            }
+            Notification.Builder builder;
+            if (Build.VERSION.SDK_INT >= 26) {
+                manager.createNotificationChannel(new NotificationChannel(
+                        NOTIFY_CHANNEL, "新章节", NotificationManager.IMPORTANCE_DEFAULT));
+                builder = new Notification.Builder(activity, NOTIFY_CHANNEL);
+            } else {
+                builder = new Notification.Builder(activity);
+            }
+            Intent intent = new Intent(activity, RustActivity.class);
+            intent.setAction("app.yejian.reader.NOTIFY");
+            intent.putExtra(NOTIFY_EXTRA, payload);
+            PendingIntent pending = PendingIntent.getActivity(
+                    activity,
+                    id,
+                    intent,
+                    PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+            builder.setSmallIcon(activity.getApplicationInfo().icon)
+                    .setContentTitle(title)
+                    .setContentText(body)
+                    .setContentIntent(pending)
+                    .setAutoCancel(true);
+            manager.notify(id, builder.build());
+        });
+    }
+
+    /** Next tapped-notification payload, null when idle. */
+    public static String pollNotificationOpen() {
+        synchronized (notifyOpenLock) {
+            return notifyOpens.pollFirst();
+        }
+    }
+
+    /** Reads the payload a notification PendingIntent brought in. */
+    private void handleNotificationIntent(Intent intent) {
+        if (intent == null) {
+            return;
+        }
+        String payload = intent.getStringExtra(NOTIFY_EXTRA);
+        if (payload != null) {
+            intent.removeExtra(NOTIFY_EXTRA);
+            synchronized (notifyOpenLock) {
+                notifyOpens.addLast(payload);
+            }
+            nativeAppLockEvent();
+        }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(
+            int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == REQUEST_POST_NOTIFICATIONS) {
+            boolean granted = grantResults.length > 0
+                    && grantResults[0] == PackageManager.PERMISSION_GRANTED;
+            enqueueNotifyPerm(granted ? "1" : "0");
         }
     }
 

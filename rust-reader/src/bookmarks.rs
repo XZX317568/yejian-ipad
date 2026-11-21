@@ -47,7 +47,6 @@ impl Bookmarks {
         })
     }
 
-    #[cfg(any(test, debug_assertions))]
     pub fn entries(&self) -> &[Bookmark] {
         &self.entries
     }
@@ -178,5 +177,13 @@ mod tests {
         assert_eq!(chapter_key("book-1", Some(&meta("c1"))), "c1");
         assert_eq!(work_key("book-1", None), "book-1");
         assert_eq!(chapter_key("book-1", None), "book-1");
+    }
+}
+
+impl Bookmarks {
+    /// Replaces every entry after a cloud merge and persists.
+    pub fn replace_all(&mut self, root: &Path, entries: Vec<Bookmark>) -> anyhow::Result<()> {
+        self.entries = entries;
+        self.save(root)
     }
 }

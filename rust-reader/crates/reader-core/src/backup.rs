@@ -63,6 +63,10 @@ pub struct BackupImportReport {
     /// already belongs to a different book on this device.
     #[serde(default)]
     pub link_failures: Vec<BackupFailure>,
+    /// Raw `app-state.json` bytes when the backup carried one — the caller
+    /// applies follows/bookmarks/stats etc. through its own owners.
+    #[serde(default)]
+    pub app_state: Option<Vec<u8>>,
 }
 
 impl BackupImportReport {
@@ -150,6 +154,17 @@ impl Library {
     /// Exports the visible library to one ZIP with a manifest, archive copies,
     /// covers and settings.
     pub fn export_backup(&self, path: &Path) -> Result<BackupReport> {
+        self.export_backup_with_extras(path, &[])
+    }
+
+    /// Like [`export_backup`], plus extra files written verbatim at the zip
+    /// root — used for `app-state.json` (the same JSON the cloud sync
+    /// snapshot carries).
+    pub fn export_backup_with_extras(
+        &self,
+        path: &Path,
+        extras: &[(String, Vec<u8>)],
+    ) -> Result<BackupReport> {
         if path.exists() {
             bail!("backup destination already exists: {}", path.display());
         }
@@ -289,6 +304,19 @@ impl Library {
                 .write_all(&manifest_bytes)
                 .context("write backup manifest")?;
 
+            for (name, bytes) in extras {
+                writer
+                    .start_file(
+                        name,
+                        SimpleFileOptions::default()
+                            .compression_method(CompressionMethod::Deflated),
+                    )
+                    .with_context(|| format!("start extra file {name}"))?;
+                writer
+                    .write_all(bytes)
+                    .with_context(|| format!("write extra file {name}"))?;
+            }
+
             for plan in &plans {
                 if let Some(files) = &plan.directory_files {
                     for (source, relative) in files {
@@ -420,6 +448,16 @@ impl Library {
         }
         let _ = manifest.created_at;
 
+        let app_state = match archive.index_for_name("app-state.json") {
+            Some(index) => {
+                let mut entry = archive.by_index(index).context("read app-state.json")?;
+                let bytes = read_reader_limited(&mut entry, MAX_MANIFEST_BYTES)
+                    .context("read app-state.json")?;
+                Some(bytes)
+            }
+            None => None,
+        };
+
         let temporary_root = self
             .archives_dir()
             .join(format!(".restore-{}", unique_suffix()));
@@ -434,6 +472,7 @@ impl Library {
             settings_restored: 0,
             links_restored: 0,
             link_failures: Vec::new(),
+            app_state,
         };
 
         let result = (|| -> Result<()> {
