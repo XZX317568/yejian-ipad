@@ -37,6 +37,9 @@ static WAKER: Mutex<Option<Arc<dyn Fn() + Send + Sync>>> = Mutex::new(None);
 /// waker is installed, a `false` flag proves the Java queue is empty, so the UI
 /// can call `poll_import()` every frame without paying a JNI round trip.
 static QUEUED: AtomicBool = AtomicBool::new(false);
+/// Same as `QUEUED` for the WebView result queue; the import poll must not
+/// consume a wake meant for a finished web page.
+static WEB_QUEUED: AtomicBool = AtomicBool::new(false);
 static WAKER_SET: AtomicBool = AtomicBool::new(false);
 /// Linux-style "back requested by the system shell". Drained by the UI.
 static BACK_PENDING: AtomicBool = AtomicBool::new(false);
@@ -77,6 +80,7 @@ pub extern "system" fn Java_app_yejian_reader_RustActivity_nativeImportFinished(
     _class: JClass<'_>,
 ) {
     QUEUED.store(true, Ordering::Release);
+    WEB_QUEUED.store(true, Ordering::Release);
     notify_waker();
 }
 
@@ -321,6 +325,86 @@ pub(crate) fn safe_insets() -> Result<Insets> {
             Err(PlatformError::NotReady("window insets"))
         } else {
             parse_insets_csv(&text)
+        }
+    })
+}
+
+/// Hands `url` to the system browser through `RustActivity.openExternalUrl`
+/// (`Intent.ACTION_VIEW` on the UI thread). The URL was validated by
+/// `lib.rs` before this call.
+pub(crate) fn open_external_url(url: &str) -> Result<()> {
+    with_activity(|env, class| {
+        let argument = env
+            .new_string(url)
+            .map_err(|error| PlatformError::Jni(format!("openExternalUrl argument: {error}")))?;
+        let result = env
+            .call_static_method(
+                class,
+                "openExternalUrl",
+                "(Ljava/lang/String;)Z",
+                &[JValue::Object(&JObject::from(argument))],
+            )
+            .map_err(|error| PlatformError::Jni(format!("openExternalUrl: {error}")))?;
+        let started = result
+            .z()
+            .map_err(|error| PlatformError::Jni(format!("openExternalUrl result: {error}")))?;
+        if started {
+            Ok(())
+        } else {
+            Err(PlatformError::Io(
+                "没有可打开链接的应用或活动未就绪".into(),
+            ))
+        }
+    })
+}
+
+/// Opens the in-app WebView dialog for `url`; cookies come back through
+/// [`poll_web`]. `false` from Java means the activity is not ready or a web
+/// dialog is already open.
+pub(crate) fn open_web(url: &str, user_agent: &str) -> Result<()> {
+    with_activity(|env, class| {
+        let url_arg = env
+            .new_string(url)
+            .map_err(|error| PlatformError::Jni(format!("openWeb url: {error}")))?;
+        let agent_arg = env
+            .new_string(user_agent)
+            .map_err(|error| PlatformError::Jni(format!("openWeb user agent: {error}")))?;
+        let result = env
+            .call_static_method(
+                class,
+                "openWeb",
+                "(Ljava/lang/String;Ljava/lang/String;)Z",
+                &[
+                    JValue::Object(&JObject::from(url_arg)),
+                    JValue::Object(&JObject::from(agent_arg)),
+                ],
+            )
+            .map_err(|error| PlatformError::Jni(format!("openWeb: {error}")))?;
+        let started = result
+            .z()
+            .map_err(|error| PlatformError::Jni(format!("openWeb result: {error}")))?;
+        if started {
+            Ok(())
+        } else {
+            Err(PlatformError::NotReady("in-app browser dialog"))
+        }
+    })
+}
+
+/// Drains the WebView dialog's own result queue, kept separate from the
+/// import queue so a picked file and a finished web page never interleave.
+pub(crate) fn poll_web() -> Result<Option<crate::WebResult>> {
+    let queued = WEB_QUEUED.swap(false, Ordering::AcqRel);
+    if WAKER_SET.load(Ordering::Acquire) && !queued {
+        return Ok(None);
+    }
+    with_activity(|env, class| {
+        let text = call_static_string(env, class, "pollWeb")?;
+        if text.is_empty() {
+            Ok(None)
+        } else {
+            WEB_QUEUED.store(true, Ordering::Release);
+            crate::parse_web_json(&text).map(Some)
         }
     })
 }

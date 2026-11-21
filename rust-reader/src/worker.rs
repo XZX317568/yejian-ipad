@@ -543,6 +543,7 @@ fn read_settings(library: &Library) -> anyhow::Result<Vec<(String, String)>> {
         "reader-fit",
         "reader-brightness",
         "reader-spread-offset",
+        "follow-interval",
     ] {
         if let Some(value) = library.get_setting(key)? {
             settings.push((key.to_string(), value));

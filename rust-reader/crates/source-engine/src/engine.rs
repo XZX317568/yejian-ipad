@@ -503,6 +503,59 @@ impl SourceEngine {
         })
     }
 
+    /// Sends one downloaded page image through the source's
+    /// `process_page_image` export. Returns `Ok(None)` for sources that do
+    /// not post-process pages, so the caller can keep the original bytes at
+    /// zero cost. On success the result is a re-encoded PNG.
+    pub fn process_page_image(
+        &self,
+        bytes: Vec<u8>,
+        context: Option<Vec<(String, String)>>,
+    ) -> BoxFuture<Result<Option<Vec<u8>>, SourceError>> {
+        self.submit(move |state| {
+            if !state.features.processes_pages {
+                return Ok(None);
+            }
+            state
+                .interpreter
+                .process_page_image(&bytes, context.as_deref())
+                .map(Some)
+        })
+    }
+
+    /// Cover variant of [`Self::process_page_image`] via `process_cover_image`.
+    pub fn process_cover_image(
+        &self,
+        bytes: Vec<u8>,
+    ) -> BoxFuture<Result<Option<Vec<u8>>, SourceError>> {
+        self.submit(move |state| {
+            if !state.features.processes_covers {
+                return Ok(None);
+            }
+            state
+                .interpreter
+                .process_cover_image(&bytes)
+                .map(Some)
+        })
+    }
+
+    /// Forwards a `settings.json` `notification` to the source's
+    /// `handle_notification` export. Returns [`SourceError::Unimplemented`]
+    /// when the module exports no handler.
+    pub fn handle_notification(
+        &self,
+        notification: String,
+    ) -> BoxFuture<Result<(), SourceError>> {
+        self.submit(move |state| {
+            if !state.features.handles_notifications {
+                return Err(SourceError::Unimplemented(
+                    "handle_notification".into(),
+                ));
+            }
+            state.interpreter.handle_notification(&notification)
+        })
+    }
+
     /// Downloads bytes through the source's own HTTP session, preserving its
     /// cookies and headers. Intended for page images and archives: the
     /// returned [`NetResponseData`] keeps the real status code and transport
