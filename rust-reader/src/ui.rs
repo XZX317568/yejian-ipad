@@ -230,7 +230,8 @@ pub struct ReaderApp {
     track_panel: Option<String>,
     track_query: String,
     /// Unsaved status/progress edits in the tracking panel, by binding key.
-    track_draft: Option<(String, crate::trackers::TrackStatus, i64)>,
+    /// Keyed by binding key and remote media id so a rebind starts fresh.
+    track_draft: Option<(String, String, crate::trackers::TrackStatus, i64)>,
     pub hitboxes: BTreeMap<String, Rect>,
     pub rendered_book_nodes: usize,
     pub frame_is_animating: bool,
@@ -4600,7 +4601,11 @@ impl ReaderApp {
                 );
             }
             let (mut status, mut progress) = match &self.track_draft {
-                Some((draft_key, status, progress)) if draft_key == key => (*status, *progress),
+                Some((draft_key, media, status, progress))
+                    if draft_key == key && *media == binding.media_id =>
+                {
+                    (*status, *progress)
+                }
                 _ => (binding.status, binding.progress.max(0)),
             };
             ui.horizontal_wrapped(|ui| {
@@ -4631,7 +4636,8 @@ impl ReaderApp {
                 }
             });
             let changed = status != binding.status || progress != binding.progress;
-            self.track_draft = changed.then(|| (key.to_string(), status, progress));
+            self.track_draft =
+                changed.then(|| (key.to_string(), binding.media_id.clone(), status, progress));
             let idle = self.trackers.idle();
             if ui
                 .add_enabled(
@@ -4643,7 +4649,7 @@ impl ReaderApp {
                 self.trackers.submit(TrackCommand::Update {
                     key: key.to_string(),
                     status,
-                    progress,
+                    progress: (progress != binding.progress).then_some(progress),
                 });
             }
             ui.horizontal(|ui| {
@@ -4657,6 +4663,7 @@ impl ReaderApp {
                     .add_enabled(idle, Button::new("解除绑定").min_size(vec2(0., 44.)))
                     .clicked()
                 {
+                    self.track_draft = None;
                     self.trackers.submit(TrackCommand::Unbind(key.to_string()));
                 }
             });
