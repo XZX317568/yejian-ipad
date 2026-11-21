@@ -3889,8 +3889,12 @@ impl Sources {
                                 }
                             })
                         })
-                        .or_else(|| ordered.iter().find(|chapter| !chapter.locked))
-                        .or_else(|| ordered.first());
+                        .or_else(|| {
+                            // No chapter reaches the carried number: resume at
+                            // the newest available chapter, not the first.
+                            ordered.iter().rev().find(|chapter| !chapter.locked)
+                        })
+                        .or_else(|| ordered.last());
                     return (target.cloned(), true);
                 }
                 (
@@ -4872,7 +4876,12 @@ impl Sources {
         let Some(manga) = self.selected_manga.clone() else {
             return;
         };
+        // 换源 carries progress through the follow record; an unfollowed
+        // work has nothing to carry and the button is disabled anyway.
         let old_source = self.source_for(&manga);
+        if self.follow_index(&old_source, &manga.key).is_none() {
+            return;
+        }
         self.global_gen += 1;
         let generation = self.global_gen;
         let groups: Vec<MigrateGroup> = self
@@ -7193,9 +7202,19 @@ impl Sources {
                 if button.clicked() {
                     download_missing = true;
                 }
-                let button = ui.add(quiet_action("换源").min_size(vec2(0., 48.)));
+                let button = ui.add_enabled(
+                    followed,
+                    quiet_action("换源").min_size(vec2(0., 48.)),
+                );
                 this.hitboxes
                     .insert("source-detail-migrate".into(), button.rect);
+                if !followed {
+                    ui.label(
+                        RichText::new("加入书架后可换源")
+                            .color(palette.muted)
+                            .small(),
+                    );
+                }
                 if button.clicked() {
                     migrate = true;
                 }
@@ -11731,6 +11750,53 @@ mod tests {
             sources.resume_chapter("source.a", &manga, &ordered, &Default::default());
         assert!(!started);
         assert_eq!(resume.unwrap().key, "c1");
+    }
+
+    #[test]
+    fn migrate_is_not_offered_for_an_unfollowed_work() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sources = test_sources(root.path());
+        sources.selected_source = "source.a".into();
+        sources.selected_manga = Some(manga("source.a", "m"));
+        sources.open_migrate();
+        assert!(
+            sources.migrate.is_none(),
+            "an unfollowed work has no progress to carry over"
+        );
+        sources.toggle_follow(&manga("source.a", "m"));
+        sources.open_migrate();
+        assert!(sources.migrate.is_some(), "followed works may migrate");
+    }
+
+    #[test]
+    fn resume_chapter_falls_back_to_the_newest_chapter_when_number_is_beyond() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sources = test_sources(root.path());
+        let manga = manga("source.a", "m");
+        let ordered = vec![
+            numbered("c1", 1.),
+            numbered("c2", 2.),
+            numbered("c3", 3.),
+        ];
+        // Read chapter 10 on the old source but the new source only has 3:
+        // resume at the newest chapter, not the first.
+        sources.follows.push(Follow {
+            source_id: "source.a".into(),
+            manga_id: "m".into(),
+            resume_number: Some(10.),
+            resume_done: false,
+            ..Default::default()
+        });
+        let (resume, started) =
+            sources.resume_chapter("source.a", &manga, &ordered, &Default::default());
+        assert!(started);
+        assert_eq!(resume.unwrap().key, "c3");
+        // Locked tail chapters are skipped for the newest reachable one.
+        let mut locked_tail = ordered.clone();
+        locked_tail[2].locked = true;
+        let (resume, _) =
+            sources.resume_chapter("source.a", &manga, &locked_tail, &Default::default());
+        assert_eq!(resume.unwrap().key, "c2");
     }
 }
 

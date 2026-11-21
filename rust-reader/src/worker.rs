@@ -606,6 +606,8 @@ fn read_settings(library: &Library) -> anyhow::Result<Vec<(String, String)>> {
         "reader-status",
         "follow-interval",
         "auto-download",
+        "app-lock",
+        "app-lock-delay",
         "shelf-grid",
         "shelf-sort",
         "search-scope",
@@ -1201,6 +1203,8 @@ mod tests {
         original
             .set_setting("auto-download", "latest3")
             .unwrap();
+        original.set_setting("app-lock", "true").unwrap();
+        original.set_setting("app-lock-delay", "300").unwrap();
         original
             .set_setting("search-history", "[\"星海\",\"猎人\"]")
             .unwrap();
@@ -1228,6 +1232,8 @@ mod tests {
                 assert!(settings.contains(&("tap-zones".into(), "next".into())));
                 assert!(settings.contains(&("reader-status".into(), "false".into())));
                 assert!(settings.contains(&("auto-download".into(), "latest3".into())));
+                assert!(settings.contains(&("app-lock".into(), "true".into())));
+                assert!(settings.contains(&("app-lock-delay".into(), "300".into())));
                 assert!(settings.contains(&(
                     "search-history".into(),
                     "[\"星海\",\"猎人\"]".into()

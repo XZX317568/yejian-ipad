@@ -348,6 +348,8 @@ pub struct ReaderApp {
     /// Keyed by binding key and remote media id so a rebind starts fresh.
     /// Each field is `Some` only while the user has edited it.
     track_draft: Option<(String, String, Option<crate::trackers::TrackStatus>, Option<i64>)>,
+    /// 应用锁 state; the lock itself is in-memory, never persisted.
+    applock: crate::applock::AppLock,
     pub hitboxes: BTreeMap<String, Rect>,
     pub rendered_book_nodes: usize,
     pub frame_is_animating: bool,
@@ -372,6 +374,7 @@ impl ReaderApp {
             track_panel: None,
             track_query: String::new(),
             track_draft: None,
+            applock: crate::applock::AppLock::default(),
             sources: crate::sources::Sources::new(root.clone(), ctx),
             root,
             stream: None,
@@ -609,6 +612,27 @@ impl ReaderApp {
     #[cfg(debug_assertions)]
     pub fn clear_acceptance_previews(&mut self) {
         self.sources.clear_acceptance_previews();
+    }
+    /// Acceptance seam: fake device-owner support/auth results on desktop.
+    #[cfg(debug_assertions)]
+    pub fn set_app_lock_fake(
+        &mut self,
+        supported: bool,
+        auth: Option<std::result::Result<(), String>>,
+    ) {
+        yejian_platform::set_app_lock_fake(supported, auth);
+    }
+    #[cfg(debug_assertions)]
+    pub fn debug_lock(&mut self) {
+        self.applock.lock();
+    }
+    #[cfg(debug_assertions)]
+    pub fn app_lock_locked(&self) -> bool {
+        self.applock.locked()
+    }
+    #[cfg(debug_assertions)]
+    pub fn app_lock_enabled(&self) -> bool {
+        self.applock.enabled()
     }
     /// Acceptance seam: Bangumi requests go to a local fake server.
     #[cfg(debug_assertions)]
@@ -1808,6 +1832,8 @@ impl ReaderApp {
                     self.replace_links(links);
                     self.replace_books(books, ctx.input(|i| i.time));
                     self.ready = true;
+                    let mut app_lock_enabled = self.applock.enabled();
+                    let mut app_lock_delay = self.applock.delay_secs();
                     for (key, value) in settings {
                         match key.as_str() {
                             "theme" => self.theme = value,
@@ -1876,6 +1902,12 @@ impl ReaderApp {
                             "auto-download" => {
                                 self.sources.set_auto_download(&value);
                             }
+                            "app-lock" => {
+                                app_lock_enabled = value == "true";
+                            }
+                            "app-lock-delay" => {
+                                app_lock_delay = value.parse().unwrap_or(0);
+                            }
                             "search-history" => {
                                 if let Ok(history) =
                                     serde_json::from_str::<Vec<String>>(&value)
@@ -1893,6 +1925,11 @@ impl ReaderApp {
                             _ => {}
                         }
                     }
+                    // The lock is decided here — before the first painted
+                    // shelf frame — so an enabled app never flashes content.
+                    self.applock.apply_settings(app_lock_enabled, app_lock_delay);
+                    self.applock.cold_start();
+                    yejian_platform::set_privacy_shield(self.applock.enabled());
                     self.sources.set_private(self.private);
                 }
                 Event::Library(books, links) => {
@@ -3092,6 +3129,27 @@ impl ReaderApp {
             }
         }
         let now = ctx.input(|i| i.time);
+        let now_secs = now as u64;
+        while let Some(event) = yejian_platform::take_foreground_event() {
+            match event {
+                yejian_platform::ForegroundEvent::Background => {
+                    self.applock.background(now_secs);
+                }
+                yejian_platform::ForegroundEvent::Foreground => {
+                    self.applock.foreground(now_secs);
+                }
+            }
+        }
+        while let Some(result) = yejian_platform::poll_auth() {
+            self.applock.auth_finished(result);
+            if let Some(on) = self.applock.take_toggle_applied() {
+                self.setting("app-lock", on.to_string());
+                yejian_platform::set_privacy_shield(on);
+            }
+        }
+        if self.applock.auth_in_flight() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
         let entrance = if self.books.is_empty() || self.reduced {
             1.
         } else {
@@ -3144,9 +3202,10 @@ impl ReaderApp {
         } else {
             full
         };
-        let system_back = yejian_platform::take_back_requested()
-            || ctx.input(|i| i.key_pressed(Key::BrowserBack));
-        if system_back || ctx.input(|i| i.key_pressed(Key::Escape)) {
+        let system_back = !self.applock.locked()
+            && (yejian_platform::take_back_requested()
+                || ctx.input(|i| i.key_pressed(Key::BrowserBack)));
+        if system_back || (!self.applock.locked() && ctx.input(|i| i.key_pressed(Key::Escape))) {
             self.request_back(now, content, system_back);
         }
         let is_reader = matches!(self.screen, Screen::Reader(_));
@@ -3324,6 +3383,9 @@ impl ReaderApp {
             }
         }
         self.dialogs(&ctx);
+        if self.applock.locked() {
+            self.lock_ui(ui, full);
+        }
         self.trim_covers();
         self.frame_is_animating = self.motion.active()
             || entrance < 1.
@@ -6001,6 +6063,67 @@ impl ReaderApp {
                                 }
                             }
                         });
+                    if yejian_platform::supports_app_lock() {
+                        ui.add_space(10.);
+                        ui.separator();
+                        Frame::new()
+                            .inner_margin(Margin::symmetric(2, 16))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                crate::design::section(ui, "隐私");
+                                let mut on = self.applock.enabled();
+                                if crate::design::toggle(
+                                    ui,
+                                    &mut on,
+                                    "应用锁（面容 ID / 触控 ID / 设备密码）",
+                                    "回到应用时验证身份后再显示内容",
+                                ) && self.applock.request_toggle(on)
+                                {
+                                    self.start_auth("验证以更改应用锁");
+                                }
+                                if self.applock.enabled() {
+                                    ui.separator();
+                                    ui.add_space(6.);
+                                    ui.label(
+                                        RichText::new("离开多久后重新锁定")
+                                            .color(palette.muted)
+                                            .small(),
+                                    );
+                                    let width = ((ui.available_width() - 20.) / 3.).floor() - 1.;
+                                    let mut delay = self.applock.delay_secs();
+                                    ui.horizontal_wrapped(|ui| {
+                                        for (secs, name) in
+                                            crate::applock::DELAY_CHOICES
+                                        {
+                                            if ui
+                                                .add(
+                                                    Button::new(*name)
+                                                        .selected(delay == *secs)
+                                                        .min_size(vec2(width, 44.))
+                                                        .wrap(),
+                                                )
+                                                .clicked()
+                                            {
+                                                delay = *secs;
+                                            }
+                                        }
+                                    });
+                                    if delay != self.applock.delay_secs() {
+                                        self.applock.set_delay(delay);
+                                        self.setting(
+                                            "app-lock-delay",
+                                            delay.to_string(),
+                                        );
+                                    }
+                                }
+                                #[cfg(target_os = "android")]
+                                ui.label(
+                                    RichText::new("Android 的最近任务预览不会被遮挡")
+                                        .color(palette.muted)
+                                        .small(),
+                                );
+                            });
+                    }
                     ui.add_space(10.);
                     ui.separator();
                     Frame::new()
@@ -6893,6 +7016,72 @@ impl ReaderApp {
             }
         }
     }
+    /// Launch a device-owner authentication; failures to even show the
+    /// prompt land as a finished error so the state machine never waits.
+    fn start_auth(&mut self, reason: &str) {
+        if let Err(error) = yejian_platform::authenticate(reason) {
+            self.applock.auth_failed_to_start(error.to_string());
+        }
+    }
+
+    /// Topmost opaque lock screen: paper surface, app name and 解锁. The
+    /// full-rect interaction swallows every touch so nothing beneath can be
+    /// tapped while locked.
+    fn lock_ui(&mut self, ui: &mut Ui, full: Rect) {
+        if self.applock.take_auto_attempt() {
+            self.start_auth("解锁页间");
+        }
+        let palette = crate::design::palette(self.dark);
+        egui::Area::new(Id::unique("app-lock"))
+            .order(Order::Foreground)
+            .fade_in(false)
+            .interactable(true)
+            .show(ui.ctx(), |ui| {
+                ui.set_clip_rect(full);
+                ui.allocate_rect(full, Sense::click());
+                ui.painter().rect_filled(full, 0., palette.surface);
+                let column = Rect::from_center_size(
+                    pos2(full.center().x, full.center().y - 20.),
+                    vec2((full.width() - 48.).min(360.), 240.),
+                );
+                ui.painter().text(
+                    pos2(column.center().x, column.top() + 30.),
+                    Align2::CENTER_CENTER,
+                    "页间",
+                    crate::typography::display(34. * self.font_scale.min(1.3)),
+                    palette.ink,
+                );
+                ui.painter().text(
+                    pos2(column.center().x, column.top() + 78.),
+                    Align2::CENTER_CENTER,
+                    "已锁定",
+                    FontId::proportional(14. * self.font_scale),
+                    palette.muted,
+                );
+                let row = Rect::from_center_size(
+                    pos2(column.center().x, column.top() + 140.),
+                    vec2(column.width().min(200.), 48.),
+                );
+                let button = ui.put(
+                    row,
+                    crate::design::primary("解锁", self.dark).min_size(row.size()),
+                );
+                self.hitboxes.insert("app-lock-unlock".into(), button.rect);
+                if button.clicked() && self.applock.begin_unlock() {
+                    self.start_auth("解锁页间");
+                }
+                if let Some(failure) = self.applock.failure() {
+                    ui.painter().text(
+                        pos2(column.center().x, column.top() + 190.),
+                        Align2::CENTER_CENTER,
+                        failure,
+                        FontId::proportional(12. * self.font_scale),
+                        palette.muted,
+                    );
+                }
+            });
+    }
+
     fn dialogs(&mut self, ctx: &Context) {
         if self.reader_options {
             let response = Modal::new(Id::unique("reader-options"))

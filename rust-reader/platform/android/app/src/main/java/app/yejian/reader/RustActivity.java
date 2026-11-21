@@ -1,5 +1,6 @@
 package app.yejian.reader;
 
+import android.app.KeyguardManager;
 import android.app.NativeActivity;
 import android.app.Dialog;
 import android.content.ClipData;
@@ -66,6 +67,7 @@ public class RustActivity extends NativeActivity {
     private static final String TAG = "YejianRust";
     private static final int REQUEST_OPEN_COMICS = 0x59454A31;
     private static final int REQUEST_CREATE_DOCUMENT = 0x59454A32;
+    private static final int REQUEST_DEVICE_CREDENTIAL = 0x59454A33;
     /** Archive picker: cbz/cbr/cbt/zip/rar/tar/gz. */
     static final int MODE_COMICS = 0;
     /** Backup picker: zip/json only. */
@@ -119,6 +121,14 @@ public class RustActivity extends NativeActivity {
     private static final ArrayDeque<String> webResults = new ArrayDeque<>();
     private static final AtomicBoolean webInFlight = new AtomicBoolean(false);
     private static volatile Dialog webDialog;
+    private static final Object appLockLock = new Object();
+    private static final ArrayDeque<String> appLockResults = new ArrayDeque<>();
+    private static final Object foregroundLock = new Object();
+    private static final ArrayDeque<String> foregroundEvents = new ArrayDeque<>();
+    private static final AtomicBoolean authInFlight = new AtomicBoolean(false);
+    // The auth prompt itself pauses/resumes the activity; that synthetic
+    // round trip must not count as a real backgrounding for the app lock.
+    private static volatile boolean suppressLifecycleEvents = false;
     private static final ExecutorService importer = Executors.newSingleThreadExecutor(runnable -> {
         Thread thread = new Thread(runnable, "yejian-import");
         thread.setDaemon(true);
@@ -150,6 +160,30 @@ public class RustActivity extends NativeActivity {
 
         // Cold start from "open with 页间".
         handleOpenIntent(getIntent());
+    }
+
+    @Override
+    protected void onPause() {
+        if (!suppressLifecycleEvents && !authInFlight.get()) {
+            synchronized (foregroundLock) {
+                foregroundEvents.addLast("b");
+            }
+            nativeAppLockEvent();
+        }
+        super.onPause();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (suppressLifecycleEvents || authInFlight.get()) {
+            suppressLifecycleEvents = false;
+            return;
+        }
+        synchronized (foregroundLock) {
+            foregroundEvents.addLast("f");
+        }
+        nativeAppLockEvent();
     }
 
     @Override
@@ -787,6 +821,10 @@ public class RustActivity extends NativeActivity {
 
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        if (requestCode == REQUEST_DEVICE_CREDENTIAL) {
+            enqueueAuthResult(resultCode == RESULT_OK ? "ok" : "canceled");
+            return;
+        }
         if (requestCode == REQUEST_CREATE_DOCUMENT) {
             String path = pendingExportPath;
             pendingExportPath = null;
@@ -1093,4 +1131,111 @@ public class RustActivity extends NativeActivity {
                 ? error.getClass().getSimpleName()
                 : message;
     }
+
+    // -- 应用锁 / device credential ----------------------------------------
+
+    /** {@code KeyguardManager.isDeviceSecure()}: pin/pattern/password/biometric enrolled. */
+    public static boolean supportsAppLock() {
+        RustActivity activity = instance;
+        if (activity == null) {
+            return false;
+        }
+        try {
+            KeyguardManager manager =
+                    (KeyguardManager) activity.getSystemService(KEYGUARD_SERVICE);
+            return manager != null && manager.isDeviceSecure();
+        } catch (Throwable error) {
+            return false;
+        }
+    }
+
+    /**
+     * Starts the device-credential prompt. API 30+ uses
+     * {@code setAllowedAuthenticators(BIOMETRIC_WEAK | DEVICE_CREDENTIAL)},
+     * API 28–29 {@code setDeviceCredentialAllowed(true)}, and older versions
+     * fall back to the {@code createConfirmDeviceCredentialIntent} activity.
+     * The result arrives through {@link #pollAppLock()}.
+     */
+    public static boolean authenticateAppLock(String reason) {
+        RustActivity activity = instance;
+        if (activity == null || !authInFlight.compareAndSet(false, true)) {
+            return false;
+        }
+        suppressLifecycleEvents = true;
+        activity.runOnUiThread(() -> {
+            try {
+                activity.showAuthPrompt(reason);
+            } catch (Throwable error) {
+                enqueueAuthResult("prompt failed: " + describe(error));
+            }
+        });
+        return true;
+    }
+
+    @SuppressWarnings("deprecation")
+    private void showAuthPrompt(String reason) {
+        if (Build.VERSION.SDK_INT >= 28) {
+            android.hardware.biometrics.BiometricPrompt.Builder builder =
+                    new android.hardware.biometrics.BiometricPrompt.Builder(this)
+                            .setTitle("页间")
+                            .setSubtitle(reason);
+            if (Build.VERSION.SDK_INT >= 30) {
+                builder.setAllowedAuthenticators(
+                        android.hardware.biometrics.BiometricManager.Authenticators.BIOMETRIC_WEAK
+                                | android.hardware.biometrics.BiometricManager.Authenticators.DEVICE_CREDENTIAL);
+            } else {
+                builder.setDeviceCredentialAllowed(true);
+            }
+            builder.build().authenticate(
+                    new android.os.CancellationSignal(),
+                    getMainExecutor(),
+                    new android.hardware.biometrics.BiometricPrompt.AuthenticationCallback() {
+                        @Override
+                        public void onAuthenticationSucceeded(
+                                android.hardware.biometrics.BiometricPrompt.AuthenticationResult result) {
+                            enqueueAuthResult("ok");
+                        }
+
+                        @Override
+                        public void onAuthenticationError(int code, CharSequence message) {
+                            enqueueAuthResult(message == null ? "canceled" : message.toString());
+                        }
+                    });
+            return;
+        }
+        KeyguardManager manager = (KeyguardManager) getSystemService(KEYGUARD_SERVICE);
+        Intent intent = manager == null
+                ? null
+                : manager.createConfirmDeviceCredentialIntent("页间", reason);
+        if (intent == null) {
+            enqueueAuthResult("no device credential");
+            return;
+        }
+        startActivityForResult(intent, REQUEST_DEVICE_CREDENTIAL);
+    }
+
+    private static void enqueueAuthResult(String result) {
+        synchronized (appLockLock) {
+            appLockResults.addLast(result);
+        }
+        authInFlight.set(false);
+        nativeAppLockEvent();
+    }
+
+    /** Next finished authentication: "ok" or an error string, null while busy. */
+    public static String pollAppLock() {
+        synchronized (appLockLock) {
+            return appLockResults.pollFirst();
+        }
+    }
+
+    /** Next "b"/"f" lifecycle event for the app lock, null when idle. */
+    public static String pollForeground() {
+        synchronized (foregroundLock) {
+            return foregroundEvents.pollFirst();
+        }
+    }
+
+    /** Called by Rust after a queued app-lock result or lifecycle event. */
+    private static native void nativeAppLockEvent();
 }

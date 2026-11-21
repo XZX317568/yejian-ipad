@@ -437,3 +437,84 @@ pub(crate) fn battery_level() -> Result<Option<f32>> {
         Ok((level >= 0.).then_some(level / 100.))
     })
 }
+
+// -- 应用锁 / device-owner authentication ---------------------------------
+
+/// `RustActivity.supportsAppLock()` → `KeyguardManager.isDeviceSecure()`.
+pub(crate) fn supports_app_lock() -> Result<bool> {
+    with_activity(|env, class| {
+        let value = env
+            .call_static_method(class, "supportsAppLock", "()Z", &[])
+            .map_err(|error| PlatformError::Jni(format!("supportsAppLock: {error}")))?;
+        value
+            .z()
+            .map_err(|error| PlatformError::Jni(format!("supportsAppLock result: {error}")))
+    })
+}
+
+/// Starts `BiometricPrompt`/the credential intent; the outcome is pushed by
+/// `nativeAppLockResult` and surfaces through [`crate::poll_auth`].
+pub(crate) fn authenticate(reason: &str) -> Result<()> {
+    with_activity(|env, class| {
+        let argument = env
+            .new_string(reason)
+            .map_err(|error| PlatformError::Jni(format!("authenticateAppLock argument: {error}")))?;
+        let result = env
+            .call_static_method(
+                class,
+                "authenticateAppLock",
+                "(Ljava/lang/String;)Z",
+                &[JValue::Object(&JObject::from(argument))],
+            )
+            .map_err(|error| PlatformError::Jni(format!("authenticateAppLock: {error}")))?;
+        let started = result
+            .z()
+            .map_err(|error| PlatformError::Jni(format!("authenticateAppLock result: {error}")))?;
+        if started {
+            Ok(())
+        } else {
+            Err(PlatformError::NotReady("device credential prompt"))
+        }
+    })
+}
+
+/// Drains the Java auth queue into the shared result slot.
+pub(crate) fn poll_auth() {
+    let _ = with_activity(|env, class| {
+        let text = call_static_string(env, class, "pollAppLock")?;
+        if !text.is_empty() {
+            crate::push_auth_result(if text == "ok" { Ok(()) } else { Err(text) });
+        }
+        Ok(())
+    });
+}
+
+/// Drains the Java lifecycle queue into the shared event slot.
+pub(crate) fn poll_foreground() {
+    let _ = with_activity(|env, class| {
+        let text = call_static_string(env, class, "pollForeground")?;
+        let event = match text.as_str() {
+            "b" => Some(crate::ForegroundEvent::Background),
+            "f" => Some(crate::ForegroundEvent::Foreground),
+            _ => None,
+        };
+        if let Some(event) = event {
+            crate::push_foreground_event(event);
+        }
+        Ok(())
+    });
+}
+
+/// JNI entry: Java queued an auth result (`ok` or an error string) — wake the
+/// event loop so the UI picks it up on the next frame.
+///
+/// # Safety
+/// Called by the JVM with the activity's `jclass`; the payload is read via
+/// the normal poll instead of trusting the callback arguments.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_app_yejian_reader_RustActivity_nativeAppLockEvent(
+    _env: JNIEnv<'_>,
+    _class: JClass<'_>,
+) {
+    notify_waker();
+}

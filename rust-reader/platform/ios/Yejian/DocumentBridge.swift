@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import LocalAuthentication
 import UIKit
 import UniformTypeIdentifiers
 import WebKit
@@ -27,6 +28,10 @@ private final class YejianDocumentBridge: NSObject, UIApplicationDelegate, UIDoc
     )
     private var prepared = false
     private var scheduled = false
+    private var authResults: [String] = []
+    private var foregroundEvents: [String] = []
+    private var shieldWanted = false
+    private weak var shieldView: UIView?
     #if DEBUG
     private var snapshotMarker: UIView?
     #endif
@@ -97,6 +102,38 @@ private final class YejianDocumentBridge: NSObject, UIApplicationDelegate, UIDoc
         // queued and the waker repaints when it is ready.
         importQueue.async { [weak self] in
             self?.adoptDocumentsInbox()
+        }
+
+        // Lifecycle for the app lock: background/foreground reach Rust as a
+        // pollable queue, and the privacy shield hides the snapshot the
+        // system keeps for the app switcher while app lock is enabled.
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.enqueueForeground("b")
+        }
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.willEnterForegroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.enqueueForeground("f")
+        }
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.willResignActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.showShield()
+        }
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.hideShield()
         }
     }
 
@@ -400,6 +437,77 @@ private final class YejianDocumentBridge: NSObject, UIApplicationDelegate, UIDoc
         lock.lock()
         defer { lock.unlock() }
         return results.isEmpty ? nil : results.removeFirst()
+    }
+
+    // MARK: - App lock (LocalAuthentication + privacy shield)
+
+    /// `LAContext.canEvaluatePolicy(.deviceOwnerAuthentication)`.
+    func supportsAppLock() -> Int64 {
+        LAContext().canEvaluatePolicy(.deviceOwnerAuthentication, error: nil) ? 1 : 0
+    }
+
+    /// Face/Touch ID or the device passcode. 0 = prompt started, -2 = the
+    /// device cannot authenticate, -1 = not prepared.
+    func authenticate(reason: String) -> Int64 {
+        guard prepared else { return -1 }
+        let context = LAContext()
+        var error: NSError?
+        guard context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &error) else {
+            return -2
+        }
+        context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason) {
+            [weak self] ok, authError in
+            let message = ok ? "ok" : (authError?.localizedDescription ?? "canceled")
+            self?.enqueueAuthResult(message)
+        }
+        return 0
+    }
+
+    private func enqueueAuthResult(_ message: String) {
+        lock.lock()
+        authResults.append(message)
+        lock.unlock()
+        wake()
+    }
+
+    func pollAuth() -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return authResults.isEmpty ? nil : authResults.removeFirst()
+    }
+
+    private func enqueueForeground(_ event: String) {
+        lock.lock()
+        foregroundEvents.append(event)
+        lock.unlock()
+        wake()
+    }
+
+    func pollForeground() -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return foregroundEvents.isEmpty ? nil : foregroundEvents.removeFirst()
+    }
+
+    /// Rust toggles this with the 应用锁 setting.
+    func setPrivacyShield(_ on: Bool) {
+        shieldWanted = on
+    }
+
+    /// Opaque paper-colored cover for the app-switcher snapshot.
+    private func showShield() {
+        guard shieldWanted, shieldView == nil, let window = keyWindow() else { return }
+        let view = UIView(frame: window.bounds)
+        view.backgroundColor = UIColor(red: 1.0, green: 0.992, blue: 0.976, alpha: 1.0)
+        view.isUserInteractionEnabled = false
+        view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        window.addSubview(view)
+        shieldView = view
+    }
+
+    private func hideShield() {
+        shieldView?.removeFromSuperview()
+        shieldView = nil
     }
 
     // MARK: - Waking Rust
@@ -752,4 +860,32 @@ public func yejian_ios_battery_level() -> Float {
 public func yejian_ios_open_external_url(_ url: UnsafePointer<CChar>?) -> Int64 {
     guard let url else { return -1 }
     return YejianDocumentBridge.shared.openExternalUrl(url: String(cString: url))
+}
+
+@_cdecl("yejian_ios_supports_app_lock")
+public func yejian_ios_supports_app_lock() -> Int64 {
+    YejianDocumentBridge.shared.supportsAppLock()
+}
+
+@_cdecl("yejian_ios_authenticate")
+public func yejian_ios_authenticate(_ reason: UnsafePointer<CChar>?) -> Int64 {
+    guard let reason else { return -1 }
+    return YejianDocumentBridge.shared.authenticate(reason: String(cString: reason))
+}
+
+@_cdecl("yejian_ios_poll_auth")
+public func yejian_ios_poll_auth() -> UnsafeMutablePointer<CChar>? {
+    guard let result = YejianDocumentBridge.shared.pollAuth() else { return nil }
+    return duplicate(result)
+}
+
+@_cdecl("yejian_ios_poll_foreground")
+public func yejian_ios_poll_foreground() -> UnsafeMutablePointer<CChar>? {
+    guard let event = YejianDocumentBridge.shared.pollForeground() else { return nil }
+    return duplicate(event)
+}
+
+@_cdecl("yejian_ios_set_privacy_shield")
+public func yejian_ios_set_privacy_shield(_ on: Bool) {
+    YejianDocumentBridge.shared.setPrivacyShield(on)
 }

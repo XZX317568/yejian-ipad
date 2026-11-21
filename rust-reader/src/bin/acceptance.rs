@@ -1242,6 +1242,75 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
         "roundB: the Bangumi tracker row is missing from settings"
     );
     design_capture(h, "tracker-bangumi", &mut captures)?;
+
+    // Round C: app lock — desktop fakes the platform support + auth, then
+    // the privacy toggle, delay picker and opaque lock screen are exercised.
+    h.app.set_app_lock_fake(true, Some(Ok(())));
+    let lock_row = |h: &Harness| {
+        let safe = design_safe_rect(h).expand(0.5);
+        h.painted_text.iter().any(|text| {
+            text.text.contains("应用锁")
+                && safe.contains_rect(text.bounds)
+                && text.clip.expand(0.5).contains_rect(text.bounds)
+        })
+    };
+    for _ in 0..24 {
+        if lock_row(h) {
+            break;
+        }
+        scroll_page(h, -120.)?;
+    }
+    for _ in 0..24 {
+        if lock_row(h) {
+            break;
+        }
+        scroll_page(h, 120.)?;
+    }
+    anyhow::ensure!(lock_row(h), "roundC: the 隐私 app-lock row is missing");
+    h.click_text("应用锁（面容 ID / 触控 ID / 设备密码）")?;
+    h.wait(|app| app.app_lock_enabled())?;
+    h.frames(3)?;
+    anyhow::ensure!(
+        lock_row(h),
+        "roundC: the enabled app-lock row is clipped at this layout"
+    );
+    design_capture(h, "app-lock-settings", &mut captures)?;
+
+    // A denied auto-prompt keeps the screen locked with the retry note.
+    h.app.set_app_lock_fake(true, Some(Err("denied".into())));
+    h.app.debug_lock();
+    h.frames(4)?;
+    anyhow::ensure!(h.app.app_lock_locked(), "roundC: debug lock did not engage");
+    design_capture(h, "app-lock", &mut captures)?;
+    // The whole screen is the lock card: a pixel well inside it must be the
+    // opaque paper surface, not whatever the shelf painted underneath.
+    {
+        let shot = image::open(h.output.join("app-lock.png"))?.to_rgba8();
+        let px = shot.get_pixel(shot.width() / 5, shot.height() / 5);
+        let surface = [255u8, 253, 249];
+        anyhow::ensure!(
+            (0..3).all(|i| (px[i] as i32 - surface[i] as i32).abs() <= 8),
+            "app-lock.png: lock screen is translucent: {px:?}"
+        );
+    }
+    // While locked, a tap that would land on a shelf hitbox must go nowhere
+    // (the nav row sits beneath the lock screen at the same coordinates).
+    let nav_pos = h
+        .app
+        .hitboxes
+        .get("nav-library")
+        .context("roundC: nav hitbox missing under the lock")?
+        .center();
+    h.click_pos(nav_pos)?;
+    h.frames(4)?;
+    anyhow::ensure!(
+        h.app.app_lock_locked() && h.app.screen_name() == "library",
+        "roundC: a tap reached through the lock screen"
+    );
+    h.app.set_app_lock_fake(true, Some(Ok(())));
+    h.click("app-lock-unlock")?;
+    h.wait(|app| !app.app_lock_locked())?;
+    h.frames(3)?;
     h.click("nav-library")?;
     h.frames(3)?;
 

@@ -1,3 +1,4 @@
+pub mod applock;
 mod bookmarks;
 mod design;
 mod follows;
