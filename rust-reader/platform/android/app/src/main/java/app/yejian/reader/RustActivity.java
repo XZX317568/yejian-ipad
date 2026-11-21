@@ -511,21 +511,20 @@ public class RustActivity extends NativeActivity {
         done.setOnClickListener(view -> {
             CookieManager manager = CookieManager.getInstance();
             manager.flush();
-            // Collect cookies for both the requested and the navigated URL;
-            // a login flow can end on a different origin than it started.
+            // Cookies are reported for the requested site only. A page that
+            // ended on another subdomain of the same site adds its cookies;
+            // a foreign origin is ignored so its cookies (or ours) are never
+            // relabelled for the other site.
             java.util.LinkedHashMap<String, JSONObject> collected =
                     new java.util.LinkedHashMap<>();
+            collectCookies(manager, initialUrl, collected);
             String currentUrl = webView.getUrl();
-            for (String candidate : new String[]{initialUrl, currentUrl}) {
-                if (candidate == null || candidate.isEmpty()) {
-                    continue;
-                }
-                collectCookies(manager, candidate, collected);
+            if (currentUrl != null && sameSite(initialUrl, currentUrl)) {
+                collectCookies(manager, currentUrl, collected);
             }
             try {
                 JSONObject payload = new JSONObject();
-                payload.put("url", currentUrl == null || currentUrl.isEmpty()
-                        ? initialUrl : currentUrl);
+                payload.put("url", initialUrl);
                 JSONArray list = new JSONArray();
                 for (JSONObject cookie : collected.values()) {
                     list.put(cookie);
@@ -550,6 +549,18 @@ public class RustActivity extends NativeActivity {
         webView.loadUrl(url);
         webDialog = dialog;
         dialog.show();
+    }
+
+    /** True when both URLs share a host, or one host is a subdomain of the other. */
+    private static boolean sameSite(String first, String second) {
+        String a = Uri.parse(first).getHost();
+        String b = Uri.parse(second).getHost();
+        if (a == null || b == null) {
+            return false;
+        }
+        a = a.toLowerCase(java.util.Locale.ROOT);
+        b = b.toLowerCase(java.util.Locale.ROOT);
+        return a.equals(b) || a.endsWith("." + b) || b.endsWith("." + a);
     }
 
     /**
