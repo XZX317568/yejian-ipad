@@ -47,7 +47,6 @@ impl Bookmarks {
         })
     }
 
-    #[cfg(any(test, debug_assertions))]
     pub fn entries(&self) -> &[Bookmark] {
         &self.entries
     }

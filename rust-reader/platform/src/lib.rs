@@ -1070,7 +1070,6 @@ pub fn debug_open_notification(payload: &str) {
 }
 
 /// Debug seam: fake the permission answer (`Some`) the next request returns.
-#[cfg(debug_assertions)]
 #[derive(Clone, Default)]
 #[allow(dead_code)]
 struct NotifyFake {
