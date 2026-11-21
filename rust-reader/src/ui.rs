@@ -2965,6 +2965,8 @@ impl ReaderApp {
                 let mut picked = None;
                 egui::Area::new(Id::unique("shelf-sort-menu"))
                     .order(Order::Foreground)
+                    .fade_in(false)
+                    .movable(false)
                     .fixed_pos(panel.min)
                     .show(ui.ctx(), |ui| {
                         crate::design::surface(ui).show(ui, |ui| {
@@ -3347,10 +3349,11 @@ impl ReaderApp {
             pos2(info.x + action_width + 12., action_y),
             vec2(detail_width, 50.),
         );
-        if !reordering
-            && self.selected.is_empty()
-            && self.button(ui, "open-book", open_rect, "详情", false)
-        {
+        // Controls stay painted (but inert) while books glide to their new
+        // order so the stage does not flicker mid-reorder.
+        let detail_clicked =
+            self.selected.is_empty() && self.button(ui, "open-book", open_rect, "详情", false);
+        if detail_clicked && !reordering {
             if let Some(volume) = volumes
                 .iter()
                 .find(|v| v.lane == self.motion.focus.round() as i32)
@@ -3359,7 +3362,7 @@ impl ReaderApp {
             }
         }
         let action = Rect::from_min_size(pos2(info.x, action_y), vec2(action_width, 50.));
-        if self.selected.is_empty()
+        let read_clicked = self.selected.is_empty()
             && self.button(
                 ui,
                 "shelf-read",
@@ -3370,8 +3373,8 @@ impl ReaderApp {
                     "开始阅读"
                 },
                 true,
-            )
-        {
+            );
+        if read_clicked && !reordering {
             self.open_reader(book);
         }
         let pager_right = if layout.short_landscape {
@@ -3385,16 +3388,15 @@ impl ReaderApp {
             .layout_no_wrap(tally, FontId::monospace(11.), muted);
         let pager_left = pager_right - 88. - tally.size().x - 4.;
         let y = layout.stage.top() + 12.;
-        if books.len() > 1
-            && !reordering
+        let prev_clicked = books.len() > 1
             && self.icon(
                 ui,
                 "shelf-prev",
                 Rect::from_min_size(pos2(pager_left, y), vec2(44., 44.)),
                 "prev",
                 "上一本",
-            )
-        {
+            );
+        if prev_clicked && !reordering {
             self.motion
                 .select(self.motion.focus.round() - 1., now, self.reduced);
         }
@@ -3405,16 +3407,15 @@ impl ReaderApp {
                 muted,
             );
         }
-        if books.len() > 1
-            && !reordering
+        let next_clicked = books.len() > 1
             && self.icon(
                 ui,
                 "shelf-next",
                 Rect::from_min_size(pos2(pager_right - 44., y), vec2(44., 44.)),
                 "next",
                 "下一本",
-            )
-        {
+            );
+        if next_clicked && !reordering {
             self.motion
                 .select(self.motion.focus.round() + 1., now, self.reduced);
         }
@@ -5727,6 +5728,10 @@ impl ReaderApp {
     pub fn focus_index(&self) -> usize {
         (self.motion.focus.round() as i32).rem_euclid(self.visible_books().len().max(1) as i32)
             as usize
+    }
+    /// Persisted key of the active shelf sort, for menu verification.
+    pub fn shelf_sort_key(&self) -> &'static str {
+        self.shelf_sort.key()
     }
     /// Title of the centred book, for sort-order verification.
     pub fn focused_book_title(&self) -> String {

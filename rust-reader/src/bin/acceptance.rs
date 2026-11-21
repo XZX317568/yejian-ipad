@@ -730,6 +730,20 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
             "design: sort menu row {id} is missing"
         );
     }
+    // The popover must be an opaque card: nothing on the shelf may show
+    // through it. Sample a pixel in the panel padding above the first row.
+    {
+        let row = h.app.hitboxes["shelf-sort-progress"];
+        let shot = image::open(h.output.join("shelf-sort-menu.png"))?.to_rgba8();
+        let x = (row.center().x as u32).min(shot.width() - 1);
+        let y = ((row.top() - 10.).max(0.) as u32).min(shot.height() - 1);
+        let px = shot.get_pixel(x, y);
+        let surface = [255u8, 253, 249];
+        anyhow::ensure!(
+            (0..3).all(|i| (px[i] as i32 - surface[i] as i32).abs() <= 8),
+            "design: sort popover is translucent at {x},{y}: {px:?} (expected {surface:?})"
+        );
+    }
     for (first, row, name) in [
         (true, "shelf-sort-added", "added"),
         (false, "shelf-sort-progress", "progress"),
@@ -747,6 +761,11 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
         } else {
             h.frames(46)?;
         }
+        // The tap landed on the popover row, not a shelf book beneath it.
+        anyhow::ensure!(
+            h.app.shelf_sort_key() == name,
+            "design: selecting {name} from the popover did not change the sort"
+        );
         design_capture(h, &format!("shelf-sort-{name}"), &mut captures)?;
         anyhow::ensure!(
             h.app.focus_index() == 0,
