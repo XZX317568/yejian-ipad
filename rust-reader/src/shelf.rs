@@ -86,6 +86,66 @@ impl Volume {
     }
 }
 
+impl Volume {
+    fn shifted(&self, delta: Vec2) -> Self {
+        let mut v = self.clone();
+        v.front.origin += delta;
+        v.face.origin += delta;
+        v.cover.origin += delta;
+        for point in &mut v.cap {
+            *point += delta;
+        }
+        v.floor += delta;
+        v
+    }
+}
+
+fn lerp_pos(a: Pos2, b: Pos2, t: f32) -> Pos2 {
+    a + (b - a) * t
+}
+fn lerp_plane(a: &Plane, b: &Plane, t: f32) -> Plane {
+    Plane {
+        origin: lerp_pos(a.origin, b.origin, t),
+        horizontal: a.horizontal + (b.horizontal - a.horizontal) * t,
+        vertical: a.vertical + (b.vertical - a.vertical) * t,
+    }
+}
+/// Blends one book's old position into its new one, lifting it on screen in
+/// the middle of the move so it never slides through a neighbour.
+pub fn lerp_volume(a: &Volume, b: &Volume, t: f32, lift: f32) -> Volume {
+    let mut volume = Volume {
+        lane: b.lane,
+        index: b.index,
+        front: lerp_plane(&a.front, &b.front, t),
+        face: lerp_plane(&a.face, &b.face, t),
+        cover: lerp_plane(&a.cover, &b.cover, t),
+        cap: [
+            lerp_pos(a.cap[0], b.cap[0], t),
+            lerp_pos(a.cap[1], b.cap[1], t),
+            lerp_pos(a.cap[2], b.cap[2], t),
+            lerp_pos(a.cap[3], b.cap[3], t),
+        ],
+        thickness: a.thickness + (b.thickness - a.thickness) * t,
+        height: a.height + (b.height - a.height) * t,
+        scale: a.scale + (b.scale - a.scale) * t,
+        ink: a.ink + (b.ink - a.ink) * t,
+        opacity: a.opacity + (b.opacity - a.opacity) * t,
+        floor: lerp_pos(a.floor, b.floor, t),
+    };
+    let rise = -(std::f32::consts::PI * t).sin() * lift * volume.scale;
+    if rise != 0. {
+        volume = volume.shifted(vec2(0., rise));
+    }
+    volume
+}
+/// An invisible copy parked off to one side, used as the entry point for
+/// books that had no rendered slot before a reorder.
+pub fn offstage(v: &Volume, dx: f32) -> Volume {
+    let mut v = v.shifted(vec2(dx, 0.));
+    v.opacity = 0.;
+    v
+}
+
 pub fn foreground(volumes: &[Volume], lane: i32, cover: Plane) -> Vec<Volume> {
     volumes
         .iter()
@@ -676,5 +736,27 @@ mod tests {
                 }
             }
         }
+    }
+    #[test]
+    fn reorder_lerp_hits_both_ends_lifts_midway_and_offstage_is_untappable() {
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(740., 560.));
+        let a = geometry(rect, 5, 0., 1.)[0].clone();
+        let b = geometry(rect, 5, 2., 1.)[0].clone();
+        for (t, want) in [(0., &a), (1., &b)] {
+            let v = lerp_volume(&a, &b, t, 20.);
+            assert!((v.front.origin.x - want.front.origin.x).abs() < 0.001);
+            assert!((v.front.origin.y - want.front.origin.y).abs() < 0.001);
+            assert!((v.opacity - want.opacity).abs() < 0.001);
+        }
+        let mid = lerp_volume(&a, &b, 0.5, 20.);
+        let straight = (a.front.origin.y + b.front.origin.y) / 2.;
+        assert!(
+            mid.front.origin.y < straight - 5.,
+            "mid-flight books must lift off their straight path"
+        );
+        let off = offstage(&a, 400.);
+        assert_eq!(off.opacity, 0.);
+        assert!(!off.contains(off.front.point(0.5, 0.5)));
+        assert!((off.front.origin.x - a.front.origin.x - 400.).abs() < 0.001);
     }
 }

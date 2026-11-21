@@ -1205,3 +1205,110 @@ fn upgrading_a_version_one_library_keeps_existing_reading_times() {
         "migration must reuse the old save time, not the import time"
     );
 }
+
+#[test]
+fn added_at_fills_from_updated_at_on_pre_column_libraries() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("library");
+    let library = open(&tmp, "library");
+    let archive = tmp.path().join("Added.cbz");
+    write_cbz(&archive, &[("1.png", sample_png([9, 9, 9]).as_slice())]);
+    let book = library.import(&archive).unwrap();
+    assert!(book.added_at > 0, "imports record when they joined");
+    drop(library);
+    // A v4 library predating the column: reopening backfills updated_at.
+    {
+        let connection = rusqlite::Connection::open(root.join("library.sqlite3")).unwrap();
+        connection
+            .execute_batch("ALTER TABLE books DROP COLUMN added_at;")
+            .unwrap();
+    }
+    let library = Library::open(&root).unwrap();
+    let books = library.list_books("").unwrap();
+    assert_eq!(books.len(), 1);
+    assert_eq!(
+        books[0].added_at, books[0].updated_at,
+        "pre-column rows must fall back to updated_at"
+    );
+}
+
+#[test]
+fn added_at_refreshes_when_a_removed_book_returns() {
+    let tmp = TempDir::new().unwrap();
+    let library = open(&tmp, "library");
+    let archive = tmp.path().join("Returning.cbz");
+    write_cbz(&archive, &[("1.png", sample_png([30, 30, 30]).as_slice())]);
+    let book = library.import(&archive).unwrap();
+    let first = book.added_at;
+    library.remove_from_library(&book.id).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let book = library.import(&archive).unwrap();
+    assert!(
+        book.added_at >= first,
+        "re-adding a removed book records the new join time"
+    );
+}
+
+#[test]
+fn backup_round_trip_keeps_added_at_and_old_backups_fall_back() {
+    let tmp = TempDir::new().unwrap();
+    let source_library = open(&tmp, "source");
+    let archive = tmp.path().join("Joined.cbz");
+    write_cbz(&archive, &[("1.png", sample_png([60, 60, 60]).as_slice())]);
+    let book = source_library.import(&archive).unwrap();
+
+    let backup = tmp.path().join("with-added.backup");
+    source_library.export_backup(&backup).unwrap();
+    let target_library = open(&tmp, "target");
+    target_library.import_backup(&backup).unwrap();
+    assert_eq!(
+        target_library.get_book(&book.id).unwrap().added_at,
+        book.added_at,
+        "native backups must carry the join date"
+    );
+
+    // A backup written before the field existed falls back to updated_at.
+    let bytes = fs::read(&backup).unwrap();
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    let manifest_raw = {
+        let mut file = zip.by_name("manifest.json").unwrap();
+        let mut raw = String::new();
+        std::io::Read::read_to_string(&mut file, &mut raw).unwrap();
+        raw
+    };
+    let mut manifest: serde_json::Value = serde_json::from_str(&manifest_raw).unwrap();
+    for book in manifest["books"].as_array_mut().unwrap() {
+        book.as_object_mut().unwrap().remove("added_at");
+    }
+    let stripped = tmp.path().join("without-added.backup");
+    {
+        let file = File::create(&stripped).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        writer
+            .start_file("manifest.json", SimpleFileOptions::default())
+            .unwrap();
+        writer
+            .write_all(serde_json::to_vec(&manifest).unwrap().as_slice())
+            .unwrap();
+        for name in 0..zip.len() {
+            let mut file = zip.by_index(name).unwrap();
+            if file.name() == "manifest.json" {
+                continue;
+            }
+            let name = file.name().to_string();
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut file, &mut bytes).unwrap();
+            writer.start_file(name, SimpleFileOptions::default()).unwrap();
+            writer.write_all(&bytes).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+    let target_library = open(&tmp, "legacy-target");
+    let report = target_library.import_backup(&stripped).unwrap();
+    assert_eq!(report.imported_count(), 1);
+    let restored = target_library.get_book(&book.id).unwrap();
+    assert!(
+        restored.added_at > 0,
+        "old backups must still yield a join date"
+    );
+}

@@ -121,6 +121,9 @@ struct BackupBook {
     #[serde(default)]
     page_fraction: Option<f32>,
     updated_at: i64,
+    /// `None` in backups written before join dates existed.
+    #[serde(default)]
+    added_at: Option<i64>,
     last_read_at: Option<i64>,
     category: String,
     content_hash: String,
@@ -709,8 +712,9 @@ impl Library {
             .execute(
                 "UPDATE books
                  SET title = ?1, author = ?2, current_page = ?3, page_fraction = ?4,
-                     last_read_at = ?5, updated_at = ?6, category = ?7, progress_at = ?8
-                 WHERE id = ?9",
+                     last_read_at = ?5, updated_at = ?6, category = ?7, progress_at = ?8,
+                     added_at = ?9
+                 WHERE id = ?10",
                 params![
                     &entry.title,
                     &entry.author,
@@ -720,6 +724,7 @@ impl Library {
                     updated_at,
                     category,
                     progress_at,
+                    entry.added_at.unwrap_or(updated_at),
                     &book.id
                 ],
             )
@@ -737,6 +742,7 @@ fn backup_book(plan: &ExportPlan) -> BackupBook {
         current_page: plan.stored.book.current_page,
         page_fraction: Some(plan.stored.book.page_fraction),
         updated_at: plan.stored.book.updated_at,
+        added_at: Some(plan.stored.book.added_at),
         last_read_at: plan.stored.book.last_read_at,
         category: plan.stored.book.category.clone(),
         content_hash: plan.stored.content_hash.clone(),

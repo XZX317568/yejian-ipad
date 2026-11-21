@@ -14,7 +14,7 @@ const SCHEMA_VERSION: i64 = 4;
 
 pub(crate) const BOOK_COLUMNS: &str = "id, title, author, archive_path, cover_path, page_count, \
      current_page, page_fraction, updated_at, last_read_at, category, content_hash, kind, removed, \
-     progress_at";
+     progress_at, COALESCE(added_at, updated_at)";
 
 #[derive(Debug, Clone)]
 pub(crate) struct StoredBook {
@@ -125,6 +125,16 @@ pub(crate) fn migrate(connection: &Connection) -> Result<()> {
             .execute_batch("ALTER TABLE books ADD COLUMN page_fraction REAL NOT NULL DEFAULT 0;")
             .context("add page position column")?;
     }
+    // `added_at` is added without a schema bump so older clients can still
+    // open the same library; their new rows simply read back as `updated_at`.
+    if !column_exists(connection, "books", "added_at")? {
+        connection
+            .execute_batch(
+                "ALTER TABLE books ADD COLUMN added_at INTEGER;
+                 UPDATE books SET added_at = updated_at WHERE added_at IS NULL;",
+            )
+            .context("add join-date column")?;
+    }
     if version < SCHEMA_VERSION {
         connection
             .execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))
@@ -150,6 +160,7 @@ pub(crate) fn stored_from_row(root: &Path, row: &Row<'_>) -> rusqlite::Result<St
             current_page: current_page.max(0) as usize,
             page_fraction: crate::book::sanitize_fraction(row.get::<_, f64>(7)? as f32),
             updated_at: row.get(8)?,
+            added_at: row.get(15)?,
             last_read_at: row.get(9)?,
             category: row.get(10)?,
         },

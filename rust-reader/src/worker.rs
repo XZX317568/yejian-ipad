@@ -546,6 +546,7 @@ fn read_settings(library: &Library) -> anyhow::Result<Vec<(String, String)>> {
         "reader-spread-offset",
         "follow-interval",
         "shelf-grid",
+        "shelf-sort",
     ] {
         if let Some(value) = library.get_setting(key)? {
             settings.push((key.to_string(), value));
@@ -1063,6 +1064,7 @@ mod tests {
         original.set_setting("theme", "dark").unwrap();
         original.set_setting("palette", "sepia").unwrap();
         original.set_setting("shelf-grid", "open").unwrap();
+        original.set_setting("shelf-sort", "progress").unwrap();
         original.set_setting("reading-direction", "rtl").unwrap();
         let backup = tmp.path().join("settings.zip");
         original.export_backup(&backup).unwrap();
@@ -1078,6 +1080,7 @@ mod tests {
                 assert!(settings.contains(&("theme".into(), "dark".into())));
                 assert!(settings.contains(&("palette".into(), "sepia".into())));
                 assert!(settings.contains(&("shelf-grid".into(), "open".into())));
+                assert!(settings.contains(&("shelf-sort".into(), "progress".into())));
                 assert!(settings.contains(&("reading-direction".into(), "rtl".into())));
             }
             _ => panic!("restore must refresh settings together with the library"),

@@ -131,6 +131,54 @@ struct StreamBook {
     waiting: HashSet<usize>,
 }
 
+/// The library shelf's book ordering; "recent" is the library order.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShelfSort {
+    Recent,
+    Progress,
+    Added,
+}
+impl ShelfSort {
+    fn key(self) -> &'static str {
+        match self {
+            ShelfSort::Recent => "recent",
+            ShelfSort::Progress => "progress",
+            ShelfSort::Added => "added",
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            ShelfSort::Recent => "最近阅读",
+            ShelfSort::Progress => "阅读进度",
+            ShelfSort::Added => "加入时间",
+        }
+    }
+    fn hitbox(self) -> &'static str {
+        match self {
+            ShelfSort::Recent => "shelf-sort-recent",
+            ShelfSort::Progress => "shelf-sort-progress",
+            ShelfSort::Added => "shelf-sort-added",
+        }
+    }
+    fn from_key(key: &str) -> Self {
+        match key {
+            "progress" => ShelfSort::Progress,
+            "added" => ShelfSort::Added,
+            _ => ShelfSort::Recent,
+        }
+    }
+}
+const SHELF_SORTS: [ShelfSort; 3] = [ShelfSort::Recent, ShelfSort::Progress, ShelfSort::Added];
+
+/// A mid-flight book swap on the 3D shelf: `from_ids` is the visible order
+/// the animation started from and `from_focus` the lane it was centred on.
+struct Reorder {
+    from_ids: Vec<String>,
+    from_focus: f32,
+    started: f64,
+}
+const REORDER_SECONDS: f64 = 0.560;
+
 #[derive(Clone, Copy)]
 struct ShelfLayout {
     stage: Rect,
@@ -214,6 +262,9 @@ pub struct ReaderApp {
     theme: String,
     color_scheme: String,
     library_grid: bool,
+    shelf_sort: ShelfSort,
+    sort_menu: bool,
+    shelf_reorder: Option<Reorder>,
     shelf_reserve: f32,
     shelf_stage: Rect,
     shelf_books: Rect,
@@ -328,6 +379,9 @@ impl ReaderApp {
             theme: "system".into(),
             color_scheme: "ink".into(),
             library_grid: false,
+            shelf_sort: ShelfSort::Recent,
+            sort_menu: false,
+            shelf_reorder: None,
             shelf_reserve: 0.,
             shelf_stage: Rect::NOTHING,
             shelf_books: Rect::NOTHING,
@@ -557,6 +611,7 @@ impl ReaderApp {
             current_page: wanted.min(state.total.saturating_sub(1)),
             page_fraction: 0.,
             updated_at: 0,
+            added_at: 0,
             last_read_at: None,
             category: String::new(),
         };
@@ -756,6 +811,7 @@ impl ReaderApp {
                 current_page: 0,
                 page_fraction: 0.,
                 updated_at: 0,
+                added_at: 0,
                 last_read_at: None,
                 category: String::new(),
             },
@@ -1081,7 +1137,7 @@ impl ReaderApp {
             }
             representatives.push(book);
         }
-        representatives
+        let mut entries: Vec<Book> = representatives
             .into_iter()
             .map(|book| {
                 let mut entry = book.clone();
@@ -1090,7 +1146,127 @@ impl ReaderApp {
                 }
                 entry
             })
-            .collect()
+            .collect();
+        self.sort_visible(&mut entries);
+        entries
+    }
+    /// A representative's position inside its series: `(ordinal, count)` in
+    /// `self.chapters` order, or `(0, 1)` for an unlinked book.
+    fn series_ordinals(&self) -> HashMap<&str, (usize, usize)> {
+        let mut groups: HashMap<(&str, &str), Vec<&str>> = HashMap::new();
+        for link in &self.chapters {
+            let m = &link.metadata;
+            groups
+                .entry((m.source_id.as_str(), m.manga_id.as_str()))
+                .or_default()
+                .push(link.book_id.as_str());
+        }
+        let mut ordinals = HashMap::new();
+        for ids in groups.values() {
+            for (ordinal, id) in ids.iter().enumerate() {
+                ordinals.insert(*id, (ordinal, ids.len()));
+            }
+        }
+        ordinals
+    }
+    /// `(group, fraction)`: 0 in progress, 1 finished, 2 not started. The
+    /// fraction blends the chapter ordinal with the page position inside it.
+    fn work_progress(&self, book: &Book, ordinals: &HashMap<&str, (usize, usize)>) -> (u8, f32) {
+        let page_progress = if book.last_read_at.is_none() {
+            0.
+        } else if book.current_page + 1 >= book.page_count {
+            1.
+        } else {
+            (book.current_page + 1) as f32 / book.page_count.max(1) as f32
+        };
+        let (ordinal, count) = ordinals.get(book.id.as_str()).copied().unwrap_or((0, 1));
+        let fraction = (ordinal as f32 + page_progress) / count as f32;
+        if book.last_read_at.is_none() {
+            (2, fraction)
+        } else if ordinal + 1 == count && page_progress >= 1. {
+            (1, fraction)
+        } else {
+            (0, fraction)
+        }
+    }
+    fn sort_visible(&self, books: &mut Vec<Book>) {
+        match self.shelf_sort {
+            ShelfSort::Recent => {}
+            ShelfSort::Added => {
+                // One pass over books and links: the earliest chapter's join
+                // date stands in for the work's.
+                let added: HashMap<&str, i64> = self
+                    .books
+                    .iter()
+                    .map(|book| (book.id.as_str(), book.added_at))
+                    .collect();
+                let mut series_added: HashMap<(&str, &str), i64> = HashMap::new();
+                for link in &self.chapters {
+                    let m = &link.metadata;
+                    let at = added.get(link.book_id.as_str()).copied().unwrap_or(0);
+                    series_added
+                        .entry((m.source_id.as_str(), m.manga_id.as_str()))
+                        .and_modify(|value| *value = (*value).min(at))
+                        .or_insert(at);
+                }
+                let work_added = |book: &Book| {
+                    self.chapter(&book.id)
+                        .and_then(|m| {
+                            series_added
+                                .get(&(m.source_id.as_str(), m.manga_id.as_str()))
+                                .copied()
+                        })
+                        .unwrap_or(book.added_at)
+                };
+                books.sort_by(|a, b| {
+                    work_added(b)
+                        .cmp(&work_added(a))
+                        .then_with(|| a.title.cmp(&b.title))
+                });
+            }
+            ShelfSort::Progress => {
+                let ordinals = self.series_ordinals();
+                books.sort_by(|a, b| {
+                    let (group_a, fraction_a) = self.work_progress(a, &ordinals);
+                    let (group_b, fraction_b) = self.work_progress(b, &ordinals);
+                    group_a
+                        .cmp(&group_b)
+                        .then_with(|| {
+                            if group_a == 0 {
+                                fraction_b
+                                    .partial_cmp(&fraction_a)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            } else {
+                                std::cmp::Ordering::Equal
+                            }
+                        })
+                        .then_with(|| b.last_read_at.cmp(&a.last_read_at))
+                        .then_with(|| a.title.cmp(&b.title))
+                });
+            }
+        }
+    }
+    /// Changes the shelf order; the books animate from their old slots and
+    /// the focus lands on the first book of the new order.
+    fn set_shelf_sort(&mut self, sort: ShelfSort, now: f64) {
+        self.sort_menu = false;
+        if self.shelf_sort == sort {
+            return;
+        }
+        if !self.reduced {
+            self.shelf_reorder = Some(Reorder {
+                from_ids: self
+                    .visible_books()
+                    .iter()
+                    .map(|book| book.id.clone())
+                    .collect(),
+                from_focus: self.motion.focus,
+                started: now,
+            });
+        }
+        self.shelf_sort = sort;
+        self.motion.jump(0.);
+        self.setting("shelf-sort", sort.key().to_string());
     }
     fn chapter(&self, id: &str) -> Option<&ChapterMetadata> {
         self.chapter_indices
@@ -1158,7 +1334,7 @@ impl ReaderApp {
             .map(|book| book.id.clone())
             .collect()
     }
-    fn replace_books(&mut self, books: Vec<Book>) {
+    fn replace_books(&mut self, books: Vec<Book>, now: f64) {
         let previous = self.visible_books();
         let selected = if previous.is_empty() {
             None
@@ -1170,6 +1346,7 @@ impl ReaderApp {
                     .clone(),
             )
         };
+        let from_focus = self.motion.focus;
         self.books = books;
         let visible = self.visible_books();
         if let Some(id) = selected {
@@ -1184,6 +1361,23 @@ impl ReaderApp {
         {
             self.motion.focus = i as f32;
         }
+        // Same shelf in a new order (a finished book resorting itself):
+        // animate the swap instead of teleporting.
+        let from_ids: Vec<String> = previous.iter().map(|book| book.id.clone()).collect();
+        let to_ids: Vec<String> = visible.iter().map(|book| book.id.clone()).collect();
+        if !self.reduced && from_ids.len() == to_ids.len() && from_ids != to_ids {
+            let mut before = from_ids.clone();
+            let mut after = to_ids;
+            before.sort();
+            after.sort();
+            if before == after {
+                self.shelf_reorder = Some(Reorder {
+                    from_ids,
+                    from_focus,
+                    started: now,
+                });
+            }
+        }
         self.selected
             .retain(|id| self.books.iter().any(|b| &b.id == id));
     }
@@ -1192,13 +1386,14 @@ impl ReaderApp {
             match event {
                 Event::Ready(books, settings, links) => {
                     self.replace_links(links);
-                    self.replace_books(books);
+                    self.replace_books(books, ctx.input(|i| i.time));
                     self.ready = true;
                     for (key, value) in settings {
                         match key.as_str() {
                             "theme" => self.theme = value,
                             "palette" => self.color_scheme = value,
                             "shelf-grid" => self.library_grid = value == "open",
+                            "shelf-sort" => self.shelf_sort = ShelfSort::from_key(&value),
                             "reduce-motion" => self.reduced = value == "true",
                             "reading-direction" => {
                                 self.reader_globals.rtl = value == "rtl";
@@ -1246,7 +1441,7 @@ impl ReaderApp {
                 }
                 Event::Library(books, links) => {
                     self.replace_links(links);
-                    self.replace_books(books);
+                    self.replace_books(books, ctx.input(|i| i.time));
                 }
                 Event::Image {
                     id,
@@ -1943,11 +2138,22 @@ impl ReaderApp {
         let side_by_side = width >= 660.;
         let short_landscape = side_by_side && self.shelf_viewport.height() < 600.;
         let stacked_header = self.font_scale > 1.4 && area.width() < 520.;
+        let row_h = (24. * self.font_scale + 20.).max(44.);
+        let category_width = (80. * self.font_scale + 26.).min(area.width() - 48.);
+        let sort_w = 150. * self.font_scale + 40.;
+        // The sort button drops to a second row when it would cover the
+        // collection label, and to a third when it cannot share the
+        // stacked second row with the category button.
+        let sort_second_row = !stacked_header
+            && 24. + 140. * self.font_scale + 12. + sort_w + 10. + category_width + 24.
+                > area.width();
+        let sort_third_row = stacked_header
+            && 24. + category_width + 10. + sort_w + 24. > area.width();
         let top = 144.
             + if stacked_header {
-                84.
+                84. + if sort_third_row { row_h + 10. } else { 0. }
             } else {
-                14. * (self.font_scale - 1.)
+                14. * (self.font_scale - 1.) + if sort_second_row { row_h + 10. } else { 0. }
             };
         let tall_extra = if side_by_side {
             ((self.shelf_viewport.height() - 900.) * 0.30).clamp(0., 100.)
@@ -2247,7 +2453,8 @@ impl ReaderApp {
         }
         let is_reader = matches!(self.screen, Screen::Reader(_));
         let animating = self.motion.tick(now);
-        self.frame_is_animating = animating || entrance < 1. || self.flight.is_some();
+        self.frame_is_animating =
+            animating || entrance < 1. || self.flight.is_some() || self.shelf_reorder.is_some();
         if self.frame_is_animating {
             ctx.request_repaint();
         }
@@ -2648,6 +2855,176 @@ impl ReaderApp {
                 self.category = categories.get(next).cloned().unwrap_or_default();
                 self.motion.focus = 0.;
             }
+            let palette = crate::design::palette(self.dark);
+            let row_h = (24. * self.font_scale + 20.).max(44.);
+            let sort_w = 150. * self.font_scale + 40.;
+            let sort_second_row = !stacked
+                && 24. + 140. * self.font_scale + 12. + sort_w + 10. + category_width
+                    + 24.
+                    > area.width();
+            let sort_third_row = stacked
+                && category_rect.left() + category_width + 10. + sort_w + 24. > area.right();
+            let sort_rect = if !stacked && !sort_second_row {
+                Rect::from_min_size(
+                    pos2(category_rect.left() - 10. - sort_w, category_rect.top()),
+                    vec2(sort_w, row_h),
+                )
+            } else if !stacked {
+                Rect::from_min_size(
+                    pos2(area.left() + 24., category_rect.bottom() + 10.),
+                    vec2(sort_w, row_h),
+                )
+            } else if sort_third_row {
+                Rect::from_min_size(
+                    pos2(area.left() + 24., category_rect.bottom() + 10.),
+                    vec2(sort_w, row_h),
+                )
+            } else {
+                Rect::from_min_size(
+                    pos2(category_rect.right() + 10., category_rect.top()),
+                    vec2(sort_w, row_h),
+                )
+            };
+            self.hitboxes.insert("shelf-sort".into(), sort_rect);
+            let sort_response =
+                ui.interact(sort_rect, Id::unique("shelf-sort"), Sense::click());
+            sort_response.widget_info(|| {
+                WidgetInfo::labeled(Role::Button, true, "排序")
+            });
+            ui.painter().rect_filled(
+                sort_rect,
+                10.,
+                if sort_response.hovered() || self.sort_menu {
+                    palette.soft
+                } else {
+                    palette.surface
+                },
+            );
+            ui.painter().rect_stroke(
+                sort_rect,
+                10.,
+                Stroke::new(1., palette.line),
+                StrokeKind::Inside,
+            );
+            let sort_label =
+                ui.painter().layout_no_wrap(
+                    format!("排序 · {}", self.shelf_sort.label()),
+                    FontId::proportional(15. * self.font_scale),
+                    palette.ink,
+                );
+            let tri_w = 8. * self.font_scale;
+            let content = sort_label.size().x + 4. * self.font_scale + tri_w;
+            let text_x = (sort_rect.center().x - content / 2.).max(sort_rect.left() + 8.);
+            ui.painter().galley(
+                pos2(text_x, sort_rect.center().y - sort_label.size().y / 2.),
+                sort_label.clone(),
+                palette.ink,
+            );
+            let cx = text_x + sort_label.size().x + 4. * self.font_scale + tri_w / 2.;
+            let cy = sort_rect.center().y;
+            let s = self.font_scale;
+            ui.painter().add(Shape::convex_polygon(
+                vec![
+                    pos2(cx - 4. * s, cy - 2.5 * s),
+                    pos2(cx + 4. * s, cy - 2.5 * s),
+                    pos2(cx, cy + 3. * s),
+                ],
+                palette.muted,
+                Stroke::NONE,
+            ));
+            if sort_response.clicked() {
+                self.sort_menu = !self.sort_menu;
+            }
+            if self.sort_menu {
+                let menu_row = (28. * self.font_scale + 16.).max(44.);
+                let labels: Vec<_> = SHELF_SORTS
+                    .iter()
+                    .map(|sort| {
+                        (
+                            *sort,
+                            ui.painter().layout_no_wrap(
+                                sort.label().to_owned(),
+                                FontId::proportional(15. * self.font_scale),
+                                palette.ink,
+                            ),
+                        )
+                    })
+                    .collect();
+                let inner_w = labels
+                    .iter()
+                    .map(|(_, galley)| galley.size().x)
+                    .fold(0., f32::max)
+                    + 34.;
+                let panel_size = vec2(inner_w + 40., menu_row * 3. + 40.);
+                let left = (sort_rect.right() - panel_size.x)
+                    .clamp(area.left() + 8., (area.right() - panel_size.x - 8.).max(area.left() + 8.));
+                let panel = Rect::from_min_size(
+                    pos2(left, (sort_rect.bottom() + 8.).min(area.bottom() - panel_size.y - 8.)),
+                    panel_size,
+                );
+                let mut picked = None;
+                egui::Area::new(Id::unique("shelf-sort-menu"))
+                    .order(Order::Foreground)
+                    .fixed_pos(panel.min)
+                    .show(ui.ctx(), |ui| {
+                        crate::design::surface(ui).show(ui, |ui| {
+                            ui.set_width(inner_w);
+                            for (sort, galley) in &labels {
+                                let (rect, response) = ui.allocate_exact_size(
+                                    vec2(inner_w, menu_row),
+                                    Sense::click(),
+                                );
+                                response.widget_info(|| {
+                                    WidgetInfo::selected(
+                                        Role::RadioButton,
+                                        true,
+                                        self.shelf_sort == *sort,
+                                        sort.label(),
+                                    )
+                                });
+                                if response.hovered() {
+                                    ui.painter().rect_filled(rect, 8., palette.soft);
+                                }
+                                if self.shelf_sort == *sort {
+                                    ui.painter().rect_filled(
+                                        Rect::from_min_size(
+                                            rect.min + vec2(0., 10.),
+                                            vec2(3., menu_row - 20.),
+                                        ),
+                                        1.5,
+                                        palette.accent,
+                                    );
+                                }
+                                ui.painter().galley(
+                                    pos2(
+                                        rect.left() + 16.,
+                                        rect.center().y - galley.size().y / 2.,
+                                    ),
+                                    galley.clone(),
+                                    if self.shelf_sort == *sort {
+                                        palette.ink
+                                    } else {
+                                        palette.muted
+                                    },
+                                );
+                                self.hitboxes.insert(sort.hitbox().into(), rect);
+                                if response.clicked() {
+                                    picked = Some(*sort);
+                                }
+                            }
+                        });
+                    });
+                if ui.ctx().input(|i| i.pointer.primary_clicked())
+                    && let Some(pos) = ui.ctx().pointer_interact_pos()
+                    && !panel.contains(pos)
+                    && !sort_rect.contains(pos)
+                {
+                    self.sort_menu = false;
+                }
+                if let Some(sort) = picked {
+                    self.set_shelf_sort(sort, now);
+                }
+            }
         }
         if let Some(error) = self.startup_error.clone() {
             self.label(
@@ -2746,6 +3123,57 @@ impl ReaderApp {
         }
         let volumes = shelf::geometry(shelf_area, books.len(), self.motion.focus, entrance);
         self.rendered_book_nodes = volumes.len();
+        // During a reorder each book slides from its old slot to the new one
+        // with a small lift; shelf input is suspended until it lands.
+        let reordering = self.shelf_reorder.is_some();
+        let draw_volumes: Vec<shelf::Volume> = if let Some(reorder) = &self.shelf_reorder {
+            let t = ((now - reorder.started) / REORDER_SECONDS).clamp(0., 1.) as f32;
+            if t >= 1. {
+                volumes.clone()
+            } else {
+                ui.ctx().request_repaint();
+                let eased = motion::cubic(t, 0.215, 0.61, 0.355, 1.);
+                let old = shelf::geometry(shelf_area, books.len(), reorder.from_focus, 1.);
+                let mut moved = Vec::with_capacity(volumes.len());
+                for volume in &volumes {
+                    let id = books[volume.index].id.as_str();
+                    let origin = old
+                        .iter()
+                        .filter(|v| reorder.from_ids[v.index] == id)
+                        .min_by(|a, b| {
+                            (a.lane - volume.lane)
+                                .abs()
+                                .cmp(&(b.lane - volume.lane).abs())
+                        });
+                    moved.push(match origin {
+                        Some(from) => {
+                            let lift = ((volume.lane - from.lane).abs() as f32 * 6.)
+                                .clamp(0., 22.);
+                            shelf::lerp_volume(from, volume, eased, lift)
+                        }
+                        None => {
+                            let dx = if (volume.lane as f32) < reorder.from_focus {
+                                -shelf_area.width()
+                            } else {
+                                shelf_area.width()
+                            };
+                            shelf::lerp_volume(&shelf::offstage(volume, dx), volume, eased, 0.)
+                        }
+                    });
+                }
+                moved.sort_by_key(|v| v.lane);
+                moved
+            }
+        } else {
+            volumes.clone()
+        };
+        if self
+            .shelf_reorder
+            .as_ref()
+            .is_some_and(|r| now - r.started >= REORDER_SECONDS)
+        {
+            self.shelf_reorder = None;
+        }
         let mut keep = HashSet::new();
         for volume in &volumes {
             if (volume.lane as f32 - self.motion.focus).abs() <= 3. {
@@ -2758,8 +3186,8 @@ impl ReaderApp {
             self.covers.retain(|id, _| keep.contains(id));
         }
         let p = ui.painter().with_clip_rect(shelf_area);
-        shelf::paint_floor(&p, &volumes, self.dark);
-        for volume in &volumes {
+        shelf::paint_floor(&p, &draw_volumes, self.dark);
+        for volume in &draw_volumes {
             let book = &books[volume.index];
             let is_central = volume.lane == self.motion.focus.round() as i32;
             let cover = self.cover_id(&book.id);
@@ -2805,10 +3233,10 @@ impl ReaderApp {
             Sense::click_and_drag(),
         );
         let pitch = shelf::lane_pitch_for(shelf_area, books.len());
-        if gesture.dragged() && books.len() > 1 {
+        if gesture.dragged() && books.len() > 1 && !reordering {
             self.motion.drag(-ui.input(|i| i.pointer.delta().x) / pitch);
         }
-        if gesture.drag_stopped() && books.len() > 1 {
+        if gesture.drag_stopped() && books.len() > 1 && !reordering {
             self.motion.release(
                 -ui.input(|i| i.pointer.velocity().x) / pitch,
                 pitch,
@@ -2816,7 +3244,7 @@ impl ReaderApp {
                 self.reduced,
             );
         }
-        if gesture.hovered() && books.len() > 1 {
+        if gesture.hovered() && books.len() > 1 && !reordering {
             let scroll = ui.input(|i| i.smooth_scroll_delta);
             if scroll.x.abs() > 0.1 || scroll.y.abs() > 0.1 {
                 self.motion.select(
@@ -2828,6 +3256,7 @@ impl ReaderApp {
         }
         if (gesture.clicked() || gesture.secondary_clicked() || gesture.long_touched())
             && self.flight.is_none()
+            && !reordering
         {
             if let Some(pos) = gesture.interact_pointer_pos() {
                 if let Some(volume) = volumes.iter().rev().find(|v| v.contains(pos)) {
@@ -2918,7 +3347,10 @@ impl ReaderApp {
             pos2(info.x + action_width + 12., action_y),
             vec2(detail_width, 50.),
         );
-        if self.selected.is_empty() && self.button(ui, "open-book", open_rect, "详情", false) {
+        if !reordering
+            && self.selected.is_empty()
+            && self.button(ui, "open-book", open_rect, "详情", false)
+        {
             if let Some(volume) = volumes
                 .iter()
                 .find(|v| v.lane == self.motion.focus.round() as i32)
@@ -2954,6 +3386,7 @@ impl ReaderApp {
         let pager_left = pager_right - 88. - tally.size().x - 4.;
         let y = layout.stage.top() + 12.;
         if books.len() > 1
+            && !reordering
             && self.icon(
                 ui,
                 "shelf-prev",
@@ -2973,6 +3406,7 @@ impl ReaderApp {
             );
         }
         if books.len() > 1
+            && !reordering
             && self.icon(
                 ui,
                 "shelf-next",
@@ -5289,6 +5723,19 @@ impl ReaderApp {
     pub fn shelf_books_fraction(&self) -> f32 {
         self.shelf_books.width() / self.shelf_stage.width()
     }
+    /// Index of the centred book in the current visible order.
+    pub fn focus_index(&self) -> usize {
+        (self.motion.focus.round() as i32).rem_euclid(self.visible_books().len().max(1) as i32)
+            as usize
+    }
+    /// Title of the centred book, for sort-order verification.
+    pub fn focused_book_title(&self) -> String {
+        let books = self.visible_books();
+        books
+            .get(self.focus_index())
+            .map(|book| book.title.clone())
+            .unwrap_or_default()
+    }
 }
 
 impl eframe::App for ReaderApp {
@@ -5324,6 +5771,7 @@ mod tests {
             current_page: 0,
             page_fraction: 0.,
             updated_at: 1,
+            added_at: 1,
             last_read_at: None,
             category: String::new(),
         }
@@ -5842,5 +6290,145 @@ mod tests {
         );
         assert_eq!(app.page, 1);
         assert_eq!(app.books[0].current_page, 1, "chapter one left at its end");
+    }
+
+    fn link(book_id: &str, chapter_id: &str, number: f64) -> ChapterLink {
+        ChapterLink {
+            book_id: book_id.into(),
+            metadata: ChapterMetadata {
+                source_id: "source.a".into(),
+                manga_id: "story".into(),
+                manga_title: "Story".into(),
+                chapter_id: chapter_id.into(),
+                chapter_title: chapter_id.into(),
+                chapter_number: Some(number),
+                volume_number: None,
+            },
+        }
+    }
+
+    #[test]
+    fn shelf_sorts_keep_recent_order_and_rank_progress_and_added() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = ReaderApp::new(root.path().into(), Context::default());
+        let mut done = book("done");
+        done.current_page = 19;
+        done.last_read_at = Some(10);
+        let mut half = book("half");
+        half.current_page = 9;
+        half.last_read_at = Some(20);
+        let mut most = book("most");
+        most.current_page = 15;
+        most.last_read_at = Some(5);
+        let fresh = book("fresh");
+        app.books = vec![done, half, most, fresh];
+        let order = |app: &ReaderApp| {
+            app.visible_books()
+                .iter()
+                .map(|book| book.id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            order(&app),
+            ["done", "half", "most", "fresh"],
+            "the default order must be the stored order exactly"
+        );
+        app.shelf_sort = ShelfSort::Progress;
+        assert_eq!(
+            order(&app),
+            ["most", "half", "done", "fresh"],
+            "in-progress by fraction, then finished, then unread"
+        );
+        for (index, book) in app.books.iter_mut().enumerate() {
+            book.added_at = (index as i64 + 1) * 100;
+        }
+        app.shelf_sort = ShelfSort::Added;
+        assert_eq!(order(&app), ["fresh", "most", "half", "done"]);
+    }
+
+    #[test]
+    fn shelf_sort_reads_series_progress_and_earliest_added() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = ReaderApp::new(root.path().into(), Context::default());
+        let mut chapter1 = book("s1");
+        chapter1.current_page = 19;
+        chapter1.last_read_at = Some(3);
+        chapter1.added_at = 300;
+        let mut chapter2 = book("s2");
+        chapter2.current_page = 9;
+        chapter2.last_read_at = Some(40);
+        chapter2.added_at = 100;
+        let mut chapter3 = book("s3");
+        chapter3.added_at = 400;
+        app.books = vec![chapter1, chapter2, chapter3];
+        app.chapters = vec![link("s1", "c1", 1.), link("s2", "c2", 2.), link("s3", "c3", 3.)];
+        app.chapter_indices = app
+            .chapters
+            .iter()
+            .enumerate()
+            .map(|(i, link)| (link.book_id.clone(), i))
+            .collect();
+        // Representative = latest read chapter (s2): progress (1 + 0.5)/3.
+        app.shelf_sort = ShelfSort::Progress;
+        let visible = app.visible_books();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].id, "s2");
+        let ordinals = app.series_ordinals();
+        let (group, fraction) = app.work_progress(&visible[0], &ordinals);
+        assert_eq!(group, 0, "a half-read middle chapter is in progress");
+        assert!((fraction - 0.5).abs() < 0.001);
+        // Finish the last chapter: the work counts as finished.
+        app.books[2].current_page = 19;
+        app.books[2].last_read_at = Some(50);
+        let visible = app.visible_books();
+        let ordinals = app.series_ordinals();
+        let (group, _) = app.work_progress(&visible[0], &ordinals);
+        assert_eq!(group, 1);
+        // Added sort takes the earliest chapter's join date.
+        app.shelf_sort = ShelfSort::Added;
+        let mut solo = book("solo");
+        solo.added_at = 200;
+        app.books.push(solo);
+        let order: Vec<String> = app.visible_books().iter().map(|b| b.id.clone()).collect();
+        assert_eq!(
+            order,
+            ["solo", "s3"],
+            "series added_at is the earliest chapter's (100 < solo's 200)"
+        );
+    }
+
+    #[test]
+    fn sorting_jumps_to_first_book_and_animates_unless_reduced() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = ReaderApp::new(root.path().into(), Context::default());
+        app.books = vec![book("a"), book("b"), book("c")];
+        app.motion.focus = 2.;
+        app.set_shelf_sort(ShelfSort::Added, 10.);
+        assert_eq!(app.motion.focus, 0.);
+        let reorder = app.shelf_reorder.expect("a sort change must animate");
+        assert_eq!(reorder.from_ids, ["a", "b", "c"]);
+        // No animation when reduce-motion is on.
+        app.reduced = true;
+        app.shelf_reorder = None;
+        app.set_shelf_sort(ShelfSort::Progress, 11.);
+        assert!(app.shelf_reorder.is_none());
+        // A same-set reorder from a library refresh also animates.
+        app.reduced = false;
+        app.shelf_sort = ShelfSort::Recent;
+        app.motion.focus = 1.;
+        let mut swapped = app.books.clone();
+        swapped.swap(0, 2);
+        app.replace_books(swapped, 12.);
+        let reorder = app
+            .shelf_reorder
+            .expect("same books in a new order must animate");
+        assert_eq!(reorder.from_ids, ["a", "b", "c"]);
+        assert_eq!(reorder.from_focus, 1.);
+        // A real change does not animate.
+        app.shelf_reorder = None;
+        let mut grown = app.books.clone();
+        grown.push(book("d"));
+        app.replace_books(grown, 13.);
+        assert!(app.shelf_reorder.is_none());
     }
 }

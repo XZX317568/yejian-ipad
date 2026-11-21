@@ -107,6 +107,12 @@ impl ShelfMotion {
         if reduced { self.focus = self.focus.round(); self.snap = None; }
         else { self.snap = Some((now, Snap::new(self.focus, velocity, pitch))); }
     }
+    /// Snaps straight to a lane with no tween or fling, for reorder jumps.
+    pub fn jump(&mut self, lane: f32) {
+        self.focus = lane;
+        self.tween = None;
+        self.snap = None;
+    }
     pub fn drag(&mut self, delta: f32) {
         self.tween = None;
         self.snap = None;

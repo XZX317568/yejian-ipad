@@ -492,14 +492,21 @@ fn design_touch(h: &Harness, id: &str, label: Option<&str>) -> Result<()> {
         "design: {id} is outside the safe area: {rect:?}"
     );
     if let Some(label) = label {
-        anyhow::ensure!(
-            h.painted_text.iter().any(|text| {
-                text.text == label
-                    && rect.expand(0.5).contains_rect(text.bounds)
-                    && text.clip.expand(0.5).contains_rect(rect)
-            }),
-            "design: {id} / {label} is clipped or detached from its touch target"
-        );
+        if !h.painted_text.iter().any(|text| {
+            text.text == label
+                && rect.expand(0.5).contains_rect(text.bounds)
+                && text.clip.expand(0.5).contains_rect(rect)
+        }) {
+            let candidates: Vec<String> = h
+                .painted_text
+                .iter()
+                .filter(|t| t.text.contains("阅读") || t.text == label || t.bounds.intersects(rect))
+                .map(|t| format!("{:?}@{:?} clip{:?}", t.text, t.bounds, t.clip))
+                .collect();
+            anyhow::bail!(
+                "design: {id} / {label} is clipped or detached from its touch target {rect:?}; candidates: {candidates:?}"
+            );
+        }
     }
     Ok(())
 }
@@ -645,6 +652,32 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
         collapsed_stage,
         h.app.shelf_stage_height()
     );
+    // On narrow widths the expanded strip sits below the fold now that the
+    // header has a second row; scroll the library column down to reach it.
+    for _ in 0..6 {
+        if h
+            .app
+            .hitboxes
+            .keys()
+            .any(|id| id.starts_with("shelf-thumbnail-"))
+        {
+            break;
+        }
+        h.frame(
+            vec![
+                Event::PointerMoved(pos2(h.size[0] as f32 - 18., h.size[1] as f32 * 0.67)),
+                Event::MouseWheel {
+                    unit: MouseWheelUnit::Point,
+                    delta: vec2(0., -180.),
+                    source: MouseWheelSource::Wheel,
+                    modifiers: Modifiers::NONE,
+                    phase: TouchPhase::Move,
+                },
+            ],
+            None,
+        )?;
+        h.frames(4)?;
+    }
     design_capture(h, "design-phone-shelf-expanded", &mut captures)?;
     let thumbnail = h
         .app
@@ -686,6 +719,51 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
     // Collapse again so the remaining captures show the default shelf.
     h.click("shelf-grid-toggle")?;
     h.frames(6)?;
+
+    // The sort menu and the book-swap animation on the collapsed shelf.
+    h.click("shelf-sort")?;
+    h.frames(4)?;
+    design_capture(h, "shelf-sort-menu", &mut captures)?;
+    for id in ["shelf-sort-recent", "shelf-sort-progress", "shelf-sort-added"] {
+        anyhow::ensure!(
+            h.app.hitboxes.contains_key(id),
+            "design: sort menu row {id} is missing"
+        );
+    }
+    for (first, row, name) in [
+        (true, "shelf-sort-added", "added"),
+        (false, "shelf-sort-progress", "progress"),
+        (false, "shelf-sort-recent", "recent"),
+    ] {
+        if !first {
+            h.click("shelf-sort")?;
+            h.frames(4)?;
+        }
+        h.click(row)?;
+        if name == "added" {
+            h.frames(16)?;
+            design_capture(h, "shelf-sort-moving", &mut captures)?;
+            h.frames(30)?;
+        } else {
+            h.frames(46)?;
+        }
+        design_capture(h, &format!("shelf-sort-{name}"), &mut captures)?;
+        anyhow::ensure!(
+            h.app.focus_index() == 0,
+            "design: focus should land on the first book of the {name} order"
+        );
+        let expected = h.app.focused_book_title();
+        anyhow::ensure!(
+            h.painted_text
+                .iter()
+                .any(|text| text.text == expected && text.bounds.height() > 20.),
+            "design: central book after {name} sorting is not the first of the new order ({expected})"
+        );
+    }
+    // Sorting lands on the first book, which is the one read above; move on
+    // so the next stage shows an unread book's 开始阅读 again.
+    h.click("shelf-next")?;
+    h.frames(40)?;
 
     h.size = [834, 1194];
     h.frames(6)?;
