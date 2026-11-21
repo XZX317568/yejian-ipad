@@ -788,7 +788,6 @@ extension YejianDocumentBridge {
             return 0
         }
     }
-}
 
     // MARK: - Notifications
 
@@ -942,6 +941,7 @@ extension YejianDocumentBridge {
             }
         }
     }
+}
 
 // MARK: - Rust ABI
 
