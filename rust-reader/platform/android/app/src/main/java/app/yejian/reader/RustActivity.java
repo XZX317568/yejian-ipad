@@ -1,6 +1,7 @@
 package app.yejian.reader;
 
 import android.app.NativeActivity;
+import android.app.Dialog;
 import android.content.ClipData;
 import android.content.Intent;
 import android.database.Cursor;
@@ -10,9 +11,21 @@ import android.os.Build;
 import android.os.Bundle;
 import android.provider.OpenableColumns;
 import android.util.Log;
+import android.util.TypedValue;
+import android.view.Gravity;
+import android.view.ViewGroup;
 import android.view.WindowInsets;
+import android.webkit.CookieManager;
+import android.webkit.WebResourceRequest;
+import android.webkit.WebSettings;
+import android.webkit.WebView;
+import android.webkit.WebViewClient;
 import android.window.OnBackInvokedCallback;
 import android.window.OnBackInvokedDispatcher;
+import android.widget.Button;
+import android.widget.FrameLayout;
+import android.widget.LinearLayout;
+import android.widget.TextView;
 
 import org.json.JSONArray;
 import org.json.JSONException;
@@ -101,6 +114,11 @@ public class RustActivity extends NativeActivity {
     private static volatile String pendingExportPath;
     private static final Object resultLock = new Object();
     private static final ArrayDeque<String> results = new ArrayDeque<>();
+    /** WebView verification/login results; kept apart from import results. */
+    private static final Object webResultLock = new Object();
+    private static final ArrayDeque<String> webResults = new ArrayDeque<>();
+    private static final AtomicBoolean webInFlight = new AtomicBoolean(false);
+    private static volatile Dialog webDialog;
     private static final ExecutorService importer = Executors.newSingleThreadExecutor(runnable -> {
         Thread thread = new Thread(runnable, "yejian-import");
         thread.setDaemon(true);
@@ -334,6 +352,256 @@ public class RustActivity extends NativeActivity {
 
     /** Called by the framework when the user presses/gestures back. */
     private static native void nativeBackPressed();
+
+    /**
+     * Opens `url` in the system browser through {@code ACTION_VIEW}.
+     *
+     * <p>Called by Rust for `link` settings items and external OAuth pages.
+     * The Rust side already restricted the value to http/https; the flag
+     * hardening and the try/catch keep a missing browser or a malformed URI
+     * from ever crashing the native loop.
+     *
+     * @return true when the intent was handed to the system
+     */
+    public static boolean openExternalUrl(String url) {
+        RustActivity activity = instance;
+        if (activity == null || url == null || url.isEmpty()) {
+            return false;
+        }
+        final String target = url;
+        activity.runOnUiThread(() -> {
+            try {
+                Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(target));
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                activity.startActivity(intent);
+            } catch (Throwable error) {
+                Log.w(TAG, "Unable to open " + target, error);
+            }
+        });
+        return true;
+    }
+
+    /**
+     * Opens the in-app WebView verification/login dialog. Returns false when
+     * the activity is not ready or another web page is already open.
+     *
+     * <p>The dialog queues a JSON result (same contract as the iOS bridge)
+     * that Rust drains through {@link #pollWeb()}; finishing collects the
+     * cookies for the initial and the current URL so Cloudflare clearance
+     * and login sessions survive.
+     */
+    public static boolean openWeb(String url, String userAgent) {
+        RustActivity activity = instance;
+        if (activity == null || url == null || url.isEmpty()) {
+            return false;
+        }
+        if (!webInFlight.compareAndSet(false, true)) {
+            return false;
+        }
+        final String agent = userAgent == null ? "" : userAgent;
+        activity.runOnUiThread(() -> {
+            try {
+                activity.showWebDialog(url, agent);
+            } catch (Throwable error) {
+                webInFlight.set(false);
+                Log.w(TAG, "Unable to open web dialog", error);
+            }
+        });
+        return true;
+    }
+
+    /** Returns the next finished web page as JSON, or null while open. */
+    public static String pollWeb() {
+        synchronized (webResultLock) {
+            return webResults.pollFirst();
+        }
+    }
+
+    private static void enqueueWebResult(String payload) {
+        synchronized (webResultLock) {
+            webResults.addLast(payload);
+        }
+        webInFlight.set(false);
+        nativeImportFinished();
+    }
+
+    /**
+     * Full-screen WebView dialog: a top bar with the current site, 「取消」
+     * and 「完成」 (each a ≥48dp touch target), then the page itself with
+     * JavaScript, DOM storage and cookies enabled — the same surface Cloudflare
+     * and site logins expect on Android WebView.
+     */
+    private void showWebDialog(String url, String userAgent) {
+        final Dialog dialog = new Dialog(this,
+                android.R.style.Theme_Black_NoTitleBar_Fullscreen);
+        int density = (int) TypedValue.applyDimension(
+                TypedValue.COMPLEX_UNIT_DIP, 1, getResources().getDisplayMetrics());
+        LinearLayout column = new LinearLayout(this);
+        column.setOrientation(LinearLayout.VERTICAL);
+
+        LinearLayout bar = new LinearLayout(this);
+        bar.setOrientation(LinearLayout.HORIZONTAL);
+        bar.setGravity(Gravity.CENTER_VERTICAL);
+        int barHeight = 56 * density;
+        bar.setMinimumHeight(barHeight);
+        Button cancel = new Button(this);
+        cancel.setText("取消");
+        cancel.setMinHeight(48 * density);
+        bar.addView(cancel, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        TextView title = new TextView(this);
+        title.setGravity(Gravity.CENTER_VERTICAL);
+        title.setSingleLine(true);
+        title.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
+        String host = Uri.parse(url).getHost();
+        title.setText(host == null ? url : host);
+        LinearLayout.LayoutParams titleParams = new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        titleParams.setMargins(12 * density, 0, 12 * density, 0);
+        bar.addView(title, titleParams);
+        Button done = new Button(this);
+        done.setText("完成");
+        done.setMinHeight(48 * density);
+        bar.addView(done, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        column.addView(bar, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        final WebView webView = new WebView(this);
+        WebSettings settings = webView.getSettings();
+        settings.setJavaScriptEnabled(true);
+        settings.setDomStorageEnabled(true);
+        settings.setAllowFileAccess(false);
+        settings.setAllowContentAccess(false);
+        if (userAgent != null && !userAgent.isEmpty()) {
+            settings.setUserAgentString(userAgent);
+        }
+        CookieManager cookies = CookieManager.getInstance();
+        cookies.setAcceptCookie(true);
+        cookies.setAcceptThirdPartyCookies(webView, true);
+        webView.setWebViewClient(new WebViewClient() {
+            @Override
+            public boolean shouldOverrideUrlLoading(
+                    WebView view, WebResourceRequest request) {
+                Uri target = request.getUrl();
+                String scheme = target.getScheme();
+                // Only http/https may load. A source page must not launch other
+                // apps through intent:, market: or custom schemes.
+                return !("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme));
+            }
+        });
+        column.addView(webView, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        dialog.setContentView(column);
+        android.view.Window window = dialog.getWindow();
+        if (window != null) {
+            window.setLayout(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT);
+            // Respect the status/navigation bars so the action bar stays
+            // reachable on notched devices.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                window.setDecorFitsSystemWindows(true);
+            }
+        }
+
+        final String initialUrl = url;
+        cancel.setOnClickListener(view -> dialog.dismiss());
+        done.setOnClickListener(view -> {
+            CookieManager manager = CookieManager.getInstance();
+            manager.flush();
+            // Cookies are reported for the requested site only. A page that
+            // ended on another subdomain of the same site adds its cookies;
+            // a foreign origin is ignored so its cookies (or ours) are never
+            // relabelled for the other site.
+            java.util.LinkedHashMap<String, JSONObject> collected =
+                    new java.util.LinkedHashMap<>();
+            collectCookies(manager, initialUrl, collected);
+            String currentUrl = webView.getUrl();
+            if (currentUrl != null && sameSite(initialUrl, currentUrl)) {
+                collectCookies(manager, currentUrl, collected);
+            }
+            try {
+                JSONObject payload = new JSONObject();
+                payload.put("url", initialUrl);
+                JSONArray list = new JSONArray();
+                for (JSONObject cookie : collected.values()) {
+                    list.put(cookie);
+                }
+                payload.put("cookies", list);
+                enqueueWebResult(payload.toString());
+            } catch (JSONException error) {
+                enqueueWebResult("{\"url\":\"" + initialUrl + "\"}");
+            }
+            dialog.dismiss();
+        });
+        dialog.setOnDismissListener(d -> {
+            webDialog = null;
+            webView.destroy();
+            // A dismissal without 「完成」 (cancel button or system back)
+            // still reports the page so Rust can leave the pending state.
+            if (webInFlight.compareAndSet(true, false)) {
+                enqueueWebResult("{\"url\":\"" + initialUrl + "\"}");
+            }
+        });
+
+        webView.loadUrl(url);
+        webDialog = dialog;
+        dialog.show();
+    }
+
+    /** True when both URLs share a host, or one host is a subdomain of the other. */
+    private static boolean sameSite(String first, String second) {
+        String a = Uri.parse(first).getHost();
+        String b = Uri.parse(second).getHost();
+        if (a == null || b == null) {
+            return false;
+        }
+        a = a.toLowerCase(java.util.Locale.ROOT);
+        b = b.toLowerCase(java.util.Locale.ROOT);
+        return a.equals(b) || a.endsWith("." + b) || b.endsWith("." + a);
+    }
+
+    /**
+     * Adds every {@code name=value} pair the {@link CookieManager} reports for
+     * `candidate` — and for its eTLD+1 origin when the URL is already a
+     * subdomain — into `collected`, keyed so later origins only deduplicate.
+     */
+    private static void collectCookies(
+            CookieManager manager, String candidate,
+            java.util.LinkedHashMap<String, JSONObject> collected) {
+        String header = manager.getCookie(candidate);
+        Uri uri = Uri.parse(candidate);
+        if ((header == null || header.isEmpty()) && uri.getHost() != null) {
+            String host = uri.getHost();
+            int dot = host.indexOf('.');
+            if (dot > 0 && dot < host.length() - 1) {
+                String parent = host.substring(dot + 1);
+                header = manager.getCookie(uri.getScheme() + "://" + parent + "/");
+            }
+        }
+        if (header == null) {
+            return;
+        }
+        for (String pair : header.split(";")) {
+            int equals = pair.indexOf('=');
+            if (equals <= 0) {
+                continue;
+            }
+            String name = pair.substring(0, equals).trim();
+            String value = pair.substring(equals + 1).trim();
+            if (name.isEmpty() || collected.containsKey(name)) {
+                continue;
+            }
+            try {
+                collected.put(name, object("name", name, "value", value));
+            } catch (IllegalStateException ignored) {
+                // object() only throws on an internal bug; skip the cookie.
+            }
+        }
+    }
+
 
     /**
      * "Save as" for a library backup: opens {@code ACTION_CREATE_DOCUMENT} so

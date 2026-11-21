@@ -33,6 +33,20 @@ pub enum SettingKind {
         web: bool,
         url: Option<String>,
     },
+    /// An action the source reacts to. Pressing it hands `notification` (the
+    /// setting key when none is declared) to the source's
+    /// `handle_notification` export; `refreshes` lists settings the source
+    /// may have changed.
+    Button {
+        notification: Option<String>,
+        destructive: bool,
+        refreshes: Vec<String>,
+    },
+    /// A tappable external link.
+    Link {
+        url: String,
+        external: bool,
+    },
     MultiSelect {
         values: Vec<String>,
         titles: Vec<String>,
@@ -131,15 +145,18 @@ fn collect(value: &Value, group: &str, out: &mut Vec<SettingItem>) {
                 let group = if title.is_empty() { group } else { &title };
                 items.iter().for_each(|item| collect(item, group, out));
             }
-            let Some(key) = map
+            let key_opt = map
                 .get("key")
                 .and_then(Value::as_str)
                 .map(str::trim)
-                .filter(|k| !k.is_empty())
-            else {
-                return;
-            };
+                .filter(|k| !k.is_empty());
+            // Aidoku's `button`, `link` and `page` items do not require a key.
             let ty = map.get("type").and_then(Value::as_str).unwrap_or("group");
+            let key = match (key_opt, ty) {
+                (Some(key), _) => key,
+                (None, "button" | "link" | "page") => "",
+                (None, _) => return,
+            };
             let default = map.get("default");
             let values = strings(map.get("values"));
             let raw_titles = strings(map.get("titles"));
@@ -183,6 +200,35 @@ fn collect(value: &Value, group: &str, out: &mut Vec<SettingItem>) {
                         return;
                     }
                     (SettingKind::Login { web, url }, None)
+                }
+                "button" => (
+                    SettingKind::Button {
+                        notification: map
+                            .get("notification")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        destructive: map
+                            .get("destructive")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                        refreshes: strings(map.get("refreshes")),
+                    },
+                    None,
+                ),
+                "link" => {
+                    let Some(url) = map.get("url").and_then(Value::as_str) else {
+                        return;
+                    };
+                    (
+                        SettingKind::Link {
+                            url: url.to_string(),
+                            external: map
+                                .get("external")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
+                        },
+                        None,
+                    )
                 }
                 "text" => (
                     SettingKind::Text {
@@ -265,9 +311,14 @@ mod tests {
             hides_filters_while_searching: false,
         };
         let items = source_settings(&manifest, Some(json));
-        assert_eq!(items.len(), 3);
+        assert_eq!(items.len(), 4);
         assert_eq!(items[2].default, Some(SettingValue::Int(1)));
         assert!(matches!(&items[2].kind, SettingKind::Segment { titles } if titles.len() == 2));
+        assert!(
+            matches!(&items[3].kind, SettingKind::Button { notification: None, .. }),
+            "{:?}",
+            items[3].kind
+        );
         assert_eq!(items[0].group, "阅读");
         assert_eq!(items[0].default, Some(SettingValue::Str("sd".into())));
         assert!(
@@ -278,6 +329,55 @@ mod tests {
         assert_eq!(
             setting_value("test.settings", "quality"),
             Some(SettingValue::Str("hd".into()))
+        );
+    }
+
+    #[test]
+    fn button_and_link_items_parse_with_notification_and_url() {
+        let json = r#"[{"type":"group","title":"账户","items":[
+            {"type":"button","key":"logout","title":"退出登录","notification":"logout","refreshes":["username"],"destructive":true},
+            {"type":"button","title":"刷新章节","notification":"reload"},
+            {"type":"link","title":"官方网站","url":"https://example.test","external":true},
+            {"type":"link","title":"站内镜像","url":"http://mirror.test"}]}]"#;
+        let manifest = SourceManifest {
+            id: "test.actions".into(),
+            name: "T".into(),
+            version: 1,
+            alt_names: vec![],
+            languages: vec!["zh".into()],
+            urls: vec![],
+            content_rating: 0,
+            listings: vec![],
+            allows_base_url_select: false,
+            hides_filters_while_searching: false,
+        };
+        let items = source_settings(&manifest, Some(json));
+        assert_eq!(items.len(), 4);
+        assert!(
+            matches!(&items[0].kind, SettingKind::Button { notification, destructive, refreshes }
+                if notification.as_deref() == Some("logout") && *destructive && refreshes == &["username"]),
+            "{:?}",
+            items[0].kind
+        );
+        // Keyless button still parses and carries its notification.
+        assert!(
+            matches!(&items[1].kind, SettingKind::Button { notification, .. }
+                if notification.as_deref() == Some("reload")),
+            "{:?}",
+            items[1].kind
+        );
+        assert_eq!(items[1].key, "");
+        assert!(
+            matches!(&items[2].kind, SettingKind::Link { url, external }
+                if url == "https://example.test" && *external),
+            "{:?}",
+            items[2].kind
+        );
+        assert!(
+            matches!(&items[3].kind, SettingKind::Link { url, external }
+                if url == "http://mirror.test" && !*external),
+            "{:?}",
+            items[3].kind
         );
     }
 }

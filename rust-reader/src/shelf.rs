@@ -245,6 +245,19 @@ fn flat(p: &Painter, plane: Plane, color: Color32) {
         Stroke::NONE,
     );
 }
+fn flat_stroked(p: &Painter, plane: Plane, color: Color32, stroke: Stroke) {
+    polygon(
+        p,
+        vec![
+            plane.point(0., 0.),
+            plane.point(1., 0.),
+            plane.point(1., 1.),
+            plane.point(0., 1.),
+        ],
+        color,
+        stroke,
+    );
+}
 
 fn gradient(p: &Painter, points: &[Pos2], direction: Vec2, first: Color32, last: Color32) {
     let bounds = Rect::from_points(points);
@@ -442,7 +455,14 @@ pub fn paint_volume(
     } else {
         Color32::from_rgb(242, 240, 233)
     };
-    flat(p, volume.face, paper);
+    // A hairline edge along the slanted paper and spine planes lets egui's
+    // anti-aliased stroke hide the pixel stairs `Stroke::NONE` left behind.
+    let edge_line = if dark {
+        Color32::from_gray(88).gamma_multiply(0.55)
+    } else {
+        Color32::from_rgb(198, 190, 172).gamma_multiply(0.9)
+    };
+    flat_stroked(p, volume.face, paper, Stroke::new(0.8, edge_line));
     let mut print = p.clone();
     print.multiply_opacity(volume.ink);
     if !hide_cover {
@@ -453,6 +473,20 @@ pub fn paint_volume(
                 shelf_face(volume.cover),
                 texture,
                 paper,
+            );
+            // The cover art ends flush with the face; a soft frame keeps the
+            // printed edge crisp against the paper underneath.
+            let frame = volume.cover;
+            polygon(
+                p,
+                vec![
+                    frame.point(0., 0.),
+                    frame.point(1., 0.),
+                    frame.point(1., 1.),
+                    frame.point(0., 1.),
+                ],
+                Color32::TRANSPARENT,
+                Stroke::new(0.75, edge_line),
             );
         } else {
             flat(&print, volume.cover, ink);
@@ -471,15 +505,24 @@ pub fn paint_volume(
             );
         }
     }
-    affine_text(
-        &print,
-        face_unit,
-        pos2(10., 9.),
-        &format!("NO.{:03}", volume.index + 1),
-        8.,
-        muted,
-        true,
-    );
+    // Below ~0.72 the engraved index would render as ≈4px noise, so tiny
+    // shelves swap both numbers for one quiet tick instead.
+    let tiny = scale < 0.72;
+    if tiny {
+        let a = face_unit.point(0.08, 0.07);
+        let b = face_unit.point(0.30, 0.07);
+        p.line_segment([a, b], Stroke::new(1., muted.gamma_multiply(0.6)));
+    } else {
+        affine_text(
+            &print,
+            face_unit,
+            pos2(10., 9.),
+            &format!("NO.{:03}", volume.index + 1),
+            8.,
+            muted,
+            true,
+        );
+    }
     let edge = if dark {
         Color32::from_gray(60)
     } else {
@@ -496,18 +539,27 @@ pub fn paint_volume(
         volume.cap.to_vec(),
         Stroke::new(0.4, muted.gamma_multiply(0.24)),
     ));
-    flat(p, volume.front, spine);
-    affine_text(
-        &print,
-        spine_unit,
-        pos2(2., 9.),
-        &format!("{:02}", volume.index + 1),
-        8.,
-        muted,
-        true,
+    flat_stroked(p, volume.front, spine, Stroke::new(0.8, edge_line));
+    // A whisper of a gutter line where the cover board meets the spine gives
+    // each volume its own silhouette against the neighbour's white edge.
+    p.line_segment(
+        [volume.front.point(1., 0.), volume.front.point(1., 1.)],
+        Stroke::new(0.9, muted.gamma_multiply(if dark { 0.30 } else { 0.42 })),
     );
+    if !tiny {
+        affine_text(
+            &print,
+            spine_unit,
+            pos2(2., 9.),
+            &format!("{:02}", volume.index + 1),
+            8.,
+            muted,
+            true,
+        );
+    }
     let chars: Vec<char> = title.chars().take(9).collect();
-    let top = (volume.height / scale - chars.len() as f32 * 11.) / 2.;
+    // Keep the vertical title clear of the bottom ring on tight heights.
+    let top = (volume.height / scale - chars.len() as f32 * 11. - 14.) / 2.;
     for (i, ch) in chars.iter().enumerate() {
         affine_text(
             &print,
@@ -524,7 +576,11 @@ pub fn paint_volume(
         p.circle_filled(
             volume.front.point(0.5, 0.94),
             3.,
-            Color32::from_rgb(45, 103, 190),
+            if dark {
+                Color32::from_rgb(156, 199, 177)
+            } else {
+                Color32::from_rgb(44, 90, 70)
+            },
         );
     }
 }

@@ -634,6 +634,20 @@ extension YejianDocumentBridge {
         defer { webLock.unlock() }
         return webResults.isEmpty ? nil : webResults.removeFirst()
     }
+
+    /// Hands `url` to `UIApplication.open` (Safari etc.). The Rust caller
+    /// already restricted it to http/https. Returns 0 when the system
+    /// accepted the request, -1 when it could not be opened.
+    func openExternalUrl(url: String) -> Int64 {
+        guard prepared, let target = URL(string: url),
+              let scheme = target.scheme?.lowercased(),
+              scheme == "http" || scheme == "https" else { return -1 }
+        return onMain {
+            guard UIApplication.shared.canOpenURL(target) else { return -1 }
+            UIApplication.shared.open(target, options: [:])
+            return 0
+        }
+    }
 }
 
 // MARK: - Rust ABI
@@ -710,4 +724,10 @@ public func yejian_ios_open_web(
 public func yejian_ios_poll_web() -> UnsafeMutablePointer<CChar>? {
     guard let json = YejianDocumentBridge.shared.pollWeb() else { return nil }
     return duplicate(json)
+}
+
+@_cdecl("yejian_ios_open_external_url")
+public func yejian_ios_open_external_url(_ url: UnsafePointer<CChar>?) -> Int64 {
+    guard let url else { return -1 }
+    return YejianDocumentBridge.shared.openExternalUrl(url: String(cString: url))
 }

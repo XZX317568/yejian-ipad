@@ -19,11 +19,11 @@ use std::{
 };
 use yejian_core::{ChapterLink, ChapterMetadata};
 use yejian_sources::*;
-
 /// The Aidoku community catalogue, kept as an explicit one-tap choice rather
-/// than a silently preinstalled repository.
-const COMMUNITY_INDEX: &str = "https://aidoku-community.github.io/sources/index.min.json";
 
+/// than a silently preinstalled repository.
+
+const COMMUNITY_INDEX: &str = "https://aidoku-community.github.io/sources/index.min.json";
 fn language_label(language: &str) -> &str {
     match language {
         "zh" | "zh-CN" | "zh-Hans" => "中文",
@@ -34,14 +34,12 @@ fn language_label(language: &str) -> &str {
         _ => language,
     }
 }
-
 fn quiet_action(label: &str) -> Button<'_> {
     Button::new(label)
         .frame_when_inactive(false)
         .min_size(vec2(44., 44.))
         .wrap()
 }
-
 fn disclosure(ui: &mut Ui, label: &str, default_open: bool, body: impl FnOnce(&mut Ui)) {
     let mut state = collapsing_header::CollapsingState::load_with_default_open(
         ui.ctx(),
@@ -60,9 +58,10 @@ fn disclosure(ui: &mut Ui, label: &str, default_open: bool, body: impl FnOnce(&m
     });
     state.show_body_unindented(ui, body);
 }
-
 /// A readable row instead of using the whole title as a flat grey button.
+
 /// The initial represents a source name; it is not a substitute cover image.
+
 fn source_item(
     ui: &mut Ui,
     id: impl std::hash::Hash + std::fmt::Debug,
@@ -155,7 +154,6 @@ fn source_item(
     );
     enabled && response.clicked()
 }
-
 #[derive(Clone)]
 enum Task {
     List,
@@ -179,6 +177,11 @@ enum Task {
         key: String,
         /// `Ok((user, password))` for basic login, `Err(cookies)` for web.
         credentials: Result<(String, String), Vec<(String, String)>>,
+    },
+    /// A `settings.json` button notification forwarded to the source.
+    Notify {
+        source: String,
+        notification: String,
     },
 }
 enum Reply {
@@ -207,35 +210,44 @@ enum Reply {
         has_next: bool,
     },
     Chapters(String, Manga, Vec<Chapter>),
+    Notified,
 }
-
 #[derive(Default, Clone)]
 struct BrowseSession {
     query: String,
     filters: Vec<FilterValue>,
     listing: Option<String>,
 }
-
 fn chapter_name(chapter: &Chapter) -> String {
-    chapter.title.clone().filter(|title| !title.trim().is_empty()).unwrap_or_else(|| {
-        chapter.chapter_number
-            .map(|number| format!("第 {number} 话"))
-            .unwrap_or_else(|| chapter.key.clone())
-    })
+    chapter
+        .title
+        .clone()
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or_else(|| {
+            chapter
+                .chapter_number
+                .map(|number| format!("第 {number} 话"))
+                .unwrap_or_else(|| chapter.key.clone())
+        })
 }
-
 /// Use one comparable volume group for chapters without explicit volumes,
+
 /// matching the library's reading order (including decimal extra chapters).
+
 /// Result-grid columns: as many `min_cell` covers as the row fits, never
+
 /// fewer than one and never overflowing horizontally.
+
 fn grid_columns(width: f32) -> usize {
     let min_cell = if width >= 600. { 150. } else { 112. };
     (((width + 16.) / (min_cell + 16.)).floor() as usize).max(1)
 }
-
 /// Retains queued covers that are still wanted, appends new wants in order
+
 /// and drops the oldest entries once the queue exceeds `COVER_QUEUE_CAP`.
+
 /// `skip` holds keys already in flight or known failed, so they never queue.
+
 fn plan_covers(queue: &mut VecDeque<CoverReq>, want: Vec<CoverReq>, skip: &HashSet<String>) {
     let wanted: HashSet<&str> = want.iter().map(|req| req.key.as_str()).collect();
     queue.retain(|req| wanted.contains(req.key.as_str()));
@@ -249,44 +261,55 @@ fn plan_covers(queue: &mut VecDeque<CoverReq>, want: Vec<CoverReq>, skip: &HashS
         queue.pop_front();
     }
 }
-
 fn chapter_list(chapters: &[Chapter], query: &str, newest_first: bool) -> Vec<Chapter> {
-    let first_volume = chapters.iter()
+    let first_volume = chapters
+        .iter()
         .filter_map(|chapter| chapter.volume_number.filter(|number| number.is_finite()))
         .min_by(f32::total_cmp)
         .unwrap_or(0.);
     let needle = query.trim().to_lowercase();
-    let mut visible: Vec<_> = chapters.iter().filter_map(|chapter| {
-        let name = chapter_name(chapter);
-        let number = chapter.chapter_number.filter(|number| number.is_finite());
-        if !needle.is_empty() && !name.to_lowercase().contains(&needle)
-            && !number.is_some_and(|number| number.to_string().contains(&needle))
-        {
-            return None;
-        }
-        let volume = chapter.volume_number
-            .filter(|number| number.is_finite()).unwrap_or(first_volume);
-        Some((chapter, name, volume, number))
-    }).collect();
+    let mut visible: Vec<_> = chapters
+        .iter()
+        .filter_map(|chapter| {
+            let name = chapter_name(chapter);
+            let number = chapter.chapter_number.filter(|number| number.is_finite());
+            if !needle.is_empty()
+                && !name.to_lowercase().contains(&needle)
+                && !number.is_some_and(|number| number.to_string().contains(&needle))
+            {
+                return None;
+            }
+            let volume = chapter
+                .volume_number
+                .filter(|number| number.is_finite())
+                .unwrap_or(first_volume);
+            Some((chapter, name, volume, number))
+        })
+        .collect();
     visible.sort_by(|left, right| {
-        left.2.total_cmp(&right.2).then_with(|| {
-            match (left.3, right.3) {
+        left.2
+            .total_cmp(&right.2)
+            .then_with(|| match (left.3, right.3) {
                 (Some(left), Some(right)) => left.total_cmp(&right),
                 (Some(_), None) => std::cmp::Ordering::Less,
                 (None, Some(_)) => std::cmp::Ordering::Greater,
                 (None, None) => std::cmp::Ordering::Equal,
-            }
-        }).then_with(|| yejian_core::natural_cmp(&left.1, &right.1))
-          .then_with(|| left.0.key.cmp(&right.0.key))
+            })
+            .then_with(|| yejian_core::natural_cmp(&left.1, &right.1))
+            .then_with(|| left.0.key.cmp(&right.0.key))
     });
     if newest_first {
         visible.reverse();
     }
-    visible.into_iter().map(|(chapter, _, _, _)| chapter.clone()).collect()
+    visible
+        .into_iter()
+        .map(|(chapter, _, _, _)| chapter.clone())
+        .collect()
 }
-
 /// `YYYY-MM-DD` for a unix timestamp, so chapter rows can show an upload date
+
 /// without pulling in a calendar dependency.
+
 fn format_epoch_date(epoch: i64) -> String {
     let z = epoch.div_euclid(86_400) + 719_468;
     let era = z.div_euclid(146_097);
@@ -299,9 +322,10 @@ fn format_epoch_date(epoch: i64) -> String {
     let year = yoe + era * 400 + i64::from(month <= 2);
     format!("{year}-{month:02}-{day:02}")
 }
-
 /// Right-column state lines for one chapter row: reading progress first, then
+
 /// download state. Kept pure so the exact strings are testable.
+
 fn chapter_state_lines(
     locked: bool,
     downloaded: bool,
@@ -319,14 +343,16 @@ fn chapter_state_lines(
         });
     if finished {
         lines.push("已读".into());
-    } else if let Some((page, count)) =
-        progress.filter(|(_, count)| *count > 0)
-    {
+    } else if let Some((page, count)) = progress.filter(|(_, count)| *count > 0) {
         lines.push(format!("读到 {}/{}", page + 1, count));
-    } else if let Some(task) = task.filter(|task| {
-        task.total > 0 && task.read_page.is_some_and(|page| page + 1 < task.total)
-    }) {
-        lines.push(format!("读到 {}/{}", task.read_page.unwrap() + 1, task.total));
+    } else if let Some(task) = task
+        .filter(|task| task.total > 0 && task.read_page.is_some_and(|page| page + 1 < task.total))
+    {
+        lines.push(format!(
+            "读到 {}/{}",
+            task.read_page.unwrap() + 1,
+            task.total
+        ));
     }
     if downloaded {
         lines.push("已下载".into());
@@ -344,11 +370,14 @@ fn chapter_state_lines(
     }
     lines
 }
-
 /// Paints a cover texture or the placeholder tile into `rect`, shared by the
+
 /// result grid and the detail header. Both get a 1px `line` border so tiles
+
 /// stay visible on the page; the placeholder uses the tinted `accent_soft`
+
 /// surface rather than blending into the background.
+
 fn paint_cover(
     painter: &Painter,
     rect: Rect,
@@ -381,11 +410,12 @@ fn paint_cover(
     }
     painter.rect_stroke(rect, 8., Stroke::new(1., palette.line), StrokeKind::Inside);
 }
-
 /// One finished chapter ready for `Command::ImportChapter`.
-///
-/// `id` is the queue task id: after `import` and `link_chapter` both succeed
+
+////// `id` is the queue task id: after `import` and `link_chapter` both succeed
+
 /// the caller acknowledges it with [`Sources::ack_downloaded`].
+
 pub struct DownloadedChapter {
     pub id: String,
     pub path: PathBuf,
@@ -393,7 +423,6 @@ pub struct DownloadedChapter {
     /// Page reached while reading online, carried into the library book.
     pub read_page: Option<usize>,
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum DownloadStatus {
     Queued,
@@ -413,10 +442,12 @@ impl DownloadStatus {
         }
     }
 }
-
 /// One persisted download job. It is self-contained: the source engine can be
+
 /// reopened on any thread and `pages_with` is fed the reconstructed
+
 /// Manga/Chapter, so an app restart never needs the original search session.
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DownloadTask {
     id: String,
@@ -438,20 +469,29 @@ struct DownloadTask {
     #[serde(default)]
     chapter_language: Option<String>,
     /// Id of the stored snapshot of the complete `Manga` object passed to
+
     /// `get_page_list`. The bytes live once per manga under
+
     /// `download-work/snapshots`, so many chapter tasks of the same work never
+
     /// duplicate its chapter list in this JSON.
+
     #[serde(default)]
     manga_snapshot: Option<String>,
     /// Postcard bytes of the exact `Chapter` object the source is asked for
+
     /// pages, keeping scanlators/date/thumbnail/locked etc. across restarts.
+
     #[serde(default)]
     chapter_snapshot: Option<Vec<u8>>,
     /// Last page read online before the chapter joined the library.
+
     #[serde(default)]
     read_page: Option<usize>,
     /// When `read_page` last moved; lets 继续阅读 pick the most recently read
+
     /// chapter across library books and online streams.
+
     #[serde(default)]
     read_at: Option<i64>,
     status: DownloadStatus,
@@ -462,14 +502,19 @@ struct DownloadTask {
     #[serde(default)]
     pages_total: usize,
     /// Page-list fingerprint the cached page files belong to. A different list
+
     /// clears this chapter's own cache before refetching.
+
     #[serde(default)]
     pages_signature: Option<String>,
     #[serde(default)]
     cbz: Option<PathBuf>,
     /// True once the library import + chapter link succeeded. Unlinked
+
     /// finished files are offered again on the next start instead of being
+
     /// downloaded again.
+
     #[serde(default)]
     linked: bool,
 }
@@ -529,9 +574,13 @@ impl DownloadTask {
         }
     }
     /// The original `Manga` for this task. Only queues written before
+
     /// snapshots existed fall back to the reduced legacy fields; a task that
+
     /// *has* a snapshot must restore it exactly, otherwise it fails visibly
+
     /// instead of sending a half-empty object to the source.
+
     fn manga_for(&self, root: &Path) -> anyhow::Result<Manga> {
         let Some(key) = self.manga_snapshot.as_deref() else {
             return Ok(self.manga());
@@ -555,7 +604,9 @@ impl DownloadTask {
         Ok(manga)
     }
     /// The original `Chapter` for this task. Legacy queues without a snapshot
+
     /// keep working; a broken snapshot fails instead of silently degrading.
+
     fn chapter_for(&self) -> anyhow::Result<Chapter> {
         let Some(bytes) = self.chapter_snapshot.as_deref() else {
             return Ok(self.chapter());
@@ -581,14 +632,13 @@ impl DownloadTask {
         }
     }
 }
-
 #[derive(Default, Serialize, Deserialize)]
 struct TaskStore {
     #[serde(default)]
     tasks: Vec<DownloadTask>,
 }
-
 /// Keep chapter rendering independent from the potentially large persisted
+
 /// manga/chapter snapshots carried by each task.
 #[derive(Clone)]
 struct ChapterQueueState {
@@ -599,22 +649,32 @@ struct ChapterQueueState {
     read_page: Option<usize>,
     read_at: Option<i64>,
 }
-
 const COVER_QUEUE_CAP: usize = 24;
 const COVER_INFLIGHT_CAP: usize = 8;
 const COVER_TEXTURE_CAP: usize = 120;
 const COVER_MAX_HEIGHT: u32 = 360;
-
+/// Default automatic follow-check cadence (minutes); `0` turns it off.
+pub(crate) const DEFAULT_FOLLOW_INTERVAL_MIN: u64 = 60;
+/// Selectable periods offered in 设置, in minutes.
+pub(crate) const FOLLOW_INTERVAL_CHOICES: &[(u64, &str)] = &[
+    (0, "关闭"),
+    (30, "30 分钟"),
+    (60, "1 小时"),
+    (120, "2 小时"),
+    (360, "6 小时"),
+];
 /// One cover the results grid wants on screen.
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CoverReq {
     key: String,
     source: String,
     url: String,
 }
-
 /// `CoverReq` resolved through the source's interpreter, ready for raw HTTP on
+
 /// any of the pool workers. The handler shares the source's cookie jar.
+
 struct CoverHttpJob {
     key: String,
     root: PathBuf,
@@ -623,14 +683,14 @@ struct CoverHttpJob {
     headers: Vec<(String, String)>,
     body: Option<Vec<u8>>,
 }
-
 /// Decoded cover delivered to the UI; `None` marks the URL as failed for the
+
 /// session so a placeholder is drawn instead of retrying every frame.
+
 struct CoverDone {
     key: String,
     image: Option<ColorImage>,
 }
-
 enum DlCmd {
     Run(DownloadTask),
 }
@@ -658,15 +718,15 @@ enum DlEvent {
         error: String,
     },
 }
-
 const STOP_NONE: u8 = 0;
 const STOP_PAUSE: u8 = 1;
 const STOP_CANCEL: u8 = 2;
-
 /// The result list plus the exact search that produced it.
-///
-/// Every entry keeps its own `source_key`, and results are only accepted for
+
+////// Every entry keeps its own `source_key`, and results are only accepted for
+
 /// the source/query/page that is still current, so a late reply from an
+
 /// abandoned search can never be shown under another source.
 #[derive(Default)]
 struct ResultsState {
@@ -694,6 +754,7 @@ impl ResultsState {
         self.has_more = false;
     }
     /// Source, query and page for the next request, or `None` at the end.
+
     fn next_page(&self) -> Option<(String, String, i32)> {
         if !self.has_more || self.source.is_empty() {
             None
@@ -702,9 +763,13 @@ impl ResultsState {
         }
     }
     /// Accepts exactly the reply we asked for. Returns `false` for stale,
+
     /// foreign-source or duplicate replies, leaving state untouched so the
+
     /// page counter only moves on real success and a failed page stays
+
     /// retryable.
+
     fn accept(
         &mut self,
         source: &str,
@@ -734,10 +799,12 @@ impl ResultsState {
         true
     }
 }
-
 /// Applies a source selection: returns `true` when the source actually changed.
+
 /// Any old result list, detail and chapter state belongs to the previous
+
 /// source and is dropped, so the next tap can never load a foreign manga key.
+
 fn apply_source_change(
     selected: &mut String,
     results: &mut ResultsState,
@@ -754,13 +821,16 @@ fn apply_source_change(
     results.clear();
     true
 }
-
 // ---------------------------------------------------------------------------
+
 // Persisted task identity and per-chapter page staging
+
 // ---------------------------------------------------------------------------
 
 /// Stable 64-bit FNV-1a over source/manga/chapter, so the same chapter always
+
 /// maps to one task id across restarts and concurrent enqueues.
+
 pub(crate) fn identity_id(source: &str, manga: &str, chapter: &str) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for part in [source, manga, chapter] {
@@ -771,16 +841,16 @@ pub(crate) fn identity_id(source: &str, manga: &str, chapter: &str) -> String {
     }
     format!("{hash:016x}")
 }
-
 fn work_root(root: &Path) -> PathBuf {
     root.join("download-work")
 }
-
 /// Reader book ids that point at a chapter still being downloaded.
-pub const STREAM_PREFIX: &str = "stream:";
 
+pub const STREAM_PREFIX: &str = "stream:";
 /// Bytes of one zero-based page already staged by a running or paused
+
 /// download, or `None` while that page has not arrived yet.
+
 pub(crate) fn stream_page(root: &Path, id: &str, page: usize) -> anyhow::Result<Option<Vec<u8>>> {
     let dir = task_dir(root, id)?;
     match stored_page(&dir, page + 1) {
@@ -788,8 +858,8 @@ pub(crate) fn stream_page(root: &Path, id: &str, page: usize) -> anyhow::Result<
         None => Ok(None),
     }
 }
-
 /// A chapter the user opened for reading before its download finished.
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct StreamChapter {
     pub id: String,
@@ -797,8 +867,8 @@ pub struct StreamChapter {
     /// Entered backwards from the following chapter: start on its last page.
     pub from_end: bool,
 }
-
 /// Download progress of a chapter being read online.
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct StreamState {
     pub total: usize,
@@ -809,18 +879,20 @@ pub struct StreamState {
     /// Where the user left off in this chapter, kept across app restarts.
     pub page: Option<usize>,
 }
-
 /// Task ids are always the 16 lowercase hex digits produced by `identity_id`.
+
 /// Anything else is treated as a corrupt queue entry, never as a path.
+
 fn valid_task_id(id: &str) -> bool {
     id.len() == 16
         && id
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
-
 /// Resolves one task's staging directory and proves it stays inside
+
 /// `download-work`, including the target of an existing symlink/junction.
+
 fn task_dir(root: &Path, id: &str) -> anyhow::Result<PathBuf> {
     anyhow::ensure!(valid_task_id(id), "非法的下载任务 id：{id:?}");
     let work = work_root(root);
@@ -846,9 +918,10 @@ fn task_dir(root: &Path, id: &str) -> anyhow::Result<PathBuf> {
     }
     Ok(dir)
 }
-
 /// Deletes only one validated task's staging directory. A malformed id or a
+
 /// link that resolves outside `download-work` is reported instead of followed.
+
 fn remove_task_cache(root: &Path, id: &str) -> anyhow::Result<()> {
     let dir = task_dir(root, id)?;
     match std::fs::symlink_metadata(&dir) {
@@ -858,24 +931,24 @@ fn remove_task_cache(root: &Path, id: &str) -> anyhow::Result<()> {
         Err(error) => Err(anyhow::anyhow!("检查缓存 {} 失败：{error}", dir.display())),
     }
 }
-
 fn snapshot_root(root: &Path) -> PathBuf {
     work_root(root).join("snapshots")
 }
-
 fn manga_snapshot_key(source: &str, manga: &str) -> String {
     identity_id(source, manga, "manga-snapshot")
 }
-
 fn manga_snapshot_path(root: &Path, key: &str) -> anyhow::Result<PathBuf> {
     anyhow::ensure!(valid_task_id(key), "非法的漫画快照 id：{key:?}");
     Ok(snapshot_root(root).join(format!("{key}.manga")))
 }
-
 /// Stores the complete `Manga` from the search result once per work. The exact
+
 /// postcard bytes the interpreter would send to `get_page_list` are written, so
+
 /// a restored task passes authors/tags/viewer/description unchanged and never
+
 /// needs a new details request. Existing identical bytes are reused.
+
 pub(crate) fn save_manga_snapshot(root: &Path, manga: &Manga) -> anyhow::Result<String> {
     let key = manga_snapshot_key(&manga.source_key, &manga.key);
     let path = manga_snapshot_path(root, &key)?;
@@ -906,9 +979,10 @@ pub(crate) fn save_manga_snapshot(root: &Path, manga: &Manga) -> anyhow::Result<
     cleanup.keep();
     Ok(key)
 }
-
 /// One OS-level exclusive lock per data root. It is held only while a task is
+
 /// actually running and is released automatically when the guard is dropped.
+
 fn acquire_download_lock(root: &Path) -> anyhow::Result<std::fs::File> {
     let work = work_root(root);
     std::fs::create_dir_all(&work)?;
@@ -922,14 +996,12 @@ fn acquire_download_lock(root: &Path) -> anyhow::Result<std::fs::File> {
         .map_err(|error| anyhow::anyhow!("上一次下载仍在退出，请稍后重试（{error}）"))?;
     Ok(file)
 }
-
 fn stored_page(dir: &Path, number: usize) -> Option<PathBuf> {
     ["jpg", "png", "webp"]
         .into_iter()
         .map(|extension| dir.join(format!("page-{number:04}.{extension}")))
         .find(|path| path.is_file())
 }
-
 fn existing_pages(dir: &Path) -> HashSet<usize> {
     let mut found = HashSet::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -955,10 +1027,12 @@ fn existing_pages(dir: &Path) -> HashSet<usize> {
     }
     found
 }
-
 /// Fingerprint of the chapter's page list. URL pages, zip entries, embedded
+
 /// images and text pages all contribute; a changed list means cached page
+
 /// files cannot be trusted and are cleared for this task only.
+
 fn page_signature(pages: &[Page]) -> String {
     use std::fmt::Write as _;
     let mut text = String::with_capacity(pages.len() * 48);
@@ -993,7 +1067,6 @@ fn page_signature(pages: &[Page]) -> String {
     }
     text
 }
-
 fn reset_page_cache(dir: &Path) -> anyhow::Result<()> {
     if !dir.exists() {
         return Ok(());
@@ -1008,17 +1081,19 @@ fn reset_page_cache(dir: &Path) -> anyhow::Result<()> {
     }
     Ok(())
 }
-
 #[derive(Debug)]
 struct FetchSummary {
     done: usize,
     aborted: bool,
 }
-
 /// The page-list signature is only a fingerprint, and inline images can reuse
+
 /// the same `image_ref` while two different 4x4 PNGs still have exactly the
+
 /// same byte length. For an inline page that already has a cached file, compare
+
 /// the actual bytes; a mismatch invalidates only that one page.
+
 fn cached_inline_page_matches(dir: &Path, number: usize, page: &Page) -> anyhow::Result<bool> {
     let PageContent::Image { image_data, .. } = &page.content else {
         return Ok(true);
@@ -1031,17 +1106,23 @@ fn cached_inline_page_matches(dir: &Path, number: usize, page: &Page) -> anyhow:
     };
     Ok(std::fs::read(path)? == *expected)
 }
-
 /// Pages are fetched on this many workers at once, handed out in ascending
-/// order so the page the reader waits for arrives first.
-const PAGE_CONCURRENCY: usize = 4;
 
+/// order so the page the reader waits for arrives first.
+
+const PAGE_CONCURRENCY: usize = 4;
 /// Downloads only the pages that are not yet stored. Each page is validated by
+
 /// its real image header, written to `page-NNNN.part`, synced and renamed, so
+
 /// a page file existing means it was fully written. A stop request between
+
 /// pages lets in-flight pages finish and leaves every completed page
+
 /// reusable. The first error stops new pages from starting and is returned
+
 /// once the workers drain.
+
 fn fetch_missing_pages(
     dir: &Path,
     pages: &[Page],
@@ -1081,9 +1162,7 @@ fn fetch_missing_pages(
             let tx = tx.clone();
             scope.spawn(move || {
                 loop {
-                    if failed.load(Ordering::SeqCst)
-                        || stop.load(Ordering::SeqCst) != STOP_NONE
-                    {
+                    if failed.load(Ordering::SeqCst) || stop.load(Ordering::SeqCst) != STOP_NONE {
                         return;
                     }
                     let Some(&index) = missing.get(next.fetch_add(1, Ordering::SeqCst)) else {
@@ -1100,11 +1179,16 @@ fn fetch_missing_pages(
                             _ => anyhow::bail!("第 {number} 页图像格式暂不支持"),
                         };
                         // A server can return a truncated image with a valid
+
                         // signature. Decode with the reader's limits before
+
                         // marking the page complete.
-                        drop(reader.decode().with_context(|| {
-                            format!("第 {number} 页图片不完整或无法解码")
-                        })?);
+
+                        drop(
+                            reader
+                                .decode()
+                                .with_context(|| format!("第 {number} 页图片不完整或无法解码"))?,
+                        );
                         let part = dir.join(format!("page-{number:04}.part"));
                         let target = dir.join(format!("page-{number:04}.{extension}"));
                         let mut file = std::fs::OpenOptions::new()
@@ -1151,7 +1235,6 @@ fn fetch_missing_pages(
         aborted: stop.load(Ordering::SeqCst) != STOP_NONE,
     })
 }
-
 fn safe_name(title: &str) -> String {
     let mut safe = String::new();
     for ch in title.chars().take(80) {
@@ -1171,16 +1254,17 @@ fn safe_name(title: &str) -> String {
         safe
     }
 }
-
 /// Builds the final CBZ from the validated page files. The archive is written
+
 /// to a fresh `.part` and renamed only after `finish + sync_all`; any failure
+
 /// removes just that file, and an existing `.cbz` is never touched.
+
 fn chapter_archive(root: &Path, task: &DownloadTask) -> PathBuf {
     let title = safe_name(&format!("{} - {}", task.manga_title, task.chapter_title));
     root.join("downloads")
         .join(format!("{title}-{}.cbz", task.id))
 }
-
 fn build_cbz(
     root: &Path,
     task: &DownloadTask,
@@ -1221,15 +1305,14 @@ fn build_cbz(
     std::fs::rename(&part, &path)?;
     Ok(path)
 }
-
 #[derive(Debug)]
 struct LoadedTasks {
     tasks: Vec<DownloadTask>,
     /// Present when part of the file was unreadable. The original file is
+
     /// never overwritten just because startup could not parse all of it.
     warning: Option<String>,
 }
-
 fn load_tasks(root: &Path) -> anyhow::Result<LoadedTasks> {
     let path = root.join("download-tasks.json");
     let bytes = match std::fs::read(&path) {
@@ -1248,7 +1331,9 @@ fn load_tasks(root: &Path) -> anyhow::Result<LoadedTasks> {
         return Err(anyhow::anyhow!("下载队列 JSON 缺少 tasks 数组"));
     };
     // Parse task by task: one damaged entry must not discard the rest of the
+
     // queue, but tell the user that something was skipped.
+
     let mut tasks = Vec::new();
     let mut skipped = 0usize;
     for item in items {
@@ -1262,10 +1347,12 @@ fn load_tasks(root: &Path) -> anyhow::Result<LoadedTasks> {
         (skipped > 0).then(|| format!("下载队列有 {skipped} 条损坏记录已跳过，原文件已保留"));
     Ok(LoadedTasks { tasks, warning })
 }
-
 /// Loads and normalizes the persisted queue. A whole-file failure is surfaced
+
 /// as a warning and leaves the file untouched; it never turns into a silent
+
 /// empty queue.
+
 fn load_queue(root: &Path) -> (Vec<DownloadTask>, Option<String>) {
     match load_tasks(root) {
         Ok(loaded) => {
@@ -1281,21 +1368,25 @@ fn load_queue(root: &Path) -> (Vec<DownloadTask>, Option<String>) {
         ),
     }
 }
-
 /// Applies the restart policy to tasks loaded from disk: an interrupted
+
 /// download waits for an explicit "继续"; a finished task whose file vanished
+
 /// becomes retryable instead of pretending success.
+
 fn recover_completed_archive(root: &Path, task: &DownloadTask) -> Option<PathBuf> {
     let archive = chapter_archive(root, task);
     archive.is_file().then_some(archive)
 }
-
 fn normalize_loaded(root: &Path, tasks: &mut [DownloadTask]) {
     for task in tasks {
         if let Some(path) = recover_completed_archive(root, task) {
             // iOS can relocate the data container during an update. A done
+
             // task still records the old absolute CBZ path; prefer this
+
             // library's own complete archive and keep its import state.
+
             if task.status != DownloadStatus::Done {
                 task.status = DownloadStatus::Done;
                 task.error = None;
@@ -1315,10 +1406,12 @@ fn normalize_loaded(root: &Path, tasks: &mut [DownloadTask]) {
         }
     }
 }
-
 /// Finished files that still need a library import, in queue order. Used on
+
 /// start so an import that failed before the last shutdown is retried without
+
 /// downloading anything again.
+
 fn pending_imports(tasks: &[DownloadTask]) -> Vec<String> {
     tasks
         .iter()
@@ -1330,17 +1423,19 @@ fn pending_imports(tasks: &[DownloadTask]) -> Vec<String> {
         .map(|task| task.id.clone())
         .collect()
 }
-
 enum EnqueueOutcome {
     Added,
     Duplicate,
     AlreadyDownloaded,
 }
-
 /// Adds one task, or explains why not. A finished task whose CBZ still exists
+
 /// is protected; a finished task whose file disappeared goes back to the queue
+
 /// and keeps its page cache (the page signature check decides whether that
+
 /// cache is still valid).
+
 fn enqueue_task(tasks: &mut Vec<DownloadTask>, task: DownloadTask) -> EnqueueOutcome {
     if let Some(existing) = tasks.iter_mut().find(|existing| existing.id == task.id) {
         if existing.status == DownloadStatus::Done {
@@ -1352,8 +1447,11 @@ fn enqueue_task(tasks: &mut Vec<DownloadTask>, task: DownloadTask) -> EnqueueOut
             existing.cbz = None;
         }
         // Re-adding from the manga detail page carries freshly saved complete
+
         // objects. Replace the references so a task whose snapshot file was
+
         // lost or corrupted can be retried without losing its cached pages.
+
         existing.manga_snapshot = task.manga_snapshot;
         existing.chapter_snapshot = task.chapter_snapshot;
         if existing.status == DownloadStatus::Failed {
@@ -1365,13 +1463,11 @@ fn enqueue_task(tasks: &mut Vec<DownloadTask>, task: DownloadTask) -> EnqueueOut
     tasks.push(task);
     EnqueueOutcome::Added
 }
-
 fn next_queued(tasks: &[DownloadTask]) -> Option<usize> {
     tasks
         .iter()
         .position(|task| task.status == DownloadStatus::Queued)
 }
-
 pub struct Sources {
     root: PathBuf,
     tx: mpsc::Sender<(u64, Task)>,
@@ -1410,7 +1506,9 @@ pub struct Sources {
     running: Option<String>,
     ready: VecDeque<String>,
     /// Import attempts that are really in flight, kept only in memory.
+
     /// `ack_downloaded` or `import_failed` clears the entry; while it is
+
     /// present the UI never offers a duplicate retry for the same file.
     import_attempts: HashSet<String>,
     dl_tx: mpsc::Sender<DlCmd>,
@@ -1418,19 +1516,46 @@ pub struct Sources {
     dl_stop: Arc<AtomicU8>,
     stream_request: Option<StreamChapter>,
     /// A download paused only so that a chapter being read can run first.
+
     /// It goes back to the queue instead of waiting for a manual "继续".
     preempted: Option<String>,
     follows: Vec<Follow>,
     /// A followed manga to open once its source has finished loading.
     pending_open: Option<Manga>,
     checking: usize,
+    /// Whether the in-flight batch came from the scheduler — its completion
+
+    /// summary goes to the notice bar rather than the sources status line.
+    checking_background: bool,
     auto_checked: bool,
+    /// egui context the scheduler uses for one-shot wake repaints.
+    ctx: Context,
+    /// Minutes between automatic follow checks; `0` disables them. Persisted
+
+    /// as `follow-interval` through the library settings store.
+    follow_interval_min: u64,
+    /// egui-time deadline of the next scheduled check. Kept as wall-clock
+
+    /// `Instant` so a suspended frame clock cannot skip a whole interval.
+    follow_next_due: Option<std::time::Instant>,
+    /// New-chapter summary surfaced to the app shell's notice bar once a
+
+    /// background (scheduled) check finishes.
+    pub(crate) follow_notice: Option<String>,
     up_tx: mpsc::Sender<Vec<(String, Manga)>>,
     up_rx: mpsc::Receiver<UpdateEvent>,
     /// Decoded follow covers by snapshot key; `None` means not on disk yet.
     covers: std::collections::HashMap<String, Option<TextureHandle>>,
+    /// Each followed manga's cover URL resolved from its snapshot, once per
+
+    /// session — the grid's `source-covers` cache keys are URL-based, so the
+
+    /// follow rows reuse the same pipeline instead of `follow-covers/`.
+    follow_cover_urls: std::collections::HashMap<String, Option<String>>,
     /// Result-grid covers. `cover_queue` only holds cells near the viewport;
+
     /// `cover_inflight` dedupes sent-but-unfinished requests and
+
     /// `cover_outstanding` bounds how many are with the workers at once.
     cover_req_tx: mpsc::Sender<CoverReq>,
     cover_done_rx: mpsc::Receiver<CoverDone>,
@@ -1438,6 +1563,7 @@ pub struct Sources {
     cover_inflight: HashSet<String>,
     cover_outstanding: usize,
     /// URLs that failed once this session; placeholders render instead of
+
     /// hammering a dead image host every frame.
     cover_failed: HashSet<String>,
     cover_ready: std::collections::HashMap<String, Option<ColorImage>>,
@@ -1445,13 +1571,16 @@ pub struct Sources {
     cover_textures: std::collections::HashMap<String, TextureHandle>,
     cover_lru: VecDeque<String>,
     /// Page already auto-loaded when its last grid row scrolled into view, so
+
     /// the marker cannot fire the same request again on the next frame.
     auto_next_page: Option<i32>,
     /// Reading progress per `identity_id` chapter, fed by the host each frame
+
     /// so the detail page can offer 继续阅读 and row read states.
     chapter_progress: std::collections::HashMap<String, (usize, usize, Option<i64>)>,
     description_expanded: bool,
     /// Clickable rects registered this frame, merged into the app's hitboxes
+
     /// so acceptance and automation can find grid cells and detail actions.
     pub(crate) hitboxes: std::collections::BTreeMap<String, Rect>,
     settings_open: bool,
@@ -1462,28 +1591,101 @@ pub struct Sources {
     stale_engines: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Origin a Cloudflare challenge blocked, until the user verifies.
     challenge: Option<String>,
-    /// Source and optional login key of the open in-app browser page.
-    web_purpose: Option<(String, Option<String>)>,
+    /// The in-flight verification/login page — an in-app WebView on mobile
+
+    /// or the system-browser + paste dialog on desktop.
+    web_session: Option<WebSession>,
     login_user: String,
     login_pass: String,
     /// Cookies from verification/login pages by URL, in `web-cookies.json`.
-    web_cookies: std::collections::BTreeMap<String, Vec<(String, String)>>,
+    web_cookies: std::collections::BTreeMap<String, WebSiteCookies>,
 }
-
+/// What one verification/login attempt is for and how it presents.
+struct WebSession {
+    /// Source the session belongs to (engine reload/login target).
+    source: String,
+    /// `settings.json` login key, or `None` for a Cloudflare verification.
+    login: Option<String>,
+    /// The URL the user should verify against.
+    url: String,
+    /// Pasted cookie text, kept across frames while the dialog is open.
+    paste: String,
+    /// Optional browser User-Agent for the site (Cloudflare UA pinning).
+    agent: String,
+}
+/// One site's saved web cookies plus the browser UA pinned with them.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct WebSiteCookies {
+    cookies: Vec<(String, String)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    user_agent: Option<String>,
+}
 const WEB_COOKIES_FILE: &str = "web-cookies.json";
+/// Reads `web-cookies.json` in either shape: the original
 
+/// `{url: [[name, value], …]}` map or the current
+
+/// `{url: {"cookies": [[name, value], …], "user_agent": "…"}}` document.
+
+/// Unknown shapes degrade to an empty site instead of dropping the file.
+fn load_web_cookies(root: &Path) -> std::collections::BTreeMap<String, WebSiteCookies> {
+    let Ok(bytes) = std::fs::read(root.join(WEB_COOKIES_FILE)) else {
+        return Default::default();
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Default::default();
+    };
+    let Some(map) = value.as_object() else {
+        return Default::default();
+    };
+    let mut sites = std::collections::BTreeMap::new();
+    for (url, entry) in map {
+        let pairs = |value: &serde_json::Value| -> Vec<(String, String)> {
+            value
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|pair| {
+                            Some((
+                                pair.get(0)?.as_str()?.to_string(),
+                                pair.get(1)?.as_str()?.to_string(),
+                            ))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let site = if entry.is_array() {
+            // Legacy format: bare cookie pair list.
+            WebSiteCookies {
+                cookies: pairs(entry),
+                user_agent: None,
+            }
+        } else {
+            WebSiteCookies {
+                cookies: entry.get("cookies").map(&pairs).unwrap_or_default(),
+                user_agent: entry
+                    .get("user_agent")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+            }
+        };
+        if !site.cookies.is_empty() || site.user_agent.is_some() {
+            sites.insert(url.clone(), site);
+        }
+    }
+    sites
+}
 type SettingsStore =
     std::collections::BTreeMap<String, std::collections::BTreeMap<String, SettingValue>>;
-
 const SETTINGS_FILE: &str = "source-settings.json";
-
 fn load_source_settings(root: &Path) -> SettingsStore {
     std::fs::read(root.join(SETTINGS_FILE))
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default()
 }
-
 fn save_source_settings(root: &Path, store: &SettingsStore) -> anyhow::Result<()> {
     std::fs::create_dir_all(root)?;
     let part = root.join(format!("{SETTINGS_FILE}.part"));
@@ -1491,15 +1693,20 @@ fn save_source_settings(root: &Path, store: &SettingsStore) -> anyhow::Result<()
     std::fs::rename(&part, root.join(SETTINGS_FILE))?;
     Ok(())
 }
-
 /// Draws one editable setting; returns the new value when the user changed it.
-fn setting_row(ui: &mut Ui, item: &SettingItem, current: Option<SettingValue>) -> Option<SettingValue> {
+
+fn setting_row(
+    ui: &mut Ui,
+    item: &SettingItem,
+    current: Option<SettingValue>,
+) -> Option<SettingValue> {
     let mut changed = None;
     let label = |ui: &mut Ui| {
         ui.add(Label::new(RichText::new(&item.title).strong()).wrap());
     };
     match &item.kind {
         SettingKind::Login { .. } => {}
+        SettingKind::Button { .. } | SettingKind::Link { .. } => {}
         SettingKind::Toggle => {
             let mut on = matches!(current, Some(SettingValue::Bool(true)));
             if ui.add(Checkbox::new(&mut on, &item.title)).changed() {
@@ -1514,7 +1721,10 @@ fn setting_row(ui: &mut Ui, item: &SettingItem, current: Option<SettingValue>) -
             };
             ui.horizontal_wrapped(|ui| {
                 for (value, title) in values.iter().zip(titles) {
-                    if ui.selectable_label(selected == Some(value.as_str()), title).clicked() {
+                    if ui
+                        .selectable_label(selected == Some(value.as_str()), title)
+                        .clicked()
+                    {
                         changed = Some(SettingValue::Str(value.clone()));
                     }
                 }
@@ -1529,7 +1739,10 @@ fn setting_row(ui: &mut Ui, item: &SettingItem, current: Option<SettingValue>) -
             };
             ui.horizontal_wrapped(|ui| {
                 for (index, title) in titles.iter().enumerate() {
-                    if ui.selectable_label(selected == index as i32, title).clicked() {
+                    if ui
+                        .selectable_label(selected == index as i32, title)
+                        .clicked()
+                    {
                         changed = Some(SettingValue::Int(index as i32));
                     }
                 }
@@ -1544,7 +1757,11 @@ fn setting_row(ui: &mut Ui, item: &SettingItem, current: Option<SettingValue>) -
             ui.horizontal_wrapped(|ui| {
                 for (value, title) in values.iter().zip(titles) {
                     let on = chosen.contains(value);
-                    let shown = if item.key == "languages" { language_label(title).to_string() } else { title.clone() };
+                    let shown = if item.key == "languages" {
+                        language_label(title).to_string()
+                    } else {
+                        title.clone()
+                    };
                     if ui.selectable_label(on, shown).clicked() {
                         if on {
                             chosen.retain(|v| v != value);
@@ -1579,47 +1796,62 @@ fn setting_row(ui: &mut Ui, item: &SettingItem, current: Option<SettingValue>) -
             ui.horizontal_wrapped(|ui| {
                 label(ui);
                 let mut next = None;
-                if ui.add_enabled(value > *min, Button::new("−").min_size(vec2(40., 36.))).clicked() {
+                if ui
+                    .add_enabled(value > *min, Button::new("−").min_size(vec2(40., 36.)))
+                    .clicked()
+                {
                     next = Some((value - step).max(*min));
                 }
-                ui.label(if integral { format!("{}", value as i64) } else { format!("{value:.2}") });
-                if ui.add_enabled(value < *max, Button::new("+").min_size(vec2(40., 36.))).clicked() {
+                ui.label(if integral {
+                    format!("{}", value as i64)
+                } else {
+                    format!("{value:.2}")
+                });
+                if ui
+                    .add_enabled(value < *max, Button::new("+").min_size(vec2(40., 36.)))
+                    .clicked()
+                {
                     next = Some((value + step).min(*max));
                 }
                 changed = next.map(|v| {
-                    if integral { SettingValue::Int(v as i32) } else { SettingValue::Float(v as f32) }
+                    if integral {
+                        SettingValue::Int(v as i32)
+                    } else {
+                        SettingValue::Float(v as f32)
+                    }
                 });
             });
         }
     }
     changed
 }
-
 fn url_host(url: &str) -> String {
     let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let host = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
     host.split(':').next().unwrap_or("").to_ascii_lowercase()
 }
-
 fn follow_cover_path(root: &Path, snapshot: &str) -> anyhow::Result<PathBuf> {
     anyhow::ensure!(valid_task_id(snapshot), "非法的封面 id：{snapshot:?}");
     Ok(root.join("follow-covers").join(format!("{snapshot}.img")))
 }
-
 /// Result-grid covers are keyed by the exact URL they came from so the same
+
 /// image shared by two manga is fetched and cached once.
+
 fn cover_key(source: &str, url: &str) -> String {
     identity_id(source, url, "cover")
 }
-
 fn source_cover_path(root: &Path, key: &str) -> anyhow::Result<PathBuf> {
     anyhow::ensure!(valid_task_id(key), "非法的封面 id：{key:?}");
     Ok(root.join("source-covers").join(format!("{key}.img")))
 }
-
 /// Downscales to the grid's display size; small covers are kept as-is rather
+
 /// than upscaled into a blur.
+
 fn shrink_cover(image: image::DynamicImage) -> image::DynamicImage {
     if image.width() > 240 || image.height() > COVER_MAX_HEIGHT {
         image.thumbnail(240, COVER_MAX_HEIGHT)
@@ -1627,10 +1859,12 @@ fn shrink_cover(image: image::DynamicImage) -> image::DynamicImage {
         image
     }
 }
-
 /// Writes a downscaled cover into the disk cache and returns the decoded
+
 /// image. The `.part` + rename pattern matches the rest of the cache so a
+
 /// crash mid-write never leaves a half file behind.
+
 fn store_source_cover(path: &Path, image: &image::DynamicImage) -> anyhow::Result<ColorImage> {
     std::fs::create_dir_all(path.parent().unwrap())?;
     let mut encoded = std::io::Cursor::new(Vec::new());
@@ -1644,9 +1878,10 @@ fn store_source_cover(path: &Path, image: &image::DynamicImage) -> anyhow::Resul
         rgba.as_raw(),
     ))
 }
-
 /// Downloads one cover through the source's own request handler, keeps the
+
 /// downscaled image in the disk cache and decodes it for the UI. The disk
+
 /// copy skips the network entirely on later launches.
 #[cfg(test)]
 fn fetch_source_cover(
@@ -1670,37 +1905,54 @@ fn fetch_source_cover(
     let image = shrink_cover(image::load_from_memory(&bytes)?);
     store_source_cover(&path, &image)
 }
+/// Downloads a follow's cover into the shared `source-covers/` cache —
 
-/// Downloads a follow's cover once, through the source's image request hook.
-fn fetch_follow_cover(root: &Path, engine: &SourceEngine, manga: &Manga) -> anyhow::Result<()> {
-    let Some(url) = manga.cover.as_deref().filter(|url| !url.is_empty()) else {
-        return Ok(());
-    };
-    let path = follow_cover_path(root, &manga_snapshot_key(&manga.source_key, &manga.key))?;
-    if path.is_file() {
-        return Ok(());
+/// same key, same atomic write and same downscaled PNG the result grid uses.
+
+/// Returns the cache key and decoded thumbnail for the UI's `cover_ready`.
+fn fetch_follow_cover(
+    root: &Path,
+    engine: &SourceEngine,
+    manga: &Manga,
+) -> anyhow::Result<(String, ColorImage)> {
+    let url = manga
+        .cover
+        .as_deref()
+        .filter(|url| !url.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("no cover url"))?;
+    let key = cover_key(&manga.source_key, url);
+    let path = source_cover_path(root, &key)?;
+    if let Ok(bytes) = std::fs::read(&path) {
+        if let Ok(image) = image::load_from_memory(&bytes) {
+            let rgba = image.to_rgba8();
+            return Ok((
+                key,
+                ColorImage::from_rgba_unmultiplied(
+                    [rgba.width() as usize, rgba.height() as usize],
+                    rgba.as_raw(),
+                ),
+            ));
+        }
     }
     let handler = engine.request_handler();
     let bytes = match pollster::block_on(engine.image_request(url, None))? {
         Some(req) => request(&handler, req.url, req.headers, req.body)?,
         None => request(&handler, url.to_string(), vec![], None)?,
     };
-    image::load_from_memory(&bytes)?;
-    std::fs::create_dir_all(path.parent().unwrap())?;
-    let part = path.with_extension("part");
-    std::fs::write(&part, &bytes)?;
-    std::fs::rename(&part, &path)?;
-    Ok(())
+    let image = shrink_cover(image::load_from_memory(&bytes)?);
+    let color = store_source_cover(&path, &image)?;
+    Ok((key, color))
 }
-
 /// Result of checking one followed manga for new chapters.
+
 struct UpdateEvent {
     source: String,
     manga: String,
     /// `None`: only the cover arrived, after the batch's chapter results.
     chapters: Option<Result<Vec<String>, String>>,
+    /// `source-covers` key + decoded image delivered with `chapters: None`.
+    cover: Option<(String, ColorImage)>,
 }
-
 impl Sources {
     #[cfg(debug_assertions)]
     pub(crate) fn preview_community(&mut self) {
@@ -1718,7 +1970,9 @@ impl Sources {
     #[cfg(debug_assertions)]
     pub(crate) fn preview_browser(&mut self, mode: &str) -> anyhow::Result<()> {
         // Only explicit debug snapshot/acceptance flags install this labelled,
+
         // local WASM fixture. Release apps never embed it.
+
         let directory = self.root.join("sources/local.filter-acceptance");
         std::fs::create_dir_all(&directory)?;
         for (name, bytes) in [
@@ -1798,13 +2052,12 @@ impl Sources {
             }
         }
         let stale_engines = Arc::new(std::sync::Mutex::new(HashSet::<String>::new()));
-        let web_cookies: std::collections::BTreeMap<String, Vec<(String, String)>> =
-            std::fs::read(root.join(WEB_COOKIES_FILE))
-                .ok()
-                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-                .unwrap_or_default();
-        for (url, cookies) in &web_cookies {
-            add_web_cookies(url, cookies);
+        let web_cookies = load_web_cookies(&root);
+        for (url, site) in &web_cookies {
+            add_web_cookies(url, &site.cookies);
+            if let Some(agent) = &site.user_agent {
+                set_site_user_agent(url, agent);
+            }
         }
         let worker_stale = stale_engines.clone();
         thread::Builder::new()
@@ -1817,7 +2070,9 @@ impl Sources {
                         engines.remove(&id);
                     }
                     // Skip queued reads already replaced by a newer user choice.
+
                     // An installation is an explicit mutation and must still finish.
+
                     if request_id != worker_request.load(Ordering::Relaxed)
                         && !matches!(&task, Task::Install(_))
                     {
@@ -1857,7 +2112,9 @@ impl Sources {
                                         Ok(filters) => (filters, None),
                                         Err(error) => {
                                             // A remote dynamic-filter failure must not
+
                                             // conceal static options already installed.
+
                                             let static_filters = catalog
                                                 .get(&source)
                                                 .ok()
@@ -1939,7 +2196,11 @@ impl Sources {
                                 let chapters = pollster::block_on(engine.chapters(&manga.key))?;
                                 Reply::Chapters(source, detail, chapters)
                             }
-                            Task::Login { source, key, credentials } => {
+                            Task::Login {
+                                source,
+                                key,
+                                credentials,
+                            } => {
                                 if !engines.contains_key(&source) {
                                     engines.insert(
                                         source.clone(),
@@ -1956,11 +2217,27 @@ impl Sources {
                                         (user, ok)
                                     }
                                     Err(cookies) => {
-                                        let ok = pollster::block_on(engine.web_login(&key, cookies))?;
+                                        let ok =
+                                            pollster::block_on(engine.web_login(&key, cookies))?;
                                         ("网页登录".to_string(), ok)
                                     }
                                 };
                                 Reply::Login { key, user, ok, web }
+                            }
+                            Task::Notify {
+                                source,
+                                notification,
+                            } => {
+                                if !engines.contains_key(&source) {
+                                    engines.insert(
+                                        source.clone(),
+                                        SourceEngine::load(&catalog, &source)?,
+                                    );
+                                }
+                                pollster::block_on(
+                                    engines[&source].handle_notification(notification),
+                                )?;
+                                Reply::Notified
                             }
                         })
                     })();
@@ -1970,9 +2247,10 @@ impl Sources {
                 }
             })
             .expect("Unable to start source worker");
-
         // Update checks get their own thread so a slow source never blocks
+
         // browsing or downloads.
+
         let (up_tx, up_cmd_rx) = mpsc::channel::<Vec<(String, Manga)>>();
         let (up_event_tx, up_rx) = mpsc::channel();
         let up_root = root.clone();
@@ -1983,29 +2261,45 @@ impl Sources {
                 let catalog = SourceCatalog::new(up_root.join("sources"));
                 while let Ok(batch) = up_cmd_rx.recv() {
                     // Reload each round so an updated source is picked up.
+
                     let mut engines = std::collections::HashMap::<String, SourceEngine>::new();
                     for (source, manga) in batch.iter().cloned() {
                         let chapters = (|| -> anyhow::Result<Vec<String>> {
                             if !engines.contains_key(&source) {
-                                engines.insert(source.clone(), SourceEngine::load(&catalog, &source)?);
+                                engines
+                                    .insert(source.clone(), SourceEngine::load(&catalog, &source)?);
                             }
                             let list =
                                 pollster::block_on(engines[&source].chapters_with(manga.clone()))?;
                             Ok(list.into_iter().map(|chapter| chapter.key).collect())
                         })()
                         .map_err(|error| format!("{error:#}"));
-                        let event = UpdateEvent { source, manga: manga.key, chapters: Some(chapters) };
+                        let event = UpdateEvent {
+                            source,
+                            manga: manga.key,
+                            chapters: Some(chapters),
+                            cover: None,
+                        };
                         if up_event_tx.send(event).is_err() {
                             return;
                         }
                         up_ctx.request_repaint();
                     }
                     // Covers come last so a slow image host never delays
+
                     // new-chapter results; a missing cover is not an error.
+
                     for (source, manga) in batch {
-                        let Some(engine) = engines.get(&source) else { continue };
-                        if fetch_follow_cover(&up_root, engine, &manga).is_ok() {
-                            let event = UpdateEvent { source, manga: manga.key, chapters: None };
+                        let Some(engine) = engines.get(&source) else {
+                            continue;
+                        };
+                        if let Ok((key, image)) = fetch_follow_cover(&up_root, engine, &manga) {
+                            let event = UpdateEvent {
+                                source,
+                                manga: manga.key,
+                                chapters: None,
+                                cover: Some((key, image)),
+                            };
                             if up_event_tx.send(event).is_err() {
                                 return;
                             }
@@ -2015,14 +2309,19 @@ impl Sources {
                 }
             })
             .expect("Unable to start update worker");
-
         // Result covers resolve through each source's interpreter on a single
+
         // thread, then fetch bytes on a small HTTP pool so a slow image host
+
         // never blocks browsing. Both stages share the source's cookie jar.
+
         let (cover_req_tx, cover_req_rx) = mpsc::channel::<CoverReq>();
         let (cover_done_tx, cover_done_rx) = mpsc::channel::<CoverDone>();
         let cover_jobs: Arc<(std::sync::Mutex<VecDeque<CoverHttpJob>>, std::sync::Condvar)> =
-            Arc::new((std::sync::Mutex::new(VecDeque::new()), std::sync::Condvar::new()));
+            Arc::new((
+                std::sync::Mutex::new(VecDeque::new()),
+                std::sync::Condvar::new(),
+            ));
         {
             let cover_root = root.clone();
             let cover_ctx = ctx.clone();
@@ -2067,7 +2366,13 @@ impl Sources {
                                 cvar.notify_one();
                             }
                             Err(_) => {
-                                if done_tx.send(CoverDone { key: req.key, image: None }).is_err() {
+                                if done_tx
+                                    .send(CoverDone {
+                                        key: req.key,
+                                        image: None,
+                                    })
+                                    .is_err()
+                                {
                                     return;
                                 }
                                 cover_ctx.request_repaint();
@@ -2116,9 +2421,10 @@ impl Sources {
                 })
                 .expect("Unable to start cover http worker");
         }
-
         // Downloads live on their own thread and run one task at a time, so a
+
         // slow image server never blocks search, chapter loading or the UI.
+
         let (dl_tx, dl_cmd_rx) = mpsc::channel::<DlCmd>();
         let (dl_ev_tx, dl_rx) = mpsc::channel::<DlEvent>();
         let dl_stop = Arc::new(AtomicU8::new(STOP_NONE));
@@ -2250,10 +2556,16 @@ impl Sources {
             follows: Vec::new(),
             pending_open: None,
             checking: 0,
+            checking_background: false,
             auto_checked: false,
+            ctx,
+            follow_interval_min: DEFAULT_FOLLOW_INTERVAL_MIN,
+            follow_next_due: None,
+            follow_notice: None,
             up_tx,
             up_rx,
             covers: Default::default(),
+            follow_cover_urls: Default::default(),
             cover_req_tx,
             cover_done_rx,
             cover_queue: VecDeque::new(),
@@ -2273,7 +2585,7 @@ impl Sources {
             source_settings,
             stale_engines,
             challenge: None,
-            web_purpose: None,
+            web_session: None,
             login_user: String::new(),
             login_pass: String::new(),
             web_cookies,
@@ -2284,6 +2596,7 @@ impl Sources {
             Err(error) => sources.status = format!("{error:#}"),
         }
         // Never overwrite a file that startup could not fully parse.
+
         if load_warning.is_none() {
             let mut sources = sources;
             if let Err(error) = sources.persist() {
@@ -2296,10 +2609,12 @@ impl Sources {
         sources.submit(Task::List);
         sources
     }
-
     /// Pops one finished chapter for the library importer. Call in a loop:
+
     /// several downloads can finish between two frames, and every id is kept
+
     /// until taken.
+
     pub fn take_downloaded(&mut self) -> Option<DownloadedChapter> {
         while let Some(id) = self.ready.pop_front() {
             let Some(task) = self.tasks.iter().find(|task| task.id == id) else {
@@ -2324,19 +2639,24 @@ impl Sources {
         }
         None
     }
-
     /// Opens the exact source/manga/chapter already imported into the library.
+
     /// The host resolves the link to its book, preserving the current source
+
     /// page as the reader's return destination.
+
     pub fn take_open_chapter(&mut self) -> Option<ChapterMetadata> {
         self.open_chapter.take()
     }
-
     // -- follows -------------------------------------------------------------
 
     /// Followed manga with chapters the user has not opened yet.
+
     pub fn fresh_follows(&self) -> usize {
-        self.follows.iter().filter(|follow| !follow.fresh.is_empty()).count()
+        self.follows
+            .iter()
+            .filter(|follow| !follow.fresh.is_empty())
+            .count()
     }
 
     fn follow_index(&self, source: &str, manga: &str) -> Option<usize> {
@@ -2375,14 +2695,18 @@ impl Sources {
             snapshot,
             ..Default::default()
         };
-        let keys: Vec<String> = self.chapters.iter().map(|chapter| chapter.key.clone()).collect();
+        let keys: Vec<String> = self
+            .chapters
+            .iter()
+            .map(|chapter| chapter.key.clone())
+            .collect();
         follow.mark_seen(&keys);
         follow.checked_at = Some(follows::now());
         self.follows.insert(0, follow);
         self.status = "已加入追更，有新章节会在书源页顶部提示".into();
         self.save_follows();
         // Fetches the cover right away; the chapter list is already known.
-        self.check_follows(&[0]);
+        self.check_follows(&[0], false);
     }
 
     fn follow_manga(&self, follow: &Follow) -> anyhow::Result<Manga> {
@@ -2397,8 +2721,15 @@ impl Sources {
         let Some(follow) = self.follows.get(index).cloned() else {
             return;
         };
-        if !self.installed.iter().any(|source| source.manifest.id == follow.source_id) {
-            self.status = format!("书源 {} 未安装，无法打开《{}》", follow.source_id, follow.title);
+        if !self
+            .installed
+            .iter()
+            .any(|source| source.manifest.id == follow.source_id)
+        {
+            self.status = format!(
+                "书源 {} 未安装，无法打开《{}》",
+                follow.source_id, follow.title
+            );
             return;
         }
         let manga = match self.follow_manga(&follow) {
@@ -2415,8 +2746,30 @@ impl Sources {
             self.pending_open = Some(manga);
         }
     }
+    /// The followed manga's cover URL, read from its snapshot once per
+
+    /// session and cached. `None` until the snapshot loads or when the manga
+
+    /// has no cover, which also avoids a per-frame file read.
+    fn follow_cover_url(&mut self, index: usize) -> Option<String> {
+        let snapshot = self.follows.get(index)?.snapshot.clone();
+        if let Some(url) = self.follow_cover_urls.get(&snapshot) {
+            return url.clone();
+        }
+        let url = manga_snapshot_path(&self.root, &snapshot)
+            .ok()
+            .and_then(|path| std::fs::read(path).ok())
+            .and_then(|bytes| Manga::from_postcard_bytes(&bytes).ok())
+            .and_then(|manga| manga.cover.filter(|url| !url.is_empty()));
+        self.follow_cover_urls.insert(snapshot, url.clone());
+        url
+    }
 
     fn cover_texture(&mut self, ctx: &Context, snapshot: &str) -> Option<TextureHandle> {
+        // Covers saved before the `source-covers` unification stay readable;
+
+        // nothing is ever written under `follow-covers/` any more.
+
         if let Some(cached) = self.covers.get(snapshot) {
             return cached.clone();
         }
@@ -2436,11 +2789,14 @@ impl Sources {
         self.covers.insert(snapshot.to_string(), texture.clone());
         texture
     }
-
     /// Returns the texture for a result-grid cover, or `None` while it is
+
     /// still missing (the caller then queues a fetch). Freshly delivered
+
     /// images are textured on first paint; the disk cache is probed once per
+
     /// URL so a cold start never hits the filesystem twice for the same key.
+
     fn cover_image(&mut self, ctx: &Context, source: &str, url: &str) -> Option<TextureHandle> {
         if url.is_empty() {
             return None;
@@ -2473,11 +2829,8 @@ impl Sources {
                 image
             }
         }?;
-        let texture = ctx.load_texture(
-            format!("source-cover-{key}"),
-            image,
-            TextureOptions::LINEAR,
-        );
+        let texture =
+            ctx.load_texture(format!("source-cover-{key}"), image, TextureOptions::LINEAR);
         self.cover_textures.insert(key.clone(), texture.clone());
         self.cover_lru.push_back(key);
         while self.cover_textures.len() > COVER_TEXTURE_CAP {
@@ -2490,10 +2843,12 @@ impl Sources {
         }
         Some(texture)
     }
-
     /// Keeps the cover queue to what is nearly visible: cells that scrolled
+
     /// away drop out, new wants append in order, and the queue never exceeds
+
     /// `COVER_QUEUE_CAP` (the oldest requests are dropped first).
+
     fn plan_covers(&mut self, want: Vec<CoverReq>) {
         let skip: HashSet<String> = self
             .cover_inflight
@@ -2513,17 +2868,24 @@ impl Sources {
             self.cover_outstanding += 1;
         }
     }
-
     /// Reading progress the host knows about, by `identity_id` chapter key.
+
     /// Called once per sources frame so 继续阅读 and row states stay current.
-    pub fn set_chapter_progress(&mut self, map: std::collections::HashMap<String, (usize, usize, Option<i64>)>) {
+
+    pub fn set_chapter_progress(
+        &mut self,
+        map: std::collections::HashMap<String, (usize, usize, Option<i64>)>,
+    ) {
         self.chapter_progress = map;
     }
-
     /// The chapter 继续阅读 should open: the one touched most recently across
+
     /// library progress and online streams; when it is finished, the next
+
     /// unlocked chapter in reading order. Unread works start at the first
+
     /// unlocked chapter. The flag reports whether any progress existed.
+
     fn resume_chapter(
         &self,
         source: &str,
@@ -2576,20 +2938,30 @@ impl Sources {
             ),
         }
     }
-    pub fn check_updates(&mut self) {
+    /// `background` marks a scheduler run: it keeps the same single-flight
+
+    /// mutex as the manual button and reports its result to the app's notice
+
+    /// bar instead of overwriting the sources-page status line.
+
+    pub fn check_updates(&mut self, background: bool) {
         if self.checking > 0 {
             return;
         }
         let all: Vec<usize> = (0..self.follows.len()).collect();
-        self.check_follows(&all);
+        self.check_follows(&all, background);
     }
 
-    fn check_follows(&mut self, indices: &[usize]) {
+    fn check_follows(&mut self, indices: &[usize], background: bool) {
         let mut batch = Vec::new();
         for follow in indices.iter().filter_map(|&index| self.follows.get(index)) {
             match self.follow_manga(follow) {
                 Ok(manga) => batch.push((follow.source_id.clone(), manga)),
-                Err(error) => self.status = format!("《{}》无法检查更新：{error:#}", follow.title),
+                Err(error) => {
+                    if !background {
+                        self.status = format!("《{}》无法检查更新：{error:#}", follow.title);
+                    }
+                }
             }
         }
         if batch.is_empty() {
@@ -2598,6 +2970,7 @@ impl Sources {
         let count = batch.len();
         if self.up_tx.send(batch).is_ok() {
             self.checking += count;
+            self.checking_background = background;
         } else {
             self.status = "更新检查线程已停止，请重新打开应用".into();
         }
@@ -2605,11 +2978,11 @@ impl Sources {
 
     fn handle_update(&mut self, event: UpdateEvent) {
         let Some(chapters) = event.chapters else {
-            if let Some(index) = self.follow_index(&event.source, &event.manga) {
-                let snapshot = self.follows[index].snapshot.clone();
-                if matches!(self.covers.get(&snapshot), Some(None)) {
-                    self.covers.remove(&snapshot);
-                }
+            // A follow cover arrived through the shared cache: hand it to the
+
+            // same `cover_ready` map the grid reads, then re-texture lazily.
+            if let Some((key, image)) = event.cover {
+                self.cover_ready.insert(key, Some(image));
             }
             return;
         };
@@ -2628,11 +3001,22 @@ impl Sources {
         }
         if self.checking == 0 {
             let fresh = self.fresh_follows();
-            self.status = if fresh > 0 {
-                format!("{fresh} 部追更有新章节")
+            if self.checking_background {
+                // A scheduled check: surface only real news on the top notice
+
+                // bar; the badge count already reflects every check.
+
+                if fresh > 0 {
+                    self.follow_notice = Some(format!("追更发现 {fresh} 部作品有新章节"));
+                }
             } else {
-                "追更已是最新".into()
-            };
+                self.status = if fresh > 0 {
+                    format!("{fresh} 部追更有新章节")
+                } else {
+                    "追更已是最新".into()
+                };
+            }
+            self.checking_background = false;
             self.save_follows();
         }
     }
@@ -2646,22 +3030,30 @@ impl Sources {
         if ui
             .add_enabled(
                 !checking,
-                quiet_action(if checking { "正在检查更新…" } else { "检查更新" }),
+                quiet_action(if checking {
+                    "正在检查更新…"
+                } else {
+                    "检查更新"
+                }),
             )
             .clicked()
         {
-            self.check_updates();
+            self.check_updates(false);
         }
         let mut order: Vec<usize> = (0..self.follows.len()).collect();
         order.sort_by_key(|&index| std::cmp::Reverse(self.follows[index].fresh.len()));
         let mut open = None;
+        let mut want_covers = Vec::new();
         for index in order {
             let follow = &self.follows[index];
             let source = self
                 .installed
                 .iter()
                 .find(|source| source.manifest.id == follow.source_id)
-                .map_or_else(|| follow.source_id.clone(), |source| source.manifest.name.clone());
+                .map_or_else(
+                    || follow.source_id.clone(),
+                    |source| source.manifest.name.clone(),
+                );
             let detail = if let Some(error) = &follow.error {
                 format!("{source} · 检查失败：{error}")
             } else if !follow.fresh.is_empty() {
@@ -2676,11 +3068,35 @@ impl Sources {
                 open = Some(index);
             }
             let bottom = ui.min_rect().bottom();
-            if let Some(texture) = self.cover_texture(ui.ctx(), &snapshot) {
-                let cover = Rect::from_center_size(
-                    pos2(left + 18., (top + bottom) / 2.),
-                    vec2(40., 54.),
-                );
+            // Follow covers share the grid's `source-covers` pipeline: the
+
+            // manga snapshot supplies the URL, the FNV key and LRU texture
+
+            // path are the same, and `plan_covers` fetches what's missing.
+            let source_id = follow.source_id.clone();
+            let cover_url = self.follow_cover_url(index);
+            let texture = match &cover_url {
+                Some(url) => self.cover_image(ui.ctx(), &source_id, url),
+                None => None,
+            };
+            // Only covers without a texture are fetched; asking for loaded
+            // ones re-downloads them after every completed request.
+            if texture.is_none()
+                && let Some(url) = cover_url
+            {
+                want_covers.push(CoverReq {
+                    key: cover_key(&source_id, &url),
+                    source: source_id,
+                    url,
+                });
+            }
+            let texture = match texture {
+                Some(texture) => Some(texture),
+                None => self.cover_texture(ui.ctx(), &snapshot),
+            };
+            if let Some(texture) = texture {
+                let cover =
+                    Rect::from_center_size(pos2(left + 18., (top + bottom) / 2.), vec2(40., 54.));
                 ui.painter().image(
                     texture.id(),
                     cover,
@@ -2692,10 +3108,11 @@ impl Sources {
         if let Some(index) = open {
             self.open_follow(index);
         }
+        self.plan_covers(want_covers);
         ui.add_space(20.);
     }
-
     /// Pops a chapter the user started reading online.
+
     pub fn take_stream(&mut self) -> Option<StreamChapter> {
         self.stream_request.take()
     }
@@ -2703,9 +3120,7 @@ impl Sources {
     pub fn stream_state(&self, id: &str) -> Option<StreamState> {
         let task = self.tasks.iter().find(|task| task.id == id)?;
         let stopped = match task.status {
-            DownloadStatus::Failed => Some(
-                task.error.clone().unwrap_or_else(|| "下载失败".into()),
-            ),
+            DownloadStatus::Failed => Some(task.error.clone().unwrap_or_else(|| "下载失败".into())),
             DownloadStatus::Paused if self.preempted.as_deref() != Some(id) => {
                 Some(task.error.clone().unwrap_or_else(|| "下载已暂停".into()))
             }
@@ -2719,8 +3134,8 @@ impl Sources {
             page: task.read_page,
         })
     }
-
     /// Remembers the page of a chapter read online so it reopens there.
+
     pub fn set_stream_page(&mut self, id: &str, page: usize) {
         let Some(task) = self.tasks.iter_mut().find(|task| task.id == id) else {
             return;
@@ -2734,9 +3149,10 @@ impl Sources {
             self.status = format!("阅读位置保存失败：{error:#}");
         }
     }
-
     /// Runs this chapter's download next. A different running download is
+
     /// paused at its next page boundary and re-queued behind it.
+
     fn prioritize(&mut self, id: &str) {
         if self.running.as_deref() == Some(id) {
             return;
@@ -2760,10 +3176,12 @@ impl Sources {
     pub fn resume_stream(&mut self, id: &str) {
         self.prioritize(id);
     }
-
     /// Reads a chapter without waiting for the whole download: the chapter
+
     /// is downloaded first, the reader shows pages as they arrive, and the
+
     /// following chapter is queued so it is ready when this one ends.
+
     fn read_online(&mut self, manga: &Manga, chapter: &Chapter, from_end: bool) {
         let source = self.source_for(manga);
         let id = identity_id(&source, &manga.key, &chapter.key);
@@ -2775,9 +3193,10 @@ impl Sources {
             self.status = "这一章暂不可阅读".into();
             return;
         }
-        let queued = self.tasks.iter().any(|task| {
-            task.id == id && task.status != DownloadStatus::Failed
-        });
+        let queued = self
+            .tasks
+            .iter()
+            .any(|task| task.id == id && task.status != DownloadStatus::Failed);
         if !queued {
             self.enqueue_chapter(manga, chapter);
         }
@@ -2794,7 +3213,11 @@ impl Sources {
         }
         let metadata = task.metadata();
         self.prioritize(&id);
-        self.stream_request = Some(StreamChapter { id, metadata, from_end });
+        self.stream_request = Some(StreamChapter {
+            id,
+            metadata,
+            from_end,
+        });
         if let Some(next) = self.adjacent_online(&source, &manga.key, &chapter.key, 1)
             && self.chapter_needs_download(&source, &manga.key, &next)
         {
@@ -2803,37 +3226,64 @@ impl Sources {
             self.status = status;
         }
     }
-
     /// The neighbouring chapter in reading order, when that manga's chapter
+
     /// list is the one currently loaded.
-    fn adjacent_online(&self, source: &str, manga: &str, chapter: &str, delta: i32) -> Option<Chapter> {
+
+    fn adjacent_online(
+        &self,
+        source: &str,
+        manga: &str,
+        chapter: &str,
+        delta: i32,
+    ) -> Option<Chapter> {
         let selected = self.selected_manga.as_ref()?;
         if selected.key != manga || self.source_for(selected) != source {
             return None;
         }
         let chapters = chapter_list(&self.chapters, "", false);
         let index = chapters.iter().position(|item| item.key == chapter)? as i64 + delta as i64;
-        usize::try_from(index).ok().and_then(|index| chapters.get(index).cloned())
+        usize::try_from(index)
+            .ok()
+            .and_then(|index| chapters.get(index).cloned())
     }
-
     /// Chapter key of the neighbour in the source's reading order, so the
+
     /// reader does not skip a chapter that is not in the library yet.
+
     pub fn adjacent_online_key(&self, metadata: &ChapterMetadata, delta: i32) -> Option<String> {
-        self.adjacent_online(&metadata.source_id, &metadata.manga_id, &metadata.chapter_id, delta)
-            .map(|chapter| chapter.key)
+        self.adjacent_online(
+            &metadata.source_id,
+            &metadata.manga_id,
+            &metadata.chapter_id,
+            delta,
+        )
+        .map(|chapter| chapter.key)
     }
 
     pub fn has_adjacent_online(&self, metadata: &ChapterMetadata, delta: i32) -> bool {
-        self.adjacent_online(&metadata.source_id, &metadata.manga_id, &metadata.chapter_id, delta)
-            .is_some_and(|chapter| !chapter.locked)
+        self.adjacent_online(
+            &metadata.source_id,
+            &metadata.manga_id,
+            &metadata.chapter_id,
+            delta,
+        )
+        .is_some_and(|chapter| !chapter.locked)
     }
-
     /// Queues the chapter after `metadata` for download without opening it,
+
     /// so the reader can keep scrolling straight into it. Returns the stream
+
     /// task id and its metadata once the chapter is tracked; `None` when the
+
     /// chapter is unknown, locked, already imported, or cannot be queued
+
     /// here (its manga detail is not loaded).
-    pub fn prepare_next(&mut self, metadata: &ChapterMetadata) -> Option<(String, ChapterMetadata)> {
+
+    pub fn prepare_next(
+        &mut self,
+        metadata: &ChapterMetadata,
+    ) -> Option<(String, ChapterMetadata)> {
         let chapter = self.adjacent_online(
             &metadata.source_id,
             &metadata.manga_id,
@@ -2859,6 +3309,7 @@ impl Sources {
         let metadata = task.metadata();
         match task.status {
             // Its staged pages are already archived: push the finished file
+
             // at the import queue so the segment becomes a library book.
             DownloadStatus::Done => {
                 if !task.linked {
@@ -2867,6 +3318,7 @@ impl Sources {
                 None
             }
             // A chapter paused earlier keeps downloading now that the reader
+
             // approaches it; the preempted stream itself is left alone.
             DownloadStatus::Paused | DownloadStatus::Failed
                 if self.preempted.as_deref() != Some(id.as_str()) =>
@@ -2877,22 +3329,26 @@ impl Sources {
             _ => Some((id, metadata)),
         }
     }
-
     /// Task metadata of a tracked download/stream chapter.
-    pub fn stream_metadata(&self, id: &str) -> Option<ChapterMetadata> {
-        self.tasks.iter().find(|task| task.id == id).map(|task| task.metadata())
-    }
 
+    pub fn stream_metadata(&self, id: &str) -> Option<ChapterMetadata> {
+        self.tasks
+            .iter()
+            .find(|task| task.id == id)
+            .map(|task| task.metadata())
+    }
     /// Pretend a manga detail page is loaded so neighbour lookups work.
+
     #[cfg(test)]
     pub(crate) fn seed_online_detail(&mut self, manga: Manga, chapters: Vec<Chapter>) {
         self.selected_source = manga.source_key.clone();
         self.selected_manga = Some(manga);
         self.chapters = chapters;
     }
-
     /// Marks a tracked task's page count as known, as its first progress
+
     /// report would.
+
     #[cfg(test)]
     pub(crate) fn force_pages(&mut self, id: &str, total: usize, done: usize) {
         if let Some(task) = self.tasks.iter_mut().find(|task| task.id == id) {
@@ -2900,10 +3356,12 @@ impl Sources {
             task.pages_done = done;
         }
     }
-
     /// The source's preferred reading direction for this work, from the
+
     /// manga details still in memory or its saved snapshot. `Unknown` counts
+
     /// as no hint.
+
     pub fn viewer_hint(&self, source_id: &str, manga_id: &str) -> Option<Viewer> {
         let viewer = self
             .selected_manga
@@ -2912,18 +3370,25 @@ impl Sources {
             .map(|manga| manga.viewer)
             .or_else(|| {
                 let path =
-                    manga_snapshot_path(&self.root, &manga_snapshot_key(source_id, manga_id)).ok()?;
+                    manga_snapshot_path(&self.root, &manga_snapshot_key(source_id, manga_id))
+                        .ok()?;
                 let bytes = std::fs::read(path).ok()?;
-                Manga::from_postcard_bytes(&bytes).ok().map(|manga| manga.viewer)
+                Manga::from_postcard_bytes(&bytes)
+                    .ok()
+                    .map(|manga| manga.viewer)
             });
         viewer.filter(|viewer| *viewer != Viewer::Unknown)
     }
-
     /// Opens the previous/next chapter of `metadata`, from the library when it
+
     /// is already there and online otherwise. Returns false when unknown.
+
     pub fn open_adjacent_online(&mut self, metadata: &ChapterMetadata, delta: i32) -> bool {
         let Some(chapter) = self.adjacent_online(
-            &metadata.source_id, &metadata.manga_id, &metadata.chapter_id, delta,
+            &metadata.source_id,
+            &metadata.manga_id,
+            &metadata.chapter_id,
+            delta,
         ) else {
             return false;
         };
@@ -2938,11 +3403,20 @@ impl Sources {
     }
 
     pub fn set_library_chapters(&mut self, links: &[ChapterLink]) {
-        self.library_chapters = links.iter().map(|link| {
-            let metadata = &link.metadata;
-            (identity_id(&metadata.source_id, &metadata.manga_id, &metadata.chapter_id),
-                metadata.clone())
-        }).collect();
+        self.library_chapters = links
+            .iter()
+            .map(|link| {
+                let metadata = &link.metadata;
+                (
+                    identity_id(
+                        &metadata.source_id,
+                        &metadata.manga_id,
+                        &metadata.chapter_id,
+                    ),
+                    metadata.clone(),
+                )
+            })
+            .collect();
     }
 
     fn read_downloaded(&mut self, task: &DownloadTask) {
@@ -2950,10 +3424,12 @@ impl Sources {
             self.open_chapter = Some(metadata.clone());
         }
     }
-
     /// Marks one finished chapter as imported and linked. Call only after both
+
     /// `import` and `link_chapter` succeeded; otherwise the file stays pending
+
     /// and is offered again on the next start without re-downloading it.
+
     pub fn ack_downloaded(&mut self, id: &str) {
         self.import_attempts.remove(id);
         let mut changed = false;
@@ -2969,9 +3445,10 @@ impl Sources {
             }
         }
     }
-
     /// Puts a chapter back at the front of the import queue, for a same-session
+
     /// retry after a failed import. The CBZ is never re-downloaded.
+
     pub fn requeue_import(&mut self, id: &str) {
         self.import_attempts.remove(id);
         if self.tasks.iter().any(|task| {
@@ -2998,17 +3475,20 @@ impl Sources {
             task.cbz = None;
             self.status = "下载文件已丢失，请重试下载此章".into();
             if let Err(error) = self.persist() {
-                self.status.push_str(&format!("；队列状态保存失败：{error:#}"));
+                self.status
+                    .push_str(&format!("；队列状态保存失败：{error:#}"));
             }
             return;
         }
         task.linked = false;
         self.requeue_import(id);
     }
-
     /// Reports a failed library import/link for a downloaded file. The CBZ is
+
     /// kept and the task stays `Done`/unlinked; the UI shows an immediate
+
     /// manual retry instead of silently re-offering or re-downloading it.
+
     pub fn import_failed(&mut self, id: &str, error: &str) {
         self.import_attempts.remove(id);
         if let Some(task) = self.tasks.iter_mut().find(|task| task.id == id) {
@@ -3016,7 +3496,8 @@ impl Sources {
         }
         self.status = format!("加入书架失败：{error}；文件已保留，可点“重试导入”");
         if let Err(persist_error) = self.persist() {
-            self.status.push_str(&format!("；队列状态保存失败：{persist_error:#}"));
+            self.status
+                .push_str(&format!("；队列状态保存失败：{persist_error:#}"));
         }
     }
 
@@ -3102,6 +3583,7 @@ impl Sources {
         }
     }
     /// New search from the text field: page one of this source and query.
+
     fn start_search(&mut self) {
         let source = self.selected_source.clone();
         if source.is_empty() {
@@ -3147,6 +3629,7 @@ impl Sources {
     fn load_next_page(&mut self) {
         if let Some((source, query, page)) = self.results.next_page() {
             // Pagination uses the committed request, never the edited text field.
+
             let task = if let Some(listing) = &self.listing {
                 Task::Browse {
                     source,
@@ -3192,7 +3675,6 @@ impl Sources {
         self.description_expanded = false;
         self.submit(Task::Chapters(source, manga));
     }
-
     // -- download queue ----------------------------------------------------
 
     fn source_for(&self, manga: &Manga) -> String {
@@ -3213,7 +3695,9 @@ impl Sources {
             .map(|task| task.status.label().to_string())
     }
     /// A failed chapter may be joined again from its manga detail page; that
+
     /// path also rewrites the saved Manga/Chapter snapshots.
+
     fn chapter_failed(&self, source: &str, manga: &str, chapter: &str) -> bool {
         let id = identity_id(source, manga, chapter);
         if self.library_chapters.contains_key(&id) {
@@ -3224,8 +3708,9 @@ impl Sources {
             .any(|task| task.id == id && task.status == DownloadStatus::Failed)
     }
     fn chapter_needs_download(&self, source: &str, manga: &str, chapter: &Chapter) -> bool {
-        !chapter.locked && (self.chapter_state(source, manga, &chapter.key).is_none()
-            || self.chapter_failed(source, manga, &chapter.key))
+        !chapter.locked
+            && (self.chapter_state(source, manga, &chapter.key).is_none()
+                || self.chapter_failed(source, manga, &chapter.key))
     }
     fn enqueue_chapter(&mut self, manga: &Manga, chapter: &Chapter) {
         let source = self.source_for(manga);
@@ -3299,7 +3784,10 @@ impl Sources {
             }
             let mut task = DownloadTask::from_chapter(&source, manga, &chapter);
             task.manga_snapshot = Some(snapshot_key.clone());
-            if !matches!(enqueue_task(&mut self.tasks, task), EnqueueOutcome::AlreadyDownloaded) {
+            if !matches!(
+                enqueue_task(&mut self.tasks, task),
+                EnqueueOutcome::AlreadyDownloaded
+            ) {
                 added += 1;
             }
         }
@@ -3316,6 +3804,7 @@ impl Sources {
         self.pump();
     }
     /// Dispatches the next queued task when the single download slot is free.
+
     fn pump(&mut self) {
         if self.running.is_some() {
             return;
@@ -3357,7 +3846,9 @@ impl Sources {
         task.status = DownloadStatus::Queued;
         task.error = None;
         // Explicit continue/retry runs this task next, even if older
+
         // queued tasks are still waiting.
+
         self.tasks.insert(0, task);
         if let Err(error) = self.persist() {
             let _ = self.tasks.remove(0);
@@ -3372,8 +3863,11 @@ impl Sources {
         self.status = "已请求暂停，当前图片请求结束后生效".into();
     }
     /// Retry a failed task. In a manga detail view the fresh complete
+
     /// Manga/Chapter are on hand, so rebuild the snapshots through the normal
+
     /// enqueue path instead of retrying a broken one; elsewhere just requeue.
+
     fn retry_task(&mut self, task: &DownloadTask) {
         if let Some(manga) = self.selected_manga.clone()
             && manga.key == task.manga_id
@@ -3402,7 +3896,9 @@ impl Sources {
         }
     }
     /// Removes a task and only that task's staging directory. Downloaded CBZ
+
     /// files, other tasks and the library are never touched.
+
     fn remove_task_now(&mut self, id: &str, success: &str) -> bool {
         self.import_attempts.remove(id);
         let Some(position) = self.tasks.iter().position(|task| task.id == id) else {
@@ -3466,7 +3962,9 @@ impl Sources {
             }
             DlEvent::Failed { id, error } => {
                 // A timeout can race with a pause/cancel tap. Honor the
+
                 // explicit user action once the in-flight request returns.
+
                 let stop = self.dl_stop.load(Ordering::SeqCst);
                 if self.running.as_deref() == Some(id.as_str()) && stop != STOP_NONE {
                     self.handle_download_event(DlEvent::Aborted { id, how: stop });
@@ -3486,6 +3984,7 @@ impl Sources {
                     return;
                 }
                 // A failed chapter must not block the rest of the queue.
+
                 self.pump();
             }
             DlEvent::Aborted { id, how } => {
@@ -3530,6 +4029,7 @@ impl Sources {
                     self.status = format!("{error}；且队列状态保存失败：{persist_error:#}");
                 }
                 // Another instance still owns the lock. Do not immediately
+
                 // retry the next queued task or hammer the same lock.
             }
         }
@@ -3554,11 +4054,16 @@ impl Sources {
         }
         while let Ok((request_id, result)) = self.rx.try_recv() {
             // Every operation (including failures and detail loads) belongs to
+
             // one request. Same text with different filters/listing is a new
+
             // identity; old replies cannot clear its spinner or replace data.
+
             if request_id != self.request_id {
                 // A completed installation still updates the catalogue even
+
                 // when the user has navigated to another source in the meantime.
+
                 if let Ok(Reply::Installed {
                     list,
                     updated: Some(_),
@@ -3581,6 +4086,7 @@ impl Sources {
                         }
                         Some(Task::Metadata(_)) => format!("书源选项加载失败：{error}"),
                         Some(Task::Login { .. }) => format!("登录失败：{error}"),
+                        Some(Task::Notify { .. }) => format!("操作失败：{error}"),
                         _ => format!("加载失败：{error}"),
                     };
                     self.failed = completed;
@@ -3619,7 +4125,9 @@ impl Sources {
                     self.metadata_loaded = true;
                     let pending = self.pending_open.take();
                     // Source updates can remove options; a session must never
+
                     // submit an identifier absent from the current schema.
+
                     self.applied_filters = crate::source_filters::overrides(
                         &self.filters,
                         &crate::source_filters::effective_values(
@@ -3637,7 +4145,9 @@ impl Sources {
                         continue;
                     }
                     // A followed manga opened from another source replaces the
+
                     // default listing; both would share one request slot.
+
                     if let Some(manga) = pending {
                         self.open_manga(manga);
                         continue;
@@ -3697,7 +4207,9 @@ impl Sources {
                             self.change_setting(&marker, SettingValue::Str(user));
                         } else {
                             // A basic-login session lives only in this process,
+
                             // so the form returns after a restart.
+
                             set_setting(&self.selected_source, &marker, SettingValue::Str(user));
                         }
                         self.status = "登录成功".into();
@@ -3719,6 +4231,9 @@ impl Sources {
                         self.status.clear();
                     }
                 }
+                Reply::Notified => {
+                    self.status = "已完成".into();
+                }
             }
         }
         while let Ok(event) = self.dl_rx.try_recv() {
@@ -3729,16 +4244,79 @@ impl Sources {
         }
         if !self.auto_checked && !self.installed.is_empty() {
             self.auto_checked = true;
-            self.check_updates();
+            self.check_updates(false);
         }
+        self.poll_follow_schedule();
+    }
+    /// Minutes between scheduled checks; `0` disables the timer.
+    pub fn follow_interval(&self) -> u64 {
+        self.follow_interval_min
+    }
+    /// Persists a new cadence and re-arms the timer from now.
+    pub fn set_follow_interval(&mut self, minutes: u64) {
+        self.follow_interval_min = minutes;
+        self.follow_next_due = None;
+        self.schedule_follow_check();
+    }
+    /// Arms the next wakeup. Only `request_repaint_after` is used, at the
+
+    /// full interval — no per-frame work, no timer thread, so an idle shelf
+
+    /// keeps its `repaint_delay` far above the acceptance floor.
+    fn schedule_follow_check(&self) {
+        if self.follow_interval_min == 0 {
+            return;
+        }
+        self.ctx
+            .request_repaint_after(std::time::Duration::from_secs(
+                self.follow_interval_min * 60,
+            ));
+    }
+    /// Runs on every frame; costs nothing while the timer is not due.
+    fn poll_follow_schedule(&mut self) {
+        let Some(due) = self.follow_next_due else {
+            // First frame (or a freshly enabled interval): arm and wait.
+            if self.follow_interval_min > 0 && !self.follows.is_empty() {
+                self.follow_next_due = Some(
+                    std::time::Instant::now()
+                        + std::time::Duration::from_secs(self.follow_interval_min * 60),
+                );
+                self.schedule_follow_check();
+            }
+            return;
+        };
+        let now = std::time::Instant::now();
+        if now < due {
+            // Another repaint may have consumed the earlier deadline; re-arm
+            // the remainder so an idle app still wakes on time.
+            self.ctx.request_repaint_after(due - now);
+            return;
+        }
+        self.follow_next_due = None;
+        if self.follow_interval_min == 0 || self.follows.is_empty() {
+            return;
+        }
+        // Re-arm before checking so a long check cannot double-fire.
+        self.follow_next_due = Some(
+            std::time::Instant::now()
+                + std::time::Duration::from_secs(self.follow_interval_min * 60),
+        );
+        self.schedule_follow_check();
+        // Shares the manual-check mutex: an in-flight batch is skipped.
+        self.check_updates(true);
     }
 
     fn download_row(&mut self, ui: &mut Ui, task: &DownloadTask) {
         // A long failure message used to share one horizontal row with the
+
         // title and the action buttons. That pushed the buttons past the right
+
         // edge on a 390px screen and also widened the whole page, which in turn
+
         // stretched the repository URL input. Keep the row inside the page
+
         // width and stack title / state / reason / actions.
+
         let palette = design::palette(ui.visuals().dark_mode);
         ui.vertical(|ui| {
             ui.set_max_width(ui.available_width());
@@ -4076,31 +4654,108 @@ impl Sources {
             self.status = format!("书源设置保存失败：{error:#}");
         }
     }
+    /// Opens `url` for verification (`login` = None) or a source's web
 
-    /// Opens `url` in the in-app browser for verification (`login` = None)
-    /// or a source's web login.
+    /// login. Mobile uses the in-app WebView; desktop opens the system
+
+    /// browser and shows the paste-cookies dialog.
+
     fn open_web(&mut self, url: &str, login: Option<String>) {
+        if yejian_platform::has_in_app_web() {
+            match yejian_platform::open_web(url, DEFAULT_USER_AGENT) {
+                Ok(()) => {
+                    self.web_session = Some(WebSession {
+                        source: self.selected_source.clone(),
+                        login,
+                        url: url.to_string(),
+                        paste: String::new(),
+                        agent: String::new(),
+                    });
+                }
+                Err(error) => self.status = format!("无法打开网页：{error}"),
+            }
+            return;
+        }
+        // Desktop: hand the page to the system browser; the modal collects
+
+        // the cookies the user copies back.
+        match yejian_platform::open_external_url(url) {
+            Ok(()) => {
+                self.web_session = Some(WebSession {
+                    source: self.selected_source.clone(),
+                    login,
+                    url: url.to_string(),
+                    paste: String::new(),
+                    agent: String::new(),
+                });
+                self.status = "已在浏览器打开，请完成验证后回到这里".into();
+            }
+            Err(error) => self.status = format!("无法打开浏览器：{error}"),
+        }
+    }
+    /// A `settings.json` `link` item. `external = true` (or any platform
+
+    /// without an in-app browser) goes to the system browser; everything
+
+    /// else opens inside the app. Shell string invocation is never used.
+    fn open_link(&mut self, url: &str, external: bool) {
+        if external || !yejian_platform::has_in_app_web() {
+            match yejian_platform::open_external_url(url) {
+                Ok(()) => {}
+                Err(error) => self.status = format!("无法打开链接：{error}"),
+            }
+            return;
+        }
         match yejian_platform::open_web(url, DEFAULT_USER_AGENT) {
-            Ok(()) => self.web_purpose = Some((self.selected_source.clone(), login)),
-            Err(error) => self.status = format!("无法打开网页：{error:?}"),
+            // Plain links don't feed cookies back into the verification flow,
+
+            // so `web_session` stays empty and `finish_web` ignores the page.
+            Ok(()) => {}
+            Err(error) => self.status = format!("无法打开链接：{error}"),
         }
     }
 
     fn finish_web(&mut self, result: yejian_platform::WebResult) {
-        let Some((source, login)) = self.web_purpose.take() else {
+        let Some(session) = self.web_session.take() else {
             return;
         };
         let Some(cookies) = result.cookies else {
             self.status = "已取消网页验证".into();
             return;
         };
-        add_web_cookies(&result.url, &cookies);
-        self.web_cookies.insert(result.url.clone(), cookies.clone());
+        self.commit_web_session(session.source, session.login, &result.url, cookies, None);
+    }
+    /// Shared tail of the in-app and paste-cookie flows: write the jar,
+
+    /// persist the site (cookies + optional UA), then run the source's web
+
+    /// login or reload it.
+    fn commit_web_session(
+        &mut self,
+        source: String,
+        login: Option<String>,
+        url: &str,
+        cookies: Vec<(String, String)>,
+        user_agent: Option<String>,
+    ) {
+        add_web_cookies(url, &cookies);
+        if let Some(agent) = user_agent.as_ref().filter(|agent| !agent.trim().is_empty()) {
+            set_site_user_agent(url, agent.trim());
+        }
+        let site = self.web_cookies.entry(url.to_string()).or_default();
+        site.cookies = cookies.clone();
+        if let Some(agent) = user_agent.filter(|agent| !agent.trim().is_empty()) {
+            site.user_agent = Some(agent.trim().to_string());
+        }
         if let Err(error) = self.save_web_cookies() {
             self.status = format!("网页验证结果保存失败：{error:#}");
         }
         if let Some(key) = login {
-            self.submit(Task::Login { source, key, credentials: Err(cookies) });
+            self.submit(Task::Login {
+                source,
+                key,
+                credentials: Err(cookies),
+            });
             return;
         }
         self.challenge = None;
@@ -4110,8 +4765,44 @@ impl Sources {
             self.select_source(&source);
         }
     }
+    /// Modal for the desktop verification flow: the URL, a re-open action,
 
+    /// the default UA to copy, the paste box and an optional browser UA.
+
+    /// Drawn every frame while `web_session` is set and the platform has no
+
+    /// in-app browser; every control meets the 44pt touch target.
+    pub(crate) fn web_dialog(&mut self, ctx: &egui::Context) {
+        if yejian_platform::has_in_app_web() {
+            return;
+        }
+        let Some(session) = self.web_session.as_mut() else {
+            return;
+        };
+        // Editable fields move out for the frame so the modal can mutate
+
+        // `self` freely (status line, commit on finish).
+        let url = session.url.clone();
+        let mut paste = std::mem::take(&mut session.paste);
+        let mut agent = std::mem::take(&mut session.agent);
+        let mut finish = false;
+        let mut cancel = false;
+        egui::Modal::new(egui::Id::unique("web-verify-dialog")).show(ctx, |ui| { ui.set_width(ui.available_width().min(460.).max(280.)); design::section(ui, "网页验证与登录"); ui.add( Label::new( RichText::new(&url) .color(design::palette(ui.visuals().dark_mode).muted) .small(), ) .wrap(), ); ui.add_space(8.); ui.horizontal_wrapped(|ui| { if ui.add(quiet_action("重新在浏览器打开")).clicked() && let Err(error) = yejian_platform::open_external_url(&url) { self.status = format!("无法打开浏览器：{error}"); } if ui.add(quiet_action("复制默认 UA")).clicked() { ui.ctx().copy_text(DEFAULT_USER_AGENT.into()); } }); ui.add_space(8.); ui.label("把浏览器里的 Cookie 粘贴到这里（支持 name=value 串、Cookie: 整行、cookies.txt 或 JSON）："); ui.add( TextEdit::multiline(&mut paste) .desired_width(ui.available_width()) .desired_rows(4), ); ui.add_space(6.); ui.label( RichText::new( "浏览器 User-Agent（Cloudflare 验证需与浏览器一致，留空保持默认）：", ) .small(), ); ui.add( TextEdit::singleline(&mut agent) .desired_width(ui.available_width()), ); ui.add_space(10.); ui.horizontal_wrapped(|ui| { let ready = !crate::trackers::parse_cookie_paste(&paste).is_empty(); if ui .add_enabled(ready, design::primary("完成导入", ui.visuals().dark_mode)) .clicked() { finish = true; } if ui.add(quiet_action("取消")).clicked() { cancel = true; } }); if finish { } });
+        if finish {
+            let session = self.web_session.take().unwrap();
+            let cookies = crate::trackers::parse_cookie_paste(&paste);
+            let agent = (!agent.trim().is_empty()).then_some(agent);
+            self.commit_web_session(session.source, session.login, &session.url, cookies, agent);
+        } else if cancel {
+            self.web_session = None;
+            self.status = "已取消网页验证".into();
+        } else if let Some(session) = self.web_session.as_mut() {
+            session.paste = paste;
+            session.agent = agent;
+        }
+    }
     /// Expires this source's cookies and drops its saved web cookies.
+
     fn forget_source_cookies(&mut self) {
         let urls: Vec<String> = self
             .installed
@@ -4128,7 +4819,12 @@ impl Sources {
             })
         };
         let mut forget: Vec<String> = urls;
-        forget.extend(self.web_cookies.keys().filter(|url| matches(&url_host(url))).cloned());
+        forget.extend(
+            self.web_cookies
+                .keys()
+                .filter(|url| matches(&url_host(url)))
+                .cloned(),
+        );
         for url in &forget {
             clear_site_cookies(url);
         }
@@ -4162,14 +4858,21 @@ impl Sources {
             return;
         }
         if web {
-            if ui.add_enabled(!self.busy, quiet_action("打开网页登录")).clicked() {
+            if ui
+                .add_enabled(!self.busy, quiet_action("打开网页登录"))
+                .clicked()
+            {
                 if let Some(url) = url {
                     self.open_web(url, Some(item.key.clone()));
                 }
             }
             return;
         }
-        ui.add(TextEdit::singleline(&mut self.login_user).hint_text("账号").desired_width(ui.available_width()));
+        ui.add(
+            TextEdit::singleline(&mut self.login_user)
+                .hint_text("账号")
+                .desired_width(ui.available_width()),
+        );
         ui.add(
             TextEdit::singleline(&mut self.login_pass)
                 .password(true)
@@ -4177,7 +4880,10 @@ impl Sources {
                 .desired_width(ui.available_width()),
         );
         let ready = !self.busy && !self.login_user.is_empty() && !self.login_pass.is_empty();
-        if ui.add_enabled(ready, design::primary("登录", ui.visuals().dark_mode)).clicked() {
+        if ui
+            .add_enabled(ready, design::primary("登录", ui.visuals().dark_mode))
+            .clicked()
+        {
             self.submit(Task::Login {
                 source,
                 key: item.key.clone(),
@@ -4190,6 +4896,7 @@ impl Sources {
         self.settings_open = false;
         if std::mem::take(&mut self.settings_changed) {
             // Reloads listings and results with the restarted engine.
+
             let source = self.selected_source.clone();
             self.select_source("");
             self.select_source(&source);
@@ -4210,7 +4917,13 @@ impl Sources {
                 design::section(ui, "书源设置");
                 ui.label(RichText::new("修改后返回书源即生效。").small());
                 if self.busy || !self.status.is_empty() {
-                    ui.add(Label::new(RichText::new(&self.status).color(design::palette(ui.visuals().dark_mode).muted)).wrap());
+                    ui.add(
+                        Label::new(
+                            RichText::new(&self.status)
+                                .color(design::palette(ui.visuals().dark_mode).muted),
+                        )
+                        .wrap(),
+                    );
                 }
                 let mut group = String::new();
                 for item in items {
@@ -4224,6 +4937,56 @@ impl Sources {
                     if let SettingKind::Login { web, url } = &item.kind {
                         self.login_row(ui, &item, *web, url.as_deref());
                         continue;
+                    }
+                    match &item.kind {
+                        SettingKind::Button {
+                            notification,
+                            destructive,
+                            refreshes: _,
+                        } => {
+                            let palette = design::palette(ui.visuals().dark_mode);
+                            let label = RichText::new(&item.title).color(if *destructive {
+                                Color32::from_rgb(190, 64, 55)
+                            } else {
+                                palette.ink
+                            });
+                            let button = Button::new(label)
+                                .min_size(vec2(ui.available_width().min(220.), 44.))
+                                .wrap();
+                            if ui.add_enabled(!self.busy, button).clicked() {
+                                let note = notification
+                                    .clone()
+                                    .filter(|n| !n.is_empty())
+                                    .unwrap_or_else(|| item.key.clone());
+                                if note.is_empty() {
+                                    self.status = "此按钮没有可发送的通知".into();
+                                } else {
+                                    self.submit(Task::Notify {
+                                        source: source.clone(),
+                                        notification: note,
+                                    });
+                                    self.status = format!("已发送：{}", item.title);
+                                }
+                            }
+                            continue;
+                        }
+                        SettingKind::Link { url, external } => {
+                            let palette = design::palette(ui.visuals().dark_mode);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.add(Label::new(RichText::new(&item.title).strong()).wrap());
+                                let button = Button::new(
+                                    RichText::new(url).color(palette.accent).underline(),
+                                )
+                                .frame_when_inactive(false)
+                                .min_size(vec2(0., 44.))
+                                .wrap();
+                                if ui.add(button).clicked() {
+                                    self.open_link(url, *external);
+                                }
+                            });
+                            continue;
+                        }
+                        _ => {}
                     }
                     let current = setting_value(&source, &item.key).or(item.default.clone());
                     if let Some(value) = setting_row(ui, &item, current) {
@@ -4441,15 +5204,22 @@ impl Sources {
             }
         }
     }
-
     /// Search and listing results as a cover grid: cover on top, a two-line
+
     /// title and one muted metadata line below, the whole cell a single tap
+
     /// target. Covers are requested only for cells near the viewport and the
+
     /// next page auto-loads when the last row scrolls into view.
+
     /// Manga detail: cover + metadata header, resume/follow/download actions,
+
     /// a collapsible description, then the touch-friendly chapter list. Rows
+
     /// are painted like the result grid so long names wrap instead of pushing
+
     /// the page wide.
+
     fn detail_ui(&mut self, ui: &mut Ui) {
         let dark = ui.visuals().dark_mode;
         let palette = design::palette(dark);
@@ -4505,9 +5275,10 @@ impl Sources {
                         .is_none_or(|state| state.status == DownloadStatus::Failed)
             })
             .count();
-
         // Header: cover beside the meta column on wide layouts, centered above
+
         // it on narrow ones.
+
         let cover_url = manga.cover.clone().unwrap_or_default();
         let texture = self.cover_image(ui.ctx(), &source, &cover_url);
         let mut want = Vec::new();
@@ -4519,7 +5290,11 @@ impl Sources {
             });
         }
         let wide = width >= 700.;
-        let cover_size = if wide { vec2(200., 300.) } else { vec2(140., 210.) };
+        let cover_size = if wide {
+            vec2(200., 300.)
+        } else {
+            vec2(140., 210.)
+        };
         let heading = TextStyle::Heading.resolve(ui.style());
         let mut read = false;
         let mut follow = false;
@@ -4562,16 +5337,16 @@ impl Sources {
                 let label = if started {
                     format!(
                         "继续阅读 · {}",
-                        resume.as_ref().map_or("".into(), |chapter| chapter_name(chapter))
+                        resume
+                            .as_ref()
+                            .map_or("".into(), |chapter| chapter_name(chapter))
                     )
                 } else {
                     "开始阅读".into()
                 };
-                let button = ui.add_enabled(
-                    resume.is_some(),
-                    design::primary(&label, dark),
-                );
-                this.hitboxes.insert("source-detail-read".into(), button.rect);
+                let button = ui.add_enabled(resume.is_some(), design::primary(&label, dark));
+                this.hitboxes
+                    .insert("source-detail-read".into(), button.rect);
                 if button.clicked() {
                     read = true;
                 }
@@ -4580,16 +5355,17 @@ impl Sources {
                 } else {
                     ui.add(quiet_action("追更").min_size(vec2(0., 48.)))
                 };
-                this.hitboxes.insert("source-detail-follow".into(), button.rect);
+                this.hitboxes
+                    .insert("source-detail-follow".into(), button.rect);
                 if button.clicked() {
                     follow = true;
                 }
                 let button = ui.add_enabled(
                     missing > 0 && !this.busy,
-                    quiet_action(&format!("下载全部未下载（{missing}）"))
-                        .min_size(vec2(0., 48.)),
+                    quiet_action(&format!("下载全部未下载（{missing}）")).min_size(vec2(0., 48.)),
                 );
-                this.hitboxes.insert("source-detail-missing".into(), button.rect);
+                this.hitboxes
+                    .insert("source-detail-missing".into(), button.rect);
                 if button.clicked() {
                     download_missing = true;
                 }
@@ -4597,8 +5373,7 @@ impl Sources {
         };
         if wide {
             ui.horizontal(|ui| {
-                let (cover_rect, _) =
-                    ui.allocate_exact_size(cover_size, Sense::hover());
+                let (cover_rect, _) = ui.allocate_exact_size(cover_size, Sense::hover());
                 paint_cover(
                     ui.painter(),
                     cover_rect,
@@ -4615,8 +5390,7 @@ impl Sources {
             });
         } else {
             ui.vertical_centered(|ui| {
-                let (cover_rect, _) =
-                    ui.allocate_exact_size(cover_size, Sense::hover());
+                let (cover_rect, _) = ui.allocate_exact_size(cover_size, Sense::hover());
                 paint_cover(
                     ui.painter(),
                     cover_rect,
@@ -4639,10 +5413,12 @@ impl Sources {
         if download_missing {
             self.enqueue_missing(&manga);
         }
-
         // Description collapses to three lines; longer text offers 展开/收起.
-        if let Some(description) =
-            manga.description.as_ref().filter(|text| !text.trim().is_empty())
+
+        if let Some(description) = manga
+            .description
+            .as_ref()
+            .filter(|text| !text.trim().is_empty())
         {
             ui.add_space(10.);
             let font = TextStyle::Body.resolve(ui.style());
@@ -4656,12 +5432,8 @@ impl Sources {
             ));
             let clipped = !self.description_expanded && full.size().y > line * 3.5;
             let galley = if clipped {
-                let mut job = egui::text::LayoutJob::simple(
-                    description.clone(),
-                    font,
-                    palette.muted,
-                    width,
-                );
+                let mut job =
+                    egui::text::LayoutJob::simple(description.clone(), font, palette.muted, width);
                 job.wrap.max_rows = 3;
                 painter.layout_job(job)
             } else {
@@ -4676,18 +5448,23 @@ impl Sources {
                 } else {
                     "展开"
                 }));
-                self.hitboxes.insert("source-detail-description".into(), toggle.rect);
+                self.hitboxes
+                    .insert("source-detail-description".into(), toggle.rect);
                 if toggle.clicked() {
                     self.description_expanded = !self.description_expanded;
                 }
             }
         }
         ui.add_space(12.);
-
         // Tasks for chapters the source no longer lists still need a place to
+
         // retry; everything else is represented by row state.
-        let listed: HashSet<&str> =
-            self.chapters.iter().map(|chapter| chapter.key.as_str()).collect();
+
+        let listed: HashSet<&str> = self
+            .chapters
+            .iter()
+            .map(|chapter| chapter.key.as_str())
+            .collect();
         let orphans: Vec<DownloadTask> = self
             .tasks
             .iter()
@@ -4700,11 +5477,16 @@ impl Sources {
             .cloned()
             .collect();
         if !orphans.is_empty() {
-            disclosure(ui, &format!("其他下载任务（{}）", orphans.len()), false, |ui| {
-                for task in &orphans {
-                    self.download_row(ui, task);
-                }
-            });
+            disclosure(
+                ui,
+                &format!("其他下载任务（{}）", orphans.len()),
+                false,
+                |ui| {
+                    for task in &orphans {
+                        self.download_row(ui, task);
+                    }
+                },
+            );
         }
 
         design::section(ui, &format!("章节 · {}", self.chapters.len()));
@@ -4720,7 +5502,11 @@ impl Sources {
                 self.chapter_query.clear();
             }
         });
-        let chapters = chapter_list(&self.chapters, &self.chapter_query, self.chapters_newest_first);
+        let chapters = chapter_list(
+            &self.chapters,
+            &self.chapter_query,
+            self.chapters_newest_first,
+        );
         if chapters.is_empty() {
             ui.label(if self.chapters.is_empty() {
                 "书源尚未提供章节。"
@@ -4739,13 +5525,11 @@ impl Sources {
             let state = states.get(&chapter.key);
             let downloaded = self.library_chapters.get(&id).cloned();
             let can_import = downloaded.is_none()
-                && state.is_some_and(|state| {
-                    state.status == DownloadStatus::Done && state.has_archive
-                })
+                && state
+                    .is_some_and(|state| state.status == DownloadStatus::Done && state.has_archive)
                 && !self.import_attempts.contains(&id)
                 && !self.ready.iter().any(|queued| queued == &id);
-            let failed =
-                state.is_some_and(|state| state.status == DownloadStatus::Failed);
+            let failed = state.is_some_and(|state| state.status == DownloadStatus::Failed);
             let show_download = downloaded.is_none()
                 && !can_import
                 && !chapter.locked
@@ -4761,15 +5545,16 @@ impl Sources {
                 progress,
                 state,
             );
-            let sub = chapter
-                .date_uploaded
-                .map(format_epoch_date)
-                .or_else(|| {
-                    chapter.scanlators.as_ref().and_then(|list| list.first().cloned())
-                });
-
+            let sub = chapter.date_uploaded.map(format_epoch_date).or_else(|| {
+                chapter
+                    .scanlators
+                    .as_ref()
+                    .and_then(|list| list.first().cloned())
+            });
             // Layout: name + sub line left, state lines right-aligned, an
+
             // optional 仅下载 button at the far right edge.
+
             let state_w = 104.;
             let button_w = if show_download { 76. } else { 0. };
             let left_w = (width - state_w - button_w - 24.).max(60.);
@@ -4777,7 +5562,11 @@ impl Sources {
             let mut name_job = egui::text::LayoutJob::simple(
                 name.clone(),
                 body.clone(),
-                if chapter.locked { palette.muted } else { palette.ink },
+                if chapter.locked {
+                    palette.muted
+                } else {
+                    palette.ink
+                },
                 left_w,
             );
             name_job.wrap.max_rows = 2;
@@ -4808,22 +5597,27 @@ impl Sources {
                     .as_ref()
                     .map_or(0., |galley| galley.size().y + 2.);
             let row_h = (text_h + 24.).max(56.);
-            let (row_rect, _) =
-                ui.allocate_exact_size(vec2(width, row_h), Sense::hover());
+            let (row_rect, _) = ui.allocate_exact_size(vec2(width, row_h), Sense::hover());
             let click_rect = if show_download {
-                Rect::from_min_max(row_rect.min, pos2(row_rect.right() - button_w - 8., row_rect.bottom()))
+                Rect::from_min_max(
+                    row_rect.min,
+                    pos2(row_rect.right() - button_w - 8., row_rect.bottom()),
+                )
             } else {
                 row_rect
             };
             let response = ui.interact(
                 click_rect,
                 ui.scope_id().with(("source-chapter", index)),
-                if chapter.locked { Sense::hover() } else { Sense::click() },
+                if chapter.locked {
+                    Sense::hover()
+                } else {
+                    Sense::click()
+                },
             );
-            response.widget_info(|| {
-                WidgetInfo::labeled(Role::Button, !chapter.locked, &name)
-            });
-            self.hitboxes.insert(format!("source-chapter-{index}"), click_rect);
+            response.widget_info(|| WidgetInfo::labeled(Role::Button, !chapter.locked, &name));
+            self.hitboxes
+                .insert(format!("source-chapter-{index}"), click_rect);
             if response.clicked() {
                 open = Some(chapter.clone());
             }
@@ -4831,10 +5625,17 @@ impl Sources {
                 painter.rect_filled(row_rect, 6., palette.accent_soft);
             }
             let text_top = row_rect.top() + (row_h - text_h) / 2.;
-            painter.galley(pos2(row_rect.left() + 4., text_top), name_galley, palette.ink);
+            painter.galley(
+                pos2(row_rect.left() + 4., text_top),
+                name_galley,
+                palette.ink,
+            );
             if let Some(galley) = sub_galley {
                 painter.galley(
-                    pos2(row_rect.left() + 4., row_rect.bottom() - 12. - galley.size().y),
+                    pos2(
+                        row_rect.left() + 4.,
+                        row_rect.bottom() - 12. - galley.size().y,
+                    ),
                     galley,
                     palette.muted,
                 );
@@ -4844,7 +5645,8 @@ impl Sources {
                 painter.galley(
                     pos2(
                         row_rect.right() - button_w - 8. - galley.size().x,
-                        row_rect.top() + (row_h - lines_h.max(0.)) / 2.
+                        row_rect.top()
+                            + (row_h - lines_h.max(0.)) / 2.
                             + row as f32 * (small_h + 2.),
                     ),
                     galley.clone(),
@@ -4861,7 +5663,8 @@ impl Sources {
                     button_rect,
                     quiet_action(label).min_size(button_rect.size()),
                 );
-                self.hitboxes.insert(format!("source-chapter-dl-{index}"), button.rect);
+                self.hitboxes
+                    .insert(format!("source-chapter-dl-{index}"), button.rect);
                 if button.clicked() {
                     enqueue = Some(chapter.clone());
                 }
@@ -4881,10 +5684,12 @@ impl Sources {
             self.enqueue_chapter(&manga, &chapter);
         }
     }
-
     /// The read action shared by the resume button and chapter rows: library
+
     /// copy when linked, import when the download only waits for the shelf,
+
     /// otherwise online streaming.
+
     fn read_detail_chapter(
         &mut self,
         manga: &Manga,
@@ -4895,9 +5700,10 @@ impl Sources {
         let id = identity_id(&source, &manga.key, &chapter.key);
         if let Some(metadata) = self.library_chapters.get(&id) {
             self.open_chapter = Some(metadata.clone());
-        } else if states.get(&chapter.key).is_some_and(|state| {
-            state.status == DownloadStatus::Done && state.has_archive
-        }) && !self.import_attempts.contains(&id)
+        } else if states
+            .get(&chapter.key)
+            .is_some_and(|state| state.status == DownloadStatus::Done && state.has_archive)
+            && !self.import_attempts.contains(&id)
             && !self.ready.iter().any(|queued| queued == &id)
         {
             self.add_downloaded_to_library(&id);
@@ -4934,11 +5740,14 @@ impl Sources {
                 let response = ui.interact(
                     cell,
                     ui.scope_id().with(("source-result", index)),
-                    if self.busy { Sense::hover() } else { Sense::click() },
+                    if self.busy {
+                        Sense::hover()
+                    } else {
+                        Sense::click()
+                    },
                 );
-                response.widget_info(|| {
-                    WidgetInfo::labeled(Role::Button, !self.busy, &manga.title)
-                });
+                response
+                    .widget_info(|| WidgetInfo::labeled(Role::Button, !self.busy, &manga.title));
                 self.hitboxes.insert(format!("source-result-{index}"), cell);
                 if response.clicked() {
                     open = Some(manga.clone());
@@ -4990,7 +5799,10 @@ impl Sources {
                     .filter(|values| !values.is_empty())
                     .map(|values| values.join(" / "))
                     .or_else(|| {
-                        manga.tags.as_ref().and_then(|values| values.first().cloned())
+                        manga
+                            .tags
+                            .as_ref()
+                            .and_then(|values| values.first().cloned())
                     })
                     .unwrap_or_default();
                 let mut meta_job = egui::text::LayoutJob::simple(
@@ -5028,7 +5840,10 @@ impl Sources {
         if let Some(origin) = self.challenge.clone() {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("书源被 Cloudflare 拦截，需要网页验证").strong());
-                if ui.add(design::primary("网页验证", ui.visuals().dark_mode)).clicked() {
+                if ui
+                    .add(design::primary("网页验证", ui.visuals().dark_mode))
+                    .clicked()
+                {
                     self.open_web(&origin, None);
                 }
                 if ui.add(quiet_action("忽略")).clicked() {
@@ -5060,7 +5875,9 @@ impl Sources {
             ))
             .show(ui, |ui| {
                 // Never let one long row stretch the page beyond the viewport; rows
+
                 // truncate or wrap inside this width instead.
+
                 ui.set_max_width(ui.available_width());
                 if self.selected_manga.is_none() {
                     let unfinished: Vec<DownloadTask> = self
@@ -5162,24 +5979,26 @@ impl Sources {
             });
     }
 }
-
 impl Drop for Sources {
     fn drop(&mut self) {
         // Do not block window/Activity teardown. The worker notices this after
+
         // the current HTTP request finishes, then exits and releases its lock.
+
         self.dl_stop.store(STOP_PAUSE, Ordering::SeqCst);
     }
 }
-
 #[derive(Debug)]
 enum Outcome {
     Done { path: PathBuf },
     Aborted { how: u8 },
 }
-
 /// Performs the HTTP on the calling thread through the source's own
+
 /// transport (shared cookies and headers), so page downloads do not queue on
+
 /// the single WASM worker.
+
 fn request(
     handler: &RequestHandler,
     url: String,
@@ -5212,10 +6031,24 @@ fn page_bytes(engine: &SourceEngine, page: &Page) -> anyhow::Result<Vec<u8>> {
     match &page.content {
         PageContent::Url { url, context } => {
             let modified = pollster::block_on(engine.image_request(url, context.clone()))?;
-            if let Some(req) = modified {
+            let bytes = if let Some(req) = modified {
                 request(&handler, req.url, req.headers, req.body)
             } else {
                 request(&handler, url.clone(), vec![], None)
+            }?;
+            // Obfuscated-image sources deobfuscate through
+
+            // `process_page_image`; it runs on the engine's single worker
+
+            // thread, which serializes the WASM calls even though the HTTP
+
+            // fetches above run concurrently.
+            if !engine.features().processes_pages {
+                return Ok(bytes);
+            }
+            match pollster::block_on(engine.process_page_image(bytes, context.clone()))? {
+                Some(processed) => Ok(processed),
+                None => anyhow::bail!("书源的图片处理未返回有效图像"),
             }
         }
         PageContent::Image {
@@ -5235,12 +6068,14 @@ fn page_bytes(engine: &SourceEngine, page: &Page) -> anyhow::Result<Vec<u8>> {
         _ => anyhow::bail!("书源未返回有效图像数据"),
     }
 }
-
 /// Runs one download job to completion (or a pause/cancel checkpoint).
-///
-/// Kept separate from the worker thread so tests can execute the real page
+
+////// Kept separate from the worker thread so tests can execute the real page
+
 /// staging, cache reuse and CBZ build paths with local pages instead of only
+
 /// flipping task statuses.
+
 fn execute_task(
     root: &Path,
     task: &DownloadTask,
@@ -5261,7 +6096,9 @@ fn execute_task(
     if recorded.as_deref() != Some(signature.as_str()) {
         if recorded.is_none() && task.pages_signature.as_deref() == Some(signature.as_str()) {
             // Old queues kept only the signature and accepted image headers.
+
             // Keep every legacy page the current reader can actually display.
+
             for number in existing_pages(&dir) {
                 if let Some(path) = stored_page(&dir, number) {
                     let bytes = std::fs::read(&path)?;
@@ -5303,13 +6140,16 @@ fn execute_task(
     anyhow::ensure!(summary.done == pages.len(), "章节存在未完成的图片");
     let path = build_cbz(root, task, &dir, pages.len())?;
     // The CBZ is already complete; a cleanup problem must not turn a real
+
     // download into a failed task or delete anything outside this cache.
+
     let _ = remove_task_cache(root, &task.id);
     Ok(Outcome::Done { path })
 }
-
 /// Removes the `.part` file created by one CBZ build when writing fails before
+
 /// the archive is complete. Final `.cbz` files are never touched.
+
 struct PartCleanup {
     path: PathBuf,
     armed: bool,
@@ -5332,7 +6172,6 @@ impl Drop for PartCleanup {
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5399,7 +6238,9 @@ mod tests {
         out.extend_from_slice(payload);
     }
     /// Minimal self-contained WASM module exporting `get_page_list` that
+
     /// returns the same postcard `Vec<Page>` the real Aidoku source ABI uses.
+
     fn pages_wasm(urls: &[String]) -> Vec<u8> {
         let mut payload = Vec::new();
         leb_u32(urls.len() as u32, &mut payload);
@@ -5484,7 +6325,9 @@ mod tests {
     fn test_sources(root: &Path) -> Sources {
         let (dl_tx, dl_cmd_rx) = mpsc::channel();
         // Keep the command receiver alive so `pump()` can actually dispatch the
+
         // next task in tests. The task itself is exercised directly.
+
         std::mem::forget(dl_cmd_rx);
         Sources {
             root: root.to_path_buf(),
@@ -5532,10 +6375,23 @@ mod tests {
             follows: Vec::new(),
             pending_open: None,
             checking: 0,
+            checking_background: false,
             auto_checked: true,
-            up_tx: mpsc::channel().0,
+            ctx: Context::default(),
+            follow_interval_min: DEFAULT_FOLLOW_INTERVAL_MIN,
+            follow_next_due: None,
+            follow_notice: None,
+            // Keep the update receiver alive so `check_follows` batches do not
+
+            // fail in tests that never drain `up_rx`.
+            up_tx: {
+                let (tx, rx) = mpsc::channel();
+                std::mem::forget(rx);
+                tx
+            },
             up_rx: mpsc::channel().1,
             covers: Default::default(),
+            follow_cover_urls: Default::default(),
             cover_req_tx: mpsc::channel().0,
             cover_done_rx: mpsc::channel().1,
             cover_queue: VecDeque::new(),
@@ -5555,7 +6411,7 @@ mod tests {
             source_settings: Default::default(),
             stale_engines: Default::default(),
             challenge: None,
-            web_purpose: None,
+            web_session: None,
             login_user: String::new(),
             login_pass: String::new(),
             web_cookies: Default::default(),
@@ -5584,7 +6440,10 @@ mod tests {
         sources.read_online(&book, &chapter("c1", 1.), false);
         let stream = sources.take_stream().expect("reader opens immediately");
         assert_eq!(stream.id, identity_id("source.a", "m", "c1"));
-        assert_eq!(sources.tasks[0].id, stream.id, "read chapter downloads first");
+        assert_eq!(
+            sources.tasks[0].id, stream.id,
+            "read chapter downloads first"
+        );
         assert_eq!(sources.preempted.as_deref(), Some(other.id.as_str()));
         assert_eq!(sources.dl_stop.load(Ordering::SeqCst), STOP_PAUSE);
         assert!(
@@ -5594,20 +6453,42 @@ mod tests {
         assert!(!sources.tasks.iter().any(|task| task.chapter_id == "c3"));
         assert_eq!(sources.stream_state(&stream.id).unwrap().stopped, None);
 
-        sources.handle_download_event(DlEvent::Aborted { id: other.id.clone(), how: STOP_PAUSE });
-        let requeued = sources.tasks.iter().find(|task| task.id == other.id).unwrap();
-        assert_eq!(requeued.status, DownloadStatus::Queued, "no manual continue needed");
+        sources.handle_download_event(DlEvent::Aborted {
+            id: other.id.clone(),
+            how: STOP_PAUSE,
+        });
+        let requeued = sources
+            .tasks
+            .iter()
+            .find(|task| task.id == other.id)
+            .unwrap();
+        assert_eq!(
+            requeued.status,
+            DownloadStatus::Queued,
+            "no manual continue needed"
+        );
         assert!(sources.preempted.is_none());
         assert_eq!(sources.running.as_deref(), Some(stream.id.as_str()));
 
         assert!(sources.has_adjacent_online(&stream.metadata, 1));
         assert!(!sources.has_adjacent_online(&stream.metadata, -1));
-        assert_eq!(sources.adjacent_online_key(&stream.metadata, 1).as_deref(), Some("c2"));
+        assert_eq!(
+            sources.adjacent_online_key(&stream.metadata, 1).as_deref(),
+            Some("c2")
+        );
 
         assert!(sources.open_adjacent_online(&sources.tasks[0].metadata(), 0));
-        let next = sources.tasks.iter().find(|task| task.chapter_id == "c2").unwrap().metadata();
+        let next = sources
+            .tasks
+            .iter()
+            .find(|task| task.chapter_id == "c2")
+            .unwrap()
+            .metadata();
         assert!(sources.open_adjacent_online(&next, -1));
-        assert!(sources.take_stream().unwrap().from_end, "backwards starts on the last page");
+        assert!(
+            sources.take_stream().unwrap().from_end,
+            "backwards starts on the last page"
+        );
     }
 
     #[test]
@@ -5622,8 +6503,15 @@ mod tests {
         read.status = DownloadStatus::Queued;
         sources.tasks.push(read.clone());
         sources.prioritize(&read.id);
-        sources.handle_download_event(DlEvent::Failed { id: other.id.clone(), error: "timeout".into() });
-        let other = sources.tasks.iter().find(|task| task.id == other.id).unwrap();
+        sources.handle_download_event(DlEvent::Failed {
+            id: other.id.clone(),
+            error: "timeout".into(),
+        });
+        let other = sources
+            .tasks
+            .iter()
+            .find(|task| task.id == other.id)
+            .unwrap();
         assert_eq!(other.status, DownloadStatus::Queued);
         assert_eq!(sources.running.as_deref(), Some(read.id.as_str()));
     }
@@ -5646,11 +6534,18 @@ mod tests {
         let mut sources = test_sources(root.path());
         sources.selected_source = "source.a".into();
         let book = manga("source.a", "m");
-        let chapter = |key: &str| Chapter { key: key.into(), ..Default::default() };
+        let chapter = |key: &str| Chapter {
+            key: key.into(),
+            ..Default::default()
+        };
         sources.chapters = vec![chapter("c1"), chapter("c2")];
         sources.toggle_follow(&book);
         assert_eq!(sources.follows.len(), 1);
-        assert_eq!(follows::load(root.path()).unwrap().len(), 1, "saved immediately");
+        assert_eq!(
+            follows::load(root.path()).unwrap().len(),
+            1,
+            "saved immediately"
+        );
         assert_eq!(sources.follow_manga(&sources.follows[0]).unwrap().key, "m");
 
         sources.checking = 1;
@@ -5658,23 +6553,34 @@ mod tests {
             source: "source.a".into(),
             manga: "m".into(),
             chapters: Some(Ok(vec!["c1".into(), "c2".into(), "c3".into()])),
+            cover: None,
         });
         assert_eq!(sources.checking, 0);
         assert_eq!(sources.fresh_follows(), 1);
-        assert_eq!(follows::load(root.path()).unwrap()[0].fresh, vec!["c3".to_string()]);
+        assert_eq!(
+            follows::load(root.path()).unwrap()[0].fresh,
+            vec!["c3".to_string()]
+        );
 
         sources.request_id = 7;
         sources.current_request.store(7, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel();
         sources.rx = rx;
-        tx.send((7, Ok(Reply::Chapters(
-            "source.a".into(),
-            book.clone(),
-            vec![chapter("c1"), chapter("c2"), chapter("c3")],
-        ))))
+        tx.send((
+            7,
+            Ok(Reply::Chapters(
+                "source.a".into(),
+                book.clone(),
+                vec![chapter("c1"), chapter("c2"), chapter("c3")],
+            )),
+        ))
         .unwrap();
         sources.poll();
-        assert_eq!(sources.fresh_follows(), 0, "opening the manga marks chapters seen");
+        assert_eq!(
+            sources.fresh_follows(),
+            0,
+            "opening the manga marks chapters seen"
+        );
 
         sources.toggle_follow(&book);
         assert!(sources.follows.is_empty());
@@ -5691,7 +6597,10 @@ mod tests {
         std::fs::write(dir.join("page-0001.png"), png()).unwrap();
         std::fs::write(dir.join("page-0002.part"), b"half").unwrap();
         assert_eq!(stream_page(root.path(), &id, 0).unwrap(), Some(png()));
-        assert!(stream_page(root.path(), &id, 1).unwrap().is_none(), "partial page is not ready");
+        assert!(
+            stream_page(root.path(), &id, 1).unwrap().is_none(),
+            "partial page is not ready"
+        );
         assert!(stream_page(root.path(), "../escape", 0).is_err());
     }
 
@@ -5714,7 +6623,14 @@ mod tests {
         sources.set_stream_page(&item.id, 7);
         assert_eq!(sources.stream_state(&item.id).unwrap().page, Some(7));
         let saved = load_tasks(root.path()).unwrap().tasks;
-        assert_eq!(saved.iter().find(|task| task.id == item.id).unwrap().read_page, Some(7));
+        assert_eq!(
+            saved
+                .iter()
+                .find(|task| task.id == item.id)
+                .unwrap()
+                .read_page,
+            Some(7)
+        );
     }
 
     #[test]
@@ -6010,7 +6926,10 @@ mod tests {
         ];
         let ordered = chapter_list(&chapters, "", false);
         assert_eq!(
-            ordered.iter().map(|chapter| chapter.key.as_str()).collect::<Vec<_>>(),
+            ordered
+                .iter()
+                .map(|chapter| chapter.key.as_str())
+                .collect::<Vec<_>>(),
             ["2", "2.5", "10", "番外", "第二卷"],
         );
         assert_eq!(chapter_list(&chapters, "", true)[0].key, "第二卷");
@@ -6024,14 +6943,26 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut sources = test_sources(root.path());
         let item = task("source.a", "m", "c");
-        let link = ChapterLink { book_id: "book".into(), metadata: item.metadata() };
+        let link = ChapterLink {
+            book_id: "book".into(),
+            metadata: item.metadata(),
+        };
         sources.set_library_chapters(&[link]);
-        assert!(sources.tasks.is_empty(), "restore does not need download-tasks.json");
-        assert_eq!(sources.chapter_state("source.a", "m", "c").as_deref(), Some("已在书架"));
+        assert!(
+            sources.tasks.is_empty(),
+            "restore does not need download-tasks.json"
+        );
+        assert_eq!(
+            sources.chapter_state("source.a", "m", "c").as_deref(),
+            Some("已在书架")
+        );
         assert!(!sources.chapter_needs_download("source.a", "m", &item.chapter()));
         sources.read_downloaded(&item);
         assert_eq!(sources.take_open_chapter(), Some(item.metadata()));
-        assert!(sources.take_open_chapter().is_none(), "consume one request once");
+        assert!(
+            sources.take_open_chapter().is_none(),
+            "consume one request once"
+        );
         assert!(sources.chapter_state("source.b", "m", "c").is_none());
         sources.set_library_chapters(&[]);
         sources.read_downloaded(&item);
@@ -6048,9 +6979,16 @@ mod tests {
             sources.tasks.push(original.clone());
             sources.selected_source = other_source.into();
             sources.selected_manga = Some(manga(other_source, other_manga));
-            sources.chapters = vec![Chapter { key: "1".into(), ..Default::default() }];
+            sources.chapters = vec![Chapter {
+                key: "1".into(),
+                ..Default::default()
+            }];
             sources.retry_task(&original);
-            assert_eq!(sources.tasks.len(), 1, "must not enqueue the current foreign manga");
+            assert_eq!(
+                sources.tasks.len(),
+                1,
+                "must not enqueue the current foreign manga"
+            );
             assert_eq!(sources.running.as_deref(), Some(original.id.as_str()));
             assert_eq!(sources.tasks[0].manga_id, "m");
             assert_eq!(sources.tasks[0].source_id, "source.a");
@@ -6087,26 +7025,39 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut sources = test_sources(root.path());
         sources.selected_source = "source.a".into();
-        sources.chapters = [10., 2., 2.5, 1.].into_iter().map(|number| Chapter {
-            key: number.to_string(),
-            chapter_number: Some(number),
-            ..Default::default()
-        }).collect();
-        let mut failed = DownloadTask::from_chapter(
-            "source.a", &manga("source.a", "m"), &sources.chapters[1],
-        );
+        sources.chapters = [10., 2., 2.5, 1.]
+            .into_iter()
+            .map(|number| Chapter {
+                key: number.to_string(),
+                chapter_number: Some(number),
+                ..Default::default()
+            })
+            .collect();
+        let mut failed =
+            DownloadTask::from_chapter("source.a", &manga("source.a", "m"), &sources.chapters[1]);
         failed.status = DownloadStatus::Failed;
         sources.tasks.push(failed);
         sources.enqueue_missing(&manga("source.a", "m"));
         assert_eq!(sources.tasks.len(), 4);
         assert!(sources.tasks.iter().all(|task| matches!(
-            task.status, DownloadStatus::Running | DownloadStatus::Queued
+            task.status,
+            DownloadStatus::Running | DownloadStatus::Queued
         )));
-        assert!(sources.status.contains("4"), "retry count should match action");
+        assert!(
+            sources.status.contains("4"),
+            "retry count should match action"
+        );
         // A failed task keeps its existing queue position; newly added tasks
+
         // are queued from the first chapter rather than the source's newest.
+
         assert_eq!(
-            sources.tasks.iter().skip(1).map(|task| task.chapter_id.as_str()).collect::<Vec<_>>(),
+            sources
+                .tasks
+                .iter()
+                .skip(1)
+                .map(|task| task.chapter_id.as_str())
+                .collect::<Vec<_>>(),
             ["1", "2.5", "10"],
         );
     }
@@ -6176,9 +7127,10 @@ mod tests {
         assert!(stored_page(&dir, 1).is_some());
         assert!(stored_page(&dir, 2).is_none());
         assert!(!chapter_archive(root, &task).exists());
-
         // Simulate the app closing before either progress or completion is
+
         // drained by its UI. Both stages recover using the worker's files.
+
         let recovered = execute_task(
             root,
             &task,
@@ -6238,7 +7190,9 @@ mod tests {
         .unwrap();
         std::fs::rename(&old_root, &new_root).unwrap();
         // A leftover old container must never take precedence over the
+
         // complete archive inside the library we actually opened.
+
         let stale = tasks[0].cbz.as_ref().unwrap();
         std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
         std::fs::write(stale, b"stale").unwrap();
@@ -6292,7 +7246,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            fetched.load(Ordering::SeqCst), 1,
+            fetched.load(Ordering::SeqCst),
+            1,
             "equal-length inline bytes must not be trusted from the signature"
         );
         assert_eq!(summary.done, 1);
@@ -6321,9 +7276,7 @@ mod tests {
     fn missing_pages_download_in_parallel_in_page_order() {
         let dir = tempfile::tempdir().unwrap();
         let work = dir.path().join("task");
-        let pages: Vec<_> = (0..8)
-            .map(|index| url_page(&format!("p{index}")))
-            .collect();
+        let pages: Vec<_> = (0..8).map(|index| url_page(&format!("p{index}"))).collect();
         let stop = AtomicU8::new(STOP_NONE);
         let in_flight = AtomicUsize::new(0);
         let peak = AtomicUsize::new(0);
@@ -6354,8 +7307,10 @@ mod tests {
         let started = order.lock().unwrap().clone();
         let first_batch = &started[..PAGE_CONCURRENCY.min(started.len())];
         assert!(
-            first_batch.iter().all(|url| url.starts_with('p')
-                && url[1..].parse::<usize>().unwrap() < PAGE_CONCURRENCY),
+            first_batch
+                .iter()
+                .all(|url| url.starts_with('p')
+                    && url[1..].parse::<usize>().unwrap() < PAGE_CONCURRENCY),
             "first pages were not handed out in ascending order: {started:?}"
         );
         for number in 1..=8 {
@@ -6367,9 +7322,7 @@ mod tests {
     fn a_failed_page_keeps_completed_siblings_and_resumes_the_rest() {
         let dir = tempfile::tempdir().unwrap();
         let work = dir.path().join("task");
-        let pages: Vec<_> = (0..6)
-            .map(|index| url_page(&format!("p{index}")))
-            .collect();
+        let pages: Vec<_> = (0..6).map(|index| url_page(&format!("p{index}"))).collect();
         let stop = AtomicU8::new(STOP_NONE);
         let error = fetch_missing_pages(
             &work,
@@ -6508,9 +7461,10 @@ mod tests {
         let work = task_dir(root.path(), &item.id).unwrap();
         assert!(stored_page(&work, 1).is_some());
         assert!(stored_page(&work, 2).is_none());
-
         // Persist the page fingerprint the UI received before the failure and
+
         // reload, as after an app restart.
+
         item.pages_signature = signature;
         item.status = DownloadStatus::Failed;
         let store = TaskStore { tasks: vec![item] };
@@ -6622,9 +7576,10 @@ mod tests {
         assert_eq!(second.id, items[1].id);
         assert_eq!(third.id, items[2].id);
         sources.ack_downloaded(&first.id);
-
         // The second import failed: put only that file back and retry it
+
         // without touching the third file or re-downloading anything.
+
         sources.requeue_import(&second.id);
         let retried = sources.take_downloaded().unwrap();
         assert_eq!(retried.id, second.id);
@@ -6805,9 +7760,10 @@ mod tests {
         let error = sources.persist().unwrap_err();
         assert!(!error.to_string().is_empty());
         assert_eq!(std::fs::read(&root).unwrap(), b"keep");
-
         // Allow the new metadata snapshot to be written, then fail the queue
+
         // file's atomic replacement rather than the earlier snapshot stage.
+
         let queue_root = dir.path().join("queue-write-failure");
         let blocked = queue_root.join("download-tasks.json");
         std::fs::create_dir_all(&blocked).unwrap();
@@ -6831,9 +7787,10 @@ mod tests {
         );
         assert!(sources.status.contains("无法保存下载队列"));
         assert_eq!(std::fs::read(blocked.join("keep.txt")).unwrap(), b"keep");
-
         // Retrying an existing failed task and bulk-adding chapters must also
+
         // roll back status/snapshot changes if the atomic queue write fails.
+
         let mut failed = DownloadTask::from_chapter("source.a", &book, &chapter);
         failed.status = DownloadStatus::Failed;
         failed.error = Some("original failure".into());
@@ -6843,7 +7800,13 @@ mod tests {
         assert_eq!(sources.tasks[0].status, DownloadStatus::Failed);
         assert_eq!(sources.tasks[0].manga_snapshot, None);
         assert_eq!(sources.tasks[0].error, failed.error);
-        sources.chapters = vec![chapter, Chapter { key: "new".into(), ..Default::default() }];
+        sources.chapters = vec![
+            chapter,
+            Chapter {
+                key: "new".into(),
+                ..Default::default()
+            },
+        ];
         sources.enqueue_missing(&book);
         assert_eq!(sources.tasks.len(), 1);
         assert_eq!(sources.tasks[0].status, DownloadStatus::Failed);
@@ -6914,6 +7877,7 @@ mod tests {
         assert_eq!(item.id, done.id);
         assert!(item.path.exists());
         // A failed import can put it back; the file is not downloaded again.
+
         sources.requeue_import(&done.id);
         assert!(sources.take_downloaded().is_some());
         sources.ack_downloaded(&done.id);
@@ -7026,8 +7990,8 @@ mod tests {
             thumbnail: Some("thumb.png".into()),
             locked: true,
         };
-
         // Real enqueue path: writes the shared manga snapshot and the queue.
+
         let mut sources = test_sources(root.path());
         sources.enqueue_chapter(&book, &chapter);
         let id = identity_id("test.source", "m42", "c42");
@@ -7043,8 +8007,8 @@ mod tests {
                 ..Default::default()
             },
         );
-
         // One snapshot per work, not one per chapter task.
+
         let snapshots: Vec<_> = std::fs::read_dir(snapshot_root(root.path()))
             .unwrap()
             .flatten()
@@ -7065,8 +8029,8 @@ mod tests {
             json.contains("\"manga_snapshot\""),
             "task references the shared snapshot"
         );
-
         // Restart: reload the queue from disk and restore both objects.
+
         let (tasks, warning) = load_queue(root.path());
         assert!(warning.is_none());
         let restored = tasks
@@ -7091,6 +8055,7 @@ mod tests {
         assert_eq!(restored_chapter.thumbnail, chapter.thumbnail);
         assert!(restored_chapter.locked);
         // These are exactly the bytes the interpreter sends to get_page_list.
+
         assert_eq!(
             manga.to_postcard_bytes(),
             book.to_postcard_bytes(),
@@ -7101,8 +8066,8 @@ mod tests {
             chapter.to_postcard_bytes(),
             "source receives the identical chapter bytes"
         );
-
         // A real WASM engine still accepts the restored objects for page listing.
+
         let urls = vec!["https://example.test/page-1.png".to_string()];
         let engine = SourceEngine::load_wasm(
             source_manifest(),
@@ -7136,15 +8101,15 @@ mod tests {
             task.chapter_snapshot.is_some(),
             "new tasks record snapshots"
         );
-
         // Old queues have no snapshot at all and keep the reduced DTO fallback.
+
         let mut legacy = task.clone();
         legacy.manga_snapshot = None;
         legacy.chapter_snapshot = None;
         assert_eq!(legacy.manga_for(root.path()).unwrap().title, "m7");
         assert_eq!(legacy.chapter_for().unwrap().key, "c7");
-
         // A task that recorded a snapshot never degrades to that fallback.
+
         let key = manga_snapshot_key("test.source", "m7");
         let mut recorded = task.clone();
         recorded.manga_snapshot = Some(key.clone());
@@ -7192,9 +8157,10 @@ mod tests {
                 .to_string()
                 .contains("章节快照已损坏")
         );
-
         // Re-adding the chapter from the manga detail page rebuilds the
+
         // snapshot from the new complete object and requeues the task.
+
         let mut updated = book.clone();
         updated.authors = Some(vec!["New Author".into()]);
         let mut sources = test_sources(root.path());
@@ -7235,7 +8201,9 @@ mod tests {
             assert_eq!(grid_columns(width), cols, "width {width}");
         }
         // Even at 200% type the math is font-independent: one column minimum
+
         // and every cell stays at least its minimum width inside the row.
+
         for width in [200., 320., 507.] {
             let cols = grid_columns(width);
             assert!(cols >= 1);
@@ -7262,14 +8230,25 @@ mod tests {
             vec![req("a"), req("b"), req("in-flight"), req("failed")],
             &skip,
         );
-        assert_eq!(keys(&queue), ["a", "b"], "sent and failed covers never queue");
+        assert_eq!(
+            keys(&queue),
+            ["a", "b"],
+            "sent and failed covers never queue"
+        );
         plan_covers(&mut queue, vec![req("a"), req("c"), req("d")], &skip);
-        assert_eq!(keys(&queue), ["a", "c", "d"], "scrolled-away cells drop out");
+        assert_eq!(
+            keys(&queue),
+            ["a", "c", "d"],
+            "scrolled-away cells drop out"
+        );
         let many: Vec<CoverReq> = (0..30).map(|i| req(&format!("k{i}"))).collect();
         plan_covers(&mut queue, many, &skip);
         assert_eq!(queue.len(), COVER_QUEUE_CAP);
         assert_eq!(queue.back().unwrap().key, "k29", "newest requests win");
-        assert!(!queue.iter().any(|req| req.key == "a"), "oldest drops first");
+        assert!(
+            !queue.iter().any(|req| req.key == "a"),
+            "oldest drops first"
+        );
     }
 
     #[test]
@@ -7300,12 +8279,9 @@ mod tests {
     fn cover_fetch_runs_end_to_end_and_caches_on_disk() {
         let root = tempfile::tempdir().unwrap();
         let (base, server) = serve_png(1);
-        let engine = SourceEngine::load_wasm(
-            source_manifest(),
-            pages_wasm(&[]),
-            EngineOptions::default(),
-        )
-        .unwrap();
+        let engine =
+            SourceEngine::load_wasm(source_manifest(), pages_wasm(&[]), EngineOptions::default())
+                .unwrap();
         let url = format!("{base}/cover.png");
         let image = fetch_source_cover(root.path(), &engine, "test.source", &url).unwrap();
         assert_eq!(image.size, [4, 4]);
@@ -7313,6 +8289,7 @@ mod tests {
         let path = source_cover_path(root.path(), &cover_key("test.source", &url)).unwrap();
         assert!(path.is_file());
         // The second fetch must come from disk: the server only answered once.
+
         let cached = fetch_source_cover(root.path(), &engine, "test.source", &url).unwrap();
         assert_eq!(cached.size, image.size);
     }
@@ -7351,7 +8328,9 @@ mod tests {
     #[test]
     fn chapter_state_lines_map_progress_and_queue() {
         // Locked wins outright; finished progress beats partial reads; download
+
         // state appears below the reading state.
+
         assert_eq!(
             chapter_state_lines(true, false, false, None, None),
             vec!["暂不可阅读"]
@@ -7395,34 +8374,36 @@ mod tests {
             detail_chapter("c3", 3.),
         ];
         let mut states = std::collections::HashMap::new();
-        states.insert("c2".into(), queue_state(DownloadStatus::Done, Some(9), Some(200)));
-        sources.chapter_progress.insert(
-            identity_id("source.a", "m", "c1"),
-            (2, 10, Some(100)),
+        states.insert(
+            "c2".into(),
+            queue_state(DownloadStatus::Done, Some(9), Some(200)),
         );
+        sources
+            .chapter_progress
+            .insert(identity_id("source.a", "m", "c1"), (2, 10, Some(100)));
         // The stream read of c2 is newer but finished, so resume lands on c3.
-        let (resume, started) =
-            sources.resume_chapter("source.a", &book, &ordered, &states);
-        assert!(started && resume.unwrap().key == "c3");
 
+        let (resume, started) = sources.resume_chapter("source.a", &book, &ordered, &states);
+        assert!(started && resume.unwrap().key == "c3");
         // A newer partial library read wins over the finished stream.
-        sources.chapter_progress.insert(
-            identity_id("source.a", "m", "c1"),
-            (2, 10, Some(300)),
-        );
-        let (resume, started) =
-            sources.resume_chapter("source.a", &book, &ordered, &states);
+
+        sources
+            .chapter_progress
+            .insert(identity_id("source.a", "m", "c1"), (2, 10, Some(300)));
+        let (resume, started) = sources.resume_chapter("source.a", &book, &ordered, &states);
         assert!(started && resume.unwrap().key == "c1");
-
         // Finishing the last chapter keeps it as the resume target.
-        sources.chapter_progress.clear();
-        states.insert("c3".into(), queue_state(DownloadStatus::Done, Some(9), Some(400)));
-        states.remove("c2");
-        let (resume, started) =
-            sources.resume_chapter("source.a", &book, &ordered, &states);
-        assert!(started && resume.unwrap().key == "c3");
 
+        sources.chapter_progress.clear();
+        states.insert(
+            "c3".into(),
+            queue_state(DownloadStatus::Done, Some(9), Some(400)),
+        );
+        states.remove("c2");
+        let (resume, started) = sources.resume_chapter("source.a", &book, &ordered, &states);
+        assert!(started && resume.unwrap().key == "c3");
         // Nothing read starts at the first unlocked chapter.
+
         let (resume, started) =
             sources.resume_chapter("source.a", &book, &ordered, &Default::default());
         assert!(!started && resume.unwrap().key == "c1");
@@ -7454,5 +8435,161 @@ mod tests {
         let task = sources.tasks.iter().find(|task| task.id == id).unwrap();
         assert_eq!(task.read_page, Some(7));
         assert!(task.read_at.is_some());
+    }
+    // -----------------------------------------------------------------
+
+    // Scheduled follow checks
+
+    // -----------------------------------------------------------------
+    #[test]
+    fn follow_schedule_due_fires_once_and_rearms() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sources = test_sources(root.path());
+        let book = manga("source.a", "m");
+        sources.chapters = vec![Chapter {
+            key: "c1".into(),
+            ..Default::default()
+        }];
+        sources.toggle_follow(&book);
+        // A manga snapshot is needed for check_follows to build a batch —
+
+        // toggle_follow saves one already, so the follow has a snapshot.
+        assert!(sources.follow_manga(&sources.follows[0]).is_ok());
+        // toggle_follow itself queued a cover check; the scheduler assertions
+
+        // below start from a quiet state.
+        sources.checking = 0;
+        // Not due yet: nothing happens.
+        sources.follow_next_due =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(3600));
+        sources.poll_follow_schedule();
+        assert_eq!(sources.checking, 0);
+        // Due: the batch starts once and the timer rearms for the full
+
+        // interval instead of refiring on the next frame.
+        sources.follow_next_due =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        sources.poll_follow_schedule();
+        assert_eq!(sources.checking, 1, "due check dispatched once");
+        assert!(sources.checking_background, "scheduled check is background");
+        let due = sources.follow_next_due.expect("timer rearmed");
+        assert!(due > std::time::Instant::now() + std::time::Duration::from_secs(3500));
+        // The in-flight batch blocks the next manual/scheduled start.
+        sources.follow_next_due =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        sources.poll_follow_schedule();
+        assert_eq!(sources.checking, 1, "in-flight check is not duplicated");
+    }
+    #[test]
+    fn follow_schedule_disabled_and_empty_never_fire() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sources = test_sources(root.path());
+        // No follows at all: even a due timer does nothing.
+        sources.follow_next_due =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        sources.poll_follow_schedule();
+        assert_eq!(sources.checking, 0);
+        assert!(sources.follow_next_due.is_none());
+        // Disabled interval never arms.
+        sources.set_follow_interval(0);
+        let book = manga("source.a", "m");
+        sources.chapters = vec![Chapter {
+            key: "c1".into(),
+            ..Default::default()
+        }];
+        sources.toggle_follow(&book);
+        sources.checking = 0;
+        sources.poll_follow_schedule();
+        assert!(sources.follow_next_due.is_none());
+        assert_eq!(sources.checking, 0);
+    }
+    #[test]
+    fn background_check_completion_goes_to_notice_not_status() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sources = test_sources(root.path());
+        let book = manga("source.a", "m");
+        sources.chapters = vec![Chapter {
+            key: "c1".into(),
+            ..Default::default()
+        }];
+        sources.toggle_follow(&book);
+        sources.status.clear();
+        sources.checking = 1;
+        sources.checking_background = true;
+        sources.handle_update(UpdateEvent {
+            source: "source.a".into(),
+            manga: "m".into(),
+            chapters: Some(Ok(vec!["c1".into(), "c2".into()])),
+            cover: None,
+        });
+        assert_eq!(sources.checking, 0);
+        assert_eq!(
+            sources.follow_notice.as_deref(),
+            Some("追更发现 1 部作品有新章节")
+        );
+        assert!(
+            sources.status.is_empty(),
+            "background checks keep the sources status clear"
+        );
+    }
+    // -----------------------------------------------------------------
+
+    // Follow covers on the shared source-covers cache
+
+    // -----------------------------------------------------------------
+    #[test]
+    fn follow_cover_uses_source_cover_key_and_legacy_files_still_read() {
+        let root = tempfile::tempdir().unwrap();
+        // The same URL must resolve to the same `.img` file as the grid.
+        let url = "https://img.example/cover/1.jpg";
+        let key = cover_key("source.a", url);
+        assert_eq!(key.len(), 16);
+        let path = source_cover_path(root.path(), &key).unwrap();
+        assert_eq!(path.parent().unwrap().file_name().unwrap(), "source-covers");
+        // A pre-unification `follow-covers` file still paints — compat read
+
+        // keeps working while the pipeline only writes to `source-covers/`.
+        let mut sources = test_sources(root.path());
+        let snapshot = "a1b2c3d4e5f60708".to_string();
+        let legacy = follow_cover_path(root.path(), &snapshot).unwrap();
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        let png = {
+            let img = image::RgbaImage::from_pixel(4, 6, image::Rgba([10, 20, 30, 255]));
+            let mut out = std::io::Cursor::new(Vec::new());
+            img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+            out.into_inner()
+        };
+        std::fs::write(&legacy, &png).unwrap();
+        let texture = sources.cover_texture(&Context::default(), &snapshot);
+        assert!(texture.is_some(), "legacy follow cover still renders");
+        assert!(legacy.is_file(), "legacy file is left in place");
+    }
+    #[test]
+    fn follow_cover_url_resolves_from_the_manga_snapshot_once() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sources = test_sources(root.path());
+        let mut book = manga("source.a", "m");
+        book.cover = Some("https://img.example/c.jpg".into());
+        sources.chapters = vec![Chapter {
+            key: "c1".into(),
+            ..Default::default()
+        }];
+        sources.toggle_follow(&book);
+        let url = sources.follow_cover_url(0);
+        assert_eq!(url.as_deref(), Some("https://img.example/c.jpg"));
+        // Second call comes from the cache, not the file — deleting the
+
+        // snapshot does not change the resolved value.
+        let snapshot = sources.follows[0].snapshot.clone();
+        std::fs::remove_file(manga_snapshot_path(root.path(), &snapshot).unwrap()).unwrap();
+        assert_eq!(
+            sources.follow_cover_url(0).as_deref(),
+            Some("https://img.example/c.jpg")
+        );
+        // And the cache key matches what plan_covers would queue.
+        assert_eq!(
+            cover_key("source.a", "https://img.example/c.jpg"),
+            cover_key(&sources.follows[0].source_id, &url.unwrap()),
+        );
     }
 }

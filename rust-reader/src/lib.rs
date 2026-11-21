@@ -8,6 +8,7 @@ mod shelf;
 mod source_filters;
 mod sources;
 mod sync;
+mod trackers;
 mod typography;
 mod ui;
 mod vertical;
