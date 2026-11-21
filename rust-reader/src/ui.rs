@@ -5,6 +5,7 @@ use crate::{
     sources::{STREAM_PREFIX, StreamChapter},
     worker::{Command, Event, PAGE_NOT_READY, Worker},
 };
+use chrono::Datelike;
 use egui::*;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -350,6 +351,17 @@ pub struct ReaderApp {
     track_draft: Option<(String, String, Option<crate::trackers::TrackStatus>, Option<i64>)>,
     /// 应用锁 state; the lock itself is in-memory, never persisted.
     applock: crate::applock::AppLock,
+    /// 阅读统计 per local day per device (`reading-stats.json`).
+    stats: crate::stats::Stats,
+    /// Whether the shell currently reports the app as foregrounded
+    /// (desktop stays true; mobile reports via ForegroundEvent).
+    app_foreground: bool,
+    /// `history-hidden` setting: footprint row key -> hidden_at epoch secs.
+    history_hidden: std::collections::BTreeMap<String, i64>,
+    /// 阅读足迹 search field.
+    history_query: String,
+    /// Pending 清空足迹 confirmation.
+    history_clear: bool,
     pub hitboxes: BTreeMap<String, Rect>,
     pub rendered_book_nodes: usize,
     pub frame_is_animating: bool,
@@ -375,6 +387,11 @@ impl ReaderApp {
             track_query: String::new(),
             track_draft: None,
             applock: crate::applock::AppLock::default(),
+            stats: crate::stats::Stats::load(&root),
+            app_foreground: true,
+            history_hidden: Default::default(),
+            history_query: String::new(),
+            history_clear: false,
             sources: crate::sources::Sources::new(root.clone(), ctx),
             root,
             stream: None,
@@ -606,6 +623,40 @@ impl ReaderApp {
         self.tab = Tab::Sources;
         self.screen = Screen::Library;
         self.sources.preview_migrate(stage);
+    }
+    /// Acceptance seed: grouped local/online history plus seven days of
+    /// reading stats so 阅读足迹 renders all groups and the stats card.
+    #[cfg(debug_assertions)]
+    pub fn prepare_history_acceptance(&mut self) {
+        self.tab = Tab::History;
+        self.screen = Screen::Library;
+        let now_ms = crate::follows::now() as i64 * 1000;
+        for (index, book) in self.books.iter_mut().enumerate() {
+            book.last_read_at = Some(match index % 4 {
+                0 => now_ms - 600_000,
+                1 => now_ms - 90_000_000,
+                2 => now_ms - 200_000_000,
+                _ => now_ms - 2_600_000_000,
+            });
+        }
+        self.sources.preview_history();
+        self.stats.seed_capture(crate::follows::now() as f64);
+    }
+    /// Acceptance seed: the 我的书源 manage view with an update badge, a
+    /// finished 测试 result and a repository index for the filter capture.
+    #[cfg(debug_assertions)]
+    pub fn prepare_sources_manage_acceptance(&mut self) {
+        self.tab = Tab::Sources;
+        self.screen = Screen::Library;
+        self.sources.preview_sources_manage();
+    }
+    /// Acceptance seam: open the opaque uninstall confirm for a fake source.
+    #[cfg(debug_assertions)]
+    pub fn open_uninstall_acceptance(&mut self) {
+        self.prepare_sources_manage_acceptance();
+        if let Some(source) = self.sources.installed_source("local.manage-a") {
+            self.sources.ask_uninstall(source);
+        }
     }
     /// Acceptance teardown: remove preview follows/tasks before the app is
     /// dropped so they never leak into the real saved state.
@@ -1364,6 +1415,13 @@ impl ReaderApp {
             .map(|book| self.reading_title(&book))
     }
     fn open_neighbor(&mut self, id: &str, delta: i32) -> bool {
+        let moved = self.open_neighbor_inner(id, delta);
+        if moved && delta > 0 {
+            self.stats.chapter_finished(crate::follows::now() as f64);
+        }
+        moved
+    }
+    fn open_neighbor_inner(&mut self, id: &str, delta: i32) -> bool {
         let start = |book: &mut Book| {
             book.current_page = if delta < 0 {
                 book.page_count.saturating_sub(1)
@@ -1902,6 +1960,29 @@ impl ReaderApp {
                             "auto-download" => {
                                 self.sources.set_auto_download(&value);
                             }
+                            "source-repos" => {
+                                self.sources.set_repos_setting(&value);
+                            }
+                            "source-repos-checked-at" => {
+                                self.sources
+                                    .set_repos_checked_day(value.parse::<i64>().ok());
+                            }
+                            "history-hidden" => {
+                                if let Ok(entries) = serde_json::from_str::<
+                                    Vec<serde_json::Value>,
+                                >(&value)
+                                {
+                                    self.history_hidden = entries
+                                        .iter()
+                                        .filter_map(|entry| {
+                                            Some((
+                                                entry.get("key")?.as_str()?.to_string(),
+                                                entry.get("hidden_at")?.as_i64()?,
+                                            ))
+                                        })
+                                        .collect();
+                                }
+                            }
                             "app-lock" => {
                                 app_lock_enabled = value == "true";
                             }
@@ -2416,6 +2497,7 @@ impl ReaderApp {
             return;
         }
         self.page = page;
+        self.stats.page_turned(crate::follows::now() as f64);
         let base = self.vertical_prev.as_ref().map(|(_, c)| *c).unwrap_or(0);
         self.vertical_reader.reset(base + page, 0.);
         self.pan = Vec2::ZERO;
@@ -2438,6 +2520,10 @@ impl ReaderApp {
         match self.screen.clone() {
             Screen::Reader(_) => {
                 self.flush_position();
+                let epoch = crate::follows::now() as f64;
+                self.stats.set_reader_open(false, epoch);
+                self.stats.tick(epoch);
+                self.stats.flush(&self.root);
                 self.keep_awake(false);
                 self.chapter_end = false;
                 self.vertical_reader.stop();
@@ -3054,6 +3140,9 @@ impl ReaderApp {
                 self.setting("search-history", json);
             }
         }
+        for (key, value) in self.sources.take_setting_writes() {
+            self.setting(&key, value);
+        }
         if let Some(post) = self.sources.take_migrate_post() {
             if post.resume_unparsed {
                 self.pending_notice =
@@ -3134,9 +3223,18 @@ impl ReaderApp {
             match event {
                 yejian_platform::ForegroundEvent::Background => {
                     self.applock.background(now_secs);
+                    self.app_foreground = false;
+                    // Settle and persist the reading clock while the app is
+                    // still allowed to run — the process may never see
+                    // another frame once it is suspended.
+                    let epoch = crate::follows::now() as f64;
+                    self.stats.set_foreground(false, epoch);
+                    self.stats.tick(epoch);
+                    self.stats.flush(&self.root);
                 }
                 yejian_platform::ForegroundEvent::Foreground => {
                     self.applock.foreground(now_secs);
+                    self.app_foreground = true;
                 }
             }
         }
@@ -3146,6 +3244,18 @@ impl ReaderApp {
                 self.setting("app-lock", on.to_string());
                 yejian_platform::set_privacy_shield(on);
             }
+        }
+        // 阅读统计: conditions are pushed every frame; the module settles
+        // the interval itself so no span is credited to the wrong state.
+        {
+            let epoch = crate::follows::now() as f64;
+            let reading = matches!(self.screen, Screen::Reader(_));
+            self.stats.set_reader_open(reading, epoch);
+            self.stats.set_private(self.private, epoch);
+            self.stats.set_foreground(self.app_foreground, epoch);
+            self.stats.set_locked(self.applock.locked(), epoch);
+            self.stats.tick(epoch);
+            self.stats.flush_due(epoch, &self.root);
         }
         if self.applock.auth_in_flight() {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
@@ -3485,7 +3595,11 @@ impl ReaderApp {
             );
             let clicked = self.icon(ui, &format!("nav-{kind}"), icon_rect, kind, label);
             self.hitboxes.insert(format!("nav-{kind}"), rect);
-            let fresh = if tab == Tab::Sources { self.sources.fresh_follows() } else { 0 };
+            let fresh = if tab == Tab::Sources {
+                self.sources.fresh_follows() + self.sources.updatable_count()
+            } else {
+                0
+            };
             if fresh > 0 {
                 let badge = Rect::from_center_size(icon_rect.right_top() + vec2(2., 2.), vec2(20., 18.));
                 ui.painter().rect_filled(badge, 9., palette.accent);
@@ -4693,6 +4807,7 @@ impl ReaderApp {
         self.awake_log.push(on);
     }
     fn reader_tap(&mut self, id: &str, relative: f32, step: i32) {
+        self.stats.activity(crate::follows::now() as f64);
         if self.vertical || self.zoom > 1. || (0.27..=0.73).contains(&relative) {
             self.controls = !self.controls;
         } else {
@@ -5346,6 +5461,10 @@ impl ReaderApp {
         } else {
             ui.input(|i| i.smooth_scroll_delta.y)
         };
+        // Scrolling/dragging is user input: it keeps the reading clock live.
+        if scroll.abs() > 0.1 || gesture.dragged() {
+            self.stats.activity(crate::follows::now() as f64);
+        }
         self.vertical_reader.scroll(-scroll);
         if gesture.dragged() {
             self.vertical_reader
@@ -5575,36 +5694,194 @@ impl ReaderApp {
     }
     fn history_ui(&mut self, ui: &mut Ui, area: Rect) {
         let palette = crate::design::palette(self.dark);
-        let mut column = Self::page_column(area, 112. + 20. * (self.font_scale - 1.), 88.);
-        let mut books: Vec<_> = self
-            .books
-            .iter()
-            .filter(|b| b.last_read_at.is_some())
-            .cloned()
-            .collect();
-        books.sort_by_key(|b| std::cmp::Reverse(b.last_read_at));
+        let column = Self::page_column(area, 112. + 20. * (self.font_scale - 1.), 88.);
+        let now = crate::follows::now() as i64;
+
+        // Unified rows: local books carry last_read_at (millis), online
+        // works carry the download task's read_at (secs).
+        struct Row {
+            key: String,
+            title: String,
+            detail: String,
+            progress: f32,
+            at: i64,
+            book: Option<Book>,
+            online: Option<(String, String)>,
+        }
+        let mut rows: Vec<Row> = Vec::new();
+        for book in &self.books {
+            let Some(at) = book.last_read_at else {
+                continue;
+            };
+            rows.push(Row {
+                key: book.id.clone(),
+                title: self.reading_title(book),
+                detail: format!("第 {} / {} 页", book.current_page + 1, book.page_count),
+                progress: (book.current_page + 1) as f32 / book.page_count.max(1) as f32,
+                at: at / 1000,
+                book: Some(book.clone()),
+                online: None,
+            });
+        }
+        for read in self.sources.reading_history() {
+            let chapter = read
+                .chapter_number
+                .filter(|n| n.is_finite() && *n >= 1.)
+                .map(|n| format!("第 {n} 话"))
+                .unwrap_or_else(|| read.chapter_title.clone());
+            rows.push(Row {
+                key: format!("{}\u{1f}{}", read.source_id, read.manga_id),
+                title: read.manga_title.clone(),
+                detail: format!("在线 · {chapter} · 第 {} 页", read.read_page + 1),
+                progress: if read.pages_total > 0 {
+                    (read.read_page + 1) as f32 / read.pages_total as f32
+                } else {
+                    0.
+                },
+                at: read.read_at,
+                book: None,
+                online: Some((read.source_id, read.manga_id)),
+            });
+        }
+        // Hidden rows reappear when the work is read again after hidden_at.
+        rows.retain(|row| Self::history_row_visible(&self.history_hidden, &row.key, row.at));
+        let needle = self.history_query.trim().to_lowercase();
+        if !needle.is_empty() {
+            rows.retain(|row| row.title.to_lowercase().contains(&needle));
+        }
+        rows.sort_by_key(|row| std::cmp::Reverse(row.at));
+
+        // 今天 / 昨天 / 本周 / 更早 by local date (same ISO week = 本周).
+        let today = chrono::Local::now().date_naive();
+        let mut grouped: [Vec<Row>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        for row in rows {
+            grouped[Self::history_group(row.at, today)].push(row);
+        }
+        let any_rows = grouped.iter().any(|rows| !rows.is_empty());
+
         let introduction = ui.painter().layout(
-            if books.is_empty() {
-                "下一次打开，从离开的那一页继续。"
+            if any_rows {
+                "本地和网络，最近读过的故事都在这里。"
             } else {
-                "最近读过的故事，都在这里。"
+                "下一次打开，从离开的那一页继续。"
             }
             .into(),
             FontId::proportional(14. * self.font_scale),
             palette.muted,
             column.width(),
         );
-        column.min.y = area.top() + 82. + introduction.size().y + 20.;
-        ui.painter().galley(
-            pos2(column.left(), area.top() + 82.),
-            introduction,
-            palette.muted,
-        );
-        ui.scope_builder(UiBuilder::new().max_rect(column), |ui| {
+        let mut body = column;
+        body.min.y = area.top() + 82. + introduction.size().y + 20.;
+        ui.painter()
+            .galley(pos2(column.left(), area.top() + 82.), introduction, palette.muted);
+
+        ui.scope_builder(UiBuilder::new().max_rect(body), |ui| {
             ScrollArea::vertical()
                 .id_salt("reading-history")
                 .show(ui, |ui| {
-                    if books.is_empty() {
+                    // egui hands the inner content an unconstrained max
+                    // width here; clamp every child to the column so 320pt
+                    // splits never paint off-screen.
+                    ui.set_max_width(column.width());
+                    // Stats card: 今天/本周 minutes, streak, month chapters,
+                    // painted 7-day bar chart.
+                    crate::design::surface(ui).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.add_space(12.);
+                        crate::design::section(ui, "阅读统计");
+                        let epoch = crate::follows::now() as f64;
+                        let cells = [
+                            ("今天", format!("{} 分钟", self.stats.today_seconds(epoch) / 60)),
+                            ("本周", format!("{} 分钟", self.stats.week_seconds(epoch) / 60)),
+                            ("连续阅读", format!("{} 天", self.stats.streak(epoch))),
+                            ("本月读完", format!("{} 章", self.stats.month_chapters(epoch))),
+                        ];
+                        // Four equal columns: they never overflow the card,
+                        // even at 200 percent on a 320pt split.
+                        ui.columns(cells.len(), |cols| {
+                            for (col, (label, value)) in
+                                cols.iter_mut().zip(cells.into_iter())
+                            {
+                                col.vertical(|ui| {
+                                    ui.label(
+                                        RichText::new(value)
+                                            .strong()
+                                            .size(17. * self.font_scale),
+                                    );
+                                    ui.label(
+                                        RichText::new(label).small().color(palette.muted),
+                                    );
+                                });
+                            }
+                        });
+                        ui.add_space(10.);
+                        // 7-day bars, oldest left, accent fill.
+                        let seven = self.stats.last_seven(epoch);
+                        let max = seven.iter().map(|(_, s)| *s).max().unwrap_or(0).max(1) as f32;
+                        let width = ui.available_width();
+                        let gap = 8.;
+                        let bar_w = ((width - gap * 6.) / 7.).max(6.);
+                        let chart_h = 56. * self.font_scale.min(1.4);
+                        let (rect, _) = ui.allocate_exact_size(
+                            vec2(width, chart_h + 18. * self.font_scale),
+                            Sense::hover(),
+                        );
+                        for (index, (day, secs)) in seven.iter().enumerate() {
+                            let x = rect.left() + index as f32 * (bar_w + gap);
+                            let h =
+                                (chart_h * (*secs as f32 / max)).max(if *secs > 0 { 3. } else { 0. });
+                            let bar = Rect::from_min_size(
+                                pos2(x, rect.top() + chart_h - h),
+                                vec2(bar_w, h.max(2.)),
+                            );
+                            ui.painter().rect_filled(
+                                bar,
+                                4.,
+                                if h > 0. { palette.accent } else { palette.line },
+                            );
+                            let weekday = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d")
+                                .map(|d| d.weekday().num_days_from_monday() as usize)
+                                .unwrap_or(0);
+                            let ch = ['一', '二', '三', '四', '五', '六', '日'][weekday];
+                            ui.painter().text(
+                                pos2(x + bar_w / 2., rect.bottom() - 6. * self.font_scale),
+                                Align2::CENTER_CENTER,
+                                ch.to_string(),
+                                FontId::proportional(10. * self.font_scale),
+                                palette.muted,
+                            );
+                        }
+                        ui.add_space(8.);
+                    });
+                    ui.add_space(14.);
+
+                    // Button first in right-to-left layout so the search
+                    // field gets exactly what is left — no overflow at 200%.
+                    // The outer horizontal row pins the height to the
+                    // content; a bare with_layout would allocate the whole
+                    // remaining scroll height.
+                    ui.horizontal(|ui| {
+                        ui.with_layout(
+                            Layout::right_to_left(Align::Center),
+                            |ui| {
+                                let clear =
+                                    ui.add_enabled(any_rows, Button::new("清空足迹"));
+                                self.hitboxes.insert("history-clear".into(), clear.rect);
+                                if clear.clicked() {
+                                    self.history_clear = true;
+                                }
+                                let search = ui.add(
+                                    TextEdit::singleline(&mut self.history_query)
+                                        .hint_text("搜索标题")
+                                        .desired_width(ui.available_width().max(60.)),
+                                );
+                                self.hitboxes.insert("history-search".into(), search.rect);
+                            },
+                        );
+                    });
+                    ui.add_space(10.);
+
+                    if !any_rows {
                         crate::design::surface(ui).show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             ui.add_space(24.);
@@ -5620,97 +5897,271 @@ impl ReaderApp {
                             ui.add_space(16.);
                         });
                     }
-                    for book in books {
-                        let narrow = ui.available_width() < 380. || self.font_scale > 1.4;
-                        let height = if narrow {
-                            156. * self.font_scale.sqrt()
-                        } else {
-                            116.
-                        };
-                        let (rect, _) = ui.allocate_exact_size(
-                            vec2(ui.available_width(), height),
-                            Sense::hover(),
-                        );
-                        if !ui.is_rect_visible(rect) {
+
+                    for (index, rows) in grouped.into_iter().enumerate() {
+                        if rows.is_empty() {
                             continue;
                         }
-                        let cover_id = self.cover_id(&book.id);
-                        self.ask_cover(ui.ctx(), &cover_id);
-                        ui.painter().rect_filled(rect, 18., palette.surface);
-                        let cover = Rect::from_min_size(rect.min + vec2(14., 14.), vec2(58., 82.));
-                        if let Some(texture) = self.covers.get(&cover_id) {
-                            shelf::paint_art(
+                        crate::design::section(ui, ["今天", "昨天", "本周", "更早"][index]);
+                        for row in rows {
+                            let narrow = ui.available_width() < 380. || self.font_scale > 1.4;
+                            let height = if narrow {
+                                156. * self.font_scale.sqrt()
+                            } else {
+                                116.
+                            };
+                            let (rect, _) = ui.allocate_exact_size(
+                                vec2(ui.available_width(), height),
+                                Sense::hover(),
+                            );
+                            if !ui.is_rect_visible(rect) {
+                                continue;
+                            }
+                            // The row continues reading; the action zone
+                            // (继续/移除) on the right is left to its widgets.
+                            let open = ui.interact(
+                                Rect::from_min_max(
+                                    rect.min,
+                                    pos2(rect.right() - 110., rect.max.y),
+                                ),
+                                ui.scope_id().with(("history-row", &row.key)),
+                                Sense::click(),
+                            );
+                            self.hitboxes
+                                .insert(format!("history-{}", row.key), rect);
+                            ui.painter().rect_filled(rect, 18., palette.surface);
+                            let cover_rect =
+                                Rect::from_min_size(rect.min + vec2(14., 14.), vec2(58., 82.));
+                            let mut covered = false;
+                            if let Some(book) = &row.book {
+                                let cover_id = self.cover_id(&book.id);
+                                self.ask_cover(ui.ctx(), &cover_id);
+                                if let Some(texture) = self.covers.get(&cover_id) {
+                                    covered = true;
+                                    shelf::paint_art(
+                                        ui.painter(),
+                                        Plane::rect(cover_rect),
+                                        cover_rect.size(),
+                                        texture,
+                                        palette.soft,
+                                    );
+                                }
+                            }
+                            if !covered {
+                                ui.painter().rect_filled(cover_rect, 7., palette.soft);
+                                if row.online.is_some() {
+                                    ui.painter().text(
+                                        cover_rect.center(),
+                                        Align2::CENTER_CENTER,
+                                        "在线",
+                                        FontId::proportional(12. * self.font_scale),
+                                        palette.muted,
+                                    );
+                                }
+                            }
+                            let text_pos = rect.min + vec2(88., 16.);
+                            let mut title = egui::text::LayoutJob::simple(
+                                row.title.clone(),
+                                FontId::proportional(17. * self.font_scale),
+                                palette.ink,
+                                (rect.width() - if narrow { 104. } else { 210. }).max(60.),
+                            );
+                            title.wrap.max_rows = 1;
+                            ui.painter()
+                                .galley(text_pos, ui.painter().layout_job(title), palette.ink);
+                            self.label(
                                 ui.painter(),
-                                Plane::rect(cover),
-                                cover.size(),
-                                texture,
-                                palette.soft,
+                                text_pos + vec2(0., 24. * self.font_scale + 4.),
+                                &row.detail,
+                                13.,
+                                palette.muted,
                             );
-                        } else {
-                            ui.painter().rect_filled(cover, 7., palette.soft);
-                        }
-                        let text_pos = rect.min + vec2(88., 16.);
-                        let mut title = egui::text::LayoutJob::simple(
-                            self.reading_title(&book),
-                            FontId::proportional(17. * self.font_scale),
-                            palette.ink,
-                            (rect.width() - if narrow { 104. } else { 210. }).max(60.),
-                        );
-                        title.wrap.max_rows = 1;
-                        ui.painter()
-                            .galley(text_pos, ui.painter().layout_job(title), palette.ink);
-                        self.label(
-                            ui.painter(),
-                            text_pos + vec2(0., 24. * self.font_scale + 4.),
-                            &format!("第 {} / {} 页", book.current_page + 1, book.page_count),
-                            13.,
-                            palette.muted,
-                        );
-                        let track = Rect::from_min_size(
-                            pos2(text_pos.x, cover.bottom() - 5.),
-                            vec2(
-                                (rect.right() - text_pos.x - if narrow { 16. } else { 120. })
-                                    .max(20.),
-                                3.,
-                            ),
-                        );
-                        if self.font_scale <= 1.4 {
-                            ui.painter().rect_filled(track, 2., palette.line);
-                            ui.painter().rect_filled(
-                                Rect::from_min_size(
-                                    track.min,
-                                    vec2(
-                                        track.width() * (book.current_page + 1) as f32
-                                            / book.page_count.max(1) as f32,
-                                        3.,
+                            let track = Rect::from_min_size(
+                                pos2(text_pos.x, cover_rect.bottom() - 5.),
+                                vec2(
+                                    (rect.right() - text_pos.x - if narrow { 16. } else { 120. })
+                                        .max(20.),
+                                    3.,
+                                ),
+                            );
+                            if self.font_scale <= 1.4 {
+                                ui.painter().rect_filled(track, 2., palette.line);
+                                ui.painter().rect_filled(
+                                    Rect::from_min_size(
+                                        track.min,
+                                        vec2(track.width() * row.progress.clamp(0., 1.), 3.),
                                     ),
+                                    2.,
+                                    palette.accent,
+                                );
+                            }
+                            let button_y = if narrow {
+                                rect.bottom() - 58.
+                            } else {
+                                rect.center().y - 24.
+                            };
+                            let continue_clicked = self.button(
+                                ui,
+                                &format!("history-go-{}", row.key),
+                                Rect::from_min_size(
+                                    pos2(rect.right() - 104., button_y),
+                                    vec2(88., 48.),
                                 ),
-                                2.,
-                                palette.accent,
+                                "继续",
+                                true,
+                            ) || open.clicked();
+                            if continue_clicked {
+                                if let Some(book) = &row.book {
+                                    let book = book.clone();
+                                    self.open_reader(&book);
+                                } else if let Some((source, manga)) = &row.online {
+                                    let (source, manga) = (source.clone(), manga.clone());
+                                    if self.sources.open_history_work(&source, &manga) {
+                                        self.selected.clear();
+                                        self.tab = Tab::Sources;
+                                        self.screen = Screen::Library;
+                                    }
+                                }
+                            }
+                            // 从足迹移除 hides the row; progress is untouched
+                            // and a later read reappears it.
+                            let hide_rect = Rect::from_min_size(
+                                pos2(rect.right() - 60., rect.top() + 8.),
+                                vec2(52., 30.),
                             );
-                        }
-                        if self.button(
-                            ui,
-                            &format!("history-{}", book.id),
-                            Rect::from_min_size(
-                                pos2(
-                                    rect.right() - 104.,
-                                    if narrow {
-                                        rect.bottom() - 58.
-                                    } else {
-                                        rect.center().y - 24.
-                                    },
-                                ),
-                                vec2(88., 48.),
-                            ),
-                            "继续",
-                            true,
-                        ) {
-                            self.open_reader(&book);
+                            let hide = ui.interact(
+                                hide_rect,
+                                ui.scope_id().with(("history-hide", &row.key)),
+                                Sense::click(),
+                            );
+                            self.hitboxes
+                                .insert(format!("history-hide-{}", row.key), hide_rect);
+                            ui.painter().text(
+                                hide_rect.center(),
+                                Align2::CENTER_CENTER,
+                                "移除",
+                                FontId::proportional(12. * self.font_scale),
+                                if hide.hovered() {
+                                    palette.ink
+                                } else {
+                                    palette.muted
+                                },
+                            );
+                            if hide.clicked() {
+                                self.history_hidden.insert(row.key.clone(), now);
+                                self.save_history_hidden();
+                            }
                         }
                     }
                 });
         });
+    }
+
+    /// A hidden footprint row reappears once it is read again after
+    /// `hidden_at` (epoch seconds).
+    fn history_row_visible(
+        hidden: &BTreeMap<String, i64>,
+        key: &str,
+        at: i64,
+    ) -> bool {
+        hidden.get(key).is_none_or(|hidden_at| at > *hidden_at)
+    }
+
+    /// 0=今天 1=昨天 2=本周(same ISO week) 3=更早 for a local-day group.
+    fn history_group(at: i64, today: chrono::NaiveDate) -> usize {
+        let Some(date) = chrono::DateTime::from_timestamp(at, 0)
+            .map(|stamp| stamp.with_timezone(&chrono::Local).date_naive())
+        else {
+            return 3;
+        };
+        if date == today {
+            0
+        } else if date == today - chrono::Duration::days(1) {
+            1
+        } else if date.iso_week() == today.iso_week() {
+            2
+        } else {
+            3
+        }
+    }
+
+    /// `history-hidden` entries [{key, hidden_at}] through the settings store.
+    fn save_history_hidden(&mut self) {
+        let entries: Vec<serde_json::Value> = self
+            .history_hidden
+            .iter()
+            .map(|(key, at)| serde_json::json!({"key": key, "hidden_at": at}))
+            .collect();
+        self.setting(
+            "history-hidden",
+            serde_json::to_string(&entries).unwrap_or_else(|_| "[]".into()),
+        );
+    }
+
+    /// Opaque 清空足迹 confirm, same recipe as the storage modals.
+    fn history_clear_ui(&mut self, ctx: &Context) {
+        if !self.history_clear {
+            return;
+        }
+        let screen = ctx.content_rect();
+        let scrim = Area::new(Id::unique("footprint-clear-scrim"))
+            .order(Order::Foreground)
+            .fade_in(false)
+            .interactable(true)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                ui.painter()
+                    .rect_filled(screen, 0., Color32::from_black_alpha(96));
+                ui.allocate_rect(screen, Sense::click())
+            });
+        if scrim.inner.clicked() {
+            self.history_clear = false;
+            return;
+        }
+        let mut card_rect = Rect::NOTHING;
+        Area::new(Id::unique("footprint-clear"))
+            .order(Order::Foreground)
+            .fade_in(false)
+            .interactable(true)
+            .movable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                let frame = crate::design::surface(ui).show(ui, |ui| {
+                    ui.set_width((screen.width() - 56.).clamp(220., 420.));
+                    ui.heading("清空阅读足迹");
+                    ui.label("从足迹移除全部记录，阅读进度不受影响，再次阅读会重新出现。");
+                    ui.add_space(6.);
+                    ui.horizontal(|ui| {
+                        if ui.button("取消").clicked() {
+                            self.history_clear = false;
+                        }
+                        let confirm = ui.add(crate::design::danger("清空", self.dark));
+                        self.hitboxes
+                            .insert("footprint-clear-go".into(), confirm.rect);
+                        if confirm.clicked() {
+                            // Hide everything currently visible at this
+                            // moment; re-reading surfaces the work again.
+                            let now = crate::follows::now() as i64;
+                            for book in &self.books {
+                                if book.last_read_at.is_some() {
+                                    self.history_hidden.insert(book.id.clone(), now);
+                                }
+                            }
+                            for read in self.sources.reading_history() {
+                                self.history_hidden.insert(
+                                    format!("{}\u{1f}{}", read.source_id, read.manga_id),
+                                    now,
+                                );
+                            }
+                            self.save_history_hidden();
+                            self.history_clear = false;
+                        }
+                    });
+                });
+                card_rect = frame.response.rect;
+            });
+        self.hitboxes
+            .insert("footprint-clear-card".into(), card_rect);
     }
     fn settings_ui(&mut self, ui: &mut Ui, area: Rect) {
         if !self.storage_opened {
@@ -7538,6 +7989,7 @@ impl ReaderApp {
                 });
         }
         self.storage_confirm_ui(ctx);
+        self.history_clear_ui(ctx);
         self.category_panels_ui(ctx);
         if let Some(key) = self.track_panel.clone() {
             let response = Modal::new(Id::unique("track-panel")).show(ctx, |ui| {
@@ -7666,6 +8118,10 @@ impl eframe::App for ReaderApp {
     fn on_exit(&mut self) {
         self.keep_awake(false);
         self.flush_position();
+        let epoch = crate::follows::now() as f64;
+        self.stats.set_reader_open(false, epoch);
+        self.stats.tick(epoch);
+        self.stats.flush(&self.root);
         self.page_generation += 1;
         self.worker
             .generation

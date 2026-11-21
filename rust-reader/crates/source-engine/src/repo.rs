@@ -56,7 +56,7 @@ impl From<CatalogError> for RepoError {
 }
 
 /// One installable entry from a repository index.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RepositorySource {
     pub id: String,
     pub name: String,
@@ -70,7 +70,7 @@ pub struct RepositorySource {
 }
 
 /// Parsed repository index.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RepositoryIndex {
     pub name: Option<String>,
     pub website: Option<String>,

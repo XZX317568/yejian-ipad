@@ -36,6 +36,10 @@ pub struct Follow {
     /// finished means the resume target is the first chapter *after* it.
     #[serde(default)]
     pub resume_done: bool,
+    /// Set when its source was uninstalled: the row reads 书源已卸载 and
+    /// update checks skip it (cleared automatically if the source returns).
+    #[serde(default)]
+    pub source_removed: bool,
     #[serde(default)]
     pub error: Option<String>,
 }

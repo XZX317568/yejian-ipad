@@ -520,6 +520,51 @@ fn scroll_page(h: &mut Harness, delta: f32) -> Result<()> {
     Ok(())
 }
 
+/// Scroll the page until hitbox `id` is fully inside its scroll clip and
+/// its `label` caption is painted within it — the same condition
+/// design_touch asserts. Used for rows the stats card can push anywhere
+/// below the fold.
+fn scroll_until_row_visible(h: &mut Harness, id: &str, label: &str) -> Result<()> {
+    let mut last_center: Option<f32> = None;
+    for _ in 0..60 {
+        let rect = h.app.hitboxes.get(id).copied();
+        if let Some(rect) = rect {
+            let visible = h.painted_text.iter().any(|text| {
+                text.text == label
+                    && rect.expand(0.5).contains_rect(text.bounds)
+                    && text.clip.expand(0.5).contains_rect(rect)
+            });
+            if visible {
+                return Ok(());
+            }
+            last_center = Some(rect.center().y);
+            // Negative delta scrolls down (rows move up) and vice versa.
+            // Use the row's own scroll clip to pick the direction: if the
+            // bottom is cut, scroll down; if the top is cut, scroll up.
+            let clip = h
+                .painted_text
+                .iter()
+                .find(|text| rect.intersects(text.bounds))
+                .map(|text| text.clip)
+                .unwrap_or_else(|| design_safe_rect(h));
+            let delta = if rect.bottom() > clip.bottom() + 1. {
+                -30.
+            } else if rect.top() < clip.top() - 1. {
+                30.
+            } else if rect.center().y > clip.center().y {
+                -30.
+            } else {
+                30.
+            };
+            scroll_page(h, delta)?;
+        } else {
+            let down = last_center.map(|y| y > design_safe_rect(h).center().y).unwrap_or(true);
+            scroll_page(h, if down { -30. } else { 30. })?;
+        }
+    }
+    Ok(())
+}
+
 fn design_touch(h: &Harness, id: &str, label: Option<&str>) -> Result<()> {
     let rect = *h
         .app
@@ -918,6 +963,10 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
     h.click("nav-history")?;
     h.frames(4)?;
     let resume = format!("history-{read_id}");
+    // The stats card sits on top now; scroll until the resume row's
+    // touch target is fully inside its scroll clip before tapping it
+    // (the same condition design_touch asserts).
+    scroll_until_row_visible(h, &resume, "继续")?;
     design_touch(h, &resume, None)?;
     design_capture(h, "design-history", &mut captures)?;
     h.click(&resume)?;
@@ -1190,6 +1239,119 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
     );
     design_capture(h, "migrate-done", &mut captures)?;
 
+    // Round D: 阅读足迹 — grouped local+online rows under the stats card,
+    // then 书源管理 — update badge, 测试 result, opaque uninstall confirm
+    // and the repository language/name filter.
+    h.app.prepare_history_acceptance();
+    h.frames(6)?;
+    // The ScrollArea offset persists in egui memory across screens;
+    // return to the top so the stats card is in view.
+    for _ in 0..24 {
+        if design_label_visible(h, "阅读统计") {
+            break;
+        }
+        scroll_page(h, 300.)?;
+    }
+    anyhow::ensure!(
+        design_label_visible(h, "阅读统计")
+            && design_label_visible(h, "连续阅读")
+            && design_label_visible(h, "本月读完")
+            && design_label_visible(h, "今天"),
+        "roundD: the stats card did not render: {:?}",
+        h.texts.iter().map(|(text, _)| text).collect::<Vec<_>>()
+    );
+    anyhow::ensure!(
+        h.app.hitboxes.contains_key("history-search")
+            && h.app.hitboxes.contains_key("history-clear"),
+        "roundD: history search/clear controls are missing"
+    );
+    design_capture(h, "history-stats", &mut captures)?;
+    // The group sections beyond 今天 sit below the first viewport; scroll
+    // the page until 昨天/更早 render.
+    for _ in 0..24 {
+        if design_label_visible(h, "更早") {
+            break;
+        }
+        scroll_page(h, -300.)?;
+    }
+    design_capture(h, "history-grouped", &mut captures)?;
+    anyhow::ensure!(
+        design_label_visible(h, "更早")
+            && (design_label_visible(h, "昨天") || design_label_visible(h, "本周")),
+        "roundD: history groups did not render: {:?}",
+        h.texts.iter().map(|(text, _)| text).collect::<Vec<_>>()
+    );
+
+    h.app.prepare_sources_manage_acceptance();
+    h.frames(6)?;
+    anyhow::ensure!(
+        h.app.hitboxes.contains_key("source-uninstall-local.manage-a")
+            && h.app.hitboxes.contains_key("source-test-local.manage-b")
+            && h.app.hitboxes.contains_key("source-update-local.manage-a"),
+        "roundD: 我的书源 action slots are missing"
+    );
+    design_capture(h, "sources-manage", &mut captures)?;
+    // The manage-a/manage-b rows sit below the fold; scroll until both the
+    // update badge and the finished 测试 result are painted.
+    for _ in 0..24 {
+        let badge = h
+            .texts
+            .iter()
+            .any(|(text, _)| text.contains("有更新 v3"));
+        let result = h
+            .texts
+            .iter()
+            .any(|(text, _)| text.contains("可用 · 820 ms"));
+        if badge && result {
+            break;
+        }
+        scroll_page(h, -200.)?;
+    }
+    anyhow::ensure!(
+        h.texts
+            .iter()
+            .any(|(text, _)| text.contains("可用 · 820 ms")),
+        "roundD: the 测试 result did not render"
+    );
+    anyhow::ensure!(
+        h.texts
+            .iter()
+            .any(|(text, _)| text.contains("有更新 v3")),
+        "roundD: the 有更新 badge did not render"
+    );
+    design_capture(h, "sources-test", &mut captures)?;
+
+    // Scroll past 我的书源 to the repository list for the filter capture.
+    for _ in 0..24 {
+        if h.app.hitboxes.contains_key("repo-lang-中文") {
+            break;
+        }
+        scroll_page(h, -160.)?;
+    }
+    anyhow::ensure!(
+        h.app.hitboxes.contains_key("repo-lang-中文"),
+        "roundD: repository language chips are missing"
+    );
+    h.click("repo-lang-中文")?;
+    h.frames(4)?;
+    anyhow::ensure!(
+        !design_label_visible(h, "さくら文庫")
+            && design_label_visible(h, "纸间图源 · 中文"),
+        "roundD: the 中文 language chip did not filter the repository list"
+    );
+    design_capture(h, "repo-filter", &mut captures)?;
+
+    h.app.open_uninstall_acceptance();
+    h.frames(4)?;
+    anyhow::ensure!(
+        design_label_visible(h, "已下载的章节保留；这个书源上的追更会停止更新，并标为「书源已卸载」。"),
+        "roundD: the uninstall warning did not render"
+    );
+    design_capture(h, "source-uninstall-confirm", &mut captures)?;
+    assert_opaque_card(h, "source-uninstall-confirm.png", "source-uninstall-card")?;
+    h.click_text("取消")?;
+    h.frames(3)?;
+
     // Round B: Bangumi login + binding against a local fake API, then the
     // 进度跟踪 settings row shows the account.
     let (bangumi_base, _bangumi_server) = fake_bangumi();
@@ -1360,18 +1522,30 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
         h.app.screen_name() == "library",
         "design: direct reading lost its shelf return"
     );
+    h.app.prepare_history_acceptance();
     h.click("nav-history")?;
     h.frames(5)?;
+    // The ScrollArea offset persists in egui memory across the recreated
+    // app; return to the top so the stats card and rows are visible.
+    for _ in 0..24 {
+        if design_label_visible(h, "阅读统计") {
+            break;
+        }
+        scroll_page(h, 300.)?;
+    }
     design_capture(h, "design-large-text-history", &mut captures)?;
+    design_capture(h, "history-stats-320", &mut captures)?;
     anyhow::ensure!(
-        design_label_visible(h, "最近读过的故事，都在这里。"),
+        design_label_visible(h, "本地和网络，最近读过的故事都在这里。")
+            && design_label_visible(h, "阅读统计"),
         "design: 320pt/200 percent history introduction is clipped"
     );
-    design_touch(h, &resume, Some("继续"))?;
+    // Covers in the groups below must never overlap the wrapped
+    // introduction (checked here while the top of the page is visible).
     let introduction = h
         .painted_text
         .iter()
-        .find(|text| text.text == "最近读过的故事，都在这里。")
+        .find(|text| text.text == "本地和网络，最近读过的故事都在这里。")
         .context("design: history introduction is missing")?;
     let visible_covers: Vec<_> = h
         .painted_images
@@ -1379,13 +1553,23 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
         .map(|image| image.bounds.intersect(image.clip))
         .filter(|rect| rect.is_positive())
         .collect();
+    // With the stats card on top there may be no cover in the first
+    // viewport; every cover that is painted must still sit below the intro.
     anyhow::ensure!(
-        !visible_covers.is_empty()
-            && visible_covers
-                .iter()
-                .all(|rect| rect.top() >= introduction.bounds.bottom()),
-        "design: large-text history rows overlap the wrapped introduction"
+        visible_covers
+            .iter()
+            .all(|rect| rect.top() >= introduction.bounds.bottom()),
+        "design: large-text history rows overlap the wrapped introduction {:?} covers {:?}",
+        introduction.bounds,
+        visible_covers
     );
+    // The resume row can sit anywhere below the stats card; scroll
+    // adaptively until its touch target is fully inside the safe area.
+
+    // scroll_page issues six wheel events per call — keep the delta small
+    // or the row overshoots the safe area in both directions.
+    scroll_until_row_visible(h, &resume, "继续")?;
+    design_touch(h, &resume, Some("继续"))?;
     h.click(&resume)?;
     h.wait(ReaderApp::page_loaded)?;
     h.frame(vec![], None)?;
@@ -2103,6 +2287,8 @@ fn daily_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
     h.frames(5)?;
     let resume = format!("history-{}", one.id);
     let mut captures = Vec::new();
+    // The stats card can push the resume row below the fold.
+    scroll_until_row_visible(h, &resume, "继续")?;
     design_touch(h, &resume, None)?;
     h.click(&resume)?;
     h.wait(ReaderApp::page_loaded)?;
@@ -2374,7 +2560,9 @@ fn daily_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
         h.frames(8)?;
         h.click("nav-history")?;
         h.frames(5)?;
-        h.click(&format!("history-{}", two.id))?;
+        let row = format!("history-{}", two.id);
+        scroll_until_row_visible(h, &row, "继续")?;
+        h.click(&row)?;
         h.wait(ReaderApp::page_loaded)?;
         h.frames(3)?;
         h.click("reader-settings")?;

@@ -608,6 +608,9 @@ fn read_settings(library: &Library) -> anyhow::Result<Vec<(String, String)>> {
         "auto-download",
         "app-lock",
         "app-lock-delay",
+        "history-hidden",
+        "source-repos",
+        "source-repos-checked-at",
         "shelf-grid",
         "shelf-sort",
         "search-scope",
@@ -1206,6 +1209,12 @@ mod tests {
         original.set_setting("app-lock", "true").unwrap();
         original.set_setting("app-lock-delay", "300").unwrap();
         original
+            .set_setting("source-repos", "[\"https://repo.example/index.json\"]")
+            .unwrap();
+        original
+            .set_setting("history-hidden", "[{\"key\":\"b1\",\"hidden_at\":7}]")
+            .unwrap();
+        original
             .set_setting("search-history", "[\"星海\",\"猎人\"]")
             .unwrap();
         original
@@ -1234,6 +1243,14 @@ mod tests {
                 assert!(settings.contains(&("auto-download".into(), "latest3".into())));
                 assert!(settings.contains(&("app-lock".into(), "true".into())));
                 assert!(settings.contains(&("app-lock-delay".into(), "300".into())));
+                assert!(settings.contains(&(
+                    "source-repos".into(),
+                    "[\"https://repo.example/index.json\"]".into()
+                )));
+                assert!(settings.contains(&(
+                    "history-hidden".into(),
+                    "[{\"key\":\"b1\",\"hidden_at\":7}]".into()
+                )));
                 assert!(settings.contains(&(
                     "search-history".into(),
                     "[\"星海\",\"猎人\"]".into()
