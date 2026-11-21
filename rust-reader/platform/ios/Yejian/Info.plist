@@ -173,5 +173,7 @@
             </dict>
         </dict>
     </array>
+    <key>NSPhotoLibraryAddUsageDescription</key>
+    <string>保存漫画页面到相册</string>
 </dict>
 </plist>

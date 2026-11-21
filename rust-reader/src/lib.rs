@@ -1,3 +1,4 @@
+mod bookmarks;
 mod design;
 mod follows;
 #[cfg(target_os = "ios")]

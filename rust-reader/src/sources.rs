@@ -1490,6 +1490,15 @@ pub struct Sources {
     global_groups: Vec<GlobalGroup>,
     /// New scope choice for `ReaderApp` to persist under `search-scope`.
     scope_dirty: Option<String>,
+    /// Submitted keywords, newest first, capped at 20. Persisted by
+    /// `ReaderApp` under `search-history`.
+    search_history: Vec<String>,
+    /// History changed and `ReaderApp` should persist it.
+    history_dirty: bool,
+    /// A tap on 清空 asks for confirmation before dropping the history.
+    history_confirm: bool,
+    /// Private reading suppresses history recording (mirrors the setting).
+    private: bool,
     global_tx: mpsc::Sender<GlobalCmd>,
     global_rx: mpsc::Receiver<GlobalEvent>,
     storage_tx: mpsc::Sender<StorageCmd>,
@@ -2931,6 +2940,10 @@ impl Sources {
             global_query: String::new(),
             global_groups: Vec::new(),
             scope_dirty: None,
+            search_history: Vec::new(),
+            history_dirty: false,
+            history_confirm: false,
+            private: false,
             global_tx: global_cmd_tx,
             global_rx,
             storage_tx,
@@ -3705,6 +3718,55 @@ impl Sources {
     pub fn resume_stream(&mut self, id: &str) {
         self.prioritize(id);
     }
+    /// A bookmarked online chapter reopens as a stream when its download
+    /// task exists; returns false when nothing for the chapter was queued.
+    pub(crate) fn open_bookmarked(&mut self, source: &str, manga: &str, chapter: &str) -> bool {
+        let Some(task) = self.tasks.iter().find(|task| {
+            let meta = task.metadata();
+            meta.source_id == source && meta.manga_id == manga && meta.chapter_id == chapter
+        }) else {
+            return false;
+        };
+        let id = task.id.clone();
+        let metadata = task.metadata();
+        self.prioritize(&id);
+        self.stream_request = Some(StreamChapter {
+            id,
+            metadata,
+            from_end: false,
+        });
+        true
+    }
+    #[cfg(debug_assertions)]
+    /// A paused online chapter with no staged pages — the acceptance
+    /// share-disabled state needs bytes that never arrive.
+    pub(crate) fn preview_share_stream(&mut self) -> Option<StreamChapter> {
+        let manga = Manga {
+            source_key: "acceptance".into(),
+            key: "share-preview".into(),
+            title: "分享验收".into(),
+            ..Default::default()
+        };
+        let chapter = Chapter {
+            key: "c1".into(),
+            title: Some("第 1 话".into()),
+            ..Default::default()
+        };
+        let mut task = DownloadTask::from_chapter("acceptance", &manga, &chapter);
+        task.pages_total = 4;
+        task.status = DownloadStatus::Paused;
+        if self.tasks.iter().any(|queued| queued.id == task.id) {
+            return None;
+        }
+        let id = task.id.clone();
+        let metadata = task.metadata();
+        self.tasks.push(task);
+        Some(StreamChapter {
+            id,
+            metadata,
+            from_end: false,
+        })
+    }
     /// Reads a chapter without waiting for the whole download: the chapter
 
     /// is downloaded first, the reader shows pages as they arrive, and the
@@ -4150,6 +4212,64 @@ impl Sources {
     pub(crate) fn take_scope_change(&mut self) -> Option<String> {
         self.scope_dirty.take()
     }
+
+    /// Restored from the `search-history` setting at startup.
+    pub(crate) fn set_search_history(&mut self, history: Vec<String>) {
+        self.search_history = history;
+    }
+    #[cfg(debug_assertions)]
+    /// Empties the search field so history chips show (acceptance).
+    pub(crate) fn clear_query(&mut self) {
+        self.query.clear();
+    }
+    #[allow(dead_code)] // read by the acceptance bin and unit tests
+    pub(crate) fn search_history(&self) -> &[String] {
+        &self.search_history
+    }
+    /// History changed (record/clear/remove): `ReaderApp` persists it.
+    pub(crate) fn take_history_change(&mut self) -> Option<Vec<String>> {
+        if self.history_dirty {
+            self.history_dirty = false;
+            Some(self.search_history.clone())
+        } else {
+            None
+        }
+    }
+    pub(crate) fn set_private(&mut self, private: bool) {
+        self.private = private;
+    }
+
+    /// Newest first, deduplicated, at most 20 entries; private mode records
+    /// nothing.
+    fn record_history(&mut self) {
+        let query = self.query.trim();
+        if self.private || query.is_empty() {
+            return;
+        }
+        let query = query.to_string();
+        self.search_history.retain(|item| item != &query);
+        self.search_history.insert(0, query);
+        self.search_history.truncate(20);
+        self.history_dirty = true;
+    }
+
+    /// Whether the page's original bytes already exist locally — required
+    /// before sharing is enabled.
+    pub(crate) fn page_ready(&self, id: &str, page: usize) -> bool {
+        let Some(task_id) = id.strip_prefix(STREAM_PREFIX) else {
+            return true;
+        };
+        let Some(task) = self.tasks.iter().find(|task| task.id == task_id) else {
+            return false;
+        };
+        if task.pages_done > page {
+            return true;
+        }
+        task_dir(&self.root, task_id)
+            .ok()
+            .and_then(|dir| stored_page(&dir, page + 1))
+            .is_some()
+    }
     /// Width of the two-segment scope control, so the search row can budget.
     fn scope_segment_width(&self, ui: &Ui) -> f32 {
         let font = TextStyle::Body.resolve(ui.style());
@@ -4310,6 +4430,7 @@ impl Sources {
     /// New search from the text field: page one of this source and query.
 
     fn start_search(&mut self) {
+        self.record_history();
         if self.global_mode() {
             self.global_search();
             return;
@@ -5375,6 +5496,33 @@ impl Sources {
                     self.start_search();
                 }
             });
+            if self.query.trim().is_empty() && !self.search_history.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    let mut index = 0;
+                    while index < self.search_history.len() {
+                        let label = self.search_history[index].clone();
+                        let chip = ui.add(quiet_action(&label));
+                        self.hitboxes
+                            .insert(format!("history-{index}"), chip.rect);
+                        if chip.long_touched() {
+                            self.search_history.remove(index);
+                            self.history_dirty = true;
+                            continue;
+                        }
+                        index += 1;
+                        if chip.clicked() {
+                            self.query = label;
+                            self.start_search();
+                            return;
+                        }
+                    }
+                    let clear = ui.add(quiet_action("清空"));
+                    self.hitboxes.insert("history-clear".into(), clear.rect);
+                    if clear.clicked() {
+                        self.history_confirm = true;
+                    }
+                });
+            }
             ui.horizontal_wrapped(|ui| {
                 if !self.global_mode() {
                     let hidden = self.filters_hidden();
@@ -7152,6 +7300,64 @@ impl Sources {
                 }
             });
         }
+        self.history_confirm_ui(ui.ctx());
+    }
+
+    /// Opaque scrim + card, matching the shelf delete confirmations.
+    fn history_confirm_ui(&mut self, ctx: &Context) {
+        if !self.history_confirm {
+            return;
+        }
+        let screen = ctx.content_rect();
+        let scrim = Area::new(egui::Id::unique("history-clear-scrim"))
+            .order(Order::Foreground)
+            .fade_in(false)
+            .interactable(true)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                ui.painter()
+                    .rect_filled(screen, 0., Color32::from_black_alpha(96));
+                ui.allocate_rect(screen, Sense::click())
+            });
+        if scrim.inner.clicked() {
+            self.history_confirm = false;
+            return;
+        }
+        let mut card_rect = Rect::NOTHING;
+        Area::new(egui::Id::unique("history-clear"))
+            .order(Order::Foreground)
+            .fade_in(false)
+            .interactable(true)
+            .movable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                let frame = crate::design::surface(ui).show(ui, |ui| {
+                    ui.set_width((screen.width() - 56.).clamp(220., 420.));
+                    ui.heading("清空搜索历史");
+                    ui.label("删除全部搜索记录，书架和阅读进度不受影响。");
+                    ui.add_space(6.);
+                    ui.horizontal(|ui| {
+                        if ui.button("取消").clicked() {
+                            self.history_confirm = false;
+                        }
+                        let confirm =
+                            ui.add(crate::design::danger(
+                                "清空",
+                                ui.visuals().dark_mode,
+                            ));
+                        self.hitboxes
+                            .insert("history-clear-go".into(), confirm.rect);
+                        if confirm.clicked() {
+                            self.search_history.clear();
+                            self.history_dirty = true;
+                            self.history_confirm = false;
+                        }
+                    });
+                });
+                card_rect = frame.response.rect;
+            });
+        self.hitboxes
+            .insert("history-clear-card".into(), card_rect);
     }
 }
 impl Drop for Sources {
@@ -7556,6 +7762,10 @@ mod tests {
             global_query: String::new(),
             global_groups: Vec::new(),
             scope_dirty: None,
+            search_history: Vec::new(),
+            history_dirty: false,
+            history_confirm: false,
+            private: false,
             global_tx: mpsc::channel().0,
             global_rx: mpsc::channel().1,
             storage_tx: mpsc::channel().0,
@@ -10097,6 +10307,59 @@ mod tests {
             1
         );
         assert!(snapshots.join("a".repeat(16) + ".manga").exists());
+    }
+
+    #[test]
+    fn search_history_dedupes_and_caps_at_twenty() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sources = test_sources(root.path());
+        sources.query = "  星海  ".into();
+        sources.record_history();
+        sources.query = "猎人".into();
+        sources.record_history();
+        sources.query = "星海".into();
+        sources.record_history();
+        assert_eq!(
+            sources.search_history(),
+            &["星海".to_string(), "猎人".to_string()]
+        );
+        for index in 0..25 {
+            sources.query = format!("关键词{index}");
+            sources.record_history();
+        }
+        assert_eq!(sources.search_history().len(), 20);
+        assert_eq!(sources.search_history()[0], "关键词24");
+        // The most recent submit marks history dirty exactly once per drain.
+        assert!(sources.take_history_change().is_some());
+        assert!(sources.take_history_change().is_none());
+    }
+
+    #[test]
+    fn private_reading_records_no_search_history() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sources = test_sources(root.path());
+        sources.set_private(true);
+        sources.query = "星海".into();
+        sources.record_history();
+        assert!(sources.search_history().is_empty());
+        assert!(sources.take_history_change().is_none());
+        sources.set_private(false);
+        sources.record_history();
+        assert_eq!(sources.search_history(), &["星海".to_string()]);
+    }
+
+    #[test]
+    fn bookmarked_online_chapter_reopens_its_stream_task() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sources = test_sources(root.path());
+        let mut download = task("source.a", "m1", "c1");
+        download.id = "aaaaaaaaaaaaaaaa".into();
+        sources.tasks.push(download);
+        assert!(!sources.open_bookmarked("source.a", "m1", "missing"));
+        assert!(sources.open_bookmarked("source.a", "m1", "c1"));
+        let stream = sources.take_stream().unwrap();
+        assert_eq!(stream.id, "aaaaaaaaaaaaaaaa");
+        assert_eq!(stream.metadata.chapter_id, "c1");
     }
 }
 

@@ -1312,3 +1312,44 @@ fn backup_round_trip_keeps_added_at_and_old_backups_fall_back() {
         "old backups must still yield a join date"
     );
 }
+
+#[test]
+fn rename_category_moves_every_book_in_one_update() {
+    let tmp = TempDir::new().unwrap();
+    let library = open(&tmp, "library");
+    let page = sample_png([9, 9, 9]);
+    let one = library
+        .import(&{
+            let path = tmp.path().join("one.cbz");
+            write_cbz(&path, &[("1.png", page.as_slice())]);
+            path
+        })
+        .unwrap();
+    let two = library
+        .import(&{
+            let path = tmp.path().join("two.cbz");
+            write_cbz(&path, &[("1.png", page.as_slice())]);
+            path
+        })
+        .unwrap();
+    library.set_category(&one.id, "热血").unwrap();
+    library.set_category(&two.id, "热血").unwrap();
+    library.rename_category("热血", "少年").unwrap();
+    let books = library.list_books("").unwrap();
+    assert!(books.iter().all(|book| book.category == "少年"));
+    // Renaming an empty category is a no-op, not an error.
+    library.rename_category("不存在", "其他").unwrap();
+}
+
+#[test]
+fn clear_category_returns_books_to_the_default() {
+    let tmp = TempDir::new().unwrap();
+    let library = open(&tmp, "library");
+    let page = sample_png([9, 9, 9]);
+    let path = tmp.path().join("book.cbz");
+    write_cbz(&path, &[("1.png", page.as_slice())]);
+    let book = library.import(&path).unwrap();
+    library.set_category(&book.id, "热血").unwrap();
+    library.clear_category("热血").unwrap();
+    assert_eq!(library.get_book(&book.id).unwrap().category, "未分类");
+}

@@ -24,6 +24,8 @@ enum StorageConfirm {
     Covers,
     /// Delete these downloaded chapter books (files + rows kept progress).
     Chapters(Vec<String>),
+    /// Delete a category; its books move back to 未分类.
+    Category(String),
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -214,7 +216,25 @@ pub struct ReaderApp {
     query: String,
     search: bool,
     category: String,
-    category_edit: String,
+    /// User-created categories in stored order (the `categories` setting).
+    user_categories: Vec<String>,
+    /// The 分类管理 panel (opaque card) is open.
+    category_manage: bool,
+    /// Multi-select 分类 picker is open.
+    category_pick: bool,
+    /// 新建分类 input inside the manage/pick panels.
+    category_new: String,
+    /// Category being renamed inside the manage panel.
+    category_renaming: Option<String>,
+    /// Draft name for the row being renamed.
+    category_rename_edit: String,
+    bookmarks: crate::bookmarks::Bookmarks,
+    /// Chapter dialog shows the 书签 tab instead of 章节.
+    dialog_bookmarks: bool,
+    /// Page to land on when a bookmarked online chapter's stream opens.
+    pending_bookmark_page: Option<usize>,
+    /// Last page bytes staged under `share/` (acceptance asserts on it).
+    last_shared: Option<PathBuf>,
     selected: HashSet<String>,
     tab: Tab,
     screen: Screen,
@@ -337,6 +357,9 @@ impl ReaderApp {
     pub fn new(root: PathBuf, ctx: Context) -> Self {
         let backup_path = root.join("backup.yejian.zip").to_string_lossy().to_string();
         let reader_prefs = crate::reader_prefs::load(&root).unwrap_or_default();
+        // Page files staged for the share sheet are one-shot temp files.
+        let _ = std::fs::remove_dir_all(root.join("share"));
+        let bookmarks = crate::bookmarks::Bookmarks::load(&root);
         Self {
             worker: Worker::start(root.clone(), ctx.clone()),
             sync: crate::sync::ProgressSync::new(root.clone(), ctx.clone()),
@@ -359,7 +382,16 @@ impl ReaderApp {
             query: String::new(),
             search: false,
             category: String::new(),
-            category_edit: String::new(),
+            user_categories: Vec::new(),
+            category_manage: false,
+            category_pick: false,
+            category_new: String::new(),
+            category_renaming: None,
+            category_rename_edit: String::new(),
+            bookmarks,
+            dialog_bookmarks: false,
+            pending_bookmark_page: None,
+            last_shared: None,
             selected: HashSet::new(),
             tab: Tab::Library,
             screen: Screen::Library,
@@ -494,6 +526,59 @@ impl ReaderApp {
                         .all(|group| group["state"] != "searching")
             })
             .unwrap_or(false)
+    }
+    #[cfg(debug_assertions)]
+    pub fn seed_search_history(&mut self, history: Vec<String>) {
+        self.sources.set_search_history(history);
+        self.sources.clear_query();
+    }
+    #[cfg(debug_assertions)]
+    pub fn seed_categories(&mut self, categories: Vec<String>) {
+        self.user_categories = categories;
+    }
+    #[cfg(debug_assertions)]
+    pub fn open_category_manage(&mut self) {
+        self.category_manage = true;
+    }
+    #[cfg(debug_assertions)]
+    pub fn pick_categories(&mut self, ids: Vec<String>) {
+        self.selected = ids.into_iter().collect();
+        self.category_pick = true;
+    }
+    #[cfg(debug_assertions)]
+    pub fn first_book_id(&self) -> Option<String> {
+        self.books.first().map(|book| book.id.clone())
+    }
+    #[cfg(debug_assertions)]
+    pub fn share_ready_now(&self) -> bool {
+        matches!(&self.screen, Screen::Reader(id) if self.share_enabled(id))
+    }
+    #[cfg(debug_assertions)]
+    pub fn last_shared(&self) -> Option<&std::path::Path> {
+        self.last_shared.as_deref()
+    }
+    #[cfg(debug_assertions)]
+    pub fn bookmark_count(&self) -> usize {
+        self.bookmarks.entries().len()
+    }
+    #[cfg(debug_assertions)]
+    pub fn add_bookmark_here(&mut self) {
+        if let Screen::Reader(id) = self.screen.clone() {
+            self.bookmark_toggle(&id);
+        }
+    }
+    #[cfg(debug_assertions)]
+    pub fn open_bookmark_dialog(&mut self) {
+        if let Screen::Reader(id) = self.screen.clone() {
+            self.dialog_bookmarks = true;
+            self.chapter_dialog = Some(id);
+        }
+    }
+    #[cfg(debug_assertions)]
+    pub fn prepare_share_stream(&mut self) {
+        if let Some(chapter) = self.sources.preview_share_stream() {
+            self.open_stream(chapter);
+        }
     }
     #[cfg(debug_assertions)]
     pub fn prepare_installed_source_acceptance(&mut self, id: &str) -> anyhow::Result<()> {
@@ -661,13 +746,102 @@ impl ReaderApp {
                     .and_then(|task| self.sources.stream_metadata(task))
             })
     }
+    /// The page's original bytes exist locally — share stays grey until then.
+    fn share_enabled(&self, id: &str) -> bool {
+        if id.starts_with(STREAM_PREFIX) {
+            self.sources.page_ready(id, self.page)
+        } else {
+            true
+        }
+    }
+    /// Whether the currently shown page already has a bookmark.
+    fn bookmarked(&self, id: &str) -> bool {
+        if self.private {
+            return false;
+        }
+        let meta = self.reading_metadata(id);
+        let work = crate::bookmarks::work_key(id, meta.as_ref());
+        let chapter = crate::bookmarks::chapter_key(id, meta.as_ref());
+        self.bookmarks.has(&work, &chapter, self.page)
+    }
+    fn bookmark_toggle(&mut self, id: &str) {
+        if self.private {
+            self.pending_notice = Some("私密阅读时书签不可用".into());
+            return;
+        }
+        let meta = self.reading_metadata(id);
+        let work = crate::bookmarks::work_key(id, meta.as_ref());
+        let chapter = crate::bookmarks::chapter_key(id, meta.as_ref());
+        let title = meta
+            .as_ref()
+            .map(|meta| meta.chapter_title.clone())
+            .unwrap_or_else(|| "本页".into());
+        self.bookmarks.toggle(crate::bookmarks::Bookmark {
+            work,
+            chapter,
+            page: self.page,
+            title,
+            created_at: crate::follows::now(),
+        });
+        if let Err(error) = self.bookmarks.save(&self.root) {
+            self.error = Some(format!("书签保存失败：{error}"));
+        }
+    }
+    /// Local book for a bookmark's work+chapter, if it was downloaded.
+    fn bookmark_book(&self, mark: &crate::bookmarks::Bookmark) -> Option<Book> {
+        self.chapters
+            .iter()
+            .find(|link| {
+                crate::bookmarks::work_key(&link.book_id, Some(&link.metadata))
+                    == mark.work
+                    && link.metadata.chapter_id == mark.chapter
+            })
+            .and_then(|link| {
+                self.books
+                    .iter()
+                    .find(|book| book.id == link.book_id)
+                    .cloned()
+            })
+            .or_else(|| {
+                // Unlinked local books use the book id for both keys.
+                (mark.work == mark.chapter)
+                    .then(|| self.books.iter().find(|book| book.id == mark.work).cloned())
+                    .flatten()
+            })
+    }
+    fn bookmark_jump(&mut self, mark: crate::bookmarks::Bookmark, current: &str) {
+        if let Some(book) = self.bookmark_book(&mark) {
+            let id = book.id.clone();
+            self.open_reader(&book);
+            self.chapter_dialog = None;
+            let delta = mark.page as i32 - self.page as i32;
+            if delta != 0 {
+                self.next_page(&id, delta);
+            }
+            return;
+        }
+        // Online chapter with an existing download task: reopen the stream
+        // and land on the bookmarked page once it is open.
+        if let Some((source, manga)) = mark.work.split_once('\u{1f}')
+            && self.sources.open_bookmarked(source, manga, &mark.chapter)
+        {
+            self.pending_bookmark_page = Some(mark.page);
+            self.chapter_dialog = None;
+            let _ = current;
+        } else {
+            self.error = Some("书签的章节还没下载，请先从详情页打开".into());
+        }
+    }
     fn open_stream(&mut self, chapter: StreamChapter) {
         let id = format!("{STREAM_PREFIX}{}", chapter.id);
         let state = self.sources.stream_state(&chapter.id).unwrap_or_default();
         let wanted = if chapter.from_end {
             usize::MAX
         } else {
-            state.page.unwrap_or(0)
+            self.pending_bookmark_page
+                .take()
+                .or(state.page)
+                .unwrap_or(0)
         };
         let resume = (state.total == 0 && wanted > 0).then_some(wanted);
         let book = Book {
@@ -1600,7 +1774,10 @@ impl ReaderApp {
                                 self.reader_globals.rtl = value == "rtl";
                                 self.rtl = self.reader_globals.rtl;
                             }
-                            "private" => self.private = value == "true",
+                            "private" => {
+                                self.private = value == "true";
+                                self.sources.set_private(self.private);
+                            }
                             "reading-mode" => {
                                 self.reader_globals.mode = match value.as_str() {
                                     "vertical" => crate::reader_prefs::Mode::Vertical,
@@ -1650,9 +1827,24 @@ impl ReaderApp {
                                     .unwrap_or(crate::sources::DEFAULT_FOLLOW_INTERVAL_MIN);
                                 self.sources.set_follow_interval(minutes);
                             }
+                            "search-history" => {
+                                if let Ok(history) =
+                                    serde_json::from_str::<Vec<String>>(&value)
+                                {
+                                    self.sources.set_search_history(history);
+                                }
+                            }
+                            "categories" => {
+                                if let Ok(categories) =
+                                    serde_json::from_str::<Vec<String>>(&value)
+                                {
+                                    self.user_categories = categories;
+                                }
+                            }
                             _ => {}
                         }
                     }
+                    self.sources.set_private(self.private);
                 }
                 Event::Library(books, links) => {
                     self.replace_links(links);
@@ -1740,6 +1932,27 @@ impl ReaderApp {
                     }
                 }
                 Event::Notice(text) => self.pending_notice = Some(text),
+                Event::ShareReady(result) => match result {
+                    Ok(path) => {
+                        self.last_shared = Some(path.clone());
+                        match yejian_platform::share_file(&path) {
+                            Ok(()) => {}
+                            // Desktop has no share sheet; the staged file is
+                            // the acceptance-verifiable outcome there.
+                            Err(yejian_platform::PlatformError::Unsupported(_)) => {}
+                            Err(error) => {
+                                self.error = Some(format!("无法打开分享：{error}"))
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        self.error = Some(if error == PAGE_NOT_READY {
+                            "页面还没下载完，稍后再试".into()
+                        } else {
+                            format!("无法读取页面：{error}")
+                        });
+                    }
+                },
                 Event::Storage(report) => self.storage = Some(report),
                 Event::Error(text) => self.error = Some(text),
                 Event::StartupError(text) => self.startup_error = Some(text),
@@ -2288,6 +2501,119 @@ impl ReaderApp {
             .galley(rect.center() - galley.size() / 2., galley, text_color);
         response.clicked()
     }
+    /// The shelf tab list: fixed entries, stored user categories in order,
+    /// then any category found on books that is not stored yet.
+    /// `None` marks the trailing 管理 tab.
+    fn category_tabs(&self) -> Vec<(String, Option<String>)> {
+        let mut tabs = vec![
+            ("全部".to_string(), Some(String::new())),
+            ("未分类".to_string(), Some("未分类".to_string())),
+            ("在线追更".to_string(), Some("在线追更".to_string())),
+        ];
+        let mut seen = std::collections::HashSet::from(["未分类", "在线追更"]);
+        for name in &self.user_categories {
+            if seen.insert(name.as_str()) {
+                tabs.push((name.clone(), Some(name.clone())));
+            }
+        }
+        let mut derived: Vec<String> = self
+            .books
+            .iter()
+            .map(|book| book.category.clone())
+            .filter(|name| !name.is_empty() && !seen.contains(name.as_str()))
+            .collect();
+        derived.sort();
+        derived.dedup();
+        for name in derived {
+            tabs.push((name.clone(), Some(name)));
+        }
+        tabs.push(("管理".to_string(), None));
+        tabs
+    }
+    /// Saves the user-category list under `categories`.
+    fn save_categories(&mut self) {
+        if let Ok(json) = serde_json::to_string(&self.user_categories) {
+            self.setting("categories", json);
+        }
+    }
+    /// Horizontally scrolling category tabs; the selected tab gets ink text
+    /// and a vermillion underline. Last tab opens the manage panel.
+    fn category_strip(&mut self, ui: &mut Ui, rect: Rect) {
+        let palette = crate::design::palette(self.dark);
+        let tabs = self.category_tabs();
+        let font_scale = self.font_scale;
+        ui.scope_builder(
+            UiBuilder::new()
+                .max_rect(rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            |ui| {
+                ScrollArea::horizontal()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for (index, (label, value)) in tabs.iter().enumerate() {
+                            let selected = value.as_deref() == Some(self.category.as_str());
+                            let galley = ui.painter().layout_no_wrap(
+                                label.clone(),
+                                FontId::proportional(15. * font_scale),
+                                if selected { palette.ink } else { palette.muted },
+                            );
+                            let width =
+                                (galley.size().x + 20. * font_scale).max(44.);
+                            let (tab_rect, response) = ui.allocate_exact_size(
+                                vec2(width, rect.height()),
+                                Sense::click(),
+                            );
+                            let id = value
+                                .as_ref()
+                                .map(|value| format!("category-tab-{index}-{value}"))
+                                .unwrap_or_else(|| "category-tabs-manage".into());
+                            self.hitboxes.insert(id, tab_rect);
+                            response.widget_info(|| {
+                                WidgetInfo::labeled(Role::Button, true, label.clone())
+                            });
+                            let text_color = if response.hovered() || selected {
+                                palette.ink
+                            } else {
+                                palette.muted
+                            };
+                            ui.painter().galley(
+                                pos2(
+                                    tab_rect.center().x - galley.size().x / 2.,
+                                    tab_rect.center().y - galley.size().y / 2.,
+                                ),
+                                galley.clone(),
+                                text_color,
+                            );
+                            if selected {
+                                ui.painter().rect_filled(
+                                    Rect::from_center_size(
+                                        pos2(
+                                            tab_rect.center().x,
+                                            tab_rect.bottom() - 3.,
+                                        ),
+                                        vec2(galley.size().x + 8., 3.),
+                                    ),
+                                    1.5,
+                                    palette.accent,
+                                );
+                            }
+                            if response.clicked() {
+                                match value {
+                                    Some(value) => {
+                                        self.category = value.clone();
+                                        self.motion.focus = 0.;
+                                    }
+                                    None => {
+                                        self.category_manage = true;
+                                        self.category_renaming = None;
+                                    }
+                                }
+                            }
+                        }
+                    });
+            },
+        );
+    }
     fn icon(&mut self, ui: &mut Ui, id: &str, rect: Rect, kind: &str, label: &str) -> bool {
         self.hitboxes.insert(id.into(), rect);
         let response = ui.interact(rect, Id::unique(id), Sense::click());
@@ -2378,6 +2704,32 @@ impl ReaderApp {
                 for y in [-5., 0., 5.] {
                     p.line_segment([c + vec2(-7., y), c + vec2(7., y)], stroke);
                 }
+            }
+            "bookmark" => {
+                p.line_segment([c + vec2(-5., -7.), c + vec2(-5., 7.)], stroke);
+                p.line_segment([c + vec2(5., -7.), c + vec2(5., 7.)], stroke);
+                p.line_segment([c + vec2(-5., -7.), c + vec2(5., -7.)], stroke);
+                p.line_segment([c + vec2(-5., 7.), c + vec2(0., 3.)], stroke);
+                p.line_segment([c + vec2(5., 7.), c + vec2(0., 3.)], stroke);
+            }
+            "bookmark-on" => {
+                let pts = vec![
+                    c + vec2(-5., -7.),
+                    c + vec2(5., -7.),
+                    c + vec2(5., 7.),
+                    c + vec2(0., 3.),
+                    c + vec2(-5., 7.),
+                ];
+                p.add(Shape::convex_polygon(pts, color, stroke));
+            }
+            "share" => {
+                // Open box with an arrow rising out of it.
+                p.line_segment([c + vec2(-7., -1.), c + vec2(-7., 7.)], stroke);
+                p.line_segment([c + vec2(-7., 7.), c + vec2(7., 7.)], stroke);
+                p.line_segment([c + vec2(7., 7.), c + vec2(7., -1.)], stroke);
+                p.line_segment([c + vec2(0., 4.), c + vec2(0., -7.)], stroke);
+                p.line_segment([c + vec2(0., -7.), c + vec2(-4., -3.)], stroke);
+                p.line_segment([c + vec2(0., -7.), c + vec2(4., -3.)], stroke);
             }
             _ => {
                 p.circle_stroke(c, 7., stroke);
@@ -2610,6 +2962,11 @@ impl ReaderApp {
         self.sources.poll();
         if let Some(scope) = self.sources.take_scope_change() {
             self.setting("search-scope", scope);
+        }
+        if let Some(history) = self.sources.take_history_change() {
+            if let Ok(json) = serde_json::to_string(&history) {
+                self.setting("search-history", json);
+            }
         }
         if let Some(notice) = self.sources.follow_notice.take() {
             self.pending_notice = Some(notice);
@@ -3092,76 +3449,57 @@ impl ReaderApp {
                 muted,
             );
             let stacked = self.font_scale > 1.4 && area.width() < 520.;
-            let category_width = (80. * self.font_scale + 26.).min(area.width() - 48.);
-            let category_rect = Rect::from_min_size(
-                if stacked {
-                    area.min + vec2(24., 142.)
-                } else {
-                    pos2(area.right() - 24. - category_width, area.top() + 82.)
-                },
-                vec2(category_width, (24. * self.font_scale + 20.).max(44.)),
-            );
-            if self.button(
-                ui,
-                "categories",
-                category_rect,
-                &if self.category.is_empty() {
-                    "全部分类".into()
-                } else {
-                    self.category.clone()
-                },
-                false,
-            ) {
-                let mut categories: Vec<_> = self
-                    .books
-                    .iter()
-                    .map(|b| b.category.clone())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                categories.sort();
-                categories.dedup();
-                let next = categories
-                    .iter()
-                    .position(|x| x == &self.category)
-                    .map(|i| i + 1)
-                    .unwrap_or(0);
-                self.category = categories.get(next).cloned().unwrap_or_default();
-                self.motion.focus = 0.;
-            }
             let palette = crate::design::palette(self.dark);
             let row_h = (24. * self.font_scale + 20.).max(44.);
             let sort_w = 150. * self.font_scale + 40.;
             let margin = if area.width() >= 700. { 32. } else { 16. };
             let short = (area.width() - margin * 2.).min(1200.) >= 660.
                 && self.shelf_viewport.height() < 600.;
+            // Layout: [我的收藏 label][category tab strip][排序]. The strip
+            // scrolls horizontally, so a modest footprint decides when the
+            // sort button wraps to its own row.
+            let strip_min = 120. * self.font_scale + 40.;
             let sort_second_row = !stacked
                 && !short
-                && 24. + 140. * self.font_scale + 12. + sort_w + 10. + category_width
+                && 24. + 140. * self.font_scale + 12. + strip_min + 10. + sort_w
                     + 24.
                     > area.width();
             let sort_third_row = stacked
-                && category_rect.left() + category_width + 10. + sort_w + 24. > area.right();
-            let sort_rect = if !stacked && !sort_second_row {
+                && 24. + strip_min + 10. + sort_w + 24. > area.width();
+            let strip_top = area.top()
+                + if stacked {
+                    142.
+                } else {
+                    82.
+                };
+            let strip_left = area.left() + 24.
+                + if !stacked {
+                    140. * self.font_scale + 12.
+                } else {
+                    0.
+                };
+            let strip_right = if sort_third_row || !stacked && sort_second_row {
+                area.right() - 24.
+            } else {
+                area.right() - 24. - sort_w - 10.
+            };
+            let strip_rect = Rect::from_min_max(
+                pos2(strip_left.min(strip_right - 44.), strip_top),
+                pos2(strip_right.max(strip_left + 44.), strip_top + row_h),
+            );
+            let sort_rect = if !stacked && !sort_second_row || stacked && !sort_third_row {
                 Rect::from_min_size(
-                    pos2(category_rect.left() - 10. - sort_w, category_rect.top()),
-                    vec2(sort_w, row_h),
-                )
-            } else if !stacked {
-                Rect::from_min_size(
-                    pos2(area.left() + 24., category_rect.bottom() + 10.),
-                    vec2(sort_w, row_h),
-                )
-            } else if sort_third_row {
-                Rect::from_min_size(
-                    pos2(area.left() + 24., category_rect.bottom() + 10.),
+                    pos2(strip_rect.right() + 10., strip_top),
                     vec2(sort_w, row_h),
                 )
             } else {
                 Rect::from_min_size(
-                    pos2(category_rect.right() + 10., category_rect.top()),
+                    pos2(area.left() + 24., strip_rect.bottom() + 10.),
                     vec2(sort_w, row_h),
                 )
             };
+            self.hitboxes.insert("categories".into(), strip_rect);
+            self.category_strip(ui, strip_rect);
             self.hitboxes.insert("shelf-sort".into(), sort_rect);
             let sort_response =
                 ui.interact(sort_rect, Id::unique("shelf-sort"), Sense::click());
@@ -3727,22 +4065,21 @@ impl ReaderApp {
                 12.,
                 ink,
             );
-            ui.put(
-                Rect::from_min_size(rect.min + vec2(80., 6.), vec2(120., 34.)),
-                TextEdit::singleline(&mut self.category_edit).hint_text("分类名称"),
-            );
-            if self.button(
-                ui,
-                "set-category",
-                Rect::from_min_size(rect.min + vec2(205., 6.), vec2(58., 34.)),
-                "分类",
-                false,
-            ) {
-                self.send(Command::Category(
-                    self.selected_books(),
-                    self.category_edit.clone(),
-                ));
-                self.selected.clear();
+            // Online-only selections have no library row to categorize.
+            let has_local = self
+                .selected
+                .iter()
+                .any(|id| Self::online_parts(id).is_none());
+            if has_local
+                && self.button(
+                    ui,
+                    "set-category",
+                    Rect::from_min_size(rect.min + vec2(80., 6.), vec2(120., 34.)),
+                    "分类",
+                    false,
+                )
+            {
+                self.category_pick = true;
             }
             if self.button(
                 ui,
@@ -4712,15 +5049,7 @@ impl ReaderApp {
             ui.painter()
                 .with_clip_rect(Rect::from_min_max(
                     area.min + vec2(56., 0.),
-                    pos2(
-                        area.right()
-                            - if self.chapter(id).is_some() {
-                                110.
-                            } else {
-                                58.
-                            },
-                        area.top() + 56.,
-                    ),
+                    pos2(area.right() - 216., area.top() + 56.),
                 ))
                 .text(
                     area.min + vec2(56., 20.),
@@ -4729,16 +5058,51 @@ impl ReaderApp {
                     FontId::proportional(15.),
                     ink,
                 );
-            if self.chapter(id).is_some()
-                && self.icon(
-                    ui,
-                    "reader-chapters",
-                    Rect::from_min_size(pos2(area.right() - 104., area.top() + 8.), vec2(44., 44.)),
-                    "chapters",
-                    "已下载章节",
-                )
-            {
+            if self.icon(
+                ui,
+                "reader-chapters",
+                Rect::from_min_size(pos2(area.right() - 104., area.top() + 8.), vec2(44., 44.)),
+                "chapters",
+                if self.chapter(id).is_some() {
+                    "章节与书签"
+                } else {
+                    "书签"
+                },
+            ) {
+                self.dialog_bookmarks = self.chapter(id).is_none();
                 self.chapter_dialog = Some(id.to_string());
+            }
+            let bookmarked = self.bookmarked(id);
+            if self.icon(
+                ui,
+                "reader-bookmark",
+                Rect::from_min_size(pos2(area.right() - 156., area.top() + 8.), vec2(44., 44.)),
+                if bookmarked { "bookmark-on" } else { "bookmark" },
+                if bookmarked { "取消书签" } else { "加书签" },
+            ) {
+                self.bookmark_toggle(id);
+            }
+            let share_rect =
+                Rect::from_min_size(pos2(area.right() - 208., area.top() + 8.), vec2(44., 44.));
+            if self.share_enabled(id) {
+                if self.icon(ui, "reader-share", share_rect, "share", "分享本页") {
+                    self.send(Command::SharePage {
+                        id: id.to_string(),
+                        page: self.page,
+                    });
+                }
+            } else {
+                self.hitboxes.insert("reader-share".into(), share_rect);
+                // Disabled until the page's original bytes exist.
+                let p = ui.painter();
+                let c = share_rect.center();
+                let stroke = Stroke::new(1.7, Color32::from_gray(140));
+                p.line_segment([c + vec2(-7., -1.), c + vec2(-7., 7.)], stroke);
+                p.line_segment([c + vec2(-7., 7.), c + vec2(7., 7.)], stroke);
+                p.line_segment([c + vec2(7., 7.), c + vec2(7., -1.)], stroke);
+                p.line_segment([c + vec2(0., 4.), c + vec2(0., -7.)], stroke);
+                p.line_segment([c + vec2(0., -7.), c + vec2(-4., -3.)], stroke);
+                p.line_segment([c + vec2(0., -7.), c + vec2(4., -3.)], stroke);
             }
             if self.icon(
                 ui,
@@ -5361,6 +5725,7 @@ impl ReaderApp {
                                 "不保存新的阅读进度和历史",
                             ) {
                                 self.setting("private", self.private.to_string());
+                                self.sources.set_private(self.private);
                             }
                             ui.separator();
                             ui.add_space(6.);
@@ -5717,6 +6082,10 @@ impl ReaderApp {
                     ids.len()
                 ),
             ),
+            StorageConfirm::Category(name) => (
+                "删除分类",
+                format!("分类“{name}”会删除，分类里的漫画会回到未分类。阅读进度保留。"),
+            ),
         };
         let screen = ctx.content_rect();
         // Dim everything under the card and swallow the tap so it can only
@@ -5776,6 +6145,14 @@ impl ReaderApp {
                                     self.chapter_selected.clear();
                                     self.chapter_manage = false;
                                 }
+                                StorageConfirm::Category(name) => {
+                                    self.send(Command::ClearCategory(name.clone()));
+                                    self.user_categories.retain(|item| item != &name);
+                                    self.save_categories();
+                                    if self.category == name {
+                                        self.category = String::new();
+                                    }
+                                }
                             }
                             self.storage_confirm = None;
                         }
@@ -5785,6 +6162,247 @@ impl ReaderApp {
             });
         self.hitboxes
             .insert("storage-confirm-card".into(), card_rect);
+    }
+    /// Categories shown in the manage panel / pick list: stored user order
+    /// plus categories found on books that are not stored yet. Fixed entries
+    /// (全部/未分类/在线追更) never appear here.
+    fn managed_categories(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::from(["未分类", "在线追更"]);
+        let mut list = Vec::new();
+        for name in &self.user_categories {
+            if seen.insert(name.as_str()) {
+                list.push(name.clone());
+            }
+        }
+        let mut derived: Vec<String> = self
+            .books
+            .iter()
+            .map(|book| book.category.clone())
+            .filter(|name| !name.is_empty() && !seen.contains(name.as_str()))
+            .collect();
+        derived.sort();
+        derived.dedup();
+        list.extend(derived);
+        list
+    }
+    /// Adds a user category (deduped, trimmed) and persists the list.
+    fn add_category(&mut self, name: &str) -> Option<String> {
+        let name = name.trim();
+        if name.is_empty()
+            || matches!(name, "全部" | "未分类" | "在线追更")
+            || self.managed_categories().iter().any(|item| item == name)
+        {
+            return None;
+        }
+        let name = name.to_string();
+        self.user_categories.push(name.clone());
+        self.save_categories();
+        Some(name)
+    }
+    /// Opaque scrim + card shared by the manage and pick panels — same
+    /// pattern as the storage delete confirmations.
+    fn opaque_card<R>(
+        &mut self,
+        ctx: &Context,
+        id: &str,
+        open: &mut bool,
+        body: impl FnOnce(&mut Self, &mut Ui) -> R,
+    ) -> Option<R> {
+        let screen = ctx.content_rect();
+        let scrim = Area::new(Id::unique(format!("{id}-scrim")))
+            .order(Order::Foreground)
+            .fade_in(false)
+            .interactable(true)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                ui.painter()
+                    .rect_filled(screen, 0., Color32::from_black_alpha(96));
+                ui.allocate_rect(screen, Sense::click())
+            });
+        if scrim.inner.clicked() {
+            *open = false;
+            return None;
+        }
+        let mut card_rect = Rect::NOTHING;
+        let mut out: Option<R> = None;
+        Area::new(Id::unique(id))
+            .order(Order::Foreground)
+            .fade_in(false)
+            .interactable(true)
+            .movable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                let frame = crate::design::surface(ui).show(ui, |ui| {
+                    ui.set_width((screen.width() - 56.).clamp(240., 440.));
+                    out = Some(body(self, ui));
+                });
+                card_rect = frame.response.rect;
+            });
+        self.hitboxes.insert(format!("{id}-card"), card_rect);
+        out
+    }
+    /// 分类管理 panel and the multi-select 分类 picker.
+    fn category_panels_ui(&mut self, ctx: &Context) {
+        if self.category_manage {
+            let mut open = true;
+            let categories = self.managed_categories();
+            self.opaque_card::<()>(ctx, "category-manage", &mut open, |app, ui| {
+                ui.heading("分类管理");
+                ScrollArea::vertical().max_height(300.).show(ui, |ui| {
+                    for (index, name) in categories.iter().enumerate() {
+                        if app.category_renaming.as_deref() == Some(name.as_str()) {
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    TextEdit::singleline(&mut app.category_rename_edit)
+                                        .desired_width(ui.available_width() - 60.),
+                                );
+                                if ui.button("确定").clicked() {
+                                    let new = app.category_rename_edit.trim().to_string();
+                                    if !new.is_empty() && new != *name {
+                                        app.send(Command::RenameCategory(
+                                            name.clone(),
+                                            new.clone(),
+                                        ));
+                                        if let Some(pos) =
+                                            app.user_categories.iter().position(|x| x == name)
+                                        {
+                                            app.user_categories[pos] = new.clone();
+                                        } else {
+                                            app.user_categories.push(new.clone());
+                                        }
+                                        app.save_categories();
+                                        if app.category == *name {
+                                            app.category = new;
+                                        }
+                                    }
+                                    app.category_renaming = None;
+                                }
+                            });
+                            continue;
+                        }
+                        ui.horizontal(|ui| {
+                            ui.add(Label::new(name).wrap());
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.button("删除").clicked() {
+                                        app.storage_confirm =
+                                            Some(StorageConfirm::Category(name.clone()));
+                                    }
+                                    if ui.button("重命名").clicked() {
+                                        app.category_renaming = Some(name.clone());
+                                        app.category_rename_edit = name.clone();
+                                    }
+                                    let can_move = index > 0
+                                        && app
+                                            .user_categories
+                                            .iter()
+                                            .any(|item| item == name);
+                                    if can_move && ui.button("上移").clicked() {
+                                        if let Some(pos) = app
+                                            .user_categories
+                                            .iter()
+                                            .position(|item| item == name)
+                                        {
+                                            app.user_categories.swap(pos, pos - 1);
+                                            app.save_categories();
+                                        }
+                                    }
+                                    if can_move && ui.button("下移").clicked() {
+                                        if let Some(pos) = app
+                                            .user_categories
+                                            .iter()
+                                            .position(|item| item == name)
+                                            && pos + 1 < app.user_categories.len()
+                                        {
+                                            app.user_categories.swap(pos, pos + 1);
+                                            app.save_categories();
+                                        }
+                                    }
+                                },
+                            );
+                        });
+                        ui.add_space(4.);
+                    }
+                    if categories.is_empty() {
+                        ui.label(RichText::new("还没有自建分类").small());
+                    }
+                });
+                ui.add_space(6.);
+                ui.horizontal(|ui| {
+                    let edit = ui.add(
+                        TextEdit::singleline(&mut app.category_new)
+                            .hint_text("新分类名")
+                            .desired_width(ui.available_width() - 60.),
+                    );
+                    app.hitboxes.insert("category-new".into(), edit.rect);
+                    let add = ui.button("新建");
+                    app.hitboxes.insert("category-add".into(), add.rect);
+                    if (add.clicked()
+                        || edit.lost_focus()
+                            && ui.input(|input| input.key_pressed(Key::Enter)))
+                        && app.add_category(&app.category_new.clone()).is_some()
+                    {
+                        app.category_new.clear();
+                    }
+                });
+                ui.add_space(6.);
+                if ui.button("关闭").clicked() {
+                    app.category_manage = false;
+                }
+            });
+            self.category_manage = open && self.category_manage;
+        }
+        if self.category_pick {
+            let mut open = true;
+            let mut choices = vec!["未分类".to_string()];
+            choices.extend(self.managed_categories());
+            let books = self.selected_books();
+            self.opaque_card::<()>(ctx, "category-pick", &mut open, |app, ui| {
+                ui.heading("选择分类");
+                ScrollArea::vertical().max_height(300.).show(ui, |ui| {
+                    for (index, name) in choices.iter().enumerate() {
+                        let row = ui.add_sized(
+                            [ui.available_width(), 40.],
+                            Button::new(name.clone()),
+                        );
+                        app.hitboxes
+                            .insert(format!("category-pick-{index}-{name}"), row.rect);
+                        if row.clicked() {
+                            app.send(Command::Category(books.clone(), name.clone()));
+                            app.selected.clear();
+                            app.category_pick = false;
+                        }
+                    }
+                });
+                ui.add_space(6.);
+                ui.horizontal(|ui| {
+                    let edit = ui.add(
+                        TextEdit::singleline(&mut app.category_new)
+                            .hint_text("新分类名")
+                            .desired_width(ui.available_width() - 90.),
+                    );
+                    let add = ui.add_enabled(
+                        !app.category_new.trim().is_empty(),
+                        Button::new("新建并加入"),
+                    );
+                    if add.clicked()
+                        && let Some(name) = app.add_category(&app.category_new.clone())
+                    {
+                        app.send(Command::Category(books.clone(), name));
+                        app.selected.clear();
+                        app.category_new.clear();
+                        app.category_pick = false;
+                    }
+                    let _ = edit;
+                });
+                ui.add_space(6.);
+                if ui.button("取消").clicked() {
+                    app.category_pick = false;
+                }
+            });
+            self.category_pick = open && self.category_pick;
+        }
     }
     fn tracker_login_row(&mut self, ui: &mut Ui, tracker: crate::trackers::TrackerKind) {
         let idle = self.trackers.idle();
@@ -6314,6 +6932,83 @@ impl ReaderApp {
                         },
                     );
                 });
+                let palette = crate::design::palette(self.dark);
+                ui.horizontal(|ui| {
+                    for (label, flag) in [("章节", false), ("书签", true)] {
+                        let selected = self.dialog_bookmarks == flag;
+                        let tab = Button::new(
+                            RichText::new(label).color(if selected {
+                                palette.ink
+                            } else {
+                                palette.muted
+                            }),
+                        )
+                        .fill(if selected {
+                            palette.soft
+                        } else {
+                            palette.surface
+                        });
+                        let tab = ui.add(tab);
+                        self.hitboxes
+                            .insert(format!("dialog-tab-{}", label), tab.rect);
+                        if tab.clicked() {
+                            self.dialog_bookmarks = flag;
+                        }
+                    }
+                });
+                if self.dialog_bookmarks {
+                    let meta = self.reading_metadata(&id);
+                    let work = crate::bookmarks::work_key(&id, meta.as_ref());
+                    let marks: Vec<crate::bookmarks::Bookmark> = self
+                        .bookmarks
+                        .for_work(&work)
+                        .into_iter()
+                        .cloned()
+                        .collect();
+                    if self.private {
+                        ui.label("私密阅读时书签不可用。");
+                    } else if marks.is_empty() {
+                        ui.label(RichText::new("还没有书签。顶栏的书签按钮收藏当前页。").small());
+                    }
+                    ScrollArea::vertical().max_height(300.).show(ui, |ui| {
+                        for (index, mark) in marks.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    Label::new(format!(
+                                        "{} · 第 {} 页",
+                                        mark.title,
+                                        mark.page + 1
+                                    ))
+                                    .wrap(),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui.button("删除").clicked() {
+                                            self.bookmarks.remove(&work, index);
+                                            if let Err(error) =
+                                                self.bookmarks.save(&self.root)
+                                            {
+                                                self.error =
+                                                    Some(format!("书签保存失败：{error}"));
+                                            }
+                                        }
+                                        let jump = ui.button("跳转");
+                                        self.hitboxes.insert(
+                                            format!("bookmark-jump-{index}"),
+                                            jump.rect,
+                                        );
+                                        if jump.clicked() {
+                                            self.bookmark_jump(mark.clone(), &id);
+                                        }
+                                    },
+                                );
+                            });
+                            ui.add_space(4.);
+                        }
+                    });
+                }
+                if !self.dialog_bookmarks {
                 ScrollArea::vertical().max_height(380.).show(ui, |ui| {
                     for book in &chapters {
                         let name = self
@@ -6393,16 +7088,19 @@ impl ReaderApp {
                     });
                     ui.add_space(6.);
                 }
+                }
                 if ui.button("关闭").clicked() {
                     self.chapter_dialog = None;
                     self.chapter_manage = false;
                     self.chapter_selected.clear();
+                    self.dialog_bookmarks = false;
                 }
             });
             if response.should_close() {
                 self.chapter_dialog = None;
                 self.chapter_manage = false;
                 self.chapter_selected.clear();
+                self.dialog_bookmarks = false;
             }
         }
         if let Some(text) = self.error.clone() {
@@ -6491,6 +7189,7 @@ impl ReaderApp {
                 });
         }
         self.storage_confirm_ui(ctx);
+        self.category_panels_ui(ctx);
         if let Some(key) = self.track_panel.clone() {
             let response = Modal::new(Id::unique("track-panel")).show(ctx, |ui| {
                 ui.set_width((ctx.content_rect().width() - 48.).clamp(220., 460.));
@@ -7615,5 +8314,109 @@ mod tests {
         assert_eq!(ReaderApp::status_text("21:34", Some(0.05)), "21:34 · 5%");
         assert_eq!(ReaderApp::status_text("21:34", None), "21:34");
         assert_eq!(ReaderApp::status_text("21:34", Some(1.4)), "21:34 · 100%");
+    }
+
+    #[test]
+    fn category_tabs_merge_user_and_derived_and_fixed_stay_first() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = ReaderApp::new(root.path().into(), Context::default());
+        app.user_categories = vec!["热血".into(), "悬疑".into()];
+        let mut old = book("old");
+        old.category = "旧分类".into();
+        let mut member = book("member");
+        member.category = "热血".into();
+        app.books = vec![old, member];
+        let tabs: Vec<String> = app
+            .category_tabs()
+            .iter()
+            .map(|(label, _)| label.clone())
+            .collect();
+        assert_eq!(
+            tabs,
+            ["全部", "未分类", "在线追更", "热血", "悬疑", "旧分类", "管理"]
+        );
+        // 管理 is the only tab without a filter value; fixed names are not
+        // manageable entries either.
+        assert_eq!(
+            app.managed_categories(),
+            vec!["热血".to_string(), "悬疑".to_string(), "旧分类".to_string()]
+        );
+        assert!(app.add_category("全部").is_none());
+        assert!(app.add_category("未分类").is_none());
+        assert!(app.add_category("在线追更").is_none());
+        assert!(app.add_category("热血").is_none());
+        assert_eq!(app.add_category(" 日常 ").as_deref(), Some("日常"));
+        assert_eq!(app.user_categories.last().unwrap(), "日常");
+    }
+
+    #[test]
+    fn bookmark_toggle_and_cross_chapter_jump() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = Context::default();
+        let mut app = ReaderApp::new(root.path().into(), ctx);
+        app.books = vec![book("one"), book("two")];
+        app.chapters = vec![linked("one", "c1"), linked("two", "c2")];
+        app.chapter_indices = app
+            .chapters
+            .iter()
+            .enumerate()
+            .map(|(index, link)| (link.book_id.clone(), index))
+            .collect();
+        app.screen = Screen::Reader("one".into());
+        app.page = 3;
+        app.bookmark_toggle("one");
+        assert!(app.bookmarked("one"));
+        app.bookmark_toggle("one");
+        assert!(!app.bookmarked("one"));
+        app.bookmark_toggle("one");
+        // Cross-chapter bookmark: resolves the linked local book.
+        app.bookmarks.toggle(crate::bookmarks::Bookmark {
+            work: "source.a\u{1f}story".into(),
+            chapter: "c2".into(),
+            page: 5,
+            title: "c2".into(),
+            created_at: 1,
+        });
+        let mark = app
+            .bookmarks
+            .for_work("source.a\u{1f}story")
+            .into_iter()
+            .find(|mark| mark.chapter == "c2")
+            .unwrap()
+            .clone();
+        assert_eq!(app.bookmark_book(&mark).unwrap().id, "two");
+        app.bookmark_jump(mark, "one");
+        assert!(matches!(&app.screen, Screen::Reader(id) if id == "two"));
+        assert_eq!(app.page, 5);
+        // Private mode disables bookmarks entirely.
+        app.private = true;
+        app.screen = Screen::Reader("one".into());
+        app.page = 0;
+        app.bookmark_toggle("one");
+        assert!(!app.bookmarked("one"));
+        assert!(app.pending_notice.is_some());
+        // An online key without a task reports a friendly error.
+        app.error = None;
+        app.bookmark_jump(
+            crate::bookmarks::Bookmark {
+                work: "source.b\u{1f}m2".into(),
+                chapter: "c9".into(),
+                page: 0,
+                title: "c9".into(),
+                created_at: 1,
+            },
+            "one",
+        );
+        assert!(app.error.is_some());
+    }
+
+    #[test]
+    fn startup_clears_staged_share_files() {
+        let root = tempfile::tempdir().unwrap();
+        let share = root.path().join("share");
+        std::fs::create_dir_all(&share).unwrap();
+        std::fs::write(share.join("old.png"), b"x").unwrap();
+        let _app = ReaderApp::new(root.path().into(), Context::default());
+        assert!(!share.exists());
     }
 }

@@ -1,7 +1,7 @@
 use egui::{ColorImage, Context};
 use std::{
     collections::VecDeque,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, RwLock,
         atomic::{AtomicU64, Ordering},
@@ -34,6 +34,13 @@ pub enum Command {
     },
     Setting(String, String),
     Category(Vec<String>, String),
+    /// Renames a category across every book in one update.
+    RenameCategory(String, String),
+    /// Moves every book in a category back to 未分类.
+    ClearCategory(String),
+    /// Writes the original bytes of a page into `share/` and replies with
+    /// the path so the UI can hand it to the system share sheet.
+    SharePage { id: String, page: usize },
     Remove(Vec<String>),
     /// Storage sizes for the 存储 settings group.
     StorageReport,
@@ -61,6 +68,8 @@ pub enum Event {
         result: Result<DecodedPage, String>,
     },
     Notice(String),
+    /// Original page bytes staged under `share/` (or the failure reason).
+    ShareReady(Result<PathBuf, String>),
     Storage(yejian_core::StorageReport),
     Error(String),
     StartupError(String),
@@ -309,6 +318,26 @@ impl Worker {
                                 notify(Event::Library(
                                     library.list_books("")?,
                                     library.list_chapter_links()?,
+                                ));
+                            }
+                            Command::RenameCategory(old, new) => {
+                                library.rename_category(&old, &new)?;
+                                notify(Event::Library(
+                                    library.list_books("")?,
+                                    library.list_chapter_links()?,
+                                ));
+                            }
+                            Command::ClearCategory(name) => {
+                                library.clear_category(&name)?;
+                                notify(Event::Library(
+                                    library.list_books("")?,
+                                    library.list_chapter_links()?,
+                                ));
+                            }
+                            Command::SharePage { id, page } => {
+                                let result = stage_shared_page(&root, &library, &id, page);
+                                notify(Event::ShareReady(
+                                    result.map_err(|error| error.to_string()),
                                 ));
                             }
                             Command::Remove(ids) => {
@@ -579,12 +608,46 @@ fn read_settings(library: &Library) -> anyhow::Result<Vec<(String, String)>> {
         "shelf-grid",
         "shelf-sort",
         "search-scope",
+        "search-history",
+        "categories",
     ] {
         if let Some(value) = library.get_setting(key)? {
             settings.push((key.to_string(), value));
         }
     }
     Ok(settings)
+}
+
+/// Writes the original (not re-encoded) bytes of `page` into `root/share/`
+/// and returns the staged path.
+fn stage_shared_page(
+    root: &Path,
+    library: &Library,
+    id: &str,
+    page: usize,
+) -> anyhow::Result<PathBuf> {
+    let bytes = if let Some(task) = id.strip_prefix(crate::sources::STREAM_PREFIX) {
+        crate::sources::stream_page(root, task, page)?
+            .ok_or_else(|| anyhow::anyhow!(PAGE_NOT_READY))?
+    } else {
+        library.page_bytes(id, page)?
+    };
+    let extension = match bytes.get(..4) {
+        Some([0x89, b'P', b'N', b'G']) => "png",
+        Some([0xFF, 0xD8, 0xFF, _]) => "jpg",
+        Some([b'R', b'I', b'F', b'F']) => "webp",
+        Some([b'G', b'I', b'F', _]) => "gif",
+        _ => "bin",
+    };
+    let dir = root.join("share");
+    std::fs::create_dir_all(&dir)?;
+    let safe: String = id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let path = dir.join(format!("yejian-{safe}-{}.{}", page + 1, extension));
+    std::fs::write(&path, bytes)?;
+    Ok(path)
 }
 
 pub(super) fn image_reader(
@@ -711,6 +774,38 @@ mod tests {
             .unwrap();
         writer.write_all(png.get_ref()).unwrap();
         writer.finish().unwrap();
+    }
+
+    #[test]
+    fn share_stages_original_bytes_for_local_and_online_pages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = tmp.path().join("comic.cbz");
+        small_archive(&archive);
+        let root = tmp.path().join("library");
+        let library = yejian_core::Library::open(&root).unwrap();
+        let book = library.import(&archive).unwrap();
+        // Local archive: the staged file is the stored entry byte for byte.
+        let local = super::stage_shared_page(&root, &library, &book.id, 0).unwrap();
+        assert_eq!(local.extension().unwrap(), "png");
+        let bytes = std::fs::read(&local).unwrap();
+        assert_eq!(&bytes[..4], b"\x89PNG");
+        assert!(local.starts_with(root.join("share")));
+        // Online task: the staged download page is shared verbatim.
+        let dir = root
+            .join("download-work")
+            .join("task-aaaaaaaaaaaaaaaa");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("page-0001.png"), &bytes).unwrap();
+        let online =
+            super::stage_shared_page(&root, &library, "stream:aaaaaaaaaaaaaaaa", 0).unwrap();
+        assert_eq!(std::fs::read(&online).unwrap(), bytes);
+        // A page that has not arrived yet cannot be shared.
+        assert!(
+            super::stage_shared_page(&root, &library, "stream:aaaaaaaaaaaaaaaa", 4)
+                .unwrap_err()
+                .to_string()
+                .contains(super::PAGE_NOT_READY)
+        );
     }
 
     #[test]
@@ -1102,6 +1197,12 @@ mod tests {
         original.set_setting("keep-awake", "false").unwrap();
         original.set_setting("tap-zones", "next").unwrap();
         original.set_setting("reader-status", "false").unwrap();
+        original
+            .set_setting("search-history", "[\"星海\",\"猎人\"]")
+            .unwrap();
+        original
+            .set_setting("categories", "[\"热血\",\"悬疑\"]")
+            .unwrap();
         let backup = tmp.path().join("settings.zip");
         original.export_backup(&backup).unwrap();
         let worker = super::Worker::start(tmp.path().join("destination"), egui::Context::default());
@@ -1122,6 +1223,14 @@ mod tests {
                 assert!(settings.contains(&("keep-awake".into(), "false".into())));
                 assert!(settings.contains(&("tap-zones".into(), "next".into())));
                 assert!(settings.contains(&("reader-status".into(), "false".into())));
+                assert!(settings.contains(&(
+                    "search-history".into(),
+                    "[\"星海\",\"猎人\"]".into()
+                )));
+                assert!(settings.contains(&(
+                    "categories".into(),
+                    "[\"热血\",\"悬疑\"]".into()
+                )));
             }
             _ => panic!("restore must refresh settings together with the library"),
         }

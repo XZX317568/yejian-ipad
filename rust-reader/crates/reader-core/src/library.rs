@@ -140,6 +140,44 @@ impl Library {
         Ok(())
     }
 
+    /// Renames a category, moving every book in it in a single update.
+    ///
+    /// An empty target stores the default category.
+    pub fn rename_category(&self, old: &str, new: &str) -> Result<()> {
+        let new = new.trim();
+        let new = if new.is_empty() {
+            DEFAULT_CATEGORY
+        } else {
+            new
+        };
+        let connection = self.lock_db()?;
+        connection
+            .execute(
+                "UPDATE books SET category = ?1, updated_at = ?2
+                 WHERE category = ?3 AND removed = 0",
+                params![new, crate::util::now_millis(), old],
+            )
+            .context("rename book category")?;
+        Ok(())
+    }
+
+    /// Moves every book in a category back to the default category.
+    pub fn clear_category(&self, name: &str) -> Result<()> {
+        let connection = self.lock_db()?;
+        connection
+            .execute(
+                "UPDATE books SET category = ?1, updated_at = ?2
+                 WHERE category = ?3 AND removed = 0",
+                params![
+                    DEFAULT_CATEGORY,
+                    crate::util::now_millis(),
+                    name
+                ],
+            )
+            .context("clear book category")?;
+        Ok(())
+    }
+
     /// Hides a book from the library without deleting its archive copy.
     ///
     /// Importing the same content again restores the row, keeping its saved

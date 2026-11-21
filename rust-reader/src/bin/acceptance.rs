@@ -1008,6 +1008,55 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
         );
     }
 
+    // Round A: search history chips sit under the empty field; clearing
+    // asks through an opaque card.
+    h.app.seed_search_history(vec!["星海".into(), "猎人".into()]);
+    h.frames(4)?;
+    anyhow::ensure!(
+        h.app.hitboxes.contains_key("history-0")
+            && h.app.hitboxes.contains_key("history-clear"),
+        "history: keyword chips did not render under the empty search field"
+    );
+    design_capture(h, "search-history", &mut captures)?;
+    h.click("history-clear")?;
+    h.frames(4)?;
+    design_capture(h, "search-history-confirm", &mut captures)?;
+    assert_opaque_card(h, "search-history-confirm.png", "history-clear-card")?;
+    h.click("history-clear-go")?;
+    h.frames(3)?;
+    anyhow::ensure!(
+        !h.app.hitboxes.contains_key("history-0"),
+        "history: 清空 left keyword chips behind"
+    );
+
+    // Round A: the shelf header is a scrollable tab strip ending in 管理.
+    h.click("nav-library")?;
+    h.frames(5)?;
+    h.app.seed_categories(vec!["热血".into(), "悬疑".into()]);
+    h.frames(4)?;
+    anyhow::ensure!(
+        h.app.hitboxes.contains_key("category-tabs-manage")
+            && h.app.hitboxes.keys().any(|id| id.starts_with("category-tab-0")),
+        "category: the shelf tab strip did not render"
+    );
+    design_capture(h, "shelf-category-tabs", &mut captures)?;
+    h.click("category-tabs-manage")?;
+    h.frames(4)?;
+    design_capture(h, "category-manage", &mut captures)?;
+    assert_opaque_card(h, "category-manage.png", "category-manage-card")?;
+    h.click_text("关闭")?;
+    h.frames(3)?;
+    let book_id = h
+        .app
+        .first_book_id()
+        .context("category: pick needs a library book")?;
+    h.app.pick_categories(vec![book_id]);
+    h.frames(4)?;
+    design_capture(h, "category-pick", &mut captures)?;
+    assert_opaque_card(h, "category-pick.png", "category-pick-card")?;
+    h.click_text("取消")?;
+    h.frames(3)?;
+
     // Reopen the real saved settings, preserving the source and reading
     // history. Only the temporary acceptance library is changed.
     eframe::App::on_exit(&mut h.app);
@@ -2758,6 +2807,57 @@ fn main() -> Result<()> {
         h.app.screen_name() == "reader",
         "back from chapter picker exited reading"
     );
+    // Round A: top-bar bookmark + share on a downloaded chapter.
+    if !h.app.hitboxes.contains_key("reader-bookmark") {
+        h.click("reader-canvas")?;
+        h.frames(20)?;
+    }
+    h.click("reader-bookmark")?;
+    h.frames(4)?;
+    anyhow::ensure!(
+        h.app.bookmark_count() == 1,
+        "reader: the top-bar bookmark toggle did not record a bookmark"
+    );
+    h.click("reader-chapters")?;
+    h.frames(8)?;
+    h.click("dialog-tab-书签")?;
+    h.frames(4)?;
+    h.frame(vec![], Some("reader-bookmarks"))?;
+    h.click_text("关闭")?;
+    h.frames(4)?;
+    anyhow::ensure!(
+        h.app.share_ready_now(),
+        "share: a downloaded page must be shareable"
+    );
+    h.frame(vec![], Some("reader-share-enabled"))?;
+    h.click("reader-share")?;
+    for _ in 0..40 {
+        h.frame(vec![], None)?;
+        if h.app.last_shared().is_some() {
+            break;
+        }
+    }
+    let staged = h
+        .app
+        .last_shared()
+        .context("share: the worker did not stage the page")?
+        .to_path_buf();
+    anyhow::ensure!(
+        staged.exists() && staged.parent().is_some_and(|dir| dir.ends_with("share")),
+        "share: staged file missing or outside share/"
+    );
+    // An online chapter whose bytes have not arrived keeps share disabled.
+    h.app.prepare_share_stream();
+    h.frames(10)?;
+    if !h.app.hitboxes.contains_key("reader-share") {
+        h.click("reader-canvas")?;
+        h.frames(20)?;
+    }
+    anyhow::ensure!(
+        !h.app.share_ready_now(),
+        "share: must stay disabled until the page bytes exist"
+    );
+    h.frame(vec![], Some("reader-share-disabled"))?;
     h.key(Key::BrowserBack)?;
     h.key(Key::BrowserBack)?;
     h.frames(60)?;
