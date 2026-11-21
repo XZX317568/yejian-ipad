@@ -174,7 +174,7 @@ pub(crate) fn battery_level() -> Option<f32> {
 
 /// `LAContext.canEvaluatePolicy(.deviceOwnerAuthentication)`.
 pub(crate) fn supports_app_lock() -> bool {
-    unsafe { yejian_ios_supports_app_lock() } == 1
+    (unsafe { yejian_ios_supports_app_lock() }) == 1
 }
 
 /// Starts `LAContext.evaluatePolicy`; the outcome arrives through
