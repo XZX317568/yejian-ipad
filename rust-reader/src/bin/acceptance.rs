@@ -1044,6 +1044,32 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
     h.frames(4)?;
     design_capture(h, "category-manage", &mut captures)?;
     assert_opaque_card(h, "category-manage.png", "category-manage-card")?;
+    // Every row shows all four slots; only the enabled moves register
+    // hitboxes — first row can only move down, last only up.
+    anyhow::ensure!(
+        h.app.hitboxes.contains_key("category-down-0")
+            && !h.app.hitboxes.contains_key("category-up-0"),
+        "category: first row must offer 下移 only"
+    );
+    anyhow::ensure!(
+        h.app.hitboxes.contains_key("category-up-1")
+            && !h.app.hitboxes.contains_key("category-down-1"),
+        "category: last row must offer 上移 only"
+    );
+    h.click("category-down-0")?;
+    h.frames(3)?;
+    anyhow::ensure!(
+        h.app.category_order() == ["悬疑", "热血"],
+        "category: 下移 did not reorder {:?}",
+        h.app.category_order()
+    );
+    h.click("category-up-1")?;
+    h.frames(3)?;
+    anyhow::ensure!(
+        h.app.category_order() == ["热血", "悬疑"],
+        "category: 上移 did not restore {:?}",
+        h.app.category_order()
+    );
     h.click_text("关闭")?;
     h.frames(3)?;
     let book_id = h

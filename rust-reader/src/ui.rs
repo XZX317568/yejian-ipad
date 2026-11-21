@@ -541,6 +541,10 @@ impl ReaderApp {
         self.category_manage = true;
     }
     #[cfg(debug_assertions)]
+    pub fn category_order(&self) -> &[String] {
+        &self.user_categories
+    }
+    #[cfg(debug_assertions)]
     pub fn pick_categories(&mut self, ids: Vec<String>) {
         self.selected = ids.into_iter().collect();
         self.category_pick = true;
@@ -5046,18 +5050,21 @@ impl ReaderApp {
             ) {
                 self.back(now, area);
             }
+            let title_width = (area.width() - 56. - 216.).max(0.);
+            let mut job = egui::text::LayoutJob::simple(
+                self.reading_title(&book),
+                FontId::proportional(15.),
+                ink,
+                title_width,
+            );
+            job.wrap.max_rows = 1;
+            let galley = ui.painter().layout_job(job);
             ui.painter()
                 .with_clip_rect(Rect::from_min_max(
                     area.min + vec2(56., 0.),
                     pos2(area.right() - 216., area.top() + 56.),
                 ))
-                .text(
-                    area.min + vec2(56., 20.),
-                    Align2::LEFT_TOP,
-                    self.reading_title(&book),
-                    FontId::proportional(15.),
-                    ink,
-                );
+                .galley(area.min + vec2(56., 20.), galley, ink);
             if self.icon(
                 ui,
                 "reader-chapters",
@@ -6282,42 +6289,57 @@ impl ReaderApp {
                         }
                         ui.horizontal(|ui| {
                             ui.add(Label::new(name).wrap());
+                            let pos = app
+                                .user_categories
+                                .iter()
+                                .position(|item| item == name);
+                            let up_enabled = pos.is_some_and(|pos| pos > 0);
+                            let down_enabled = pos
+                                .is_some_and(|pos| pos + 1 < app.user_categories.len());
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    if ui.button("删除").clicked() {
+                                    if ui
+                                        .add(Button::new("删除").min_size(vec2(52., 0.)))
+                                        .clicked()
+                                    {
                                         app.storage_confirm =
                                             Some(StorageConfirm::Category(name.clone()));
                                     }
-                                    if ui.button("重命名").clicked() {
+                                    if ui
+                                        .add(Button::new("重命名").min_size(vec2(52., 0.)))
+                                        .clicked()
+                                    {
                                         app.category_renaming = Some(name.clone());
                                         app.category_rename_edit = name.clone();
                                     }
-                                    let can_move = index > 0
-                                        && app
-                                            .user_categories
-                                            .iter()
-                                            .any(|item| item == name);
-                                    if can_move && ui.button("上移").clicked() {
-                                        if let Some(pos) = app
-                                            .user_categories
-                                            .iter()
-                                            .position(|item| item == name)
-                                        {
-                                            app.user_categories.swap(pos, pos - 1);
-                                            app.save_categories();
-                                        }
+                                    let down = ui.add_enabled(
+                                        down_enabled,
+                                        Button::new("下移").min_size(vec2(52., 0.)),
+                                    );
+                                    if down_enabled {
+                                        app.hitboxes
+                                            .insert(format!("category-down-{index}"), down.rect);
                                     }
-                                    if can_move && ui.button("下移").clicked() {
-                                        if let Some(pos) = app
-                                            .user_categories
-                                            .iter()
-                                            .position(|item| item == name)
-                                            && pos + 1 < app.user_categories.len()
-                                        {
-                                            app.user_categories.swap(pos, pos + 1);
-                                            app.save_categories();
-                                        }
+                                    if down.clicked()
+                                        && let Some(pos) = pos
+                                    {
+                                        app.user_categories.swap(pos, pos + 1);
+                                        app.save_categories();
+                                    }
+                                    let up = ui.add_enabled(
+                                        up_enabled,
+                                        Button::new("上移").min_size(vec2(52., 0.)),
+                                    );
+                                    if up_enabled {
+                                        app.hitboxes
+                                            .insert(format!("category-up-{index}"), up.rect);
+                                    }
+                                    if up.clicked()
+                                        && let Some(pos) = pos
+                                    {
+                                        app.user_categories.swap(pos, pos - 1);
+                                        app.save_categories();
                                     }
                                 },
                             );

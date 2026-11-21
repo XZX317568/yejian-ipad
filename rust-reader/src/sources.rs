@@ -2368,6 +2368,8 @@ impl Sources {
             "source":self.selected_source,"loaded":self.metadata_loaded,
             "filter_count":self.filters.len(),"listing_count":self.listings.len(),
             "filter_editor":self.filter_editor.is_some(),"busy":self.busy,
+            "status":self.status,"failed":self.failed.is_some(),
+            "has_more":self.results.has_more,"pending":self.pending.is_some(),
             "results":self.results.entries.iter().map(|manga|manga.title.as_str()).collect::<Vec<_>>(),
             "applied":self.applied_filters,
             "scope":self.search_scope,
@@ -4372,6 +4374,10 @@ impl Sources {
         self.listing = None;
         self.selected_manga = None;
         self.chapters.clear();
+        // Global work reports through GlobalEvent, not the request worker —
+        // no request is in flight, so a stale "正在加载…" must not linger.
+        self.status.clear();
+        self.failed = None;
         let query = self.query.trim().to_string();
         self.query = query.clone();
         self.global_query = query.clone();
@@ -7172,8 +7178,12 @@ impl Sources {
         // The status footer is painted below the viewport — reserve its
         // height so the scroll area uses the full remaining height without
         // clipping the last content line mid-glyph.
+        // "正在加载…" is only honest while a request is in flight; a stale
+        // copy left by a finished reply must not render a phantom footer.
+        let status_visible =
+            !self.status.is_empty() && (self.busy || self.status != "正在加载…");
         let footer_height =
-            if !self.status.is_empty() || self.busy || self.failed.is_some() {
+            if self.busy || self.failed.is_some() || status_visible {
                 40.
             } else {
                 0.
@@ -7218,7 +7228,10 @@ impl Sources {
                         self.follows_ui(ui);
                         self.repository_ui(ui);
                     }
-                    if self.global_mode() && !self.global_groups.is_empty() {
+                    if self.global_mode()
+                        && !self.global_groups.is_empty()
+                        && !self.query.trim().is_empty()
+                    {
                         self.global_results_ui(ui);
                     } else {
                     if !self.results.entries.is_empty() {
@@ -7284,13 +7297,13 @@ impl Sources {
                     }
                 }
             });
-        if !self.status.is_empty() || self.busy || self.failed.is_some() {
+        if self.busy || self.failed.is_some() || status_visible {
             ui.add_space(6.);
             ui.horizontal(|ui| {
                 if self.busy {
                     ui.spinner();
                 }
-                if !self.status.is_empty() {
+                if status_visible {
                     ui.add(Label::new(&self.status).wrap());
                 }
                 if let Some(task) = self.failed.clone()
