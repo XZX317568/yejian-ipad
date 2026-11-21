@@ -3078,17 +3078,21 @@ impl Sources {
                 Some(url) => self.cover_image(ui.ctx(), &source_id, url),
                 None => None,
             };
-            let texture = match texture {
-                Some(texture) => Some(texture),
-                None => self.cover_texture(ui.ctx(), &snapshot),
-            };
-            if let Some(url) = cover_url {
+            // Only covers without a texture are fetched; asking for loaded
+            // ones re-downloads them after every completed request.
+            if texture.is_none()
+                && let Some(url) = cover_url
+            {
                 want_covers.push(CoverReq {
                     key: cover_key(&source_id, &url),
                     source: source_id,
                     url,
                 });
             }
+            let texture = match texture {
+                Some(texture) => Some(texture),
+                None => self.cover_texture(ui.ctx(), &snapshot),
+            };
             if let Some(texture) = texture {
                 let cover =
                     Rect::from_center_size(pos2(left + 18., (top + bottom) / 2.), vec2(40., 54.));
@@ -4280,7 +4284,11 @@ impl Sources {
             }
             return;
         };
-        if std::time::Instant::now() < due {
+        let now = std::time::Instant::now();
+        if now < due {
+            // Another repaint may have consumed the earlier deadline; re-arm
+            // the remainder so an idle app still wakes on time.
+            self.ctx.request_repaint_after(due - now);
             return;
         }
         self.follow_next_due = None;

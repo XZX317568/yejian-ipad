@@ -230,6 +230,10 @@ pub struct ReaderApp {
     tracker_kitsu_pass: String,
     track_panel: Option<String>,
     track_query: String,
+    /// Unsaved status/progress edits in the tracking panel, by binding key.
+    /// Keyed by binding key and remote media id so a rebind starts fresh.
+    /// Each field is `Some` only while the user has edited it.
+    track_draft: Option<(String, String, Option<crate::trackers::TrackStatus>, Option<i64>)>,
     pub hitboxes: BTreeMap<String, Rect>,
     pub rendered_book_nodes: usize,
     pub frame_is_animating: bool,
@@ -249,6 +253,7 @@ impl ReaderApp {
             tracker_kitsu_pass: String::new(),
             track_panel: None,
             track_query: String::new(),
+            track_draft: None,
             sources: crate::sources::Sources::new(root.clone(), ctx),
             root,
             stream: None,
@@ -3311,6 +3316,7 @@ impl ReaderApp {
             if self.button(ui, "detail-tracking", rect, "进度跟踪", false) {
                 self.track_panel = Some(key);
                 self.track_query.clear();
+                self.track_draft = None;
             }
         }
     }
@@ -4620,7 +4626,17 @@ impl ReaderApp {
                     .small(),
                 );
             }
-            let mut status = binding.status;
+            let (status_edit, progress_edit) = match &self.track_draft {
+                Some((draft_key, media, status, progress))
+                    if draft_key == key && *media == binding.media_id =>
+                {
+                    (*status, *progress)
+                }
+                _ => (None, None),
+            };
+            let mut status = status_edit.unwrap_or(binding.status);
+            let mut progress = progress_edit.unwrap_or(binding.progress.max(0));
+            let shown_progress = progress;
             ui.horizontal_wrapped(|ui| {
                 for candidate in [
                     TrackStatus::Reading,
@@ -4638,7 +4654,6 @@ impl ReaderApp {
                     }
                 }
             });
-            let mut progress = binding.progress.max(0);
             ui.horizontal(|ui| {
                 ui.label("已读章节");
                 if ui.button("−").clicked() {
@@ -4649,10 +4664,20 @@ impl ReaderApp {
                     progress += 1;
                 }
             });
+            let status_edit = (status != binding.status).then_some(status);
+            let progress_edit = if progress != shown_progress {
+                Some(progress)
+            } else {
+                progress_edit
+            }
+            .filter(|edited| *edited != binding.progress);
+            let changed = status_edit.is_some() || progress_edit.is_some();
+            self.track_draft = changed
+                .then(|| (key.to_string(), binding.media_id.clone(), status_edit, progress_edit));
             let idle = self.trackers.idle();
             if ui
                 .add_enabled(
-                    idle && (status != binding.status || progress != binding.progress),
+                    idle && changed,
                     Button::new("保存并同步").min_size(vec2(0., 44.)),
                 )
                 .clicked()
@@ -4660,7 +4685,7 @@ impl ReaderApp {
                 self.trackers.submit(TrackCommand::Update {
                     key: key.to_string(),
                     status,
-                    progress,
+                    progress: progress_edit,
                 });
             }
             ui.horizontal(|ui| {
@@ -4674,6 +4699,7 @@ impl ReaderApp {
                     .add_enabled(idle, Button::new("解除绑定").min_size(vec2(0., 44.)))
                     .clicked()
                 {
+                    self.track_draft = None;
                     self.trackers.submit(TrackCommand::Unbind(key.to_string()));
                 }
             });
@@ -4713,7 +4739,7 @@ impl ReaderApp {
                         .small(),
                 );
             }
-            if let Some(list) = self.trackers.searches.get(key).cloned() {
+            if let Some((tracker, list)) = self.trackers.searches.get(key).cloned() {
                 ScrollArea::vertical().max_height(240.).show(ui, |ui| {
                     for item in list {
                         let text = format!(
@@ -4735,15 +4761,7 @@ impl ReaderApp {
                             .clicked()
                         {
                             self.trackers.submit(TrackCommand::Bind {
-                                tracker: if self
-                                    .trackers
-                                    .account(TrackerKind::Anilist)
-                                    .is_some()
-                                {
-                                    TrackerKind::Anilist
-                                } else {
-                                    TrackerKind::Kitsu
-                                },
+                                tracker,
                                 key: key.to_string(),
                                 pick: item,
                                 progress: 0,

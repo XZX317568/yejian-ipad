@@ -646,12 +646,16 @@ impl AidokuInterpreter {
             self.destroy(context_desc);
         }
 
+        let mut output_ref = None;
         let result = result.and_then(|code| {
             self.handle_result(code).and_then(|data| {
                 let mut r = PostcardReader::new(&data);
                 let result_ref = r
                     .read_i32()
                     .map_err(|e| SourceError::Deserialize(e.to_string()))?;
+                if result_ref != image_ref {
+                    output_ref = Some(result_ref);
+                }
                 let image = match self.store.data().store.get(result_ref) {
                     Some(StoredValue::Image(image)) => image.clone(),
                     Some(StoredValue::Bytes(bytes)) => image::load_from_memory(bytes)
@@ -662,16 +666,11 @@ impl AidokuInterpreter {
                         })?
                         .to_rgba8(),
                     _ => {
-                        self.store.data_mut().store.remove(image_ref);
                         return Err(SourceError::Deserialize(format!(
                             "{export} did not return a stored image (ref {result_ref})"
                         )));
                     }
                 };
-                if result_ref != image_ref {
-                    self.store.data_mut().store.remove(result_ref);
-                }
-                self.store.data_mut().store.remove(image_ref);
                 let mut encoded = std::io::Cursor::new(Vec::new());
                 image::codecs::png::PngEncoder::new(&mut encoded)
                     .write_image(
@@ -686,6 +685,13 @@ impl AidokuInterpreter {
                 Ok(encoded.into_inner())
             })
         });
+        // The input image and any returned image are released on every exit,
+        // including source errors, traps and undecodable results.
+        let store = &mut self.store.data_mut().store;
+        store.remove(image_ref);
+        if let Some(output_ref) = output_ref {
+            store.remove(output_ref);
+        }
         self.guard(result, |bytes| bytes.is_empty())
     }
 
