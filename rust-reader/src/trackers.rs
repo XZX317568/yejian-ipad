@@ -815,7 +815,9 @@ pub enum TrackCommand {
     /// Fetch the remote entry for the bound key.
     Refresh(String),
     /// Set status/progress on the bound entry (manual panel edits).
-    Update { key: String, status: TrackStatus, progress: i64 },
+    /// `progress` is `None` for a status-only edit, which keeps the remote
+    /// chapter count; `Some` is an explicit correction and may go down.
+    Update { key: String, status: TrackStatus, progress: Option<i64> },
     /// Auto-sync after a chapter finished; guarded by private/auto flags.
     ChapterDone { key: String, chapter: i64 },
 }
@@ -1265,7 +1267,20 @@ fn run_command(command: TrackCommand, store_path: &Path, endpoints: &Endpoints) 
             } else {
                 return fail("这部作品还没有绑定跟踪条目".into());
             }
-            let mut events = push_progress(&mut store, &key, progress, &save, endpoints);
+            let (progress, manual) = match progress {
+                Some(progress) => (progress, true),
+                None => {
+                    let Some(binding) = store.bindings.get(&key).cloned() else {
+                        return fail("这部作品还没有绑定跟踪条目".into());
+                    };
+                    match remote_progress(&store, &binding, endpoints) {
+                        Ok(remote) => (remote.max(binding.progress), false),
+                        Err(error) => return fail(format!("读取远端进度失败：{error}")),
+                    }
+                }
+            };
+            let mut events =
+                push_progress_with(&mut store, &key, progress, manual, &save, endpoints);
             if events.is_empty() {
                 events.push(TrackEvent::Notice("已保存".into()));
             }
@@ -1364,6 +1379,19 @@ fn push_progress(
     save: &dyn Fn(&Store) -> Result<(), String>,
     endpoints: &Endpoints,
 ) -> Vec<TrackEvent> {
+    push_progress_with(store, key, progress, false, save, endpoints)
+}
+
+/// `manual` records exactly `progress` locally (a user correction may lower
+/// it); automatic pushes keep the monotone `max`.
+fn push_progress_with(
+    store: &mut Store,
+    key: &str,
+    progress: i64,
+    manual: bool,
+    save: &dyn Fn(&Store) -> Result<(), String>,
+    endpoints: &Endpoints,
+) -> Vec<TrackEvent> {
     let Some(binding) = store.bindings.get(key).cloned() else {
         return vec![TrackEvent::Failed("这部作品还没有绑定跟踪条目".into())];
     };
@@ -1398,7 +1426,11 @@ fn push_progress(
         Ok(entry) => {
             if let Some(binding) = store.bindings.get_mut(key) {
                 binding.library_id = entry.library_id.clone().or(binding.library_id.clone());
-                binding.progress = binding.progress.max(progress);
+                binding.progress = if manual {
+                    progress
+                } else {
+                    binding.progress.max(progress)
+                };
             }
             if let Err(error) = save(store) {
                 return vec![TrackEvent::Failed(error)];
@@ -1759,6 +1791,59 @@ mod tests {
             .unwrap();
         let code = handle.join().unwrap().unwrap();
         assert_eq!(code, "REAL");
+    }
+
+    #[test]
+    fn manual_corrections_lower_progress_and_status_edits_keep_remote() {
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = sent.clone();
+        let (base, _server) = serve(move |_head, body| {
+            if body.contains("SaveMediaListEntry") {
+                seen.lock().unwrap().push(body.to_string());
+                return (200, r#"{"data":{"SaveMediaListEntry":{"id":7,"status":"CURRENT","progress":0}}}"#.into());
+            }
+            (
+                200,
+                r#"{"data":{"Page":{"mediaList":[{"id":7,"status":"CURRENT","scoreRaw":0,"progress":15,"media":{"id":99,"title":{"userPreferred":"A"},"chapters":80}}]}}}"#.into(),
+            )
+        });
+        let endpoints = Endpoints { graphql: base, ..Default::default() };
+        let mut store = Store::default();
+        store.anilist = Some(Account {
+            user_id: "42".into(),
+            name: "u".into(),
+            access_token: "t".into(),
+            ..Default::default()
+        });
+        store.bindings.insert(
+            "book:x".into(),
+            Binding {
+                tracker: "anilist".into(),
+                media_id: "99".into(),
+                library_id: Some("7".into()),
+                title: "A".into(),
+                progress: 10,
+                status: TrackStatus::Reading,
+            },
+        );
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(STORE_FILE);
+        std::fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
+        // Status-only edit: the remote's chapter 15 is kept, not local 10.
+        run_command(
+            TrackCommand::Update { key: "book:x".into(), status: TrackStatus::OnHold, progress: None },
+            &path,
+            &endpoints,
+        );
+        assert!(sent.lock().unwrap()[0].contains("\"progress\":15"), "{:?}", sent.lock().unwrap());
+        // Explicit correction to 12 is stored as 12 locally.
+        run_command(
+            TrackCommand::Update { key: "book:x".into(), status: TrackStatus::Reading, progress: Some(12) },
+            &path,
+            &endpoints,
+        );
+        let saved: Store = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved.bindings["book:x"].progress, 12);
     }
 
     #[test]
