@@ -4956,24 +4956,28 @@ impl ReaderApp {
             // previous chapter's last page and this segment's first page.
             // Purely visual — `top`/`heights`/anchors are untouched.
             if local == 0 && global > 0 {
-                let label = self.chapter_separator_label(&seg);
-                let band = Rect::from_center_size(
-                    pos2(content.center().x, target.top()),
-                    vec2(content.width(), 44.),
-                )
-                .intersect(content);
-                painter.rect_filled(band, 0., Color32::from_black_alpha(210));
+                let seam = target.top().clamp(content.top(), content.bottom());
                 painter.line_segment(
-                    [band.center_top(), band.right_top()],
-                    Stroke::new(1., Color32::from_white_alpha(70)),
+                    [pos2(content.left(), seam), pos2(content.right(), seam)],
+                    Stroke::new(1., Color32::from_white_alpha(40)),
                 );
-                painter.text(
-                    band.center(),
-                    Align2::CENTER_CENTER,
-                    label,
-                    FontId::proportional(14.),
+                // Compact floating pill on the seam — ellipsized to at most
+                // 70% of the strip width. Purely visual; top/heights/anchors
+                // are untouched.
+                let mut job = egui::text::LayoutJob::simple(
+                    self.chapter_separator_label(&seg),
+                    FontId::proportional(12.),
                     Color32::from_white_alpha(235),
+                    content.width() * 0.7 - 20.,
                 );
+                job.wrap.max_rows = 1;
+                let galley = painter.layout_job(job);
+                let band = Rect::from_center_size(
+                    pos2(content.center().x, seam),
+                    galley.size() + vec2(20., 10.),
+                );
+                painter.rect_filled(band, 10., Color32::from_black_alpha(150));
+                painter.galley(band.center() - galley.size() / 2., galley, Color32::WHITE);
                 self.hitboxes
                     .insert(format!("vertical-separator-{global}"), band);
             }
