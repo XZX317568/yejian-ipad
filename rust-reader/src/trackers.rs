@@ -1274,7 +1274,9 @@ fn run_command(command: TrackCommand, store_path: &Path, endpoints: &Endpoints) 
                         return fail("这部作品还没有绑定跟踪条目".into());
                     };
                     match remote_progress(&store, &binding, endpoints) {
-                        Ok(remote) => (remote.max(binding.progress), false),
+                        // Write back the tracker's own count, even if it is
+                        // below the cache, and adopt it locally.
+                        Ok(remote) => (remote, true),
                         Err(error) => return fail(format!("读取远端进度失败：{error}")),
                     }
                 }
@@ -1830,6 +1832,7 @@ mod tests {
         let path = root.path().join(STORE_FILE);
         std::fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
         // Status-only edit: the remote's chapter 15 is kept, not local 10.
+        // (A remote count below the cache is kept the same way.)
         run_command(
             TrackCommand::Update { key: "book:x".into(), status: TrackStatus::OnHold, progress: None },
             &path,

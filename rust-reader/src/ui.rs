@@ -231,7 +231,8 @@ pub struct ReaderApp {
     track_query: String,
     /// Unsaved status/progress edits in the tracking panel, by binding key.
     /// Keyed by binding key and remote media id so a rebind starts fresh.
-    track_draft: Option<(String, String, crate::trackers::TrackStatus, i64)>,
+    /// Each field is `Some` only while the user has edited it.
+    track_draft: Option<(String, String, Option<crate::trackers::TrackStatus>, Option<i64>)>,
     pub hitboxes: BTreeMap<String, Rect>,
     pub rendered_book_nodes: usize,
     pub frame_is_animating: bool,
@@ -4600,14 +4601,17 @@ impl ReaderApp {
                     .small(),
                 );
             }
-            let (mut status, mut progress) = match &self.track_draft {
+            let (status_edit, progress_edit) = match &self.track_draft {
                 Some((draft_key, media, status, progress))
                     if draft_key == key && *media == binding.media_id =>
                 {
                     (*status, *progress)
                 }
-                _ => (binding.status, binding.progress.max(0)),
+                _ => (None, None),
             };
+            let mut status = status_edit.unwrap_or(binding.status);
+            let mut progress = progress_edit.unwrap_or(binding.progress.max(0));
+            let shown_progress = progress;
             ui.horizontal_wrapped(|ui| {
                 for candidate in [
                     TrackStatus::Reading,
@@ -4635,9 +4639,16 @@ impl ReaderApp {
                     progress += 1;
                 }
             });
-            let changed = status != binding.status || progress != binding.progress;
-            self.track_draft =
-                changed.then(|| (key.to_string(), binding.media_id.clone(), status, progress));
+            let status_edit = (status != binding.status).then_some(status);
+            let progress_edit = if progress != shown_progress {
+                Some(progress)
+            } else {
+                progress_edit
+            }
+            .filter(|edited| *edited != binding.progress);
+            let changed = status_edit.is_some() || progress_edit.is_some();
+            self.track_draft = changed
+                .then(|| (key.to_string(), binding.media_id.clone(), status_edit, progress_edit));
             let idle = self.trackers.idle();
             if ui
                 .add_enabled(
@@ -4649,7 +4660,7 @@ impl ReaderApp {
                 self.trackers.submit(TrackCommand::Update {
                     key: key.to_string(),
                     status,
-                    progress: (progress != binding.progress).then_some(progress),
+                    progress: progress_edit,
                 });
             }
             ui.horizontal(|ui| {
