@@ -37,6 +37,9 @@ static WAKER: Mutex<Option<Arc<dyn Fn() + Send + Sync>>> = Mutex::new(None);
 /// waker is installed, a `false` flag proves the Java queue is empty, so the UI
 /// can call `poll_import()` every frame without paying a JNI round trip.
 static QUEUED: AtomicBool = AtomicBool::new(false);
+/// Same as `QUEUED` for the WebView result queue; the import poll must not
+/// consume a wake meant for a finished web page.
+static WEB_QUEUED: AtomicBool = AtomicBool::new(false);
 static WAKER_SET: AtomicBool = AtomicBool::new(false);
 /// Linux-style "back requested by the system shell". Drained by the UI.
 static BACK_PENDING: AtomicBool = AtomicBool::new(false);
@@ -77,6 +80,7 @@ pub extern "system" fn Java_app_yejian_reader_RustActivity_nativeImportFinished(
     _class: JClass<'_>,
 ) {
     QUEUED.store(true, Ordering::Release);
+    WEB_QUEUED.store(true, Ordering::Release);
     notify_waker();
 }
 
@@ -390,7 +394,7 @@ pub(crate) fn open_web(url: &str, user_agent: &str) -> Result<()> {
 /// Drains the WebView dialog's own result queue, kept separate from the
 /// import queue so a picked file and a finished web page never interleave.
 pub(crate) fn poll_web() -> Result<Option<crate::WebResult>> {
-    let queued = QUEUED.swap(false, Ordering::AcqRel);
+    let queued = WEB_QUEUED.swap(false, Ordering::AcqRel);
     if WAKER_SET.load(Ordering::Acquire) && !queued {
         return Ok(None);
     }
@@ -399,7 +403,7 @@ pub(crate) fn poll_web() -> Result<Option<crate::WebResult>> {
         if text.is_empty() {
             Ok(None)
         } else {
-            QUEUED.store(true, Ordering::Release);
+            WEB_QUEUED.store(true, Ordering::Release);
             crate::parse_web_json(&text).map(Some)
         }
     })

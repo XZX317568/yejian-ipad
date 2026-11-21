@@ -665,9 +665,12 @@ mod tests {
         assert!(!request.to_ascii_lowercase().contains("cookie:"), "{request}");
         use reqwest::cookie::CookieStore;
         let jar = JAR.0.read().unwrap();
-        assert!(
-            jar.cookies(&format!("http://{addr}/api").parse().unwrap())
-                .is_none()
-        );
+        // Other tests share 127.0.0.1 (cookies ignore ports), so only this
+        // reply's cookie must be absent.
+        let stored = jar
+            .cookies(&format!("http://{addr}/api").parse().unwrap())
+            .map(|header| header.to_str().unwrap_or_default().to_string())
+            .unwrap_or_default();
+        assert!(!stored.contains("tracker="), "{stored}");
     }
 }

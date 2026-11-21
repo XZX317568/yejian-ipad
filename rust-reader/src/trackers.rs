@@ -346,12 +346,31 @@ fn graphql(base: &str, token: &str, query: &str, variables: serde_json::Value) -
 
 /// The browser URL the user authorizes at; `code` comes back through the
 /// loopback listener or a pasted token.
-pub fn anilist_authorize_url(redirect: &str) -> String {
+pub fn anilist_authorize_url(redirect: &str, state: &str) -> String {
     format!(
-        "{ANILIST_AUTHORIZE}?client_id={}&redirect_uri={}&response_type=code",
+        "{ANILIST_AUTHORIZE}?client_id={}&redirect_uri={}&response_type=code&state={}",
         anilist_client_id(),
         url_encode(redirect),
+        url_encode(state),
     )
+}
+
+/// A per-attempt value the loopback callback must echo back.
+pub fn oauth_state() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    let mut parts = [0u64; 2];
+    for (index, part) in parts.iter_mut().enumerate() {
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u128(nanos);
+        hasher.write_usize(index);
+        hasher.write_u32(std::process::id());
+        *part = hasher.finish();
+    }
+    format!("{:016x}{:016x}", parts[0], parts[1])
 }
 
 /// Desktop loopback redirect AniList's public client is registered with.
@@ -362,7 +381,11 @@ pub fn anilist_loopback_redirect() -> String {
 /// Waits (bounded) on `127.0.0.1:{port}` for the OAuth redirect and returns
 /// the `code` parameter. Desktop flows call this; mobile uses the paste-token
 /// path instead, so the UI never reaches it there.
-pub fn wait_oauth_code(port: u16, timeout: std::time::Duration) -> Result<String, String> {
+pub fn wait_oauth_code(
+    port: u16,
+    timeout: std::time::Duration,
+    state: &str,
+) -> Result<String, String> {
     use std::io::{Read, Write};
     let listener = std::net::TcpListener::bind(("127.0.0.1", port))
         .map_err(|e| format!("无法监听本地回环端口 {port}：{e}"))?;
@@ -381,10 +404,24 @@ pub fn wait_oauth_code(port: u16, timeout: std::time::Duration) -> Result<String
                     .next()
                     .and_then(|line| line.split_whitespace().nth(1))
                     .unwrap_or("/");
-                let code = path
-                    .split(['?', '&'])
-                    .find_map(|part| part.strip_prefix("code="))
-                    .map(|value| percent_decode(value));
+                let param = |name: &str| {
+                    path.split(['?', '&'])
+                        .filter_map(|part| part.strip_prefix(name))
+                        .last()
+                        .map(percent_decode)
+                };
+                // The registered redirect already carries `code=1337`; the
+                // real code is the last one appended by the provider.
+                let code = param("code=");
+                if param("state=").as_deref() != Some(state) {
+                    let html = "<html><body><h2>授权请求无效，请回到应用重试。</h2></body></html>";
+                    let body = format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
+                        html.len()
+                    );
+                    let _ = stream.write_all(body.as_bytes());
+                    continue;
+                }
                 let page = if code.is_some() {
                     "已收到授权，请回到应用继续。"
                 } else {
@@ -792,7 +829,9 @@ pub enum TrackEvent {
     Account { tracker: TrackerKind, name: String },
     LoggedOut(TrackerKind),
     AutoSync(bool),
-    SearchResults { key: String, list: Vec<TrackSearch> },
+    SearchResults { key: String, tracker: TrackerKind, list: Vec<TrackSearch> },
+    /// Sent after every command, including skipped and no-op ones.
+    Done,
     Bound { key: String, title: String },
     Unbound(String),
     Entry { key: String, entry: Option<TrackEntry> },
@@ -832,8 +871,10 @@ pub struct Trackers {
     request: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Latest result per binding key for the detail panel.
     pub entries: std::collections::HashMap<String, Option<TrackEntry>>,
-    /// Latest search results per binding key.
-    pub searches: std::collections::HashMap<String, Vec<TrackSearch>>,
+    /// Latest search results per binding key, with the tracker they came from.
+    pub searches: std::collections::HashMap<String, (TrackerKind, Vec<TrackSearch>)>,
+    /// Commands queued but not yet finished by the worker.
+    pending: usize,
     /// In-flight flag for the panel spinner.
     pub busy: bool,
     /// Last failure text, shown beside the settings block.
@@ -865,6 +906,8 @@ impl Trackers {
                     if id != worker_request.load(std::sync::atomic::Ordering::Relaxed)
                         && matches!(command, TrackCommand::Search { .. } | TrackCommand::Refresh(_))
                     {
+                        let _ = event_tx.send(TrackEvent::Done);
+                        ctx.request_repaint();
                         continue;
                     }
                     let store_path = worker_root.join(STORE_FILE);
@@ -872,6 +915,7 @@ impl Trackers {
                     for event in events {
                         let _ = event_tx.send(event);
                     }
+                    let _ = event_tx.send(TrackEvent::Done);
                     ctx.request_repaint();
                 }
             })
@@ -884,6 +928,7 @@ impl Trackers {
             request,
             entries: Default::default(),
             searches: Default::default(),
+            pending: 0,
             busy: false,
             error: None,
             notices: Vec::new(),
@@ -912,13 +957,14 @@ impl Trackers {
     }
 
     pub fn submit(&mut self, command: TrackCommand) {
-        self.busy = true;
         self.request.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let id = self.request.load(std::sync::atomic::Ordering::Relaxed);
         if self.tx.send((id, command)).is_err() {
-            self.busy = false;
             self.error = Some("同步服务不可用".into());
+            return;
         }
+        self.pending += 1;
+        self.busy = true;
     }
 
     /// Called by the reader when a chapter finished. The private-mode gate
@@ -942,7 +988,6 @@ impl Trackers {
 
     pub fn poll(&mut self) {
         while let Ok(event) = self.rx.try_recv() {
-            self.busy = false;
             match event {
                 TrackEvent::Account { tracker, name } => {
                     self.error = None;
@@ -952,8 +997,12 @@ impl Trackers {
                 }
                 TrackEvent::LoggedOut(_) | TrackEvent::AutoSync(_)
                 | TrackEvent::Unbound(_) => self.reload_store(),
-                TrackEvent::SearchResults { key, list } => {
-                    self.searches.insert(key, list);
+                TrackEvent::SearchResults { key, tracker, list } => {
+                    self.searches.insert(key, (tracker, list));
+                }
+                TrackEvent::Done => {
+                    self.pending = self.pending.saturating_sub(1);
+                    self.busy = self.pending > 0;
                 }
                 TrackEvent::Bound { .. } | TrackEvent::Synced { .. } => self.reload_store(),
                 TrackEvent::Entry { key, entry } => {
@@ -986,7 +1035,7 @@ fn run_command(command: TrackCommand, store_path: &Path, endpoints: &Endpoints) 
             let _ = std::fs::create_dir_all(parent);
         }
         let part = store_path.with_extension("json.part");
-        std::fs::write(&part, serde_json::to_vec_pretty(store).unwrap_or_default())
+        write_private(&part, &serde_json::to_vec_pretty(store).unwrap_or_default())
             .map_err(|e| format!("写入 trackers.json 失败：{e}"))?;
         std::fs::rename(&part, store_path).map_err(|e| format!("保存 trackers.json 失败：{e}"))
     };
@@ -999,13 +1048,15 @@ fn run_command(command: TrackCommand, store_path: &Path, endpoints: &Endpoints) 
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             {
                 let redirect = anilist_loopback_redirect();
-                let url = anilist_authorize_url(&redirect);
+                let state = oauth_state();
+                let url = anilist_authorize_url(&redirect, &state);
                 if let Err(error) = yejian_platform::open_external_url(&url) {
                     return fail(format!("无法打开授权页：{error}"));
                 }
                 let code = match wait_oauth_code(
                     OAUTH_LOOPBACK_PORT,
                     std::time::Duration::from_secs(OAUTH_LISTEN_TIMEOUT_SECS),
+                    &state,
                 ) {
                     Ok(code) => code,
                     Err(error) => return fail(format!("等待 AniList 授权失败：{error}")),
@@ -1109,29 +1160,61 @@ fn run_command(command: TrackCommand, store_path: &Path, endpoints: &Endpoints) 
                 ),
             };
             match result {
-                Ok(list) => vec![TrackEvent::SearchResults { key, list }],
+                Ok(list) => vec![TrackEvent::SearchResults { key, tracker, list }],
                 Err(error) => fail(format!("{} 搜索失败：{error}", tracker.label())),
             }
         }
         TrackCommand::Bind { tracker, key, pick, progress } => {
-            store.bindings.insert(
-                key.clone(),
-                Binding {
-                    tracker: tracker_label(tracker).to_string(),
-                    media_id: pick.media_id.clone(),
-                    library_id: None,
-                    title: pick.title.clone(),
-                    progress: 0,
-                    status: TrackStatus::Reading,
-                },
-            );
-            // Push the current progress right away so the entry exists.
-            let events = push_progress(&mut store, &key, progress, &save, endpoints);
+            let Some(account) = account_for(&store, tracker).cloned() else {
+                return fail(format!("请先登录 {}", tracker.label()));
+            };
+            // Adopt an entry the reader already has instead of overwriting it.
+            let existing = match tracker {
+                TrackerKind::Anilist => anilist_entry(
+                    &endpoints.graphql,
+                    &account.access_token,
+                    &account.user_id,
+                    &pick.media_id,
+                ),
+                TrackerKind::Kitsu => kitsu_entry(
+                    &endpoints.kitsu_edge,
+                    &account.access_token,
+                    &account.user_id,
+                    &pick.media_id,
+                ),
+            };
+            let existing = match existing {
+                Ok(existing) => existing,
+                Err(error) => return fail(format!("读取远端条目失败：{error}")),
+            };
+            let mut binding = Binding {
+                tracker: tracker_label(tracker).to_string(),
+                media_id: pick.media_id.clone(),
+                library_id: None,
+                title: pick.title.clone(),
+                progress: 0,
+                status: TrackStatus::Reading,
+            };
+            if let Some(entry) = &existing {
+                binding.library_id = entry.library_id.clone();
+                binding.progress = entry.progress;
+                binding.status = entry.status;
+            }
+            let remote = binding.progress;
+            store.bindings.insert(key.clone(), binding);
             let mut all = vec![TrackEvent::Bound {
-                key,
+                key: key.clone(),
                 title: pick.title,
             }];
-            all.extend(events);
+            if existing.is_none() || progress > remote {
+                // Create the entry, or move it forward to local progress.
+                all.extend(push_progress(&mut store, &key, progress.max(remote), &save, endpoints));
+            } else {
+                if let Err(error) = save(&store) {
+                    return fail(error);
+                }
+                all.push(TrackEvent::Entry { key, entry: existing });
+            }
             all
         }
         TrackCommand::Unbind(key) => {
@@ -1203,6 +1286,28 @@ fn run_command(command: TrackCommand, store_path: &Path, endpoints: &Endpoints) 
                 Err(error) => vec![TrackEvent::Notice(format!("同步进度失败：{error}"))],
             }
         }
+    }
+}
+
+/// Writes a file only the current user can read: it holds access tokens.
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file.write_all(bytes)?;
+        file.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)
     }
 }
 
@@ -1637,14 +1742,76 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         drop(listener);
         let handle = std::thread::spawn(move || {
-            wait_oauth_code(port, std::time::Duration::from_secs(5))
+            wait_oauth_code(port, std::time::Duration::from_secs(5), "S1")
         });
         std::thread::sleep(std::time::Duration::from_millis(150));
+        // An unsolicited callback without the attempt's state is ignored.
+        let mut forged = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        forged
+            .write_all(b"GET /success?code=1337&code=EVIL HTTP/1.1\r\nHost: x\r\n\r\n")
+            .unwrap();
+        let mut reply = String::new();
+        let _ = forged.read_to_string(&mut reply);
+        assert!(reply.starts_with("HTTP/1.1 400"), "{reply}");
         let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
         stream
-            .write_all(b"GET /success?code=1337&auth=CODE123 HTTP/1.1\r\nHost: x\r\n\r\n")
+            .write_all(b"GET /success?code=1337&code=REAL&state=S1 HTTP/1.1\r\nHost: x\r\n\r\n")
             .unwrap();
         let code = handle.join().unwrap().unwrap();
-        assert_eq!(code, "1337");
+        assert_eq!(code, "REAL");
+    }
+
+    #[test]
+    fn binding_adopts_an_existing_remote_entry() {
+        let saves = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = saves.clone();
+        let (base, _server) = serve(move |_head, body| {
+            if body.contains("SaveMediaListEntry") {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return (200, r#"{"data":{"SaveMediaListEntry":{"id":7,"status":"COMPLETED","progress":0}}}"#.into());
+            }
+            (
+                200,
+                r#"{"data":{"Page":{"mediaList":[{"id":7,"status":"COMPLETED","scoreRaw":0,"progress":80,"media":{"id":99,"title":{"userPreferred":"A"},"chapters":80}}]}}}"#.into(),
+            )
+        });
+        let endpoints = Endpoints {
+            graphql: base,
+            ..Default::default()
+        };
+        let mut store = Store::default();
+        store.anilist = Some(Account {
+            user_id: "42".into(),
+            name: "u".into(),
+            access_token: "t".into(),
+            ..Default::default()
+        });
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(STORE_FILE);
+        std::fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
+        let pick = TrackSearch {
+            media_id: "99".into(),
+            title: "A".into(),
+            cover: String::new(),
+            total_chapters: 80,
+            status: String::new(),
+        };
+        run_command(
+            TrackCommand::Bind { tracker: TrackerKind::Anilist, key: "book:x".into(), pick, progress: 0 },
+            &path,
+            &endpoints,
+        );
+        assert_eq!(saves.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let saved: Store = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let binding = &saved.bindings["book:x"];
+        assert_eq!(binding.progress, 80);
+        assert_eq!(binding.status, TrackStatus::Completed);
+        assert_eq!(binding.library_id.as_deref(), Some("7"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "token file is readable by others");
+        }
     }
 }
