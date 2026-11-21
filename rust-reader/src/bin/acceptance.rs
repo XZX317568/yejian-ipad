@@ -372,6 +372,116 @@ fn fake_bangumi() -> (String, std::thread::JoinHandle<()>) {
     (format!("http://{addr}"), handle)
 }
 
+/// Minimal in-process WebDAV server: `MKCOL`, `GET` + `ETag`, `PUT` with
+/// `If-None-Match`/`If-Match`. Files live in the shared map so the test can
+/// seed a remote snapshot before the app syncs (a real two-root merge).
+fn fake_webdav() -> (
+    String,
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, (Vec<u8>, String)>>>,
+    std::thread::JoinHandle<()>,
+) {
+    use std::collections::HashMap;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let files: Arc<Mutex<HashMap<String, (Vec<u8>, String)>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let store = files.clone();
+    let handle = std::thread::spawn(move || loop {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut request = Vec::new();
+        let mut buffer = vec![0u8; 64 * 1024];
+        // Read the head, then however many body bytes Content-Length asks for.
+        loop {
+            let read = stream.read(&mut buffer).unwrap_or(0);
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            if let Some(pos) = request
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+            {
+                let head = String::from_utf8_lossy(&request[..pos]).to_string();
+                let want: usize = head
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|v| v.trim().parse().ok())
+                    })
+                    .unwrap_or(0);
+                if request.len() >= pos + 4 + want {
+                    break;
+                }
+            }
+        }
+        let head_end = request
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .unwrap_or(request.len());
+        let head = String::from_utf8_lossy(&request[..head_end]).to_string();
+        let body = request[head_end + 4.min(request.len() - head_end).min(4)..].to_vec();
+        let line = head.lines().next().unwrap_or("");
+        let mut parts = line.split_whitespace();
+        let method = parts.next().unwrap_or("");
+        let path = parts.next().unwrap_or("/").to_string();
+        let header = |name: &str| {
+            head.lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix(&format!("{}:", name.to_ascii_lowercase()))
+                        .map(|v| v.trim().to_string())
+                })
+        };
+        let mut files = store.lock().unwrap();
+        let next_etag = || format!("\"{}\"", files.len() + 1);
+        let (status, etag, reply): (&str, Option<String>, Vec<u8>) = match method {
+            "MKCOL" => ("201", None, Vec::new()),
+            "GET" => match files.get(&path) {
+                Some((body, etag)) => ("200", Some(etag.clone()), body.clone()),
+                None => ("404", None, b"not found".to_vec()),
+            },
+            "PUT" => {
+                let exists = files.contains_key(&path);
+                if header("if-none-match").as_deref() == Some("*") && exists {
+                    ("412", None, Vec::new())
+                } else if let Some(want) = header("if-match") {
+                    let have = files.get(&path).map(|(_, tag)| tag.clone());
+                    if have.as_deref() != Some(want.as_str()) {
+                        ("412", None, Vec::new())
+                    } else {
+                        let etag = next_etag();
+                        files.insert(path, (body.clone(), etag.clone()));
+                        ("204", Some(etag), Vec::new())
+                    }
+                } else {
+                    let etag = next_etag();
+                    files.insert(path, (body.clone(), etag.clone()));
+                    (if exists { "204" } else { "201" }, Some(etag), Vec::new())
+                }
+            }
+            _ => ("405", None, Vec::new()),
+        };
+        drop(files);
+        let mut response = format!(
+            "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n",
+            reply.len()
+        );
+        if let Some(etag) = etag {
+            response.push_str(&format!("ETag: {etag}\r\n"));
+        }
+        response.push_str("\r\n");
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.write_all(&reply);
+    });
+    (format!("http://{addr}/"), files, handle)
+}
+
 fn collect_text(
     shape: &Shape,
     clip: Rect,
@@ -1476,6 +1586,100 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
     h.click("nav-library")?;
     h.frames(3)?;
 
+    // Round D3: 新章节通知 — desktop fakes a granted permission, the 追更
+    // settings toggle is switched on and the enabled row is captured.
+    yejian_platform::set_notification_fake(Some(true));
+    h.click("nav-settings")?;
+    h.frames(4)?;
+    let notify_row = |h: &Harness| {
+        let safe = design_safe_rect(h).expand(0.5);
+        h.painted_text.iter().any(|text| {
+            text.text.contains("新章节通知")
+                && safe.contains_rect(text.bounds)
+                && text.clip.expand(0.5).contains_rect(text.bounds)
+        })
+    };
+    for _ in 0..24 {
+        if notify_row(h) {
+            break;
+        }
+        scroll_page(h, -120.)?;
+    }
+    for _ in 0..24 {
+        if notify_row(h) {
+            break;
+        }
+        scroll_page(h, 120.)?;
+    }
+    anyhow::ensure!(notify_row(h), "roundD3: the 新章节通知 row is missing");
+    h.click_text("新章节通知")?;
+    h.wait(|app| app.notify_updates_enabled())?;
+    h.frames(3)?;
+    design_capture(h, "settings-notify", &mut captures)?;
+
+    // Round D4: 云同步（WebDAV）— seed a remote snapshot written by
+    // "device-b" on a fake server, run a real two-root merge, then capture
+    // the settings section with the 上次同步 status line.
+    let (dav_url, dav_files, _dav) = fake_webdav();
+    {
+        let remote = serde_json::json!({
+            "stats": {
+                "device-b\u{1f}2001-01-01": {
+                    "updated_at": 1,
+                    "value": {"seconds": 5, "pages": 2, "chapters": 0}
+                }
+            }
+        });
+        dav_files.lock().unwrap().insert(
+            "/yejian/yejian-sync.json".into(),
+            (serde_json::to_vec(&remote)?, "\"1\"".into()),
+        );
+    }
+    h.app.prepare_webdav_acceptance(dav_url);
+    h.app.cloud_sync_once();
+    h.wait(|app| app.cloud_synced())?;
+    // The remote "device-b" day must have merged into the local stats
+    // store — proof the two-root merge ran and was applied by owners.
+    h.wait(|app| app.stats_day_seconds("2001-01-01", "device-b") == Some(5))?;
+    let webdav_row = |h: &Harness| {
+        let safe = design_safe_rect(h).expand(0.5);
+        h.painted_text.iter().any(|text| {
+            text.text.contains("云同步")
+                && safe.contains_rect(text.bounds)
+                && text.clip.expand(0.5).contains_rect(text.bounds)
+        })
+    };
+    for _ in 0..24 {
+        if webdav_row(h) {
+            break;
+        }
+        scroll_page(h, -120.)?;
+    }
+    for _ in 0..24 {
+        if webdav_row(h) {
+            break;
+        }
+        scroll_page(h, 120.)?;
+    }
+    anyhow::ensure!(webdav_row(h), "roundD4: the 云同步 section is missing");
+    design_capture(h, "settings-webdav", &mut captures)?;
+    let synced_row = |h: &Harness| {
+        let safe = design_safe_rect(h).expand(0.5);
+        h.painted_text.iter().any(|text| {
+            text.text.contains("上次同步")
+                && safe.contains_rect(text.bounds)
+                && text.clip.expand(0.5).contains_rect(text.bounds)
+        })
+    };
+    for _ in 0..24 {
+        if synced_row(h) {
+            break;
+        }
+        scroll_page(h, -120.)?;
+    }
+    anyhow::ensure!(synced_row(h), "roundD4: the 上次同步 status did not render");
+    design_capture(h, "webdav-synced", &mut captures)?;
+
     // Reopen the real saved settings, preserving the source and reading
     // history. Only the temporary acceptance library is changed. Preview
     // follows/tasks must not be persisted into the real library on exit.
@@ -1513,7 +1717,14 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
     h.frames(8)?;
     design_reveal_read(h)?;
     design_capture(h, "design-large-text-shelf", &mut captures)?;
-    h.click("shelf-read")?;
+    for attempt in 0..5 {
+        h.click("shelf-read")?;
+        h.frames(4)?;
+        if h.app.screen_name() == "reader" {
+            break;
+        }
+        anyhow::ensure!(attempt < 4, "design: 320pt shelf-read click did not open");
+    }
     h.wait(ReaderApp::page_loaded)?;
     h.frame(vec![], None)?;
     h.click("reader-back")?;

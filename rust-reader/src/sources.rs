@@ -964,7 +964,7 @@ fn snapshot_root(root: &Path) -> PathBuf {
 fn manga_snapshot_key(source: &str, manga: &str) -> String {
     identity_id(source, manga, "manga-snapshot")
 }
-fn manga_snapshot_path(root: &Path, key: &str) -> anyhow::Result<PathBuf> {
+pub(crate) fn manga_snapshot_path(root: &Path, key: &str) -> anyhow::Result<PathBuf> {
     anyhow::ensure!(valid_task_id(key), "非法的漫画快照 id：{key:?}");
     Ok(snapshot_root(root).join(format!("{key}.manga")))
 }
@@ -1597,6 +1597,9 @@ pub struct Sources {
 
     /// `Instant` so a suspended frame clock cannot skip a whole interval.
     follow_next_due: Option<std::time::Instant>,
+    /// Fresh chapters collected by finished checks, waiting for the shell
+    /// to turn into system notifications (deduped in notify.rs).
+    notify_pending: Vec<crate::notify::FreshUpdate>,
     /// New-chapter summary surfaced to the app shell's notice bar once a
 
     /// background (scheduled) check finishes.
@@ -3617,6 +3620,7 @@ impl Sources {
             follow_interval_min: DEFAULT_FOLLOW_INTERVAL_MIN,
             follow_next_due: None,
             follow_notice: None,
+            notify_pending: Vec::new(),
             up_tx,
             up_rx,
             covers: Default::default(),
@@ -4562,6 +4566,14 @@ impl Sources {
                             .cloned()
                             .collect();
                         follow.apply_check(&keys, follows::now());
+                        if !added.is_empty() {
+                            self.notify_pending.push(crate::notify::FreshUpdate {
+                                source: follow.source_id.clone(),
+                                manga: follow.manga_id.clone(),
+                                title: follow.title.clone(),
+                                added: added.clone(),
+                            });
+                        }
                         ok_list = Some(list);
                     }
                     Err(error) => {
@@ -9767,6 +9779,7 @@ mod tests {
             follow_interval_min: DEFAULT_FOLLOW_INTERVAL_MIN,
             follow_next_due: None,
             follow_notice: None,
+            notify_pending: Vec::new(),
             // Keep the update receiver alive so `check_follows` batches do not
 
             // fail in tests that never drain `up_rx`.
@@ -12898,3 +12911,114 @@ mod tests {
     }
 }
 
+
+impl Sources {
+    /// Fresh-chapter items collected since the last drain — the shell turns
+    /// them into system notifications (foregrounded frames only mark them).
+    pub(crate) fn take_notify_updates(&mut self) -> Vec<crate::notify::FreshUpdate> {
+        std::mem::take(&mut self.notify_pending)
+    }
+}
+
+/// Online chapter read state for cloud sync — one record per task that has a
+/// `read_at` (i.e. the user actually opened it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OnlineReadState {
+    pub source_id: String,
+    pub manga_id: String,
+    pub chapter_id: String,
+    pub read_page: usize,
+    pub total: usize,
+    pub read_at: i64,
+}
+
+impl Sources {
+    /// Every task's latest online read position — the cloud snapshot's
+    /// `online` group.
+    pub(crate) fn online_read_state(&self) -> Vec<OnlineReadState> {
+        self.tasks
+            .iter()
+            .filter_map(|task| {
+                Some(OnlineReadState {
+                    source_id: task.source_id.clone(),
+                    manga_id: task.manga_id.clone(),
+                    chapter_id: task.chapter_id.clone(),
+                    read_page: task.read_page?,
+                    total: task.pages_total,
+                    read_at: task.read_at?,
+                })
+            })
+            .collect()
+    }
+
+    /// Applies remote online read state onto matching tasks; returns how
+    /// many tasks were moved. `skip` excludes the work currently open in
+    /// the reader so sync never yanks a live position.
+    pub(crate) fn apply_online_state(
+        &mut self,
+        states: &[OnlineReadState],
+        skip: Option<(&str, &str)>,
+    ) -> usize {
+        let mut changed = 0;
+        for state in states {
+            if skip.is_some_and(|(s, m)| s == state.source_id && m == state.manga_id) {
+                continue;
+            }
+            let Some(task) = self.tasks.iter_mut().find(|task| {
+                task.source_id == state.source_id
+                    && task.manga_id == state.manga_id
+                    && task.chapter_id == state.chapter_id
+            }) else {
+                continue;
+            };
+            if state.read_at > task.read_at.unwrap_or(0) {
+                task.read_page = Some(state.read_page);
+                task.read_at = Some(state.read_at);
+                changed += 1;
+            }
+        }
+        if changed > 0 {
+            let _ = self.persist();
+        }
+        changed
+    }
+
+    /// Replaces the follows list wholesale after a cloud merge and persists.
+    pub(crate) fn apply_synced_follows(&mut self, follows: Vec<Follow>) {
+        self.follows = follows;
+        self.save_follows();
+    }
+
+    /// `(id, version)` per installed source — the cloud snapshot's `sources`
+    /// group, so another device can offer 一键安装.
+    pub(crate) fn installed_source_meta(&self) -> Vec<(String, i64)> {
+        self.installed
+            .iter()
+            .map(|source| (source.manifest.id.clone(), source.manifest.version))
+            .collect()
+    }
+
+    /// Repo-list urls for the cloud `sources` group entries.
+    pub(crate) fn repo_urls(&self) -> Vec<String> {
+        self.repos.urls.clone()
+    }
+
+    /// Install one remote device already had — resolves the source id in the
+    /// cached repository index and queues the normal install task. Returns
+    /// true when the id was found.
+    pub(crate) fn install_cloud_source(&mut self, id: &str) -> bool {
+        let Some(repo) = &self.repository else {
+            return false;
+        };
+        let Some(entry) = repo
+            .sources
+            .iter()
+            .find(|source| &source.id == id)
+            .cloned()
+        else {
+            return false;
+        };
+        self.submit(Task::Install(entry));
+        true
+    }
+}

@@ -48,7 +48,7 @@ pub enum Command {
     PurgeBooks(Vec<String>),
     /// Delete files of every removed book; rows stay.
     PurgeRemoved,
-    Backup(PathBuf),
+    Backup(PathBuf, Option<Vec<u8>>),
     Restore(PathBuf),
     Flush(mpsc::Sender<Result<(), String>>),
     #[cfg(test)]
@@ -74,6 +74,9 @@ pub enum Event {
     Error(String),
     StartupError(String),
     BackupReady(PathBuf),
+    /// `app-state.json` recovered from a native backup — the UI applies it
+    /// through the same owners as a cloud merge.
+    AppState(Vec<u8>),
     ChapterImported(String),
     ChapterImportFailed {
         id: String,
@@ -370,9 +373,19 @@ impl Worker {
                                 ));
                                 notify(Event::Storage(library.storage_report()?));
                             }
-                            Command::Backup(path) => {
+                            Command::Backup(path, app_state) => {
                                 wait_for_positions()?;
-                                let report = library.export_backup(&path)?;
+                                // Fill the snapshot's progress group here —
+                                // only this thread holds the library store.
+                                let app_state = app_state.map(|bytes| {
+                                    merge_backup_progress(&library, &bytes)
+                                        .unwrap_or(bytes)
+                                });
+                                let extras: Vec<(String, Vec<u8>)> = app_state
+                                    .map(|bytes| vec![("app-state.json".into(), bytes)])
+                                    .unwrap_or_default();
+                                let report =
+                                    library.export_backup_with_extras(&path, &extras)?;
                                 if report.is_complete() {
                                     notify(Event::Notice(format!(
                                         "{} 本书已备份到 {}",
@@ -401,6 +414,9 @@ impl Worker {
                                 let _archive_guard = archive_access.write()
                                     .map_err(|_| anyhow::anyhow!("漫画档案锁已失效"))?;
                                 let report = library.restore(&path)?;
+                                if let Some(state) = report.app_state.clone() {
+                                    notify(Event::AppState(state));
+                                }
                                 notify(Event::Ready(
                                     library.list_books("")?,
                                     read_settings(&library)?,
@@ -605,9 +621,14 @@ fn read_settings(library: &Library) -> anyhow::Result<Vec<(String, String)>> {
         "tap-zones",
         "reader-status",
         "follow-interval",
+        "notify-updates",
         "auto-download",
         "app-lock",
         "app-lock-delay",
+        "webdav-enabled",
+        "webdav-url",
+        "webdav-user",
+        "webdav-dir",
         "history-hidden",
         "source-repos",
         "source-repos-checked-at",
@@ -1107,7 +1128,7 @@ mod tests {
                 private: false,
             })
             .unwrap();
-        worker.send(super::Command::Backup(backup.clone())).unwrap();
+        worker.send(super::Command::Backup(backup.clone(), None)).unwrap();
         let mut saw_refresh = false;
         loop {
             match worker.rx.recv_timeout(timeout).unwrap() {
@@ -1208,6 +1229,12 @@ mod tests {
             .unwrap();
         original.set_setting("app-lock", "true").unwrap();
         original.set_setting("app-lock-delay", "300").unwrap();
+        original.set_setting("notify-updates", "true").unwrap();
+        original.set_setting("webdav-enabled", "true").unwrap();
+        original
+            .set_setting("webdav-url", "https://dav.example.com/dav/")
+            .unwrap();
+        original.set_setting("webdav-user", "sync-user").unwrap();
         original
             .set_setting("source-repos", "[\"https://repo.example/index.json\"]")
             .unwrap();
@@ -1242,6 +1269,13 @@ mod tests {
                 assert!(settings.contains(&("reader-status".into(), "false".into())));
                 assert!(settings.contains(&("auto-download".into(), "latest3".into())));
                 assert!(settings.contains(&("app-lock".into(), "true".into())));
+                assert!(settings.contains(&("notify-updates".into(), "true".into())));
+                assert!(settings.contains(&("webdav-enabled".into(), "true".into())));
+                assert!(settings.contains(&(
+                    "webdav-url".into(),
+                    "https://dav.example.com/dav/".into()
+                )));
+                assert!(settings.contains(&("webdav-user".into(), "sync-user".into())));
                 assert!(settings.contains(&("app-lock-delay".into(), "300".into())));
                 assert!(settings.contains(&(
                     "source-repos".into(),
@@ -1330,4 +1364,26 @@ mod tests {
         let bounds = super::content_bounds(&blank);
         assert_eq!(bounds, [0.25, 0.25, 0.75, 0.75]);
     }
+}
+
+
+/// Injects the library's progress records into an app-state JSON snapshot's
+/// `progress` group — the UI-side collector cannot reach the store.
+fn merge_backup_progress(library: &Library, bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let mut snapshot: serde_json::Value = serde_json::from_slice(bytes)?;
+    let records = library.export_progress()?;
+    let mut progress = serde_json::Map::new();
+    for record in records {
+        progress.insert(
+            record.book_id.clone(),
+            serde_json::json!({
+                "updated_at": record.updated_at,
+                "value": serde_json::to_value(&record)?,
+            }),
+        );
+    }
+    snapshot
+        .as_object_mut()
+        .map(|object| object.insert("progress".into(), serde_json::Value::Object(progress)));
+    Ok(serde_json::to_vec(&snapshot)?)
 }

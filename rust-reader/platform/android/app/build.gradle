@@ -12,7 +12,7 @@ android {
         applicationId "app.yejian.reader.rust"
         minSdkVersion 24
         targetSdkVersion 36
-        versionCode 7
+        versionCode 18
         versionName "0.1.1"
     }
 

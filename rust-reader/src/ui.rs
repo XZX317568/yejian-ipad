@@ -353,6 +353,22 @@ pub struct ReaderApp {
     applock: crate::applock::AppLock,
     /// 阅读统计 per local day per device (`reading-stats.json`).
     stats: crate::stats::Stats,
+    /// 新章节通知: enabled by the 追更 settings toggle after the system
+    /// grants permission; `notify_sent` dedupes chapter keys forever.
+    notify_enabled: bool,
+    notify_permission_pending: bool,
+    notify_sent: crate::notify::SentStore,
+    /// 云同步（WebDAV）worker + the settings text buffers.
+    cloud: crate::cloud::CloudSync,
+    cloud_url: String,
+    cloud_user: String,
+    cloud_password: String,
+    cloud_dir: String,
+    /// Source ids other devices installed, offered for 一键安装.
+    cloud_missing: Vec<String>,
+    /// Last appearance change (theme/palette/font-scale/direction) — the
+    /// `appearance` group's shared `updated_at`.
+    appearance_ts: i64,
     /// Whether the shell currently reports the app as foregrounded
     /// (desktop stays true; mobile reports via ForegroundEvent).
     app_foreground: bool,
@@ -375,6 +391,18 @@ impl ReaderApp {
         // Page files staged for the share sheet are one-shot temp files.
         let _ = std::fs::remove_dir_all(root.join("share"));
         let bookmarks = crate::bookmarks::Bookmarks::load(&root);
+        // iOS BGAppRefreshTask runs this handler on a system thread; it only
+        // touches disk state and the source engine (notify.rs keeps it
+        // egui-free) and posts whatever it returns through the OS.
+        let bg_root = root.clone();
+        yejian_platform::set_background_refresh_handler(Box::new(move || {
+            let mut sent = crate::notify::SentStore::load(&bg_root);
+            crate::notify::run_background_check(
+                &bg_root,
+                &mut sent,
+                std::time::Instant::now() + crate::notify::BG_DEADLINE,
+            )
+        }));
         Self {
             worker: Worker::start(root.clone(), ctx.clone()),
             sync: crate::sync::ProgressSync::new(root.clone(), ctx.clone()),
@@ -388,6 +416,16 @@ impl ReaderApp {
             track_draft: None,
             applock: crate::applock::AppLock::default(),
             stats: crate::stats::Stats::load(&root),
+            notify_enabled: false,
+            notify_permission_pending: false,
+            notify_sent: crate::notify::SentStore::load(&root),
+            cloud: crate::cloud::CloudSync::new(root.clone()),
+            cloud_url: String::new(),
+            cloud_user: String::new(),
+            cloud_password: crate::cloud::load_password(&root),
+            cloud_dir: "yejian".into(),
+            cloud_missing: Vec::new(),
+            appearance_ts: 0,
             app_foreground: true,
             history_hidden: Default::default(),
             history_query: String::new(),
@@ -684,6 +722,43 @@ impl ReaderApp {
     #[cfg(debug_assertions)]
     pub fn app_lock_enabled(&self) -> bool {
         self.applock.enabled()
+    }
+    /// Acceptance seam: the 新章节通知 toggle state.
+    #[cfg(debug_assertions)]
+    pub fn notify_updates_enabled(&self) -> bool {
+        self.notify_enabled
+    }
+    /// Acceptance seam: point the WebDAV form at a local fake server.
+    #[cfg(debug_assertions)]
+    pub fn prepare_webdav_acceptance(&mut self, url: String) {
+        self.cloud_url = url;
+        self.cloud_user = "acceptance".into();
+        self.cloud_password = "pw".into();
+        self.cloud_dir = "yejian".into();
+        self.cloud.enabled = true;
+        self.cloud.config.url = self.cloud_url.clone();
+        self.cloud.config.user = self.cloud_user.clone();
+        self.cloud.config.password = self.cloud_password.clone();
+        self.cloud.config.dir = self.cloud_dir.clone();
+    }
+    /// Acceptance seam: kick a sync round with the current snapshot.
+    #[cfg(debug_assertions)]
+    pub fn cloud_sync_once(&mut self) {
+        self.cloud.sync_now(self.cloud_snapshot());
+    }
+    /// Acceptance seam: the last round finished without an error.
+    #[cfg(debug_assertions)]
+    pub fn cloud_synced(&self) -> bool {
+        self.cloud.synced_ok()
+    }
+    /// Acceptance seam: a (day, device) stats cell merged from the remote.
+    #[cfg(debug_assertions)]
+    pub fn stats_day_seconds(&self, day: &str, device: &str) -> Option<u64> {
+        self.stats
+            .export_days()
+            .get(day)
+            .and_then(|devices| devices.get(device))
+            .map(|stats| stats.seconds)
     }
     /// Acceptance seam: Bangumi requests go to a local fake server.
     #[cfg(debug_assertions)]
@@ -1957,6 +2032,28 @@ impl ReaderApp {
                                     .unwrap_or(crate::sources::DEFAULT_FOLLOW_INTERVAL_MIN);
                                 self.sources.set_follow_interval(minutes);
                             }
+                            "notify-updates" => {
+                                self.notify_enabled = value == "true";
+                            }
+                            "webdav-enabled" => {
+                                self.cloud.enabled = value == "true";
+                            }
+                            "webdav-url" => {
+                                self.cloud_url = value;
+                            }
+                            "webdav-user" => {
+                                self.cloud_user = value;
+                            }
+                            "webdav-dir" => {
+                                self.cloud_dir = if value.is_empty() {
+                                    "yejian".into()
+                                } else {
+                                    value
+                                };
+                            }
+                            "appearance-updated" => {
+                                self.appearance_ts = value.parse().unwrap_or(0);
+                            }
                             "auto-download" => {
                                 self.sources.set_auto_download(&value);
                             }
@@ -2011,11 +2108,34 @@ impl ReaderApp {
                     self.applock.apply_settings(app_lock_enabled, app_lock_delay);
                     self.applock.cold_start();
                     yejian_platform::set_privacy_shield(self.applock.enabled());
+                    yejian_platform::set_refresh_interval(
+                        self.sources.follow_interval().max(60) * 60,
+                    );
+                    self.cloud.config.url = self.cloud_url.clone();
+                    self.cloud.config.user = self.cloud_user.clone();
+                    self.cloud.config.password = self.cloud_password.clone();
+                    self.cloud.config.dir = self.cloud_dir.clone();
+                    self.cloud.config.enabled = self.cloud.enabled;
+                    self.cloud.enabled = self.cloud.config.enabled;
                     self.sources.set_private(self.private);
+                    // 启动即同步一次（配置完整时）。
+                    self.cloud.sync_now(self.cloud_snapshot());
                 }
                 Event::Library(books, links) => {
                     self.replace_links(links);
                     self.replace_books(books, ctx.input(|i| i.time));
+                }
+                Event::AppState(bytes) => {
+                    match serde_json::from_slice::<crate::cloud::Snapshot>(&bytes) {
+                        Ok(snapshot) => {
+                            self.apply_cloud_snapshot(&snapshot);
+                            self.pending_notice =
+                                Some("已恢复备份中的应用数据".into());
+                        }
+                        Err(error) => {
+                            self.error = Some(format!("备份中的应用数据损坏：{error}"));
+                        }
+                    }
                 }
                 Event::Image {
                     id,
@@ -2536,6 +2656,7 @@ impl ReaderApp {
                     .store(self.page_generation, Ordering::Relaxed);
                 self.page_pending.clear();
                 self.screen = self.reader_return.clone();
+                self.cloud.queue_debounced();
                 self.reader_options = false;
                 self.pending_reader_tap = None;
                 self.send(Command::Refresh);
@@ -3235,6 +3356,7 @@ impl ReaderApp {
                 yejian_platform::ForegroundEvent::Foreground => {
                     self.applock.foreground(now_secs);
                     self.app_foreground = true;
+                    self.cloud.sync_now(self.cloud_snapshot());
                 }
             }
         }
@@ -3244,6 +3366,77 @@ impl ReaderApp {
                 self.setting("app-lock", on.to_string());
                 yejian_platform::set_privacy_shield(on);
             }
+        }
+        // 新章节通知: permission answer → keep or revert the toggle.
+        while let Some(granted) = yejian_platform::poll_notification_permission() {
+            if self.notify_permission_pending {
+                self.notify_permission_pending = false;
+                if granted {
+                    self.pending_notice = Some("新章节通知已开启".into());
+                } else {
+                    self.notify_enabled = false;
+                    self.setting("notify-updates", "false".into());
+                    self.pending_notice =
+                        Some("系统拒绝了通知权限，请在系统设置中允许页间的通知".into());
+                }
+            }
+        }
+        // A tapped notification routes to the updated work or the follows list.
+        while let Some(payload) = yejian_platform::take_notification_open() {
+            match crate::notify::route(&payload) {
+                Some(crate::notify::Route::Follow(source, manga)) => {
+                    self.tab = Tab::Sources;
+                    self.screen = Screen::Library;
+                    self.sources.open_history_work(&source, &manga);
+                }
+                Some(crate::notify::Route::Follows) => {
+                    self.tab = Tab::Sources;
+                    self.screen = Screen::Library;
+                }
+                None => {}
+            }
+        }
+        // Fresh chapters collected by checks: dedupe keys are marked when
+        // surfaced; the system note only goes out while backgrounded —
+        // foregrounded frames already show the in-app notice.
+        let notify_updates = self.sources.take_notify_updates();
+        if !notify_updates.is_empty() {
+            for update in &notify_updates {
+                self.notify_sent.mark_all(
+                    &crate::notify::follow_key(&update.source, &update.manga),
+                    &update.added,
+                );
+            }
+            if self.notify_enabled && !self.app_foreground {
+                for note in crate::notify::summarize(&notify_updates) {
+                    let _ = yejian_platform::post_notification(&note);
+                }
+            }
+        }
+        // 云同步: a finished round applies remote-won groups through the
+        // UI-side owners; the debounce re-collects a fresh snapshot.
+        if self.cloud.debounce_due() {
+            self.cloud.clear_debounce();
+            self.cloud.sync_now(self.cloud_snapshot());
+        }
+        self.cloud.poll();
+        if let Some(outcome) = self.cloud.take_outcome() {
+            let applied = self.apply_cloud_snapshot(&outcome.merged);
+            self.cloud_missing = outcome.report.remote_sources.clone();
+            self.pending_notice = Some(if applied > 0 {
+                format!("云同步完成 · 应用了 {applied} 项远端更新")
+            } else {
+                "云同步完成".into()
+            });
+            if !self.cloud_missing.is_empty() {
+                self.pending_notice = Some(format!(
+                    "云同步完成 · 发现 {} 个云端书源（书源页可一键安装）",
+                    self.cloud_missing.len()
+                ));
+            }
+        }
+        if self.cloud.busy() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
         // 阅读统计: conditions are pushed every frame; the module settles
         // the interval itself so no span is credited to the wrong state.
@@ -6090,6 +6283,331 @@ impl ReaderApp {
         }
     }
 
+    /// The snapshot sent to the cloud worker — progress is filled there
+    /// (only the worker thread holds the library store).
+    fn cloud_snapshot(&self) -> crate::cloud::Snapshot {
+        use crate::cloud::{Entry, Snapshot};
+        let now = follows::now() as i64;
+        let mut snapshot = Snapshot::default();
+        snapshot.online = self
+            .sources
+            .online_read_state()
+            .into_iter()
+            .map(|state| {
+                (
+                    crate::cloud::online_entry_key(
+                        &state.source_id,
+                        &state.manga_id,
+                        &state.chapter_id,
+                    ),
+                    Entry::new(
+                        state.read_at,
+                        serde_json::json!({
+                            "read_page": state.read_page,
+                            "total": state.total,
+                            "read_at": state.read_at,
+                        }),
+                    ),
+                )
+            })
+            .collect();
+        snapshot.follows = self
+            .sources
+            .follows()
+            .iter()
+            .map(|follow| {
+                (
+                    crate::cloud::follow_entry_key(&follow.source_id, &follow.manga_id),
+                    Entry::new(
+                        follow.checked_at.unwrap_or(0) as i64,
+                        serde_json::to_value(follow).unwrap_or_default(),
+                    ),
+                )
+            })
+            .collect();
+        snapshot.bookmarks = self
+            .bookmarks
+            .entries()
+            .iter()
+            .map(|bookmark| {
+                (
+                    crate::cloud::bookmark_entry_key(
+                        &bookmark.work,
+                        &bookmark.chapter,
+                        bookmark.page,
+                    ),
+                    Entry::new(
+                        bookmark.created_at as i64,
+                        serde_json::to_value(bookmark).unwrap_or_default(),
+                    ),
+                )
+            })
+            .collect();
+        snapshot.categories.insert(
+            "categories".into(),
+            Entry::new(now, serde_json::json!(self.user_categories)),
+        );
+        snapshot.reader_prefs = self
+            .reader_prefs
+            .iter()
+            .map(|(key, prefs)| {
+                (
+                    key.clone(),
+                    Entry::new(now, serde_json::to_value(prefs).unwrap_or_default()),
+                )
+            })
+            .collect();
+        for (day, devices) in self.stats.export_days() {
+            for (device, stats) in devices {
+                snapshot.stats.insert(
+                    crate::cloud::stats_entry_key(device, day),
+                    Entry::new(now, serde_json::to_value(stats).unwrap_or_default()),
+                );
+            }
+        }
+        snapshot.history_hidden = self
+            .history_hidden
+            .iter()
+            .map(|(key, at)| {
+                (
+                    key.clone(),
+                    Entry::new(*at, serde_json::json!({ "hidden_at": at })),
+                )
+            })
+            .collect();
+        let repo_urls = self.sources.repo_urls();
+        snapshot.sources = self
+            .sources
+            .installed_source_meta()
+            .into_iter()
+            .map(|(id, version)| {
+                (
+                    id,
+                    Entry::new(
+                        now,
+                        serde_json::json!({
+                            "version": version,
+                            "repos": repo_urls,
+                        }),
+                    ),
+                )
+            })
+            .collect();
+        for (key, value) in [
+            ("theme", serde_json::json!(self.theme)),
+            ("palette", serde_json::json!(self.color_scheme)),
+            ("font-scale", serde_json::json!(self.font_scale)),
+            (
+                "reading-direction",
+                serde_json::json!(if self.rtl { "rtl" } else { "ltr" }),
+            ),
+        ] {
+            snapshot
+                .appearance
+                .insert(key.into(), Entry::new(self.appearance_ts, value));
+        }
+        snapshot
+    }
+
+    /// `app-state.json` bytes for the backup zip — the same Snapshot the
+    /// cloud sync carries (progress is merged in by the worker).
+    fn app_state_json(&self) -> Vec<u8> {
+        serde_json::to_vec(&self.cloud_snapshot()).unwrap_or_else(|_| b"{}".to_vec())
+    }
+
+    /// Stamps appearance changes so a remote winner can outdate them.
+    fn mark_appearance_changed(&mut self) {
+        self.appearance_ts = follows::now() as i64;
+        self.setting("appearance-updated", self.appearance_ts.to_string());
+    }
+
+    /// Applies the merged groups of a finished cloud sync (or a restored
+    /// backup's app-state.json) to their UI-side owners. Returns how many
+    /// records moved — used for the completion notice.
+    fn apply_cloud_snapshot(&mut self, merged: &crate::cloud::Snapshot) -> usize {
+        let mut applied = 0usize;
+        // 在线阅读状态: skip the work currently open in the reader so a
+        // live position is never yanked mid-session.
+        let skip = if let Screen::Reader(id) = &self.screen {
+            self.reading_metadata(id)
+                .map(|metadata| (metadata.source_id, metadata.manga_id))
+        } else {
+            None
+        };
+        let states: Vec<crate::sources::OnlineReadState> = merged
+            .online
+            .iter()
+            .filter_map(|(key, entry)| {
+                let value = entry.value.as_object()?;
+                let parts: Vec<&str> = key.split('\u{1f}').collect();
+                if parts.len() != 3 {
+                    return None;
+                }
+                Some(crate::sources::OnlineReadState {
+                    source_id: parts[0].into(),
+                    manga_id: parts[1].into(),
+                    chapter_id: parts[2].into(),
+                    read_page: value.get("read_page")?.as_u64()? as usize,
+                    total: value.get("total")?.as_u64()? as usize,
+                    read_at: value.get("read_at")?.as_i64()?,
+                })
+            })
+            .collect();
+        applied += self
+            .sources
+            .apply_online_state(&states, skip.as_ref().map(|(s, m)| (s.as_str(), m.as_str())));
+
+        // 追更: the merged map is authoritative — replaces the local list.
+        if !merged.follows.is_empty() {
+            let follows: Vec<follows::Follow> = merged
+                .follows
+                .values()
+                .filter_map(|entry| serde_json::from_value(entry.value.clone()).ok())
+                .collect();
+            if follows.len() == merged.follows.len() {
+                self.sources.apply_synced_follows(follows);
+                applied += merged.follows.len();
+            }
+        }
+
+        // 书签
+        let bookmarks: Vec<crate::bookmarks::Bookmark> = merged
+            .bookmarks
+            .values()
+            .filter_map(|entry| serde_json::from_value(entry.value.clone()).ok())
+            .collect();
+        if self.bookmarks.entries().len() != bookmarks.len()
+            || !merged.bookmarks.is_empty()
+        {
+            if self
+                .bookmarks
+                .replace_all(&self.root, bookmarks)
+                .is_ok()
+            {
+                applied += merged.bookmarks.len();
+            }
+        }
+
+        // 分类
+        if let Some(entry) = merged.categories.get("categories") {
+            if let Ok(categories) =
+                serde_json::from_value::<Vec<String>>(entry.value.clone())
+            {
+                if categories != self.user_categories {
+                    self.user_categories = categories;
+                    applied += 1;
+                }
+            }
+        }
+
+        // 每部作品阅读设置
+        let prefs: HashMap<String, crate::reader_prefs::ReaderPrefs> = merged
+            .reader_prefs
+            .iter()
+            .filter_map(|(key, entry)| {
+                serde_json::from_value::<crate::reader_prefs::ReaderPrefs>(
+                    entry.value.clone(),
+                )
+                .ok()
+                .map(|prefs| (key.clone(), prefs))
+            })
+            .collect();
+        if prefs != self.reader_prefs {
+            self.reader_prefs = prefs;
+            let _ = crate::reader_prefs::save(&self.root, &self.reader_prefs);
+            applied += 1;
+        }
+
+        // 阅读统计: per (device, day) max-merge.
+        let mut days: BTreeMap<String, BTreeMap<String, crate::stats::DayStats>> =
+            BTreeMap::new();
+        for (key, entry) in &merged.stats {
+            let parts: Vec<&str> = key.split('\u{1f}').collect();
+            if parts.len() != 2 {
+                continue;
+            }
+            if let Ok(stats) =
+                serde_json::from_value::<crate::stats::DayStats>(entry.value.clone())
+            {
+                days.entry(parts[1].into())
+                    .or_default()
+                    .insert(parts[0].into(), stats);
+            }
+        }
+        applied += self.stats.merge_remote(&days);
+
+        // 隐藏的足迹行
+        let hidden: BTreeMap<String, i64> = merged
+            .history_hidden
+            .iter()
+            .filter_map(|(key, entry)| {
+                entry
+                    .value
+                    .get("hidden_at")?
+                    .as_i64()
+                    .map(|at| (key.clone(), at))
+            })
+            .collect();
+        if hidden != self.history_hidden {
+            self.history_hidden = hidden;
+            self.save_history_hidden();
+            applied += 1;
+        }
+
+        // 外观
+        for (key, value) in &merged.appearance {
+            match key.as_str() {
+                "theme" => {
+                    if let Some(theme) = value.value.as_str() {
+                        if theme != self.theme {
+                            self.theme = theme.into();
+                            self.setting("theme", self.theme.clone());
+                            applied += 1;
+                        }
+                    }
+                }
+                "palette" => {
+                    if let Some(scheme) = value.value.as_str() {
+                        if scheme != self.color_scheme {
+                            self.color_scheme = scheme.into();
+                            self.setting("palette", self.color_scheme.clone());
+                            applied += 1;
+                        }
+                    }
+                }
+                "font-scale" => {
+                    if let Some(scale) = value.value.as_f64() {
+                        let scale = (scale as f32).clamp(1., 2.);
+                        if (scale - self.font_scale).abs() > f32::EPSILON {
+                            self.font_scale = scale;
+                            self.setting("font-scale", scale.to_string());
+                            applied += 1;
+                        }
+                    }
+                }
+                "reading-direction" => {
+                    if let Some(direction) = value.value.as_str() {
+                        let rtl = direction == "rtl";
+                        if rtl != self.rtl {
+                            self.rtl = rtl;
+                            self.reader_globals.rtl = rtl;
+                            self.setting(
+                                "reading-direction",
+                                if rtl { "rtl" } else { "ltr" }.into(),
+                            );
+                            applied += 1;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if applied > 0 {
+            self.appearance_ts = follows::now() as i64;
+        }
+        applied
+    }
+
     /// `history-hidden` entries [{key, hidden_at}] through the settings store.
     fn save_history_hidden(&mut self) {
         let entries: Vec<serde_json::Value> = self
@@ -6205,6 +6723,7 @@ impl ReaderApp {
                                     ) {
                                         self.theme = key.into();
                                         self.setting("theme", self.theme.clone());
+                                        self.mark_appearance_changed();
                                     }
                                 }
                             });
@@ -6230,6 +6749,7 @@ impl ReaderApp {
                                             "palette",
                                             self.color_scheme.clone(),
                                         );
+                                        self.mark_appearance_changed();
                                     }
                                 }
                             });
@@ -6247,6 +6767,7 @@ impl ReaderApp {
                             {
                                 self.font_scale = percent / 100.;
                                 self.setting("font-scale", self.font_scale.to_string());
+                                self.mark_appearance_changed();
                             }
                             ui.add_space(12.);
                             if crate::design::toggle(
@@ -6313,6 +6834,7 @@ impl ReaderApp {
                                     "reading-direction",
                                     if self.rtl { "rtl" } else { "ltr" }.into(),
                                 );
+                                self.mark_appearance_changed();
                             }
                             ui.separator();
                             ui.add_space(6.);
@@ -6464,6 +6986,25 @@ impl ReaderApp {
                                 self.sources.set_auto_download(&mode);
                                 self.setting("auto-download", mode);
                             }
+                            ui.add_space(10.);
+                            let mut notify = self.notify_enabled;
+                            if crate::design::toggle(
+                                ui,
+                                &mut notify,
+                                "新章节通知",
+                                "追更发现新章节时发送系统通知；iOS 后台刷新由系统调度，LiveContainer 安装时可能不会运行",
+                            ) {
+                                if notify {
+                                    self.notify_enabled = true;
+                                    self.setting("notify-updates", "true".into());
+                                    self.notify_permission_pending = true;
+                                    let _ = yejian_platform::request_notification_permission();
+                                } else {
+                                    self.notify_enabled = false;
+                                    self.notify_permission_pending = false;
+                                    self.setting("notify-updates", "false".into());
+                                }
+                            }
                         });
                     ui.add_space(10.);
                     ui.separator();
@@ -6586,6 +7127,120 @@ impl ReaderApp {
                         .inner_margin(Margin::symmetric(2, 16))
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
+                            crate::design::section(ui, "云同步（WebDAV）");
+                            let mut enabled = self.cloud.enabled;
+                            if crate::design::toggle(
+                                ui,
+                                &mut enabled,
+                                "启用 WebDAV 云同步",
+                                "进度、追更、书签、统计等在两台设备间同步；密码只存在本机",
+                            ) {
+                                self.cloud.enabled = enabled;
+                                self.cloud.config.enabled = enabled;
+                                self.setting("webdav-enabled", enabled.to_string());
+                                if enabled {
+                                    self.cloud.sync_now(self.cloud_snapshot());
+                                }
+                            }
+                            ui.add_space(8.);
+                            ui.label(
+                                RichText::new("服务器地址（如 https://dav.jianguoyun.com/dav/）")
+                                    .color(palette.muted)
+                                    .small(),
+                            );
+                            if ui
+                                .add(
+                                    TextEdit::singleline(&mut self.cloud_url)
+                                        .desired_width(f32::INFINITY)
+                                        .hint_text("https://dav.example.com/dav/"),
+                                )
+                                .changed()
+                            {
+                                self.cloud.config.url = self.cloud_url.clone();
+                                self.setting("webdav-url", self.cloud_url.clone());
+                            }
+                            ui.add_space(6.);
+                            ui.horizontal(|ui| {
+                                let half = (ui.available_width() - 8.) / 2.;
+                                ui.label("用户名");
+                                ui.add_space(4.);
+                                if ui
+                                    .add(
+                                        TextEdit::singleline(&mut self.cloud_user)
+                                            .desired_width(half),
+                                    )
+                                    .changed()
+                                {
+                                    self.cloud.config.user = self.cloud_user.clone();
+                                    self.setting("webdav-user", self.cloud_user.clone());
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("应用密码");
+                                ui.add_space(4.);
+                                if ui
+                                    .add(
+                                        TextEdit::singleline(&mut self.cloud_password)
+                                            .password(true)
+                                            .desired_width(
+                                                (ui.available_width() - 8.) / 2.,
+                                            ),
+                                    )
+                                    .changed()
+                                {
+                                    self.cloud.config.password =
+                                        self.cloud_password.clone();
+                                    let _ = crate::cloud::save_password(
+                                        &self.root,
+                                        &self.cloud_password,
+                                    );
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("目录");
+                                ui.add_space(4.);
+                                if ui
+                                    .add(
+                                        TextEdit::singleline(&mut self.cloud_dir)
+                                            .desired_width(140.)
+                                            .hint_text("yejian"),
+                                    )
+                                    .changed()
+                                {
+                                    self.cloud.config.dir = self.cloud_dir.clone();
+                                    self.setting("webdav-dir", self.cloud_dir.clone());
+                                }
+                            });
+                            ui.add_space(8.);
+                            ui.horizontal(|ui| {
+                                let sync_now = ui.add(
+                                    Button::new("立即同步").min_size(vec2(96., 36.)),
+                                );
+                                self.hitboxes
+                                    .insert("webdav-sync-now".into(), sync_now.rect);
+                                if sync_now.clicked() {
+                                    if let Err(error) =
+                                        crate::cloud::validate_url(&self.cloud_url)
+                                    {
+                                        self.error = Some(error);
+                                    } else {
+                                        self.cloud.sync_now(self.cloud_snapshot());
+                                    }
+                                }
+                                ui.add_space(8.);
+                                ui.label(
+                                    RichText::new(self.cloud.status())
+                                        .color(palette.muted)
+                                        .small(),
+                                );
+                            });
+                        });
+                    ui.add_space(10.);
+                    ui.separator();
+                    Frame::new()
+                        .inner_margin(Margin::symmetric(2, 16))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
                             crate::design::section(ui, "存储");
                             self.storage_group_ui(ui, palette);
                         });
@@ -6616,7 +7271,10 @@ impl ReaderApp {
                             ui.add_space(12.);
                             ui.horizontal_wrapped(|ui| {
                                 if ui.button("创建完整备份").clicked() {
-                                    self.send(Command::Backup(self.backup_path.clone().into()));
+                                    self.send(Command::Backup(
+                                        self.backup_path.clone().into(),
+                                        Some(self.app_state_json()),
+                                    ));
                                 }
                                 if ui.button("恢复备份").clicked() {
                                     self.pick_restore();
@@ -7436,6 +8094,62 @@ impl ReaderApp {
             ui.style_mut().wrap_mode = Some(TextWrapMode::Wrap);
             self.sources.ui(ui);
         });
+        // 云同步发现的书源: opaque banner with a one-tap install; the ids
+        // resolve through the cached repository index, nothing auto-installs.
+        if !self.cloud_missing.is_empty() {
+            let palette = crate::design::palette(self.dark);
+            let rect = Rect::from_min_size(
+                column.min + vec2(16., 12.),
+                vec2((column.width() - 32.).max(0.), 48.),
+            );
+            Area::new(Id::unique("cloud-missing-sources"))
+                .order(Order::Foreground)
+                .fade_in(false)
+                .fixed_pos(rect.min)
+                .show(ui.ctx(), |ui| {
+                    Frame::new()
+                        .fill(palette.surface)
+                        .stroke(Stroke::new(1., palette.line))
+                        .corner_radius(10.)
+                        .inner_margin(Margin::symmetric(12, 6))
+                        .show(ui, |ui| {
+                            ui.set_width(rect.width() - 24.);
+                            ui.horizontal(|ui| {
+                                ui.label(format!(
+                                    "云端发现 {} 个未安装书源",
+                                    self.cloud_missing.len()
+                                ));
+                                ui.with_layout(
+                                    Layout::right_to_left(Align::Center),
+                                    |ui| {
+                                        let install = ui.add(
+                                            Button::new("一键安装")
+                                                .min_size(vec2(88., 32.)),
+                                        );
+                                        self.hitboxes.insert(
+                                            "cloud-install".into(),
+                                            install.rect,
+                                        );
+                                        if install.clicked() {
+                                            let mut missing =
+                                                std::mem::take(&mut self.cloud_missing);
+                                            missing.retain(|id| {
+                                                !self.sources.install_cloud_source(id)
+                                            });
+                                            self.cloud_missing = missing;
+                                        }
+                                        let dismiss = ui.add(
+                                            Button::new("忽略").min_size(vec2(56., 32.)),
+                                        );
+                                        if dismiss.clicked() {
+                                            self.cloud_missing.clear();
+                                        }
+                                    },
+                                );
+                            });
+                        });
+                });
+        }
         if self.sources.take_shelf_return() {
             self.tab = Tab::Library;
         }

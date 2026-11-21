@@ -518,3 +518,68 @@ pub extern "system" fn Java_app_yejian_reader_RustActivity_nativeAppLockEvent(
 ) {
     notify_waker();
 }
+
+/// `RustActivity.requestNotificationPermission()` — on API < 33 the Java side
+/// answers "granted" immediately.
+pub(crate) fn request_notification_permission() -> Result<()> {
+    with_activity(|env, class| {
+        env.call_static_method(class, "requestNotificationPermission", "()V", &[])
+            .map_err(|error| {
+                PlatformError::Jni(format!("requestNotificationPermission: {error}"))
+            })?;
+        Ok(())
+    })
+}
+
+/// Drains the Java permission queue into the shared slot.
+pub(crate) fn poll_notification_permission() {
+    let _ = with_activity(|env, class| {
+        let text = call_static_string(env, class, "pollNotificationPermission")?;
+        match text.as_str() {
+            "1" => crate::push_notification_permission(true),
+            "0" => crate::push_notification_permission(false),
+            _ => {}
+        }
+        Ok(())
+    });
+}
+
+/// `RustActivity.postNotification(int, String, String, String)` — posts onto
+/// the 新章节 channel with an immutable PendingIntent carrying the payload.
+pub(crate) fn post_notification(note: &crate::Notification) -> Result<()> {
+    with_activity(|env, class| {
+        let title = env
+            .new_string(&note.title)
+            .map_err(|error| PlatformError::Jni(format!("postNotification title: {error}")))?;
+        let body = env
+            .new_string(&note.body)
+            .map_err(|error| PlatformError::Jni(format!("postNotification body: {error}")))?;
+        let payload = env
+            .new_string(&note.payload)
+            .map_err(|error| PlatformError::Jni(format!("postNotification payload: {error}")))?;
+        env.call_static_method(
+            class,
+            "postNotification",
+            "(ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+            &[
+                JValue::Int(note.id as i32),
+                JValue::Object(&JObject::from(title)),
+                JValue::Object(&JObject::from(body)),
+                JValue::Object(&JObject::from(payload)),
+            ],
+        )
+        .map_err(|error| PlatformError::Jni(format!("postNotification: {error}")))?;
+        Ok(())
+    })
+}
+
+/// Drains the Java notification-open queue into the shared slot.
+pub(crate) fn poll_notification_open() {
+    let _ = with_activity(|env, class| {
+        let text = call_static_string(env, class, "pollNotificationOpen")?;
+        if !text.is_empty() {
+            crate::push_notification_open(text);
+        }
+        Ok(())
+    });
+}

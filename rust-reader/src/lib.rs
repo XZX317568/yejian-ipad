@@ -1,4 +1,5 @@
 pub mod applock;
+mod cloud;
 mod bookmarks;
 mod design;
 mod follows;
@@ -8,6 +9,7 @@ mod motion;
 mod reader_prefs;
 mod shelf;
 mod source_filters;
+mod notify;
 mod source_repos;
 mod sources;
 mod stats;

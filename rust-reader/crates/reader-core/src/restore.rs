@@ -65,6 +65,10 @@ pub struct RestoreSummary {
     pub link_failures: Vec<RestoreEntry>,
     /// True when the legacy raw JSON was preserved in the library database.
     pub raw_preserved: bool,
+    /// `app-state.json` bytes carried by a native backup (cloud snapshot);
+    /// the caller applies it through the UI-side owners.
+    #[serde(default)]
+    pub app_state: Option<Vec<u8>>,
 }
 
 impl RestoreSummary {
@@ -182,6 +186,7 @@ impl Library {
             links_restored: report.links_restored,
             link_failures,
             raw_preserved: false,
+            app_state: report.app_state,
         }
     }
 }
@@ -250,6 +255,7 @@ fn summary_from_legacy(report: LegacyImportReport) -> RestoreSummary {
         links_restored: 0,
         link_failures: Vec::new(),
         raw_preserved: report.raw_preserved,
+        app_state: None,
     }
 }
 

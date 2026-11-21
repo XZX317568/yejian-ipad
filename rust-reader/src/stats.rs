@@ -588,3 +588,40 @@ mod tests {
         assert!(!dir.path().join("reading-stats.json.tmp").exists());
     }
 }
+
+impl Stats {
+    /// All day records by device — the cloud snapshot's `stats` group.
+    pub fn export_days(&self) -> &BTreeMap<String, BTreeMap<String, DayStats>> {
+        &self.days
+    }
+
+    /// Merges another device's day records element-wise `max`; returns how
+    /// many (day, device) cells changed. Persisted by the caller's next
+    /// flush.
+    pub fn merge_remote(&mut self, days: &BTreeMap<String, BTreeMap<String, DayStats>>) -> usize {
+        let mut changed = 0;
+        for (day, devices) in days {
+            for (device, remote) in devices {
+                let entry = self
+                    .days
+                    .entry(day.clone())
+                    .or_default()
+                    .entry(device.clone())
+                    .or_default();
+                let merged = DayStats {
+                    seconds: entry.seconds.max(remote.seconds),
+                    pages: entry.pages.max(remote.pages),
+                    chapters: entry.chapters.max(remote.chapters),
+                };
+                if merged != *entry {
+                    *entry = merged;
+                    changed += 1;
+                }
+            }
+        }
+        if changed > 0 {
+            self.dirty = true;
+        }
+        changed
+    }
+}

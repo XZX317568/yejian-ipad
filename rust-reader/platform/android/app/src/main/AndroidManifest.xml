@@ -3,6 +3,7 @@
 
     <!-- The reader downloads comic files and queries书源 over HTTPS itself. -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <!-- No storage permissions: imports go through ACTION_OPEN_DOCUMENT and
          are copied into the app-private filesDir/inbox. Exports leave through

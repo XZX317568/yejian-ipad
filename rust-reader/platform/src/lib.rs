@@ -856,6 +856,7 @@ pub fn set_privacy_shield(_on: bool) {}
 /// Fake support/auth answers for desktop acceptance runs (debug only).
 #[cfg(debug_assertions)]
 #[derive(Clone, Default)]
+#[allow(dead_code)]
 struct AppLockFake {
     supported: bool,
     auth: Option<std::result::Result<(), String>>,
@@ -869,12 +870,14 @@ static APP_LOCK_FAKE: std::sync::Mutex<AppLockFake> =
     });
 
 #[cfg(debug_assertions)]
+#[allow(dead_code)]
 fn app_lock_fake() -> Option<AppLockFake> {
     let fake = APP_LOCK_FAKE.lock().ok()?.clone();
     (fake.supported || fake.auth.is_some()).then_some(fake)
 }
 
 #[cfg(debug_assertions)]
+#[allow(dead_code)]
 fn fake_auth_result() -> Option<std::result::Result<(), String>> {
     app_lock_fake().and_then(|fake| fake.auth)
 }
@@ -890,6 +893,212 @@ fn fake_auth_result() -> Option<std::result::Result<(), String>> {
 pub fn set_app_lock_fake(supported: bool, auth: Option<std::result::Result<(), String>>) {
     if let Ok(mut slot) = APP_LOCK_FAKE.lock() {
         *slot = AppLockFake { supported, auth };
+    }
+}
+
+// -- 新章节通知 -----------------------------------------------------------
+
+/// One notification the shell should post. `payload` is handed back through
+/// [`take_notification_open`] when the user taps it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notification {
+    pub id: i64,
+    pub title: String,
+    pub body: String,
+    pub payload: String,
+}
+
+static NOTIFY_PERMISSION: std::sync::Mutex<std::collections::VecDeque<bool>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+static NOTIFY_OPENS: std::sync::Mutex<std::collections::VecDeque<String>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+pub(crate) fn push_notification_permission(granted: bool) {
+    if let Ok(mut queue) = NOTIFY_PERMISSION.lock() {
+        queue.push_back(granted);
+    }
+}
+
+pub(crate) fn push_notification_open(payload: String) {
+    if let Ok(mut queue) = NOTIFY_OPENS.lock() {
+        queue.push_back(payload);
+    }
+}
+
+/// Ask the system for notification permission; the answer arrives through
+/// [`poll_notification_permission`].
+#[cfg(target_os = "ios")]
+pub fn request_notification_permission() -> Result<()> {
+    ios::request_notification_permission()
+}
+
+/// Ask the system for notification permission (Android 13+; granted below).
+#[cfg(target_os = "android")]
+pub fn request_notification_permission() -> Result<()> {
+    if let Some(granted) = notify_fake().and_then(|fake| fake.permission) {
+        push_notification_permission(granted);
+        return Ok(());
+    }
+    android::request_notification_permission()
+}
+
+/// Desktops have no system notifications; the debug fake still lets
+/// acceptance runs exercise the permission flow.
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+pub fn request_notification_permission() -> Result<()> {
+    if let Some(granted) = notify_fake().and_then(|fake| fake.permission) {
+        push_notification_permission(granted);
+        return Ok(());
+    }
+    Err(PlatformError::Unsupported("system notifications"))
+}
+
+/// Next finished permission request, if any (`true` = granted).
+pub fn poll_notification_permission() -> Option<bool> {
+    #[cfg(target_os = "ios")]
+    ios::poll_notification_permission();
+    #[cfg(target_os = "android")]
+    android::poll_notification_permission();
+    NOTIFY_PERMISSION
+        .lock()
+        .ok()
+        .and_then(|mut queue| queue.pop_front())
+}
+
+/// Post one notification. The UI skips this while the app is foregrounded —
+/// the in-app notice already covers it.
+#[cfg(target_os = "ios")]
+pub fn post_notification(note: &Notification) -> Result<()> {
+    ios::post_notification(note)
+}
+
+/// Post one notification through the `新章节` channel.
+#[cfg(target_os = "android")]
+pub fn post_notification(note: &Notification) -> Result<()> {
+    #[cfg(debug_assertions)]
+    let _ = posted_notifications().lock().map(|mut slot| slot.push(note.clone()));
+    android::post_notification(note)
+}
+
+/// Desktops record the note (debug only) so acceptance can assert on it.
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+pub fn post_notification(note: &Notification) -> Result<()> {
+    #[cfg(debug_assertions)]
+    let _ = posted_notifications().lock().map(|mut slot| slot.push(note.clone()));
+    let _ = note;
+    Ok(())
+}
+
+/// The payload of the notification the user opened, if any.
+pub fn take_notification_open() -> Option<String> {
+    #[cfg(target_os = "ios")]
+    ios::poll_notification_open();
+    #[cfg(target_os = "android")]
+    android::poll_notification_open();
+    NOTIFY_OPENS
+        .lock()
+        .ok()
+        .and_then(|mut queue| queue.pop_front())
+}
+
+/// Install the handler an iOS `BGAppRefreshTask` runs. It executes off the
+/// UI thread: no egui access, at most ~25 s of work, and it returns the
+/// notifications the shell should post.
+#[cfg(target_os = "ios")]
+pub fn set_background_refresh_handler(
+    handler: Box<dyn Fn() -> Vec<Notification> + Send + Sync>,
+) {
+    ios::set_background_refresh_handler(handler);
+}
+
+/// Android has no WorkManager hook here; the check still runs whenever the
+/// process is alive (same handler, fired by the in-app scheduler).
+#[cfg(not(target_os = "ios"))]
+pub fn set_background_refresh_handler(
+    handler: Box<dyn Fn() -> Vec<Notification> + Send + Sync>,
+) {
+    if let Ok(mut slot) = BG_HANDLER.lock() {
+        *slot = Some(handler);
+    }
+}
+
+#[cfg(not(target_os = "ios"))]
+static BG_HANDLER: std::sync::Mutex<
+    Option<Box<dyn Fn() -> Vec<Notification> + Send + Sync>>,
+> = std::sync::Mutex::new(None);
+
+/// How long the iOS shell waits before asking the system for the next
+/// background refresh. Android/desktop ignore it.
+#[cfg(target_os = "ios")]
+pub fn set_refresh_interval(seconds: u64) {
+    ios::set_refresh_interval(seconds);
+}
+
+/// No-op off iOS.
+#[cfg(not(target_os = "ios"))]
+pub fn set_refresh_interval(_seconds: u64) {}
+
+/// Debug seam for acceptance runs: pretend a background refresh fired and
+/// return the notifications the installed handler produced (and record them
+/// as posted, like a real shell would).
+#[cfg(debug_assertions)]
+pub fn debug_fire_bg_refresh() -> Vec<Notification> {
+    #[cfg(target_os = "ios")]
+    let notes = ios::run_background_refresh_handler();
+    #[cfg(not(target_os = "ios"))]
+    let notes = BG_HANDLER
+        .lock()
+        .ok()
+        .and_then(|slot| slot.as_ref().map(|handler| handler()))
+        .unwrap_or_default();
+    let _ = posted_notifications().lock().map(|mut slot| slot.extend(notes.iter().cloned()));
+    notes
+}
+
+/// Notifications recorded on platforms without a real system center
+/// (debug only) — and on Android, mirroring what was posted.
+#[cfg(debug_assertions)]
+pub fn posted_notifications() -> &'static std::sync::Mutex<Vec<Notification>> {
+    static POSTED: std::sync::Mutex<Vec<Notification>> = std::sync::Mutex::new(Vec::new());
+    &POSTED
+}
+
+/// Debug seam: feed a notification-open payload as if the user tapped it.
+#[cfg(debug_assertions)]
+pub fn debug_open_notification(payload: &str) {
+    push_notification_open(payload.to_string());
+}
+
+/// Debug seam: fake the permission answer (`Some`) the next request returns.
+#[cfg(debug_assertions)]
+#[derive(Clone, Default)]
+#[allow(dead_code)]
+struct NotifyFake {
+    permission: Option<bool>,
+}
+
+#[cfg(debug_assertions)]
+static NOTIFY_FAKE: std::sync::Mutex<NotifyFake> = std::sync::Mutex::new(NotifyFake {
+    permission: None,
+});
+
+#[cfg(debug_assertions)]
+#[allow(dead_code)]
+fn notify_fake() -> Option<NotifyFake> {
+    let fake = NOTIFY_FAKE.lock().ok()?.clone();
+    fake.permission.is_some().then_some(fake)
+}
+
+#[cfg(not(debug_assertions))]
+#[allow(dead_code)]
+fn notify_fake() -> Option<NotifyFake> {
+    None
+}
+
+#[cfg(debug_assertions)]
+pub fn set_notification_fake(permission: Option<bool>) {
+    if let Ok(mut slot) = NOTIFY_FAKE.lock() {
+        *slot = NotifyFake { permission };
     }
 }
 

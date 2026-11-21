@@ -34,6 +34,20 @@ extern "C" {
     fn yejian_ios_poll_auth() -> *mut c_char;
     fn yejian_ios_poll_foreground() -> *mut c_char;
     fn yejian_ios_set_privacy_shield(on: bool);
+    fn yejian_ios_request_notification_permission();
+    fn yejian_ios_poll_notification_permission() -> *mut c_char;
+    fn yejian_ios_post_notification(
+        id: i64,
+        title: *const c_char,
+        body: *const c_char,
+        payload: *const c_char,
+    ) -> i64;
+    fn yejian_ios_take_notification_open() -> *mut c_char;
+    fn yejian_ios_set_refresh_interval(seconds: u64);
+    fn yejian_ios_set_bg_refresh_handler(
+        handler: Option<extern "C" fn() -> *mut c_char>,
+        free: Option<unsafe extern "C" fn(*mut c_char)>,
+    );
 }
 
 static WAKER: Mutex<Option<Box<dyn Fn() + Send + Sync>>> = Mutex::new(None);
@@ -221,4 +235,107 @@ pub(crate) fn poll_foreground() {
 /// Shows/removes the opaque recent-tasks shield on the key window.
 pub(crate) fn set_privacy_shield(on: bool) {
     unsafe { yejian_ios_set_privacy_shield(on) };
+}
+
+/// Asks `UNUserNotificationCenter` for `.alert/.badge/.sound`.
+pub(crate) fn request_notification_permission() -> Result<()> {
+    unsafe { yejian_ios_request_notification_permission() };
+    Ok(())
+}
+
+/// Drains the Swift permission queue into the shared slot.
+pub(crate) fn poll_notification_permission() {
+    while let Some(text) = take_string(unsafe { yejian_ios_poll_notification_permission() }) {
+        match text.as_str() {
+            "1" => crate::push_notification_permission(true),
+            "0" => crate::push_notification_permission(false),
+            _ => {}
+        }
+    }
+}
+
+/// Schedules a `UNNotificationRequest` that fires immediately.
+pub(crate) fn post_notification(note: &crate::Notification) -> Result<()> {
+    let title = CString::new(note.title.clone())
+        .map_err(|_| PlatformError::Io("title contains a NUL byte".into()))?;
+    let body = CString::new(note.body.clone())
+        .map_err(|_| PlatformError::Io("body contains a NUL byte".into()))?;
+    let payload = CString::new(note.payload.clone())
+        .map_err(|_| PlatformError::Io("payload contains a NUL byte".into()))?;
+    match unsafe {
+        yejian_ios_post_notification(note.id, title.as_ptr(), body.as_ptr(), payload.as_ptr())
+    } {
+        0 => Ok(()),
+        _ => Err(PlatformError::NotReady("notification center")),
+    }
+}
+
+/// Drains the Swift notification-open queue into the shared slot.
+pub(crate) fn poll_notification_open() {
+    while let Some(text) = take_string(unsafe { yejian_ios_take_notification_open() }) {
+        if !text.is_empty() {
+            crate::push_notification_open(text);
+        }
+    }
+}
+
+/// The delay `BGAppRefreshTaskRequest.earliestBeginDate` uses on background.
+pub(crate) fn set_refresh_interval(seconds: u64) {
+    unsafe { yejian_ios_set_refresh_interval(seconds) };
+}
+
+static REFRESH_HANDLER: Mutex<
+    Option<Box<dyn Fn() -> Vec<crate::Notification> + Send + Sync>>,
+> = Mutex::new(None);
+
+pub(crate) fn set_background_refresh_handler(
+    handler: Box<dyn Fn() -> Vec<crate::Notification> + Send + Sync>,
+) {
+    if let Ok(mut slot) = REFRESH_HANDLER.lock() {
+        *slot = Some(handler);
+    }
+    unsafe {
+        yejian_ios_set_bg_refresh_handler(
+            Some(yejian_ios_bg_refresh),
+            Some(yejian_ios_free_rust_string),
+        );
+    }
+}
+
+pub(crate) fn run_background_refresh_handler() -> Vec<crate::Notification> {
+    REFRESH_HANDLER
+        .lock()
+        .ok()
+        .and_then(|slot| slot.as_ref().map(|handler| handler()))
+        .unwrap_or_default()
+}
+
+/// Called by the Swift `BGAppRefreshTask` handler; returns the notifications
+/// to post as a JSON array the bridge frees through
+/// [`yejian_ios_free_rust_string`].
+#[no_mangle]
+pub extern "C" fn yejian_ios_bg_refresh() -> *mut c_char {
+    let notes = run_background_refresh_handler();
+    let payload = serde_json::json!(notes
+        .iter()
+        .map(|note| {
+            serde_json::json!({
+                "id": note.id,
+                "title": note.title,
+                "body": note.body,
+                "payload": note.payload,
+            })
+        })
+        .collect::<Vec<_>>());
+    CString::new(payload.to_string())
+        .map(CString::into_raw)
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// Frees a string produced by [`yejian_ios_bg_refresh`].
+#[no_mangle]
+pub unsafe extern "C" fn yejian_ios_free_rust_string(pointer: *mut c_char) {
+    if !pointer.is_null() {
+        let _ = CString::from_raw(pointer);
+    }
 }

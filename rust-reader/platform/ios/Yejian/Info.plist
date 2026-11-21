@@ -177,5 +177,13 @@
     <string>保存漫画页面到相册</string>
     <key>NSFaceIDUsageDescription</key>
     <string>使用面容 ID 解锁页间</string>
+    <key>UIBackgroundModes</key>
+    <array>
+        <string>fetch</string>
+    </array>
+    <key>BGTaskSchedulerPermittedIdentifiers</key>
+    <array>
+        <string>app.yejian.reader.rust.refresh</string>
+    </array>
 </dict>
 </plist>
