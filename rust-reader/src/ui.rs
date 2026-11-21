@@ -257,6 +257,20 @@ pub struct ReaderApp {
     zoom: f32,
     pan: Vec2,
     controls: bool,
+    /// Showing the 本章完 end card past the last page.
+    chapter_end: bool,
+    /// "lr" | "next" | "off" — tap-zone behaviour (`tap-zones` setting).
+    tap_zones: String,
+    /// 阅读时屏幕常亮 setting; `awake` mirrors the platform flag.
+    keep_awake_setting: bool,
+    awake: bool,
+    /// Calls made to `set_keep_awake`, asserted by tests.
+    #[cfg(test)]
+    awake_log: Vec<bool>,
+    /// 显示时间和电量 setting + cached battery (refreshed ≤1/min).
+    reader_status: bool,
+    battery: Option<f32>,
+    battery_at: Option<std::time::Instant>,
     reader_drag: f32,
     reader_drag_y: f32,
     reader_fit_limit: f32,
@@ -385,6 +399,15 @@ impl ReaderApp {
             zoom: 1.,
             pan: Vec2::ZERO,
             controls: true,
+            chapter_end: false,
+            tap_zones: "lr".into(),
+            keep_awake_setting: true,
+            awake: false,
+            #[cfg(test)]
+            awake_log: Vec::new(),
+            reader_status: true,
+            battery: None,
+            battery_at: None,
             reader_drag: 0.,
             reader_drag_y: 0.,
             reader_fit_limit: 0.,
@@ -1085,6 +1108,17 @@ impl ReaderApp {
     /// Opens the previous/next chapter in the source's order when that list
     /// is known (library copy if present, online otherwise), else the
     /// neighbouring library chapter.
+    /// Display name of the next chapter (local or online) for the end card;
+    /// `None` when this is the latest chapter.
+    fn next_chapter_name(&self, id: &str) -> Option<String> {
+        if let Some(metadata) = self.reading_metadata(id) {
+            if let Some(name) = self.sources.adjacent_online_name(&metadata, 1) {
+                return Some(name);
+            }
+        }
+        self.adjacent_chapter(id, 1)
+            .map(|book| self.reading_title(&book))
+    }
     fn open_neighbor(&mut self, id: &str, delta: i32) -> bool {
         let start = |book: &mut Book| {
             book.current_page = if delta < 0 {
@@ -1596,6 +1630,20 @@ impl ReaderApp {
                             "font-scale" => {
                                 self.font_scale = value.parse::<f32>().unwrap_or(1.).clamp(1., 2.)
                             }
+                            "keep-awake" => {
+                                self.keep_awake_setting = value != "false";
+                                if !self.keep_awake_setting {
+                                    self.keep_awake(false);
+                                }
+                            }
+                            "tap-zones" => {
+                                if matches!(value.as_str(), "lr" | "next" | "off") {
+                                    self.tap_zones = value;
+                                }
+                            }
+                            "reader-status" => {
+                                self.reader_status = value != "false";
+                            }
                             "follow-interval" => {
                                 let minutes: u64 = value
                                     .parse()
@@ -1997,6 +2045,8 @@ impl ReaderApp {
             self.reader_return = self.screen.clone();
         }
         self.page = book.current_page.min(book.page_count.saturating_sub(1));
+        self.chapter_end = false;
+        self.keep_awake(self.keep_awake_setting);
         self.screen = Screen::Reader(book.id.clone());
         self.vertical_reader.reset(self.page, book.page_fraction);
         self.vertical_prev = None;
@@ -2033,8 +2083,31 @@ impl ReaderApp {
             .stream
             .as_ref()
             .is_some_and(|stream| stream.book.id == id && stream.done == 0 && book.page_count <= 1);
-        if (target < 0 || target >= book.page_count as i64) && !streaming_unknown {
-            if self.open_neighbor(id, if target < 0 { -1 } else { 1 }) {
+        if self.chapter_end {
+            // End card: forward continues into the next chapter, back
+            // returns to the real last page. Progress never leaves [0, count).
+            self.chapter_end = false;
+            if delta > 0 {
+                if self.open_neighbor(id, 1) {
+                    return;
+                }
+                self.chapter_end = true; // 已是最新一章 — stay on the card.
+            }
+            return;
+        }
+        if target >= book.page_count as i64 && !streaming_unknown {
+            // Paged mode shows the 本章完 card first; the vertical strip
+            // crosses chapters on its own separator path.
+            if !self.vertical {
+                self.chapter_end = true;
+                return;
+            }
+            if self.open_neighbor(id, 1) {
+                return;
+            }
+        }
+        if target < 0 && !streaming_unknown {
+            if self.open_neighbor(id, -1) {
                 return;
             }
         }
@@ -2066,6 +2139,8 @@ impl ReaderApp {
         match self.screen.clone() {
             Screen::Reader(_) => {
                 self.flush_position();
+                self.keep_awake(false);
+                self.chapter_end = false;
                 self.vertical_reader.stop();
                 self.vertical_prev = None;
                 self.vertical_next = None;
@@ -4131,13 +4206,134 @@ impl ReaderApp {
             self.setting("reading-mode", mode.into());
         }
     }
+    /// Transition-driven keep-awake calls (platform no-ops on desktop).
+    fn keep_awake(&mut self, on: bool) {
+        if self.awake == on {
+            return;
+        }
+        self.awake = on;
+        yejian_platform::set_keep_awake(on);
+        #[cfg(test)]
+        self.awake_log.push(on);
+    }
     fn reader_tap(&mut self, id: &str, relative: f32, step: i32) {
         if self.vertical || self.zoom > 1. || (0.27..=0.73).contains(&relative) {
             self.controls = !self.controls;
-        } else if relative < 0.27 {
-            self.next_page(id, if self.rtl { step } else { -step });
         } else {
-            self.next_page(id, if self.rtl { -step } else { step });
+            match self.tap_zones.as_str() {
+                "next" => self.next_page(id, step),
+                "off" => {}
+                _ => {
+                    if relative < 0.27 {
+                        self.next_page(id, if self.rtl { step } else { -step });
+                    } else {
+                        self.next_page(id, if self.rtl { -step } else { step });
+                    }
+                }
+            }
+        }
+    }
+    /// "第 X 话 · 标题" for the vertical chapter separator.
+    fn chapter_separator_label(&self, seg: &str) -> String {
+        let metadata = self
+            .chapter(seg)
+            .or_else(|| self.stream_for(seg).map(|stream| &stream.metadata));
+        metadata
+            .map(|meta| {
+                meta.chapter_number
+                    .map(|n| {
+                        let number = format!("第 {n} 话");
+                        if meta.chapter_title.starts_with(&number) {
+                            meta.chapter_title.clone()
+                        } else {
+                            format!("{number} · {}", meta.chapter_title)
+                        }
+                    })
+                    .unwrap_or_else(|| meta.chapter_title.clone())
+            })
+            .unwrap_or_else(|| seg.into())
+    }
+    /// "21:34 · 85%", or just the time when no battery reading exists.
+    fn status_text(time: &str, battery: Option<f32>) -> String {
+        match battery {
+            Some(level) => format!("{time} · {:.0}%", level.clamp(0., 1.) * 100.),
+            None => time.into(),
+        }
+    }
+    /// Battery charge 0.0–1.0, refreshed at most once per minute.
+    fn cached_battery(&mut self) -> Option<f32> {
+        let stale = self
+            .battery_at
+            .map(|at| at.elapsed().as_secs() >= 60)
+            .unwrap_or(true);
+        if stale {
+            self.battery = yejian_platform::battery_level();
+            self.battery_at = Some(std::time::Instant::now());
+        }
+        self.battery
+    }
+    /// The 本章完 card shown after the last page (one per chapter).
+    fn chapter_end_card(&mut self, ui: &mut Ui, content: Rect, id: &str) {
+        let palette = crate::design::palette(true);
+        let width = (content.width() - 48.).min(340.);
+        let card = Rect::from_center_size(content.center(), vec2(width, 220.));
+        ui.painter().rect_filled(card, 14., palette.soft);
+        ui.painter().rect_stroke(
+            card,
+            14.,
+            Stroke::new(1., palette.line),
+            StrokeKind::Inside,
+        );
+        ui.painter().text(
+            pos2(card.center().x, card.top() + 48.),
+            Align2::CENTER_CENTER,
+            "本章完",
+            FontId::proportional(24.),
+            palette.ink,
+        );
+        match self.next_chapter_name(id) {
+            Some(name) => {
+                ui.painter().text(
+                    pos2(card.center().x, card.top() + 92.),
+                    Align2::CENTER_CENTER,
+                    name,
+                    FontId::proportional(13.),
+                    palette.muted,
+                );
+                let button = Rect::from_center_size(
+                    pos2(card.center().x, card.bottom() - 48.),
+                    vec2(160., 44.),
+                );
+                self.hitboxes.insert("chapter-end-continue".into(), button);
+                let response =
+                    ui.interact(button, Id::unique("chapter-end-continue"), Sense::click());
+                response.widget_info(|| WidgetInfo::labeled(Role::Button, true, "继续"));
+                let fill = if response.hovered() {
+                    palette.primary.gamma_multiply(0.88)
+                } else {
+                    palette.primary
+                };
+                ui.painter().rect_filled(button, 10., fill);
+                ui.painter().text(
+                    button.center(),
+                    Align2::CENTER_CENTER,
+                    "继续",
+                    FontId::proportional(15.),
+                    palette.on_primary,
+                );
+                if response.clicked() {
+                    self.next_page(id, 1);
+                }
+            }
+            None => {
+                ui.painter().text(
+                    pos2(card.center().x, card.bottom() - 48.),
+                    Align2::CENTER_CENTER,
+                    "已是最新一章",
+                    FontId::proportional(14.),
+                    palette.muted,
+                );
+            }
         }
     }
     fn reader_ui(&mut self, ui: &mut Ui, area: Rect, id: &str, now: f64) {
@@ -4297,7 +4493,9 @@ impl ReaderApp {
             return;
         }
         self.rendered_page_nodes = 0;
-        if self.vertical {
+        if self.chapter_end {
+            self.chapter_end_card(ui, content, id);
+        } else if self.vertical {
             self.vertical_ui(ui, content, id, book.page_count, now, &gesture);
         } else if let Some(error) = self.page_errors.get(&(id.into(), self.page)).cloned() {
             ui.put(
@@ -4603,6 +4801,28 @@ impl ReaderApp {
                 FontId::monospace(10.),
                 muted,
             );
+        } else if self.reader_status {
+            // Bottom-right 时间 · 电量 pill while the controls are hidden;
+            // repaint once at each minute boundary, battery polled ≤1/min.
+            let now = chrono::Local::now();
+            let text = Self::status_text(&now.format("%H:%M").to_string(), self.cached_battery());
+            let palette = crate::design::palette(true);
+            let galley = ui.painter().layout_no_wrap(
+                text,
+                FontId::proportional(12.),
+                Color32::from_white_alpha(230),
+            );
+            let size = galley.size() + vec2(20., 12.);
+            let rect = Rect::from_min_size(
+                pos2(area.right() - 10. - size.x, area.bottom() - 10. - size.y),
+                size,
+            );
+            ui.painter()
+                .rect_filled(rect, size.y / 2., Color32::from_black_alpha(120));
+            ui.painter().galley(rect.center() - galley.size() / 2., galley, palette.muted);
+            let wait = 61 - chrono::Timelike::second(&now) as u64;
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_secs(wait));
         }
     }
     fn vertical_ui(
@@ -4732,6 +4952,31 @@ impl ReaderApp {
             }
             self.hitboxes
                 .insert(format!("vertical-page-{global}"), target);
+            // Chapter separator: a strip on the boundary between the
+            // previous chapter's last page and this segment's first page.
+            // Purely visual — `top`/`heights`/anchors are untouched.
+            if local == 0 && global > 0 {
+                let label = self.chapter_separator_label(&seg);
+                let band = Rect::from_center_size(
+                    pos2(content.center().x, target.top()),
+                    vec2(content.width(), 44.),
+                )
+                .intersect(content);
+                painter.rect_filled(band, 0., Color32::from_black_alpha(210));
+                painter.line_segment(
+                    [band.center_top(), band.right_top()],
+                    Stroke::new(1., Color32::from_white_alpha(70)),
+                );
+                painter.text(
+                    band.center(),
+                    Align2::CENTER_CENTER,
+                    label,
+                    FontId::proportional(14.),
+                    Color32::from_white_alpha(235),
+                );
+                self.hitboxes
+                    .insert(format!("vertical-separator-{global}"), band);
+            }
             if let Some(texture) = self.pages.get(&(seg.to_string(), local)) {
                 texture.paint(&painter, target, self.crop);
                 self.rendered_page_nodes += 1;
@@ -5112,6 +5357,69 @@ impl ReaderApp {
                                 "不保存新的阅读进度和历史",
                             ) {
                                 self.setting("private", self.private.to_string());
+                            }
+                            ui.separator();
+                            ui.add_space(6.);
+                            if crate::design::toggle(
+                                ui,
+                                &mut self.keep_awake_setting,
+                                "阅读时屏幕常亮",
+                                "打开书籍时不让屏幕自动熄灭",
+                            ) {
+                                self.setting(
+                                    "keep-awake",
+                                    self.keep_awake_setting.to_string(),
+                                );
+                                if !self.keep_awake_setting {
+                                    self.keep_awake(false);
+                                } else if matches!(self.screen, Screen::Reader(_)) {
+                                    self.keep_awake(true);
+                                }
+                            }
+                            ui.separator();
+                            ui.add_space(6.);
+                            if crate::design::toggle(
+                                ui,
+                                &mut self.reader_status,
+                                "显示时间和电量",
+                                "阅读时右下角显示时间与电量",
+                            ) {
+                                self.setting(
+                                    "reader-status",
+                                    self.reader_status.to_string(),
+                                );
+                            }
+                            ui.separator();
+                            ui.add_space(6.);
+                            crate::design::section(ui, "点击翻页");
+                            let zone_width = if ui.available_width() < 370. {
+                                ((ui.available_width() - 10.) / 2.).floor() - 1.
+                            } else {
+                                ((ui.available_width() - 20.) / 3.).floor() - 1.
+                            };
+                            let mut zones = self.tap_zones.clone();
+                            ui.horizontal_wrapped(|ui| {
+                                for (key, name) in [
+                                    ("lr", "左右翻页"),
+                                    ("next", "两侧都是下一页"),
+                                    ("off", "关闭点击翻页"),
+                                ] {
+                                    if ui
+                                        .add(
+                                            Button::new(name)
+                                                .selected(zones == key)
+                                                .min_size(vec2(zone_width, 48.))
+                                                .wrap(),
+                                        )
+                                        .clicked()
+                                    {
+                                        zones = key.into();
+                                    }
+                                }
+                            });
+                            if zones != self.tap_zones {
+                                self.tap_zones = zones.clone();
+                                self.setting("tap-zones", zones);
                             }
                         });
                     ui.add_space(10.);
@@ -6203,6 +6511,31 @@ impl ReaderApp {
     pub fn current_page(&self) -> usize {
         self.page
     }
+    /// The 本章完 card is showing past the last page.
+    pub fn chapter_end(&self) -> bool {
+        self.chapter_end
+    }
+    /// Strip segments joined so far, for vertical-flow acceptance checks.
+    pub fn strip_segments_len(&self) -> usize {
+        self.strip_segments().len()
+    }
+    pub fn is_vertical(&self) -> bool {
+        self.vertical
+    }
+    /// Which input blocker is active, for acceptance diagnostics.
+    pub fn block_reason(&self) -> &'static str {
+        if self.reader_options {
+            "options"
+        } else if self.chapter_dialog.is_some() {
+            "chapters"
+        } else if self.track_panel.is_some() {
+            "track"
+        } else if self.error.is_some() {
+            "error"
+        } else {
+            "none"
+        }
+    }
     pub fn current_fraction(&self) -> f32 {
         if self.vertical {
             self.vertical_reader.fraction
@@ -6279,6 +6612,7 @@ impl eframe::App for ReaderApp {
         self.report_snapshot_ready(ui.ctx());
     }
     fn on_exit(&mut self) {
+        self.keep_awake(false);
         self.flush_position();
         self.page_generation += 1;
         self.worker
@@ -7167,5 +7501,115 @@ mod tests {
             ),
             "在线 · 读到 第 1 话"
         );
+    }
+
+    #[test]
+    fn tap_zones_respect_mode_and_rtl() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = ReaderApp::new(root.path().into(), Context::default());
+        let mut target = book("one");
+        target.current_page = 5;
+        app.books = vec![target.clone()];
+        app.open_reader(&target);
+        // lr follows the reading direction.
+        app.tap_zones = "lr".into();
+        app.reader_tap("one", 0.9, 1);
+        assert_eq!(app.page, 6);
+        app.reader_tap("one", 0.1, 1);
+        assert_eq!(app.page, 5);
+        app.rtl = true;
+        app.reader_tap("one", 0.1, 1);
+        assert_eq!(app.page, 6, "rtl left edge advances");
+        app.reader_tap("one", 0.9, 1);
+        assert_eq!(app.page, 5, "rtl right edge retreats");
+        app.rtl = false;
+        // next: both outer zones advance.
+        app.tap_zones = "next".into();
+        app.reader_tap("one", 0.1, 1);
+        assert_eq!(app.page, 6);
+        app.reader_tap("one", 0.9, 1);
+        assert_eq!(app.page, 7);
+        // off: outer taps do nothing, the center still toggles controls.
+        app.tap_zones = "off".into();
+        app.reader_tap("one", 0.1, 1);
+        app.reader_tap("one", 0.9, 1);
+        assert_eq!(app.page, 7);
+        let controls = app.controls;
+        app.reader_tap("one", 0.5, 1);
+        assert_eq!(app.controls, !controls);
+        app.reader_tap("one", 0.5, 1);
+        assert_eq!(app.controls, controls);
+    }
+
+    #[test]
+    fn chapter_end_card_enters_leaves_and_never_saves_past_the_last_page() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = ReaderApp::new(root.path().into(), Context::default());
+        let mut one = book("one");
+        one.current_page = 19;
+        let two = book("two");
+        app.books = vec![one.clone(), two];
+        app.chapters = vec![link("one", "c1", 1.), link("two", "c2", 2.)];
+        app.chapter_indices = app
+            .chapters
+            .iter()
+            .enumerate()
+            .map(|(i, link)| (link.book_id.clone(), i))
+            .collect();
+        app.open_reader(&one);
+        assert_eq!(app.page, 19);
+        // The first advance past the last page shows the card instead of
+        // moving — progress stays on the real last page.
+        app.next_page("one", 1);
+        assert!(app.chapter_end);
+        assert_eq!(app.page, 19);
+        assert_eq!(app.current_book_id(), Some("one"));
+        // Back returns to the last page without a card.
+        app.next_page("one", -1);
+        assert!(!app.chapter_end);
+        assert_eq!(app.page, 19);
+        // Forward again, then continue into the next linked chapter.
+        app.next_page("one", 1);
+        assert!(app.chapter_end);
+        app.next_page("one", 1);
+        assert_eq!(app.current_book_id(), Some("two"));
+        assert_eq!(app.page, 0);
+        assert!(!app.chapter_end);
+        // The last chapter's card stays when there is no next chapter.
+        let mut tail = book("two");
+        tail.current_page = 19;
+        app.open_reader(&tail);
+        app.next_page("two", 1);
+        assert!(app.chapter_end);
+        app.next_page("two", 1);
+        assert!(app.chapter_end && app.page == 19);
+        assert_eq!(app.current_book_id(), Some("two"));
+    }
+
+    #[test]
+    fn keep_awake_only_fires_on_state_transitions() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = ReaderApp::new(root.path().into(), Context::default());
+        let target = book("one");
+        app.books = vec![target.clone()];
+        app.open_reader(&target);
+        assert_eq!(app.awake_log, [true]);
+        // Re-entering the reader while already awake does not repeat.
+        app.open_reader(&target);
+        assert_eq!(app.awake_log, [true]);
+        app.back(1.0, Rect::from_min_size(Pos2::ZERO, vec2(390., 844.)));
+        assert_eq!(app.awake_log, [true, false]);
+        app.open_reader(&target);
+        assert_eq!(app.awake_log, [true, false, true]);
+        eframe::App::on_exit(&mut app);
+        assert_eq!(app.awake_log, [true, false, true, false]);
+    }
+
+    #[test]
+    fn reader_status_formats_time_and_battery() {
+        assert_eq!(ReaderApp::status_text("21:34", Some(0.85)), "21:34 · 85%");
+        assert_eq!(ReaderApp::status_text("21:34", Some(0.05)), "21:34 · 5%");
+        assert_eq!(ReaderApp::status_text("21:34", None), "21:34");
+        assert_eq!(ReaderApp::status_text("21:34", Some(1.4)), "21:34 · 100%");
     }
 }

@@ -3790,6 +3790,17 @@ impl Sources {
         .map(|chapter| chapter.key)
     }
 
+    /// Display name of the neighbouring chapter in reading order.
+    pub fn adjacent_online_name(&self, metadata: &ChapterMetadata, delta: i32) -> Option<String> {
+        self.adjacent_online(
+            &metadata.source_id,
+            &metadata.manga_id,
+            &metadata.chapter_id,
+            delta,
+        )
+        .map(|chapter| chapter_name(&chapter))
+    }
+
     pub fn has_adjacent_online(&self, metadata: &ChapterMetadata, delta: i32) -> bool {
         self.adjacent_online(
             &metadata.source_id,

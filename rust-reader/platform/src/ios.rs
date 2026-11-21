@@ -27,6 +27,8 @@ extern "C" {
     fn yejian_ios_open_web(url: *const c_char, user_agent: *const c_char) -> i64;
     fn yejian_ios_poll_web() -> *mut c_char;
     fn yejian_ios_open_external_url(url: *const c_char) -> i64;
+    fn yejian_ios_set_keep_awake(awake: bool);
+    fn yejian_ios_battery_level() -> f32;
 }
 
 static WAKER: Mutex<Option<Box<dyn Fn() + Send + Sync>>> = Mutex::new(None);
@@ -152,4 +154,15 @@ pub(crate) fn open_external_url(url: &str) -> Result<()> {
         0 => Ok(()),
         _ => Err(PlatformError::Io("系统无法打开该链接".into())),
     }
+}
+
+/// Toggles `UIApplication.isIdleTimerDisabled` (main thread on the Swift side).
+pub(crate) fn set_keep_awake(awake: bool) {
+    unsafe { yejian_ios_set_keep_awake(awake) };
+}
+
+/// `UIDevice.batteryLevel` mapped to 0.0–1.0; `None` when unavailable.
+pub(crate) fn battery_level() -> Option<f32> {
+    let level = unsafe { yejian_ios_battery_level() };
+    (level >= 0.).then_some(level / 100.)
 }

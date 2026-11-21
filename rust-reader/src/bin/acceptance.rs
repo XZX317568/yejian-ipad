@@ -2716,14 +2716,32 @@ fn main() -> Result<()> {
     h.read_from_beginning()?;
     h.wait(ReaderApp::page_loaded)?;
     for _ in 0..6 {
+        if h.app.chapter_end() {
+            break;
+        }
         h.click("reader-next")?;
         h.wait(ReaderApp::page_loaded)?;
     }
+    anyhow::ensure!(
+        h.app.chapter_end() && h.app.current_book_id() == Some(one.id.as_str()),
+        "last page did not show the chapter end card"
+    );
+    // The end card sits past the last page; progress stays on it.
+    h.frame(vec![], Some("reader-chapter-end"))?;
+    h.click("chapter-end-continue")?;
+    h.wait(ReaderApp::page_loaded)?;
     anyhow::ensure!(
         h.app.current_book_id() == Some(two.id.as_str()) && h.app.current_page() == 0,
         "end-of-chapter did not continue into the next downloaded chapter"
     );
     h.frame(vec![], Some("reader-next-chapter"))?;
+    // Time/battery pill shows only while the controls are hidden. Taps
+    // resolve after the double-click delay, so let them fire first.
+    h.click("reader-canvas")?;
+    h.frames(20)?;
+    h.frame(vec![], Some("reader-status"))?;
+    h.click("reader-canvas")?;
+    h.frames(20)?;
     h.click("reader-chapters")?;
     h.frames(12)?;
     h.frame(vec![], Some("chapter-picker"))?;
@@ -2790,6 +2808,77 @@ fn main() -> Result<()> {
             && (closing_saved.page_fraction - closing_fraction).abs() < 0.0001,
         "normal exit returned before the final reading position was committed"
     );
+
+    // The vertical strip draws a labelled separator where one chapter hands
+    // off to the next — scroll the first chapter down until it appears.
+    h.app = ReaderApp::new(data.join("library"), h.ctx.clone());
+    h.wait(ReaderApp::ready)?;
+    h.frames(30)?;
+    h.wait(ReaderApp::covers_loaded)?;
+    h.click("search")?;
+    h.frames(2)?;
+    h.click("search-field")?;
+    h.frame(vec![Event::Text("山海之间".into())], None)?;
+    h.frames(4)?;
+    h.click("open-book")?;
+    h.frames(65)?;
+    h.read_from_beginning()?;
+    h.wait(ReaderApp::page_loaded)?;
+    // The paged run above stored per-work prefs; switch this work to the
+    // strip through the reader options like a user would.
+    h.click("reader-settings")?;
+    h.frames(3)?;
+    h.click("reader-mode-vertical")?;
+    h.frames(3)?;
+    h.click("reader-options-close")?;
+    h.frames(4)?;
+    let separator = |app: &ReaderApp| {
+        app.hitboxes
+            .keys()
+            .any(|key| key.starts_with("vertical-separator-"))
+    };
+    // Page to the last page of the first chapter, then ease over the seam:
+    // each step waits for the strip to load before scrolling on.
+    for _ in 0..one.page_count {
+        if h.app.current_page() + 1 == one.page_count {
+            break;
+        }
+        h.click("reader-next")?;
+        h.wait(ReaderApp::page_loaded)?;
+        h.frames(2)?;
+    }
+    let canvas = h.app.hitboxes["reader-canvas"];
+    let wheel = || {
+        vec![
+            Event::PointerMoved(canvas.center()),
+            Event::MouseWheel {
+                unit: MouseWheelUnit::Point,
+                delta: vec2(0., -220.),
+                source: MouseWheelSource::Wheel,
+                modifiers: Modifiers::NONE,
+                phase: TouchPhase::Move,
+            },
+        ]
+    };
+    let mut crossed = false;
+    for _ in 0..300 {
+        if separator(&h.app) {
+            crossed = true;
+            break;
+        }
+        h.frame(wheel(), None)?;
+        h.wait(ReaderApp::page_loaded)?;
+    }
+    anyhow::ensure!(
+        crossed,
+        "vertical strip never showed a chapter separator (book={:?} page={} end={} keys={:?})",
+        h.app.current_book_id(),
+        h.app.current_page(),
+        h.app.chapter_end(),
+        h.app.hitboxes.keys().collect::<Vec<_>>()
+    );
+    h.frame(vec![], Some("reader-vertical-separator"))?;
+
     // A persisted, interrupted queue is visible without repeating a search.
     // These records are labelled fixture data; the queue execution itself is
     // covered by the real WASM/HTTP and recovery tests in sources.rs.

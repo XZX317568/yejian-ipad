@@ -408,3 +408,32 @@ pub(crate) fn poll_web() -> Result<Option<crate::WebResult>> {
         }
     })
 }
+
+/// `RustActivity.setKeepAwake(boolean)`: toggles `FLAG_KEEP_SCREEN_ON` on the
+/// activity's window from the UI thread. Errors are ignored — the flag is a
+/// nicety, never worth surfacing to the reader.
+pub(crate) fn set_keep_awake(awake: bool) -> Result<()> {
+    with_activity(|env, class| {
+        env.call_static_method(
+            class,
+            "setKeepAwake",
+            "(Z)V",
+            &[JValue::Bool(awake as u8)],
+        )
+        .map_err(|error| PlatformError::Jni(format!("setKeepAwake: {error}")))?;
+        Ok(())
+    })
+}
+
+/// `RustActivity.batteryLevel()`: 0–100 percent, negative when unavailable.
+pub(crate) fn battery_level() -> Result<Option<f32>> {
+    with_activity(|env, class| {
+        let value = env
+            .call_static_method(class, "batteryLevel", "()F", &[])
+            .map_err(|error| PlatformError::Jni(format!("batteryLevel: {error}")))?;
+        let level = value
+            .f()
+            .map_err(|error| PlatformError::Jni(format!("batteryLevel result: {error}")))?;
+        Ok((level >= 0.).then_some(level / 100.))
+    })
+}

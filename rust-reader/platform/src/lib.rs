@@ -456,6 +456,41 @@ pub fn has_in_app_web() -> bool {
     cfg!(any(target_os = "ios", target_os = "android"))
 }
 
+/// Keeps the screen on while `awake` is true. Called only on transitions;
+/// a no-op on desktop.
+#[cfg(target_os = "ios")]
+pub fn set_keep_awake(awake: bool) {
+    ios::set_keep_awake(awake);
+}
+
+/// Keeps the screen on while `awake` is true (`FLAG_KEEP_SCREEN_ON`).
+#[cfg(target_os = "android")]
+pub fn set_keep_awake(awake: bool) {
+    let _ = android::set_keep_awake(awake);
+}
+
+/// Desktop builds never keep the screen on.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn set_keep_awake(_awake: bool) {}
+
+/// Battery charge 0.0–1.0, or `None` when the platform cannot report it.
+#[cfg(target_os = "ios")]
+pub fn battery_level() -> Option<f32> {
+    ios::battery_level()
+}
+
+/// Battery charge 0.0–1.0, or `None` when the platform cannot report it.
+#[cfg(target_os = "android")]
+pub fn battery_level() -> Option<f32> {
+    android::battery_level().ok().flatten()
+}
+
+/// Desktops do not report a battery level.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn battery_level() -> Option<f32> {
+    None
+}
+
 /// Opens `url` with the system browser/handler using an argument array —
 /// never a shell string.
 #[cfg(target_os = "android")]

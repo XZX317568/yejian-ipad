@@ -572,6 +572,9 @@ fn read_settings(library: &Library) -> anyhow::Result<Vec<(String, String)>> {
         "reader-fit",
         "reader-brightness",
         "reader-spread-offset",
+        "keep-awake",
+        "tap-zones",
+        "reader-status",
         "follow-interval",
         "shelf-grid",
         "shelf-sort",
@@ -1096,6 +1099,9 @@ mod tests {
         original.set_setting("shelf-sort", "progress").unwrap();
         original.set_setting("search-scope", "global").unwrap();
         original.set_setting("reading-direction", "rtl").unwrap();
+        original.set_setting("keep-awake", "false").unwrap();
+        original.set_setting("tap-zones", "next").unwrap();
+        original.set_setting("reader-status", "false").unwrap();
         let backup = tmp.path().join("settings.zip");
         original.export_backup(&backup).unwrap();
         let worker = super::Worker::start(tmp.path().join("destination"), egui::Context::default());
@@ -1113,6 +1119,9 @@ mod tests {
                 assert!(settings.contains(&("shelf-sort".into(), "progress".into())));
                 assert!(settings.contains(&("search-scope".into(), "global".into())));
                 assert!(settings.contains(&("reading-direction".into(), "rtl".into())));
+                assert!(settings.contains(&("keep-awake".into(), "false".into())));
+                assert!(settings.contains(&("tap-zones".into(), "next".into())));
+                assert!(settings.contains(&("reader-status".into(), "false".into())));
             }
             _ => panic!("restore must refresh settings together with the library"),
         }
