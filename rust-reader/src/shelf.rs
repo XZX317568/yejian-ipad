@@ -275,11 +275,7 @@ fn gradient(p: &Painter, points: &[Pos2], direction: Vec2, first: Color32, last:
 }
 
 pub fn paint_floor(p: &Painter, volumes: &[Volume], dark: bool) {
-    let ink = if dark {
-        Color32::from_rgb(254, 253, 248)
-    } else {
-        Color32::from_rgb(138, 128, 107)
-    };
+    let ink = crate::design::palette(dark).floor;
     for volume in volumes {
         let origin = volume.floor;
         let front = volume.front.horizontal;
@@ -435,33 +431,16 @@ pub fn paint_volume(
         horizontal: vec2(1., 0.10) * scale,
         vertical: Vec2::Y * scale,
     };
-    let ink = if dark {
-        Color32::from_rgb(237, 231, 222)
-    } else {
-        Color32::from_rgb(31, 27, 23)
-    };
-    let muted = if dark {
-        Color32::from_rgb(161, 152, 142)
-    } else {
-        Color32::from_rgb(120, 113, 106)
-    };
-    let paper = if dark {
-        Color32::from_rgb(40, 37, 33)
-    } else {
-        Color32::from_rgb(255, 253, 249)
-    };
-    let spine = if dark {
-        Color32::from_rgb(48, 43, 38)
-    } else {
-        Color32::from_rgb(244, 240, 231)
-    };
+    let scheme = crate::design::palette(dark);
+    let ink = scheme.ink;
+    let muted = scheme.muted;
+    let paper = scheme.page;
+    let spine = scheme.spine;
     // A hairline edge along the slanted paper and spine planes lets egui's
     // anti-aliased stroke hide the pixel stairs `Stroke::NONE` left behind.
-    let edge_line = if dark {
-        Color32::from_rgb(90, 83, 75).gamma_multiply(0.55)
-    } else {
-        Color32::from_rgb(198, 190, 172).gamma_multiply(0.9)
-    };
+    let edge_line = scheme
+        .muted
+        .gamma_multiply(if dark { 0.35 } else { 0.45 });
     flat_stroked(p, volume.face, paper, Stroke::new(0.8, edge_line));
     let mut print = p.clone();
     print.multiply_opacity(volume.ink);
@@ -523,11 +502,7 @@ pub fn paint_volume(
             true,
         );
     }
-    let edge = if dark {
-        Color32::from_rgb(62, 56, 50)
-    } else {
-        Color32::from_rgb(227, 223, 211)
-    };
+    let edge = scheme.edge;
     gradient(
         p,
         &volume.cap,
@@ -616,11 +591,7 @@ pub fn paint_flight(
     paint_paper_mesh(
         p,
         mesh,
-        if dark {
-            Color32::from_rgb(40, 37, 33)
-        } else {
-            Color32::from_rgb(255, 253, 249)
-        },
+        crate::design::palette(dark).page,
     );
 }
 

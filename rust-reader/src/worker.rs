@@ -534,6 +534,7 @@ fn read_settings(library: &Library) -> anyhow::Result<Vec<(String, String)>> {
     let mut settings = Vec::new();
     for key in [
         "theme",
+        "palette",
         "reduce-motion",
         "reading-direction",
         "private",
@@ -1059,6 +1060,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let original = yejian_core::Library::open(&tmp.path().join("original")).unwrap();
         original.set_setting("theme", "dark").unwrap();
+        original.set_setting("palette", "sepia").unwrap();
         original.set_setting("reading-direction", "rtl").unwrap();
         let backup = tmp.path().join("settings.zip");
         original.export_backup(&backup).unwrap();
@@ -1072,6 +1074,7 @@ mod tests {
         match worker.rx.recv_timeout(deadline).unwrap() {
             super::Event::Ready(_, settings, _) => {
                 assert!(settings.contains(&("theme".into(), "dark".into())));
+                assert!(settings.contains(&("palette".into(), "sepia".into())));
                 assert!(settings.contains(&("reading-direction".into(), "rtl".into())));
             }
             _ => panic!("restore must refresh settings together with the library"),

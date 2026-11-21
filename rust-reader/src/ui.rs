@@ -212,6 +212,7 @@ pub struct ReaderApp {
     dark: bool,
     reduced: bool,
     theme: String,
+    color_scheme: String,
     font_scale: f32,
     widget_font_scale: f32,
     error: Option<String>,
@@ -316,6 +317,7 @@ impl ReaderApp {
             dark: false,
             reduced: false,
             theme: "system".into(),
+            color_scheme: "ink".into(),
             font_scale: 1.,
             widget_font_scale: 0.,
             error: None,
@@ -1182,6 +1184,7 @@ impl ReaderApp {
                     for (key, value) in settings {
                         match key.as_str() {
                             "theme" => self.theme = value,
+                            "palette" => self.color_scheme = value,
                             "reduce-motion" => self.reduced = value == "true",
                             "reading-direction" => {
                                 self.reader_globals.rtl = value == "rtl";
@@ -2147,6 +2150,7 @@ impl ReaderApp {
             "light" => false,
             _ => ctx.input(|i| i.raw.system_theme == Some(Theme::Dark)),
         };
+        crate::design::set_scheme(crate::design::Scheme::from_key(&self.color_scheme));
         let visuals = crate::design::visuals(self.dark);
         ctx.set_visuals(visuals.clone());
         ui.style_mut().visuals = visuals;
@@ -4201,6 +4205,31 @@ impl ReaderApp {
                                     ) {
                                         self.theme = key.into();
                                         self.setting("theme", self.theme.clone());
+                                    }
+                                }
+                            });
+                            ui.add_space(18.);
+                            ui.label(
+                                RichText::new("配色").color(palette.muted).small(),
+                            );
+                            let scheme_width = if ui.available_width() < 330. {
+                                ((ui.available_width() - 10.) / 2.).floor() - 1.
+                            } else {
+                                ((ui.available_width() - 20.) / 3.).floor() - 1.
+                            };
+                            ui.horizontal_wrapped(|ui| {
+                                for scheme in crate::design::Scheme::ALL {
+                                    if crate::design::scheme_choice(
+                                        ui,
+                                        scheme,
+                                        self.color_scheme == scheme.key(),
+                                        scheme_width,
+                                    ) {
+                                        self.color_scheme = scheme.key().into();
+                                        self.setting(
+                                            "palette",
+                                            self.color_scheme.clone(),
+                                        );
                                     }
                                 }
                             });

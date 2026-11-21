@@ -1352,6 +1352,43 @@ fn ipad_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// One iPad-11 portrait sweep per colour scheme: shelf in light and dark,
+/// plus a settings capture with that scheme selected in the picker.
+fn schemes_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
+    use yejian_platform::{Insets, set_insets_override};
+    set_insets_override(Some(Insets {
+        left: 0,
+        top: 24,
+        right: 0,
+        bottom: 20,
+    }));
+    let library = yejian_core::Library::open(library_root)?;
+    for key in ["ink", "mist", "sepia", "mono", "sakura", "dusk"] {
+        library.set_setting("palette", key)?;
+        for theme in ["light", "dark"] {
+            library.set_setting("theme", theme)?;
+            h.app = ReaderApp::new(library_root.into(), h.ctx.clone());
+            h.wait(ReaderApp::ready)?;
+            h.wait(ReaderApp::covers_loaded)?;
+            h.size = [834, 1194];
+            h.frames(8)?;
+            h.frame(vec![], Some(&format!("shelf-{key}-{theme}")))?;
+            if theme == "light" {
+                h.click("nav-settings")?;
+                h.frames(4)?;
+                h.frame(vec![], Some(&format!("settings-{key}")))?;
+                h.click("nav-library")?;
+                h.frames(4)?;
+            }
+        }
+    }
+    library.set_setting("theme", "system")?;
+    library.set_setting("palette", "ink")?;
+    set_insets_override(None);
+    println!("PASS: six colour schemes on iPad 11 portrait, light and dark");
+    Ok(())
+}
+
 /// Exercise gestures and interruptions that a sequence of toolbar clicks
 /// misses: double taps, constrained panning, modal input and real return paths.
 fn daily_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
@@ -1891,6 +1928,9 @@ fn main() -> Result<()> {
     }
     if std::env::var_os("YEJIAN_DESIGN_ONLY").is_some() {
         return design_pass(&mut h, &data.join("library"));
+    }
+    if std::env::var_os("YEJIAN_SCHEMES_ONLY").is_some() {
+        return schemes_pass(&mut h, &data.join("library"));
     }
     if std::env::var_os("YEJIAN_DAILY_ONLY").is_some() {
         return daily_pass(&mut h, &data.join("library"));
