@@ -1,4 +1,5 @@
 use crate::{
+    follows,
     motion::{self, ShelfMotion},
     shelf::{self, Plane},
     sources::{STREAM_PREFIX, StreamChapter},
@@ -1147,6 +1148,57 @@ impl ReaderApp {
                 entry
             })
             .collect();
+        // Followed works with no local chapters still belong on the shelf:
+        // synthesise one entry per follow so sorting, animation and hit
+        // testing all apply unchanged. Dedupe against every linked work —
+        // filtering must not resurrect a hidden local work's online twin.
+        let linked_works: HashSet<(&str, &str)> = self
+            .chapters
+            .iter()
+            .map(|link| {
+                (
+                    link.metadata.source_id.as_str(),
+                    link.metadata.manga_id.as_str(),
+                )
+            })
+            .collect();
+        for follow in self.sources.follows() {
+            let key = (follow.source_id.as_str(), follow.manga_id.as_str());
+            if linked_works.contains(&key) {
+                continue;
+            }
+            if (!self.category.is_empty() && self.category != "在线追更")
+                || (!query.is_empty() && !follow.title.to_lowercase().contains(&query))
+            {
+                continue;
+            }
+            let order = follow.known.iter().chain(follow.fresh.iter());
+            let (mut current_page, mut last_read_at) = (0, None);
+            if let Some((chapter_key, at)) =
+                self.sources.work_last_read(&follow.source_id, &follow.manga_id)
+            {
+                last_read_at = Some(at);
+                current_page = order
+                    .enumerate()
+                    .find_map(|(index, key)| (key == &chapter_key).then_some(index))
+                    .unwrap_or(0);
+            }
+            let added_at = follow.followed() as i64;
+            entries.push(Book {
+                id: format!("online:{}\u{1f}{}", follow.source_id, follow.manga_id),
+                title: follow.title.clone(),
+                author: String::new(),
+                archive_path: PathBuf::new(),
+                cover_path: None,
+                page_count: follow.total.max(1),
+                current_page,
+                page_fraction: 0.,
+                updated_at: last_read_at.unwrap_or(added_at),
+                added_at,
+                last_read_at,
+                category: "在线追更".into(),
+            });
+        }
         self.sort_visible(&mut entries);
         entries
     }
@@ -1308,6 +1360,45 @@ impl ReaderApp {
         }
         chapters.get(index as usize).cloned()
     }
+    /// `online:{source}\u{1f}{manga}` entries synthesised for the shelf.
+    fn online_parts(id: &str) -> Option<(&str, &str)> {
+        id.strip_prefix("online:")?.split_once('\u{1f}')
+    }
+    fn online_follow(&self, id: &str) -> Option<&follows::Follow> {
+        let (source, manga) = Self::online_parts(id)?;
+        self.sources
+            .follows()
+            .iter()
+            .find(|follow| follow.source_id == source && follow.manga_id == manga)
+    }
+    /// Fresh-chapter count shown on the spine badge: online entries use their
+    /// own follow; local books borrow the follow of their work.
+    fn online_badge(&self, book: &Book) -> Option<usize> {
+        let follows = self.sources.follows();
+        let follow = if let Some((source, manga)) = Self::online_parts(&book.id) {
+            follows
+                .iter()
+                .find(|f| f.source_id == source && f.manga_id == manga)
+        } else {
+            let meta = self.chapter(&book.id)?;
+            follows
+                .iter()
+                .find(|f| f.source_id == meta.source_id && f.manga_id == meta.manga_id)
+        }?;
+        (follow.fresh.len() > 0).then(|| follow.fresh.len())
+    }
+    fn open_online(&mut self, id: &str, resume: bool) {
+        let Some((source, manga)) = Self::online_parts(id).map(|(s, m)| (s.to_string(), m.to_string()))
+        else {
+            return;
+        };
+        if self.sources.open_work(&source, &manga, resume) {
+            self.flight = None;
+            self.selected.clear();
+            self.tab = Tab::Sources;
+            self.screen = Screen::Library;
+        }
+    }
     fn cover_id(&self, id: &str) -> String {
         if self.chapter(id).is_none() {
             return id.to_string();
@@ -1379,7 +1470,7 @@ impl ReaderApp {
             }
         }
         self.selected
-            .retain(|id| self.books.iter().any(|b| &b.id == id));
+            .retain(|id| Self::online_parts(id).is_some() || self.books.iter().any(|b| &b.id == id));
     }
     fn receive(&mut self, ctx: &Context) {
         while let Ok(event) = self.worker.rx.try_recv() {
@@ -1648,10 +1739,20 @@ impl ReaderApp {
             }
         }
     }
-    fn ask_cover(&mut self, id: &str) {
+    fn ask_cover(&mut self, ctx: &Context, id: &str) {
         self.visible_covers.insert(id.into());
         self.cover_clock += 1;
         self.cover_usage.insert(id.into(), self.cover_clock);
+        if let Some((source, manga)) = Self::online_parts(id) {
+            // Online entries have no library archive; their cover comes from
+            // the followed snapshot through the source cover cache.
+            if !self.covers.contains_key(id)
+                && let Some(texture) = self.sources.work_cover(ctx, source, manga)
+            {
+                self.covers.insert(id.into(), texture);
+            }
+            return;
+        }
         if !self.covers.contains_key(id)
             && !self.cover_failed.contains(id)
             && self.cover_pending.insert(id.into())
@@ -1966,6 +2067,9 @@ impl ReaderApp {
         }
         if matches!(self.screen, Screen::Library) && self.tab == Tab::Sources && self.sources.back()
         {
+            if self.sources.take_shelf_return() {
+                self.tab = Tab::Library;
+            }
             return;
         }
         let at_root = matches!(self.screen, Screen::Library)
@@ -2590,6 +2694,7 @@ impl ReaderApp {
                                     self.dark,
                                     false,
                                     self.selected.contains(&book.id),
+                                    None,
                                 );
                             }
                         }
@@ -3181,7 +3286,7 @@ impl ReaderApp {
             if (volume.lane as f32 - self.motion.focus).abs() <= 3. {
                 let cover = self.cover_id(&books[volume.index].id);
                 keep.insert(cover.clone());
-                self.ask_cover(&cover);
+                self.ask_cover(ui.ctx(), &cover);
             }
         }
         if self.covers.len() > 40 {
@@ -3202,6 +3307,7 @@ impl ReaderApp {
                 self.dark,
                 hidden,
                 self.selected.contains(&book.id),
+                self.online_badge(book),
             );
             if is_central {
                 self.hitboxes.insert("shelf-center".into(), volume.bounds());
@@ -3272,6 +3378,8 @@ impl ReaderApp {
                         }
                     } else if volume.lane != self.motion.focus.round() as i32 {
                         self.motion.select(volume.lane as f32, now, self.reduced);
+                    } else if Self::online_parts(&book.id).is_some() {
+                        self.open_online(&book.id, false);
                     } else {
                         self.open_detail(book, volume, &volumes, area, now);
                     }
@@ -3301,15 +3409,26 @@ impl ReaderApp {
         let progress_pos = info + vec2(0., title.size().y + 10.);
         ui.painter().galley(info, title, ink);
         let has_progress = book.last_read_at.is_some();
-        let pages = if has_progress {
-            format!("第 {} / {} 页", book.current_page + 1, book.page_count)
+        let progress = if let Some(follow) = self.online_follow(&book.id) {
+            let name = self.sources.source_display_name(&follow.source_id);
+            if !follow.fresh.is_empty() {
+                format!("在线 · {} · {} 话更新", name, follow.fresh.len())
+            } else if has_progress {
+                format!("在线 · 读到第 {} 话", book.current_page + 1)
+            } else {
+                format!("在线 · {name}")
+            }
         } else {
-            format!("共 {} 页", book.page_count)
-        };
-        let progress = if let Some(chapter) = self.chapter(&book.id) {
-            format!("{} · {pages}", chapter.chapter_title)
-        } else {
-            pages
+            let pages = if has_progress {
+                format!("第 {} / {} 页", book.current_page + 1, book.page_count)
+            } else {
+                format!("共 {} 页", book.page_count)
+            };
+            if let Some(chapter) = self.chapter(&book.id) {
+                format!("{} · {pages}", chapter.chapter_title)
+            } else {
+                pages
+            }
         };
         let mut progress = egui::text::LayoutJob::simple(
             progress,
@@ -3349,12 +3468,15 @@ impl ReaderApp {
             pos2(info.x + action_width + 12., action_y),
             vec2(detail_width, 50.),
         );
+        let online = Self::online_parts(&book.id).is_some();
         // Controls stay painted (but inert) while books glide to their new
         // order so the stage does not flicker mid-reorder.
         let detail_clicked =
             self.selected.is_empty() && self.button(ui, "open-book", open_rect, "详情", false);
         if detail_clicked && !reordering {
-            if let Some(volume) = volumes
+            if online {
+                self.open_online(&book.id, false);
+            } else if let Some(volume) = volumes
                 .iter()
                 .find(|v| v.lane == self.motion.focus.round() as i32)
             {
@@ -3367,7 +3489,9 @@ impl ReaderApp {
                 ui,
                 "shelf-read",
                 action,
-                if has_progress {
+                if online && self.sources.resume_pending() {
+                    "正在打开…"
+                } else if has_progress {
                     "继续阅读"
                 } else {
                     "开始阅读"
@@ -3375,7 +3499,11 @@ impl ReaderApp {
                 true,
             );
         if read_clicked && !reordering {
-            self.open_reader(book);
+            if online {
+                self.open_online(&book.id, true);
+            } else {
+                self.open_reader(book);
+            }
         }
         let pager_right = if layout.short_landscape {
             layout.books.right() - 8.
@@ -3619,7 +3747,7 @@ impl ReaderApp {
                             );
                         }
                         let cover_id = self.cover_id(&book.id);
-                        self.ask_cover(&cover_id);
+                        self.ask_cover(ui.ctx(), &cover_id);
                         if let Some(texture) = self.covers.get(&cover_id) {
                             shelf::paint_art(
                                 ui.painter(),
@@ -3695,6 +3823,10 @@ impl ReaderApp {
         area: Rect,
         now: f64,
     ) {
+        if Self::online_parts(&book.id).is_some() {
+            self.open_online(&book.id, false);
+            return;
+        }
         self.screen = Screen::Detail(book.id.clone());
         let cover = self.cover_id(&book.id);
         if !self.reduced && self.covers.contains_key(&cover) {
@@ -3715,7 +3847,7 @@ impl ReaderApp {
             return;
         };
         let cover_id = self.cover_id(id);
-        self.ask_cover(&cover_id);
+        self.ask_cover(ui.ctx(), &cover_id);
         let cover = self.detail_cover_rect(area);
         let palette = crate::design::palette(self.dark);
         ui.painter()
@@ -4657,7 +4789,7 @@ impl ReaderApp {
                             continue;
                         }
                         let cover_id = self.cover_id(&book.id);
-                        self.ask_cover(&cover_id);
+                        self.ask_cover(ui.ctx(), &cover_id);
                         ui.painter().rect_filled(rect, 18., palette.surface);
                         let cover = Rect::from_min_size(rect.min + vec2(14., 14.), vec2(58., 82.));
                         if let Some(texture) = self.covers.get(&cover_id) {
@@ -5358,6 +5490,9 @@ impl ReaderApp {
             ui.style_mut().wrap_mode = Some(TextWrapMode::Wrap);
             self.sources.ui(ui);
         });
+        if self.sources.take_shelf_return() {
+            self.tab = Tab::Library;
+        }
         self.hitboxes
             .extend(self.sources.hitboxes.iter().map(|(id, rect)| (id.clone(), *rect)));
     }
@@ -5638,16 +5773,34 @@ impl ReaderApp {
                 .resizable(false)
                 .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
                 .show(ctx, |ui| {
-                    ui.label(format!(
-                        "将 {} 本书移出书架。原漫画文件保留。",
-                        self.selected.len()
-                    ));
+                    let online: Vec<String> = self
+                        .selected
+                        .iter()
+                        .filter(|id| Self::online_parts(id).is_some())
+                        .cloned()
+                        .collect();
+                    let local = self.selected.len() - online.len();
+                    ui.label(if online.is_empty() {
+                        format!("将 {} 本书移出书架。原漫画文件保留。", self.selected.len())
+                    } else if local == 0 {
+                        format!(
+                            "将 {} 部作品移出书架。会取消追更，已下载的章节不受影响。",
+                            online.len()
+                        )
+                    } else {
+                        "本地漫画文件保留；在线作品会取消追更，已下载的章节不受影响。".into()
+                    });
                     ui.horizontal(|ui| {
                         if ui.button("取消").clicked() {
                             self.confirm_remove = false;
                         }
                         if ui.button("移出").clicked() {
                             self.send(Command::Remove(self.selected_books()));
+                            for id in online {
+                                if let Some((source, manga)) = Self::online_parts(&id) {
+                                    self.sources.unfollow(source, manga);
+                                }
+                            }
                             self.selected.clear();
                             self.confirm_remove = false;
                         }
@@ -5670,6 +5823,10 @@ impl ReaderApp {
     }
     pub fn book_count(&self) -> usize {
         self.books.len()
+    }
+    /// Shelf entries including synthesised online follows.
+    pub fn visible_count(&self) -> usize {
+        self.visible_books().len()
     }
     pub fn current_page(&self) -> usize {
         self.page
@@ -6435,5 +6592,103 @@ mod tests {
         grown.push(book("d"));
         app.replace_books(grown, 13.);
         assert!(app.shelf_reorder.is_none());
+    }
+
+    fn online_app(root: &tempfile::TempDir) -> ReaderApp {
+        crate::follows::save(
+            root.path(),
+            &[
+                follows::Follow {
+                    source_id: "source.a".into(),
+                    manga_id: "story".into(),
+                    title: "Story".into(),
+                    snapshot: String::new(),
+                    known: vec!["c1".into()],
+                    total: 1,
+                    followed_at: Some(7),
+                    ..Default::default()
+                },
+                follows::Follow {
+                    source_id: "source.b".into(),
+                    manga_id: "web".into(),
+                    title: "网络连载".into(),
+                    snapshot: String::new(),
+                    known: vec!["a".into(), "b".into()],
+                    fresh: vec!["c".into()],
+                    total: 3,
+                    checked_at: Some(20),
+                    ..Default::default()
+                },
+            ],
+        )
+        .unwrap();
+        ReaderApp::new(root.path().into(), Context::default())
+    }
+
+    #[test]
+    fn online_follows_join_the_shelf_without_duplicating_local_works() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = online_app(&root);
+        app.books = vec![book("local"), book("linked")];
+        app.replace_links(vec![linked("linked", "c1")]);
+        let books = app.visible_books();
+        let ids: Vec<String> = books.iter().map(|b| b.id.clone()).collect();
+        // The local-linked work is not duplicated as an online entry.
+        assert!(!ids.iter().any(|id| id.starts_with("online:source.a")));
+        let online = books
+            .iter()
+            .find(|book| book.id == "online:source.b\u{1f}web")
+            .expect("the followed work joins the shelf");
+        assert_eq!(online.title, "网络连载");
+        assert_eq!(online.category, "在线追更");
+        assert_eq!(online.page_count, 3);
+        assert_eq!(online.added_at, 20, "followed_at falls back to checked_at");
+        assert_eq!(online.last_read_at, None);
+        assert_eq!(app.online_badge(online), Some(1));
+        // The badge rides the local representative of a followed work instead.
+        let linked_book = books.iter().find(|book| book.id == "linked").unwrap();
+        assert_eq!(app.online_badge(linked_book), None);
+        // The category filter can isolate online works.
+        app.category = "在线追更".into();
+        let ids: Vec<String> = app
+            .visible_books()
+            .iter()
+            .map(|book| book.id.clone())
+            .collect();
+        assert_eq!(ids, ["online:source.b\u{1f}web"]);
+    }
+
+    #[test]
+    fn online_entries_participate_in_all_three_sorts() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = online_app(&root);
+        let mut local = book("local");
+        local.last_read_at = Some(5);
+        app.books = vec![local];
+        let first = |app: &ReaderApp| app.visible_books()[0].id.clone();
+        // Recent keeps library order, online entries appended by follow order.
+        assert_eq!(first(&app), "local");
+        app.shelf_sort = ShelfSort::Added;
+        // added_at 20 beats the fixture's 1.
+        assert_eq!(first(&app), "online:source.b\u{1f}web");
+        app.shelf_sort = ShelfSort::Progress;
+        // Unread online entries sort into the not-started group, i.e. last.
+        assert_eq!(first(&app), "local");
+    }
+
+    #[test]
+    fn removing_an_online_entry_unfollows_it() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = online_app(&root);
+        assert!(app.sources.unfollow("source.b", "web"));
+        assert!(!app.sources.unfollow("source.b", "missing"));
+        assert_eq!(crate::follows::load(root.path()).unwrap().len(), 1);
+        let ids: Vec<String> = app
+            .visible_books()
+            .iter()
+            .map(|book| book.id.clone())
+            .collect();
+        // The removed work leaves; unrelated follows stay on the shelf.
+        assert_eq!(ids, ["online:source.a\u{1f}story"]);
     }
 }

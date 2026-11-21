@@ -1521,6 +1521,12 @@ pub struct Sources {
     follows: Vec<Follow>,
     /// A followed manga to open once its source has finished loading.
     pending_open: Option<Manga>,
+    /// Detail was opened from the shelf: 返回 pops back to 书架 instead of
+    /// the source browser.
+    shelf_origin: bool,
+    shelf_return: bool,
+    /// A shelf 继续阅读 asked for the resume action once chapters arrive.
+    pending_resume: bool,
     checking: usize,
     /// Whether the in-flight batch came from the scheduler — its completion
 
@@ -2554,6 +2560,9 @@ impl Sources {
             preempted: None,
             follows: Vec::new(),
             pending_open: None,
+            shelf_origin: false,
+            shelf_return: false,
+            pending_resume: false,
             checking: 0,
             checking_background: false,
             auto_checked: false,
@@ -2701,6 +2710,7 @@ impl Sources {
             .collect();
         follow.mark_seen(&keys);
         follow.checked_at = Some(follows::now());
+        follow.followed_at = Some(follows::now());
         self.follows.insert(0, follow);
         self.status = "已加入追更，有新章节会在书源页顶部提示".into();
         self.save_follows();
@@ -2716,9 +2726,9 @@ impl Sources {
         Ok(manga)
     }
 
-    fn open_follow(&mut self, index: usize) {
+    fn open_follow(&mut self, index: usize) -> bool {
         let Some(follow) = self.follows.get(index).cloned() else {
-            return;
+            return false;
         };
         if !self
             .installed
@@ -2729,13 +2739,13 @@ impl Sources {
                 "书源 {} 未安装，无法打开《{}》",
                 follow.source_id, follow.title
             );
-            return;
+            return false;
         }
         let manga = match self.follow_manga(&follow) {
             Ok(manga) => manga,
             Err(error) => {
                 self.status = format!("无法打开《{}》：{error:#}", follow.title);
-                return;
+                return false;
             }
         };
         if self.selected_source == follow.source_id {
@@ -2744,6 +2754,79 @@ impl Sources {
             self.select_source(&follow.source_id);
             self.pending_open = Some(manga);
         }
+        true
+    }
+
+    /// Opens a followed work's detail page, remembering whether it came from
+    /// the shelf so 返回 can hand back to 书架. `resume` makes the chapter
+    /// list auto-fire the existing 继续阅读 once it lands.
+    pub(crate) fn open_work(&mut self, source: &str, manga: &str, resume: bool) -> bool {
+        let Some(index) = self.follow_index(source, manga) else {
+            return false;
+        };
+        if !self.open_follow(index) {
+            return false;
+        }
+        self.shelf_origin = true;
+        self.pending_resume = resume;
+        true
+    }
+    /// `open_work` marked this visit as shelf-originated: 返回 pops to 书架.
+    pub(crate) fn take_shelf_return(&mut self) -> bool {
+        std::mem::take(&mut self.shelf_return)
+    }
+    /// A resume queued by the shelf is still waiting for the chapter list.
+    pub(crate) fn resume_pending(&self) -> bool {
+        self.pending_resume
+    }
+    /// The followed works, in follow order (newest first).
+    pub(crate) fn follows(&self) -> &[Follow] {
+        &self.follows
+    }
+    /// Display name of an installed source; falls back to its id.
+    pub(crate) fn source_display_name(&self, source_id: &str) -> String {
+        self.installed
+            .iter()
+            .find(|source| source.manifest.id == source_id)
+            .map_or_else(|| source_id.to_string(), |source| source.manifest.name.clone())
+    }
+    /// Latest chapter read state for a work: (chapter key, read_at).
+    pub(crate) fn work_last_read(&self, source: &str, manga: &str) -> Option<(String, i64)> {
+        self.tasks
+            .iter()
+            .filter(|task| task.source_id == source && task.manga_id == manga)
+            .filter_map(|task| task.read_at.map(|at| (task.chapter_id.clone(), at)))
+            .max_by_key(|(_, at)| *at)
+    }
+    /// Drops a follow; used when an online shelf entry is 移出'd.
+    pub(crate) fn unfollow(&mut self, source: &str, manga: &str) -> bool {
+        let Some(index) = self.follow_index(source, manga) else {
+            return false;
+        };
+        self.follows.remove(index);
+        self.status = "已取消追更".into();
+        self.save_follows();
+        true
+    }
+    /// Cover texture for a followed work via the `source-covers` pipeline;
+    /// queues a fetch while it is still missing.
+    pub(crate) fn work_cover(
+        &mut self,
+        ctx: &Context,
+        source: &str,
+        manga: &str,
+    ) -> Option<TextureHandle> {
+        let index = self.follow_index(source, manga)?;
+        let url = self.follow_cover_url(index)?;
+        let texture = self.cover_image(ctx, source, &url);
+        if texture.is_none() {
+            self.plan_covers(vec![CoverReq {
+                key: cover_key(source, &url),
+                source: source.to_string(),
+                url,
+            }]);
+        }
+        texture
     }
     /// The followed manga's cover URL, read from its snapshot once per
 
@@ -4089,6 +4172,7 @@ impl Sources {
                         _ => format!("加载失败：{error}"),
                     };
                     self.failed = completed;
+                    self.pending_resume = false;
                     if let Some(manga) = self.pending_open.take() {
                         self.open_manga(manga);
                     }
@@ -4228,6 +4312,10 @@ impl Sources {
                         self.selected_manga = Some(manga);
                         self.chapters = list;
                         self.status.clear();
+                        if self.pending_resume {
+                            self.pending_resume = false;
+                            self.auto_resume();
+                        }
                     }
                 }
                 Reply::Notified => {
@@ -4458,6 +4546,10 @@ impl Sources {
         }
         if self.selected_manga.take().is_some() {
             self.chapters.clear();
+            if self.shelf_origin {
+                self.shelf_origin = false;
+                self.shelf_return = true;
+            }
             return true;
         }
         if !self.selected_source.is_empty() {
@@ -5228,33 +5320,25 @@ impl Sources {
         let source = self.source_for(&manga);
         let width = ui.available_width();
 
-        let back = ui.add(quiet_action("返回搜索结果").min_size(vec2(88., 44.)));
+        let back_label = if self.shelf_origin {
+            "返回书架"
+        } else {
+            "返回搜索结果"
+        };
+        let back = ui.add(quiet_action(back_label).min_size(vec2(88., 44.)));
         self.hitboxes.insert("source-detail-back".into(), back.rect);
         if back.clicked() {
             self.selected_manga = None;
             self.chapters.clear();
+            if self.shelf_origin {
+                self.shelf_origin = false;
+                self.shelf_return = true;
+            }
             return;
         }
         ui.add_space(8.);
 
-        let states: std::collections::HashMap<String, ChapterQueueState> = self
-            .tasks
-            .iter()
-            .filter(|task| task.source_id == source && task.manga_id == manga.key)
-            .map(|task| {
-                (
-                    task.chapter_id.clone(),
-                    ChapterQueueState {
-                        status: task.status,
-                        has_archive: task.cbz.is_some(),
-                        done: task.pages_done,
-                        total: task.pages_total,
-                        read_page: task.read_page,
-                        read_at: task.read_at,
-                    },
-                )
-            })
-            .collect();
+        let states = self.chapter_states(&source, &manga.key);
         let ordered = chapter_list(&self.chapters, "", false);
         let (resume, started) = self.resume_chapter(&source, &manga, &ordered, &states);
         let resume_key = resume.as_ref().map(|chapter| chapter.key.clone());
@@ -5350,9 +5434,9 @@ impl Sources {
                     read = true;
                 }
                 let button = if followed {
-                    ui.add(quiet_action("已追更 · 取消追更").min_size(vec2(0., 48.)))
+                    ui.add(quiet_action("已在书架 · 移出").min_size(vec2(0., 48.)))
                 } else {
-                    ui.add(quiet_action("追更").min_size(vec2(0., 48.)))
+                    ui.add(quiet_action("加入书架").min_size(vec2(0., 48.)))
                 };
                 this.hitboxes
                     .insert("source-detail-follow".into(), button.rect);
@@ -5695,6 +5779,44 @@ impl Sources {
     /// copy when linked, import when the download only waits for the shelf,
 
     /// otherwise online streaming.
+
+    /// Queue state per chapter key, as the detail page collects it.
+    fn chapter_states(
+        &self,
+        source: &str,
+        manga: &str,
+    ) -> std::collections::HashMap<String, ChapterQueueState> {
+        self.tasks
+            .iter()
+            .filter(|task| task.source_id == source && task.manga_id == manga)
+            .map(|task| {
+                (
+                    task.chapter_id.clone(),
+                    ChapterQueueState {
+                        status: task.status,
+                        has_archive: task.cbz.is_some(),
+                        done: task.pages_done,
+                        total: task.pages_total,
+                        read_page: task.read_page,
+                        read_at: task.read_at,
+                    },
+                )
+            })
+            .collect()
+    }
+    /// The shelf asked to resume as soon as the chapter list landed.
+    fn auto_resume(&mut self) {
+        let Some(manga) = self.selected_manga.clone() else {
+            return;
+        };
+        let source = self.source_for(&manga);
+        let states = self.chapter_states(&source, &manga.key);
+        let ordered = chapter_list(&self.chapters, "", false);
+        let (resume, _) = self.resume_chapter(&source, &manga, &ordered, &states);
+        if let Some(chapter) = resume {
+            self.read_detail_chapter(&manga, &chapter, &states);
+        }
+    }
 
     fn read_detail_chapter(
         &mut self,
@@ -6380,6 +6502,9 @@ mod tests {
             preempted: None,
             follows: Vec::new(),
             pending_open: None,
+            shelf_origin: false,
+            shelf_return: false,
+            pending_resume: false,
             checking: 0,
             checking_background: false,
             auto_checked: true,

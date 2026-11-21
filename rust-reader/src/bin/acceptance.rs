@@ -1040,6 +1040,7 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
         "design: large-text filter cancel did not leave the form"
     );
     library.set_setting("font-scale", "1")?;
+    online_shelf_pass(h, library_root, &mut captures)?;
     let report = serde_json::json!({
         "result": "PASS",
         "library": library_root,
@@ -1069,6 +1070,129 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
         captures.len(),
         h.output.display()
     );
+    Ok(())
+}
+
+/// Round 1 online shelf: a followed work with no local chapters appears on
+/// the shelf, a fresh chapter badges its locally-linked book, and the shelf
+/// resume opens the online detail page and enters the reader by itself.
+fn online_shelf_pass(
+    h: &mut Harness,
+    library_root: &Path,
+    captures: &mut Vec<serde_json::Value>,
+) -> Result<()> {
+    let library = yejian_core::Library::open(library_root)?;
+    let books = library.list_books("")?;
+    let linked = books
+        .iter()
+        .find(|book| book.title == "山海之间")
+        .context("online: first fixture is missing")?;
+    library.link_chapter(
+        &linked.id,
+        &yejian_core::ChapterMetadata {
+            source_id: "local.filter-acceptance".into(),
+            manga_id: "fx-pop-1".into(),
+            manga_title: "热门-第1页".into(),
+            chapter_id: "daily-1".into(),
+            chapter_title: "第 1 话".into(),
+            chapter_number: Some(1.),
+            volume_number: None,
+        },
+    )?;
+    h.size = [834, 1194];
+    h.app = ReaderApp::new(library_root.to_path_buf(), h.ctx.clone());
+    h.wait(ReaderApp::ready)?;
+    h.app.prepare_source_acceptance("browse")?;
+    h.wait(ReaderApp::source_browser_ready)?;
+    // Follow the linked work and a second work with no local chapters.
+    for (listing, title) in [(None, "热门-第1页"), (Some("最新"), "最新-第1页")] {
+        if let Some(listing) = listing {
+            h.click_text(listing)?;
+            h.wait(|app| app.source_browser_report()["results"][0] == title)?;
+        }
+        h.click("source-result-0")?;
+        h.wait(|app| {
+            app.hitboxes.contains_key("source-detail-follow")
+                && app.source_browser_report()["busy"] == false
+        })?;
+        h.click("source-detail-follow")?;
+        h.frames(3)?;
+        anyhow::ensure!(
+            h.painted_text
+                .iter()
+                .any(|text| text.text == "已在书架 · 移出"),
+            "online: 《{title}》 did not land on the shelf"
+        );
+        h.click("source-detail-back")?;
+        h.frames(3)?;
+    }
+    h.click("nav-library")?;
+    h.wait(ReaderApp::covers_loaded)?;
+    h.frames(6)?;
+    anyhow::ensure!(
+        h.app.visible_count() == 6,
+        "online: followed work did not synthesise a shelf entry"
+    );
+    design_capture(h, "shelf-online", captures)?;
+    // A check that finds a fresh chapter badges the locally-linked book.
+    let follows_path = library_root.join("follows.json");
+    let mut store: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&follows_path)?)?;
+    for follow in store["follows"]
+        .as_array_mut()
+        .context("online: follows store is corrupt")?
+    {
+        if follow["manga_id"] == "fx-pop-1" {
+            follow["known"] = serde_json::json!(["daily-1"]);
+            follow["fresh"] = serde_json::json!(["daily-2"]);
+        }
+    }
+    std::fs::write(&follows_path, serde_json::to_vec(&store)?)?;
+    h.app = ReaderApp::new(library_root.to_path_buf(), h.ctx.clone());
+    h.wait(ReaderApp::ready)?;
+    h.wait(ReaderApp::covers_loaded)?;
+    h.frames(8)?;
+    // Centre the linked book — its spine carries the manga title — so the
+    // fresh-chapter badge is visible.
+    for _ in 0..6 {
+        if h.app.focused_book_title() == "热门-第1页" {
+            break;
+        }
+        h.click("shelf-prev")?;
+        h.wait(|app| !app.frame_is_animating)?;
+    }
+    anyhow::ensure!(
+        h.app.focused_book_title() == "热门-第1页",
+        "online: shelf could not focus the linked book"
+    );
+    design_capture(h, "shelf-online-badge", captures)?;
+    // Focus the online entry and resume it.
+    for _ in 0..6 {
+        if h.app.focused_book_title() == "最新-第1页" {
+            break;
+        }
+        h.click("shelf-next")?;
+        h.wait(|app| !app.frame_is_animating)?;
+    }
+    for _ in 0..6 {
+        if h.app.focused_book_title() == "最新-第1页" {
+            break;
+        }
+        h.click("shelf-prev")?;
+        h.wait(|app| !app.frame_is_animating)?;
+    }
+    anyhow::ensure!(
+        h.app.focused_book_title() == "最新-第1页",
+        "online: shelf could not focus the followed work"
+    );
+    h.click("shelf-read")?;
+    // The fixture exports no get_page_list, so the stream stays pending;
+    // entering the online reader is the observable outcome.
+    h.wait(|app| app.screen_name() == "reader")?;
+    h.frames(4)?;
+    design_capture(h, "shelf-online-reader", captures)?;
+    h.click("reader-back")?;
+    h.frames(6)?;
     Ok(())
 }
 
@@ -2059,6 +2183,10 @@ fn main() -> Result<()> {
     }
     if std::env::var_os("YEJIAN_DAILY_ONLY").is_some() {
         return daily_pass(&mut h, &data.join("library"));
+    }
+    if std::env::var_os("YEJIAN_ONLINE_ONLY").is_some() {
+        let mut captures = Vec::new();
+        return online_shelf_pass(&mut h, &data.join("library"), &mut captures);
     }
     h.frame(vec![], Some("phone-shelf"))?;
     anyhow::ensure!(h.app.rendered_book_nodes < 45);

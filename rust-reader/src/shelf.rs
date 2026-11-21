@@ -476,6 +476,7 @@ pub fn paint_volume(
     dark: bool,
     hide_cover: bool,
     selected: bool,
+    badge: Option<usize>,
 ) {
     let mut faded = p.clone();
     faded.multiply_opacity(volume.opacity);
@@ -604,6 +605,21 @@ pub fn paint_volume(
             9.,
             ink,
             false,
+        );
+    }
+    // A vermillion marker on the spine's top edge carries the fresh-chapter
+    // count for followed works.
+    if let Some(count) = badge {
+        let radius = (10. * scale).clamp(7., 11.);
+        let center = volume.front.point(0.5, 0.03) + vec2(radius * 0.4, 0.);
+        print.circle_filled(center, radius, scheme.accent);
+        print.circle_stroke(center, radius, Stroke::new(1., scheme.paper));
+        print.text(
+            center,
+            Align2::CENTER_CENTER,
+            if count > 99 { "99+".into() } else { count.to_string() },
+            FontId::proportional((9.5 * scale).clamp(7., 10.)),
+            scheme.on_accent,
         );
     }
     p.circle_stroke(volume.front.point(0.5, 0.94), 2.2, Stroke::new(0.6, muted));
