@@ -3986,10 +3986,11 @@ impl Sources {
         (widest + 28.) * 2.
     }
     /// Joined two-segment toggle: selected segment is soft-filled and stroked.
-    fn scope_segment(&mut self, ui: &mut Ui) {
+    /// `width` is the natural measured width, or the full row on narrow
+    /// layouts so the control never overflows its row.
+    fn scope_segment(&mut self, ui: &mut Ui, width: f32) {
         let palette = design::palette(ui.visuals().dark_mode);
         let font = TextStyle::Body.resolve(ui.style());
-        let width = self.scope_segment_width(ui);
         let (rect, _) = ui.allocate_exact_size(vec2(width, 44.), Sense::hover());
         let seg_w = width / 2.;
         let mut choose = None;
@@ -5104,12 +5105,12 @@ impl Sources {
                     && ui.input(|input| input.key_pressed(Key::Enter));
                 self.hitboxes.insert("source-search".into(), input.rect);
             }
+            let gap = ui.spacing().item_spacing.x;
             ui.horizontal_wrapped(|ui| {
                 if !narrow {
-                    let rest = self.scope_segment_width(ui)
-                        + 12.
-                        + (56. + 16.) // 搜索 button + spacing
-                        ;
+                    // Field takes whatever the segmented control and the
+                    // 搜索 button (min 88pt) leave behind.
+                    let rest = self.scope_segment_width(ui) + 88. + gap * 4.;
                     let input = ui.add(
                         TextEdit::singleline(&mut self.query)
                             .hint_text("搜索漫画")
@@ -5121,15 +5122,18 @@ impl Sources {
                         && ui.input(|input| input.key_pressed(Key::Enter));
                     self.hitboxes.insert("source-search".into(), input.rect);
                 }
-                self.scope_segment(ui);
-                if ui
-                    .add_enabled(
-                        self.metadata_loaded,
-                        design::primary("搜索", ui.visuals().dark_mode),
-                    )
-                    .clicked()
-                    || enter && self.metadata_loaded
-                {
+                let seg_width = if narrow {
+                    ui.available_width()
+                } else {
+                    self.scope_segment_width(ui)
+                };
+                self.scope_segment(ui, seg_width);
+                let go = ui.add_enabled(
+                    self.metadata_loaded,
+                    design::primary("搜索", ui.visuals().dark_mode),
+                );
+                self.hitboxes.insert("source-search-go".into(), go.rect);
+                if go.clicked() || enter && self.metadata_loaded {
                     self.start_search();
                 }
             });

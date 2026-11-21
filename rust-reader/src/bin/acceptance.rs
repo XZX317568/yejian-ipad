@@ -959,6 +959,16 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
         );
     }
     design_capture(h, "design-global-search", &mut captures)?;
+    // The scope control and search action stay fully on screen.
+    let screen =
+        Rect::from_min_size(Pos2::ZERO, vec2(h.size[0] as f32, h.size[1] as f32));
+    for id in ["scope-current", "scope-global", "source-search-go"] {
+        anyhow::ensure!(
+            screen.contains_rect(h.app.hitboxes[id]),
+            "global: {id} {:?} overflows {screen:?}",
+            h.app.hitboxes[id]
+        );
+    }
 
     // Reopen the real saved settings, preserving the source and reading
     // history. Only the temporary acceptance library is changed.
@@ -1074,6 +1084,15 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
     h.wait(ReaderApp::global_search_done)?;
     h.frames(5)?;
     design_capture(h, "design-large-text-global-search", &mut captures)?;
+    let screen =
+        Rect::from_min_size(Pos2::ZERO, vec2(h.size[0] as f32, h.size[1] as f32));
+    for id in ["scope-current", "scope-global", "source-search-go"] {
+        anyhow::ensure!(
+            screen.contains_rect(h.app.hitboxes[id]),
+            "global 200 percent: {id} {:?} overflows {screen:?}",
+            h.app.hitboxes[id]
+        );
+    }
     library.set_setting("font-scale", "1")?;
     online_shelf_pass(h, library_root, &mut captures)?;
     let report = serde_json::json!({
