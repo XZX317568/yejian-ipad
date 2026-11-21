@@ -341,6 +341,7 @@ pub struct ReaderApp {
     tracker_anilist_token: String,
     tracker_kitsu_user: String,
     tracker_kitsu_pass: String,
+    tracker_bangumi_token: String,
     track_panel: Option<String>,
     track_query: String,
     /// Unsaved status/progress edits in the tracking panel, by binding key.
@@ -367,6 +368,7 @@ impl ReaderApp {
             tracker_anilist_token: String::new(),
             tracker_kitsu_user: String::new(),
             tracker_kitsu_pass: String::new(),
+            tracker_bangumi_token: String::new(),
             track_panel: None,
             track_query: String::new(),
             track_draft: None,
@@ -589,6 +591,46 @@ impl ReaderApp {
         self.tab = Tab::Sources;
         self.screen = Screen::Library;
         self.sources.preview_installed_source(id)
+    }
+    #[cfg(debug_assertions)]
+    pub fn prepare_auto_follow_acceptance(&mut self) {
+        self.tab = Tab::Sources;
+        self.screen = Screen::Library;
+        self.sources.preview_auto_download();
+    }
+    #[cfg(debug_assertions)]
+    pub fn prepare_migrate_acceptance(&mut self, stage: &str) {
+        self.tab = Tab::Sources;
+        self.screen = Screen::Library;
+        self.sources.preview_migrate(stage);
+    }
+    /// Acceptance teardown: remove preview follows/tasks before the app is
+    /// dropped so they never leak into the real saved state.
+    #[cfg(debug_assertions)]
+    pub fn clear_acceptance_previews(&mut self) {
+        self.sources.clear_acceptance_previews();
+    }
+    /// Acceptance seam: Bangumi requests go to a local fake server.
+    #[cfg(debug_assertions)]
+    pub fn set_bangumi_endpoint(&mut self, ctx: Context, base: String) {
+        self.trackers
+            .replace_for_test(self.root.clone(), ctx, base);
+    }
+    #[cfg(debug_assertions)]
+    pub fn tracker_command(&mut self, command: crate::trackers::TrackCommand) {
+        self.trackers.submit(command);
+    }
+    #[cfg(debug_assertions)]
+    pub fn tracker_report(&self, key: &str) -> serde_json::Value {
+        let binding = self.trackers.binding(key);
+        serde_json::json!({
+            "bangumi": self
+                .trackers
+                .account(crate::trackers::TrackerKind::Bangumi)
+                .map(|account| account.name.clone()),
+            "bound": binding.is_some(),
+            "tracker": binding.map(|entry| entry.tracker.clone()),
+        })
     }
     #[cfg(debug_assertions)]
     fn apply_snapshot(&mut self, name: &str) {
@@ -1831,6 +1873,9 @@ impl ReaderApp {
                                     .unwrap_or(crate::sources::DEFAULT_FOLLOW_INTERVAL_MIN);
                                 self.sources.set_follow_interval(minutes);
                             }
+                            "auto-download" => {
+                                self.sources.set_auto_download(&value);
+                            }
                             "search-history" => {
                                 if let Ok(history) =
                                     serde_json::from_str::<Vec<String>>(&value)
@@ -2970,6 +3015,34 @@ impl ReaderApp {
         if let Some(history) = self.sources.take_history_change() {
             if let Ok(json) = serde_json::to_string(&history) {
                 self.setting("search-history", json);
+            }
+        }
+        if let Some(post) = self.sources.take_migrate_post() {
+            if post.resume_unparsed {
+                self.pending_notice =
+                    Some("已换源，但没能从旧阅读记录解析出话数，将从第一章开始".into());
+            }
+            // One binding key covers whichever tracker the work is bound to;
+            // the command moves it to the new source's key.
+            self.trackers.submit(crate::trackers::TrackCommand::Rebind {
+                old: post.rebind.0,
+                new: post.rebind.1,
+            });
+            if let Some((source, manga)) = post.purge {
+                let ids: Vec<String> = self
+                    .chapters
+                    .iter()
+                    .filter(|link| {
+                        link.metadata.source_id == source
+                            && link.metadata.manga_id == manga
+                    })
+                    .map(|link| link.book_id.clone())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                if !ids.is_empty() {
+                    self.send(Command::PurgeBooks(ids));
+                }
             }
         }
         if let Some(notice) = self.sources.follow_notice.take() {
@@ -5834,6 +5907,45 @@ impl ReaderApp {
                                 self.sources.set_follow_interval(chosen);
                                 self.setting("follow-interval", chosen.to_string());
                             }
+                            ui.add_space(10.);
+                            ui.label(
+                                RichText::new("自动下载新章节（会使用移动网络）")
+                                    .color(palette.muted)
+                                    .small(),
+                            );
+                            let current = self.sources.auto_download().to_string();
+                            let mut mode = current.clone();
+                            let width = if ui.available_width() < 340. {
+                                ((ui.available_width() - 10.) / 2.).floor() - 1.
+                            } else {
+                                ((ui.available_width() - 30.) / 4.).floor() - 1.
+                            };
+                            ui.horizontal_wrapped(|ui| {
+                                for (value, name) in [
+                                    ("off", "关闭"),
+                                    ("all", "新章节全部"),
+                                    ("latest1", "只下最新 1 章"),
+                                    ("latest3", "只下最新 3 章"),
+                                ] {
+                                    let button = ui.add(
+                                        Button::new(name)
+                                            .selected(mode == value)
+                                            .min_size(vec2(width, 44.))
+                                            .wrap(),
+                                    );
+                                    self.hitboxes.insert(
+                                        format!("auto-download-{value}"),
+                                        button.rect,
+                                    );
+                                    if button.clicked() {
+                                        mode = value.to_string();
+                                    }
+                                }
+                            });
+                            if mode != current {
+                                self.sources.set_auto_download(&mode);
+                                self.setting("auto-download", mode);
+                            }
                         });
                     ui.add_space(10.);
                     ui.separator();
@@ -5841,7 +5953,7 @@ impl ReaderApp {
                         .inner_margin(Margin::symmetric(2, 16))
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
-                            crate::design::section(ui, "进度跟踪（AniList / Kitsu）");
+                            crate::design::section(ui, "进度跟踪（AniList / Kitsu / Bangumi）");
                             let mut sync = self.trackers.auto_sync();
                             if crate::design::toggle(
                                 ui,
@@ -5859,6 +5971,7 @@ impl ReaderApp {
                             for tracker in [
                                 crate::trackers::TrackerKind::Anilist,
                                 crate::trackers::TrackerKind::Kitsu,
+                                crate::trackers::TrackerKind::Bangumi,
                             ] {
                                 ui.add_space(10.);
                                 let name = tracker.label();
@@ -6499,6 +6612,30 @@ impl ReaderApp {
                     self.tracker_kitsu_pass.clear();
                 }
             }
+            crate::trackers::TrackerKind::Bangumi => {
+                ui.label(
+                    RichText::new("在 next.bgm.tv/demo/access-token 生成令牌后粘贴到下面")
+                        .color(crate::design::palette(self.dark).muted)
+                        .small(),
+                );
+                ui.add(
+                    TextEdit::singleline(&mut self.tracker_bangumi_token)
+                        .desired_width(ui.available_width())
+                        .password(true)
+                        .hint_text("粘贴 Bangumi Access Token"),
+                );
+                let token = self.tracker_bangumi_token.trim().to_string();
+                let button = ui.add_enabled(
+                    idle && !token.is_empty(),
+                    Button::new("用粘贴的令牌登录").min_size(vec2(0., 44.)),
+                );
+                self.hitboxes.insert("tracker-bangumi-login".into(), button.rect);
+                if button.clicked() {
+                    self.trackers
+                        .submit(crate::trackers::TrackCommand::BangumiToken(token));
+                    self.tracker_bangumi_token.clear();
+                }
+            }
         }
     }
     fn track_panel_ui(&mut self, ui: &mut Ui, key: &str) {
@@ -6507,10 +6644,10 @@ impl ReaderApp {
         let palette = crate::design::palette(self.dark);
         let bound = self.trackers.binding(key).cloned();
         if let Some(binding) = &bound {
-            let tracker = if binding.tracker == "kitsu" {
-                TrackerKind::Kitsu
-            } else {
-                TrackerKind::Anilist
+            let tracker = match binding.tracker.as_str() {
+                "kitsu" => TrackerKind::Kitsu,
+                "bangumi" => TrackerKind::Bangumi,
+                _ => TrackerKind::Anilist,
             };
             ui.label(format!(
                 "已绑定 {} · {}",
@@ -6628,7 +6765,7 @@ impl ReaderApp {
             );
             let idle = self.trackers.idle();
             ui.horizontal(|ui| {
-                for tracker in [TrackerKind::Anilist, TrackerKind::Kitsu] {
+                for tracker in [TrackerKind::Anilist, TrackerKind::Kitsu, TrackerKind::Bangumi] {
                     let logged = self.trackers.account(tracker).is_some();
                     if ui
                         .add_enabled(
@@ -6648,9 +6785,10 @@ impl ReaderApp {
             });
             if self.trackers.account(TrackerKind::Anilist).is_none()
                 && self.trackers.account(TrackerKind::Kitsu).is_none()
+                && self.trackers.account(TrackerKind::Bangumi).is_none()
             {
                 ui.label(
-                    RichText::new("先到 设置 → 进度跟踪 登录 AniList 或 Kitsu")
+                    RichText::new("先到 设置 → 进度跟踪 登录 AniList、Kitsu 或 Bangumi")
                         .color(palette.muted)
                         .small(),
                 );

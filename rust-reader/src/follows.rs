@@ -27,6 +27,15 @@ pub struct Follow {
     /// kept — their progress is unknown rather than reversed.
     #[serde(default)]
     pub reading_order: Vec<String>,
+    /// Chapter number carried over by a source migration (换源): the chapter
+    /// the user was reading on the old source. `None` when no readable
+    /// number could be parsed — the new source then resumes at chapter one.
+    #[serde(default)]
+    pub resume_number: Option<f64>,
+    /// Whether the chapter `resume_number` points at was already finished;
+    /// finished means the resume target is the first chapter *after* it.
+    #[serde(default)]
+    pub resume_done: bool,
     #[serde(default)]
     pub error: Option<String>,
 }

@@ -47,12 +47,16 @@ const OAUTH_LISTEN_TIMEOUT_SECS: u64 = 300;
 /// Fixed loopback port AniList's public desktop client redirects to.
 pub const OAUTH_LOOPBACK_PORT: u16 = 43824;
 
+const BANGUMI_API: &str = "https://api.bgm.tv";
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum TrackerKind {
     #[serde(rename = "anilist")]
     Anilist,
     #[serde(rename = "kitsu")]
     Kitsu,
+    #[serde(rename = "bangumi")]
+    Bangumi,
 }
 
 impl TrackerKind {
@@ -60,6 +64,7 @@ impl TrackerKind {
         match self {
             Self::Anilist => "AniList",
             Self::Kitsu => "Kitsu",
+            Self::Bangumi => "Bangumi",
         }
     }
 }
@@ -127,6 +132,27 @@ impl TrackStatus {
         }
     }
 
+    /// Bangumi collection type: 想读 1 · 看过 2 · 在读 3 · 搁置 4 · 弃坑 5.
+    fn bangumi(self) -> i64 {
+        match self {
+            Self::Planned => 1,
+            Self::Completed => 2,
+            Self::Reading | Self::ReReading => 3,
+            Self::OnHold => 4,
+            Self::Dropped => 5,
+        }
+    }
+
+    fn from_bangumi(value: i64) -> Self {
+        match value {
+            1 => Self::Planned,
+            2 => Self::Completed,
+            4 => Self::OnHold,
+            5 => Self::Dropped,
+            _ => Self::Reading,
+        }
+    }
+
     fn from_kitsu(value: &str) -> Self {
         match value {
             "completed" => Self::Completed,
@@ -183,7 +209,7 @@ impl Account {
 /// A book-to-remote-entry binding persisted in `trackers.json`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Binding {
-    /// `anilist` / `kitsu`.
+    /// `anilist` / `kitsu` / `bangumi`.
     pub tracker: String,
     pub media_id: String,
     #[serde(default)]
@@ -204,6 +230,8 @@ struct Store {
     anilist: Option<Account>,
     #[serde(default)]
     kitsu: Option<Account>,
+    #[serde(default)]
+    bangumi: Option<Account>,
     /// `source:{id}\x1f{manga}` or `book:{id}` → binding.
     #[serde(default)]
     bindings: std::collections::BTreeMap<String, Binding>,
@@ -793,6 +821,219 @@ fn kitsu_save(
 }
 
 // ---------------------------------------------------------------------------
+// Bangumi
+// ---------------------------------------------------------------------------
+
+/// Bangumi requires a User-Agent on every request.
+fn user_agent() -> String {
+    format!(
+        "Yejian/{} (https://github.com/XZX317568/yejian-ipad)",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+/// Sentinel errors the command runner maps to "token expired" / "no entry".
+const BGM_UNAUTHORIZED: &str = "BGM-401";
+const BGM_NO_ENTRY: &str = "BGM-404";
+
+fn bangumi_request(
+    api: &str,
+    method: &str,
+    path: &str,
+    token: &str,
+    body: Option<Vec<u8>>,
+) -> Result<String, String> {
+    let mut headers = vec![
+        ("Accept".into(), "application/json".into()),
+        ("User-Agent".into(), user_agent()),
+        ("Authorization".into(), format!("Bearer {token}")),
+    ];
+    if body.is_some() {
+        headers.push(("Content-Type".into(), "application/json".into()));
+    }
+    let response = send_isolated(NetRequestData {
+        method: method.into(),
+        url: format!("{api}{path}"),
+        headers,
+        body,
+        timeout_ms: 30_000,
+    });
+    if let Some(error) = response.error {
+        return Err(error);
+    }
+    if response.status_code == 401 {
+        return Err(BGM_UNAUTHORIZED.into());
+    }
+    if response.status_code == 404 {
+        return Err(BGM_NO_ENTRY.into());
+    }
+    let text = String::from_utf8_lossy(&response.body).into_owned();
+    if !(200..300).contains(&response.status_code) {
+        return Err(format!(
+            "HTTP {}：{}",
+            response.status_code,
+            &text[..text.len().min(160)]
+        ));
+    }
+    Ok(text)
+}
+
+/// `GET /v0/me` — validates a pasted personal token and returns the user.
+fn bangumi_login(api: &str, token: &str) -> Result<Account, String> {
+    let text = bangumi_request(api, "GET", "/v0/me", token, None)?;
+    let value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("用户响应不是 JSON：{e}"))?;
+    Ok(Account {
+        // The collection endpoints key on the login username, not the id.
+        user_id: value["username"].as_str().unwrap_or_default().to_string(),
+        name: value["nickname"]
+            .as_str()
+            .or_else(|| value["username"].as_str())
+            .unwrap_or_default()
+            .to_string(),
+        avatar: value["avatar"]["large"].as_str().unwrap_or_default().to_string(),
+        access_token: token.to_string(),
+        ..Default::default()
+    })
+}
+
+/// `POST /v0/search/subjects` — books only (`filter.type == [1]`).
+fn bangumi_search(api: &str, token: &str, query: &str) -> Result<Vec<TrackSearch>, String> {
+    let body = serde_json::json!({
+        "keyword": query,
+        "filter": { "type": [1] },
+    });
+    let text = bangumi_request(
+        api,
+        "POST",
+        "/v0/search/subjects",
+        token,
+        Some(serde_json::to_vec(&body).unwrap_or_default()),
+    )?;
+    let value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("搜索结果不是 JSON：{e}"))?;
+    Ok(value["data"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|item| {
+            let title = item["name_cn"]
+                .as_str()
+                .filter(|name| !name.is_empty())
+                .or_else(|| item["name"].as_str())
+                .unwrap_or_default()
+                .to_string();
+            let cover = ["large", "common", "medium", "small", "grid"]
+                .iter()
+                .find_map(|size| item["images"][size].as_str())
+                .unwrap_or_default()
+                .to_string();
+            Some(TrackSearch {
+                media_id: item["id"].as_i64()?.to_string(),
+                title,
+                cover,
+                total_chapters: item["volumes"].as_i64().unwrap_or(0),
+                status: item["date"].as_str().unwrap_or_default().to_string(),
+            })
+        })
+        .collect())
+}
+
+/// `GET /v0/users/{username}/collections/{subject_id}`; `None` when the user
+/// has not collected the subject.
+fn bangumi_entry(
+    api: &str,
+    token: &str,
+    username: &str,
+    subject_id: &str,
+) -> Result<Option<TrackEntry>, String> {
+    let path = format!(
+        "/v0/users/{}/collections/{}",
+        url_encode(username),
+        url_encode(subject_id)
+    );
+    let text = match bangumi_request(api, "GET", &path, token, None) {
+        Ok(text) => text,
+        Err(error) if error == BGM_NO_ENTRY => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("条目响应不是 JSON：{e}"))?;
+    let subject = &value["subject"];
+    Ok(Some(TrackEntry {
+        library_id: value["id"].as_i64().map(|id| id.to_string()),
+        media_id: subject_id.to_string(),
+        title: subject["name_cn"]
+            .as_str()
+            .filter(|name| !name.is_empty())
+            .or_else(|| subject["name"].as_str())
+            .unwrap_or_default()
+            .to_string(),
+        status: TrackStatus::from_bangumi(value["type"].as_i64().unwrap_or(3)),
+        progress: value["ep_status"].as_i64().unwrap_or(0),
+        score: (value["rate"].as_i64().unwrap_or(0) * 10),
+        total_chapters: subject["volumes"].as_i64().unwrap_or(0),
+    }))
+}
+
+/// `POST /v0/users/-/collections/{subject_id}` — creates or updates the
+/// collection entry; `ep_status` is the chapter count for books.
+fn bangumi_save(
+    api: &str,
+    token: &str,
+    binding: &Binding,
+    status: TrackStatus,
+    progress: i64,
+) -> Result<TrackEntry, String> {
+    let path = format!("/v0/users/-/collections/{}", url_encode(&binding.media_id));
+    let body = serde_json::json!({
+        "type": status.bangumi(),
+        "ep_status": progress.max(0),
+    });
+    let text = bangumi_request(
+        api,
+        "POST",
+        &path,
+        token,
+        Some(serde_json::to_vec(&body).unwrap_or_default()),
+    )?;
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+    Ok(TrackEntry {
+        library_id: binding
+            .library_id
+            .clone()
+            .or_else(|| value["id"].as_i64().map(|id| id.to_string())),
+        media_id: binding.media_id.clone(),
+        title: binding.title.clone(),
+        status,
+        progress,
+        score: 0,
+        total_chapters: 0,
+    })
+}
+
+/// Marks the Bangumi account expired when a call answered 401 so the
+/// settings row shows the re-paste prompt; other errors stay plain text.
+fn bangumi_failure(
+    store: &mut Store,
+    error: &str,
+    save: &dyn Fn(&Store) -> Result<(), String>,
+) -> Vec<TrackEvent> {
+    if error == BGM_UNAUTHORIZED {
+        if let Some(account) = store.bangumi.as_mut() {
+            account.expires_at = 1;
+        }
+        let _ = save(store);
+        vec![TrackEvent::Failed(
+            "Bangumi 令牌已过期或无效，请重新粘贴令牌".into(),
+        )]
+    } else {
+        vec![TrackEvent::Failed(format!("Bangumi 操作失败：{error}"))]
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Persistent tracker store + background commands
 // ---------------------------------------------------------------------------
 
@@ -805,6 +1046,10 @@ pub enum TrackCommand {
     AnilistToken(String),
     /// Kitsu username + password grant.
     KitsuLogin(String, String),
+    /// All platforms: the user pasted a Bangumi personal access token.
+    BangumiToken(String),
+    /// Move a work's binding from one binding key to another (换源).
+    Rebind { old: String, new: String },
     Logout(TrackerKind),
     SetAutoSync(bool),
     /// Search remote entries for the bind picker.
@@ -850,6 +1095,7 @@ struct Endpoints {
     kitsu_token: String,
     kitsu_edge: String,
     kitsu_algolia: String,
+    bangumi: String,
 }
 
 impl Default for Endpoints {
@@ -860,6 +1106,7 @@ impl Default for Endpoints {
             kitsu_token: KITSU_TOKEN.into(),
             kitsu_edge: KITSU_EDGE.into(),
             kitsu_algolia: KITSU_ALGOLIA.into(),
+            bangumi: BANGUMI_API.into(),
         }
     }
 }
@@ -889,6 +1136,19 @@ pub struct Trackers {
 impl Trackers {
     pub fn new(root: PathBuf, ctx: egui::Context) -> Self {
         Self::with_endpoints(root, ctx, Endpoints::default())
+    }
+
+    /// Acceptance seam: point Bangumi at a local fake server.
+    #[cfg(debug_assertions)]
+    pub fn replace_for_test(&mut self, root: PathBuf, ctx: egui::Context, bangumi: String) {
+        *self = Self::with_endpoints(
+            root,
+            ctx,
+            Endpoints {
+                bangumi,
+                ..Default::default()
+            },
+        );
     }
 
     fn with_endpoints(root: PathBuf, ctx: egui::Context, endpoints: Endpoints) -> Self {
@@ -941,7 +1201,9 @@ impl Trackers {
         match tracker {
             TrackerKind::Anilist => self.store.anilist.as_ref(),
             TrackerKind::Kitsu => self.store.kitsu.as_ref(),
+            TrackerKind::Bangumi => self.store.bangumi.as_ref(),
         }
+        .filter(|account| !account.expired())
     }
 
     pub fn auto_sync(&self) -> bool {
@@ -1125,10 +1387,46 @@ fn run_command(command: TrackCommand, store_path: &Path, endpoints: &Endpoints) 
                 Err(error) => fail(format!("Kitsu 登录失败：{error}")),
             }
         }
+        TrackCommand::BangumiToken(token) => {
+            let token = token.trim().to_string();
+            if token.is_empty() {
+                return fail("请粘贴 Bangumi 访问令牌".into());
+            }
+            match bangumi_login(&endpoints.bangumi, &token) {
+                Ok(account) => {
+                    let name = account.name.clone();
+                    store.bangumi = Some(account);
+                    if let Err(error) = save(&store) {
+                        return fail(error);
+                    }
+                    vec![TrackEvent::Account {
+                        tracker: TrackerKind::Bangumi,
+                        name,
+                    }]
+                }
+                Err(error) if error == BGM_UNAUTHORIZED => {
+                    fail("Bangumi 令牌无效，请到 next.bgm.tv/demo/access-token 重新生成".into())
+                }
+                Err(error) => fail(format!("Bangumi 登录失败：{error}")),
+            }
+        }
+        TrackCommand::Rebind { old, new } => {
+            if let Some(binding) = store.bindings.remove(&old) {
+                store.bindings.insert(new.clone(), binding);
+                if let Err(error) = save(&store) {
+                    return fail(error);
+                }
+            }
+            vec![TrackEvent::Bound {
+                key: new,
+                title: String::new(),
+            }]
+        }
         TrackCommand::Logout(tracker) => {
             match tracker {
                 TrackerKind::Anilist => store.anilist = None,
                 TrackerKind::Kitsu => store.kitsu = None,
+                TrackerKind::Bangumi => store.bangumi = None,
             }
             store
                 .bindings
@@ -1160,9 +1458,15 @@ fn run_command(command: TrackCommand, store_path: &Path, endpoints: &Endpoints) 
                     &account.access_token,
                     &query,
                 ),
+                TrackerKind::Bangumi => {
+                    bangumi_search(&endpoints.bangumi, &account.access_token, &query)
+                }
             };
             match result {
                 Ok(list) => vec![TrackEvent::SearchResults { key, tracker, list }],
+                Err(error) if tracker == TrackerKind::Bangumi => {
+                    bangumi_failure(&mut store, &error, &save)
+                }
                 Err(error) => fail(format!("{} 搜索失败：{error}", tracker.label())),
             }
         }
@@ -1184,9 +1488,18 @@ fn run_command(command: TrackCommand, store_path: &Path, endpoints: &Endpoints) 
                     &account.user_id,
                     &pick.media_id,
                 ),
+                TrackerKind::Bangumi => bangumi_entry(
+                    &endpoints.bangumi,
+                    &account.access_token,
+                    &account.user_id,
+                    &pick.media_id,
+                ),
             };
             let existing = match existing {
                 Ok(existing) => existing,
+                Err(error) if tracker == TrackerKind::Bangumi => {
+                    return bangumi_failure(&mut store, &error, &save);
+                }
                 Err(error) => return fail(format!("读取远端条目失败：{error}")),
             };
             let mut binding = Binding {
@@ -1246,8 +1559,17 @@ fn run_command(command: TrackCommand, store_path: &Path, endpoints: &Endpoints) 
                     &account.user_id,
                     &binding.media_id,
                 ),
+                TrackerKind::Bangumi => bangumi_entry(
+                    &endpoints.bangumi,
+                    &account.access_token,
+                    &account.user_id,
+                    &binding.media_id,
+                ),
             };
             match entry {
+                Err(error) if binding.tracker == "bangumi" => {
+                    return bangumi_failure(&mut store, &error, &save);
+                }
                 Ok(entry) => {
                     if let Some(entry) = &entry
                         && let Some(binding) = store.bindings.get_mut(&key)
@@ -1300,6 +1622,12 @@ fn run_command(command: TrackCommand, store_path: &Path, endpoints: &Endpoints) 
             match remote_progress(&store, &binding, endpoints) {
                 Ok(remote) if remote > chapter => Vec::new(),
                 Ok(_) => push_progress(&mut store, &key, chapter, &save, endpoints),
+                Err(error)
+                    if tracker_kind(&binding.tracker) == TrackerKind::Bangumi
+                        && error == BGM_UNAUTHORIZED =>
+                {
+                    bangumi_failure(&mut store, &error, &save)
+                }
                 Err(error) => vec![TrackEvent::Notice(format!("同步进度失败：{error}"))],
             }
         }
@@ -1332,12 +1660,14 @@ fn tracker_label(tracker: TrackerKind) -> &'static str {
     match tracker {
         TrackerKind::Anilist => "anilist",
         TrackerKind::Kitsu => "kitsu",
+        TrackerKind::Bangumi => "bangumi",
     }
 }
 
 fn tracker_kind(value: &str) -> TrackerKind {
     match value {
         "kitsu" => TrackerKind::Kitsu,
+        "bangumi" => TrackerKind::Bangumi,
         _ => TrackerKind::Anilist,
     }
 }
@@ -1346,6 +1676,7 @@ fn account_for<'a>(store: &'a Store, tracker: TrackerKind) -> Option<&'a Account
     match tracker {
         TrackerKind::Anilist => store.anilist.as_ref(),
         TrackerKind::Kitsu => store.kitsu.as_ref(),
+        TrackerKind::Bangumi => store.bangumi.as_ref(),
     }
     .filter(|account| !account.expired())
 }
@@ -1364,6 +1695,12 @@ fn remote_progress(store: &Store, binding: &Binding, endpoints: &Endpoints) -> R
         ),
         TrackerKind::Kitsu => kitsu_entry(
             &endpoints.kitsu_edge,
+            &account.access_token,
+            &account.user_id,
+            &binding.media_id,
+        ),
+        TrackerKind::Bangumi => bangumi_entry(
+            &endpoints.bangumi,
             &account.access_token,
             &account.user_id,
             &binding.media_id,
@@ -1423,8 +1760,18 @@ fn push_progress_with(
             status,
             progress,
         ),
+        TrackerKind::Bangumi => bangumi_save(
+            &endpoints.bangumi,
+            &account.access_token,
+            &binding,
+            status,
+            progress,
+        ),
     };
     match result {
+        Err(error) if tracker == TrackerKind::Bangumi && error == BGM_UNAUTHORIZED => {
+            bangumi_failure(store, &error, save)
+        }
         Ok(entry) => {
             if let Some(binding) = store.bindings.get_mut(key) {
                 binding.library_id = entry.library_id.clone().or(binding.library_id.clone());
@@ -1901,5 +2248,207 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o077, 0, "token file is readable by others");
         }
+    }
+
+    #[test]
+    fn bangumi_login_search_entry_and_save_roundtrip() {
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = sent.clone();
+        let headers = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let heads = headers.clone();
+        let (base, server) = serve(move |head, body| {
+            heads.lock().unwrap().push(head.to_string());
+            let line = head.lines().next().unwrap_or("").to_string();
+            if line.starts_with("GET /v0/me") {
+                return (
+                    200,
+                    r#"{"username":"tester","nickname":"测试者","avatar":{"large":"http://img"}}"#
+                        .into(),
+                );
+            }
+            if line.starts_with("POST /v0/search/subjects") {
+                let value: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+                assert_eq!(value["keyword"], "作品");
+                assert_eq!(value["filter"]["type"], serde_json::json!([1]));
+                return (
+                    200,
+                    r#"{"data":[{"id":99,"name":"bgm-title","name_cn":"作品A","volumes":0,"date":"2020-01-01","images":{"large":"http://c"}}]}"#.into(),
+                );
+            }
+            if line.starts_with("GET /v0/users/tester/collections/99") {
+                return (
+                    200,
+                    r#"{"id":7,"type":3,"ep_status":5,"rate":7,"subject":{"name_cn":"作品A","volumes":120}}"#.into(),
+                );
+            }
+            if line.starts_with("POST /v0/users/-/collections/99") {
+                seen.lock().unwrap().push(body.to_string());
+                return (200, r#"{"id":7}"#.into());
+            }
+            (404, format!("{{\"unexpected\":\"{line}\"}}"))
+        });
+        // Every request carries the fixed User-Agent Bangumi requires.
+        let account = bangumi_login(&base, "token").unwrap();
+        assert_eq!(account.user_id, "tester");
+        assert_eq!(account.name, "测试者");
+        let hits = bangumi_search(&base, "token", "作品").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].media_id, "99");
+        assert_eq!(hits[0].title, "作品A");
+        let entry = bangumi_entry(&base, "token", "tester", "99").unwrap().unwrap();
+        assert_eq!(entry.progress, 5);
+        assert_eq!(entry.status, TrackStatus::Reading);
+        let binding = Binding {
+            tracker: "bangumi".into(),
+            media_id: "99".into(),
+            library_id: Some("7".into()),
+            title: "作品A".into(),
+            progress: 5,
+            status: TrackStatus::Reading,
+        };
+        let saved = bangumi_save(&base, "token", &binding, TrackStatus::Reading, 9).unwrap();
+        assert_eq!(saved.progress, 9);
+        let body = sent.lock().unwrap().clone();
+        let posted: serde_json::Value = serde_json::from_str(&body[0]).unwrap();
+        assert_eq!(posted, serde_json::json!({"type": 3, "ep_status": 9}));
+        let head = headers.lock().unwrap().join("\n").to_lowercase();
+        let uas = head.matches("user-agent:").count();
+        assert_eq!(uas, 4, "every request needs the User-Agent header: {head}");
+        assert!(
+            head.contains(&format!("yejian/{}", env!("CARGO_PKG_VERSION"))),
+            "{head}"
+        );
+        drop(server);
+    }
+
+    #[test]
+    fn bangumi_401_marks_the_account_expired() {
+        let (base, _server) = serve(|_head, _body| {
+            (401, r#"{"title":"Unauthorized"}"#.into())
+        });
+        let mut store = Store::default();
+        store.bangumi = Some(Account {
+            user_id: "tester".into(),
+            name: "u".into(),
+            access_token: "dead".into(),
+            ..Default::default()
+        });
+        store.bindings.insert(
+            "book:x".into(),
+            Binding {
+                tracker: "bangumi".into(),
+                media_id: "99".into(),
+                library_id: Some("7".into()),
+                title: "A".into(),
+                progress: 1,
+                status: TrackStatus::Reading,
+            },
+        );
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(STORE_FILE);
+        std::fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
+        let endpoints = Endpoints {
+            bangumi: base,
+            ..Default::default()
+        };
+        let events = run_command(
+            TrackCommand::ChapterDone { key: "book:x".into(), chapter: 3 },
+            &path,
+            &endpoints,
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                TrackEvent::Failed(reason) if reason.contains("重新粘贴")
+            )),
+            "{events:?}"
+        );
+        let saved: Store = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let account = saved.bangumi.unwrap();
+        assert!(account.expired(), "401 must mark the token expired");
+    }
+
+    #[test]
+    fn bangumi_progress_never_moves_backwards() {
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = sent.clone();
+        let (base, _server) = serve(move |head, _body| {
+            let line = head.lines().next().unwrap_or("").to_string();
+            if line.starts_with("GET /v0/users/tester/collections/99") {
+                return (
+                    200,
+                    r#"{"id":7,"type":3,"ep_status":80,"subject":{"name_cn":"A","volumes":120}}"#.into(),
+                );
+            }
+            if line.starts_with("POST /v0/users/-/collections/99") {
+                seen.lock().unwrap().push("save".into());
+                return (200, r#"{"id":7}"#.into());
+            }
+            (404, "{}".into())
+        });
+        let mut store = Store::default();
+        store.auto_sync = true;
+        store.bangumi = Some(Account {
+            user_id: "tester".into(),
+            name: "u".into(),
+            access_token: "t".into(),
+            ..Default::default()
+        });
+        store.bindings.insert(
+            "book:x".into(),
+            Binding {
+                tracker: "bangumi".into(),
+                media_id: "99".into(),
+                library_id: Some("7".into()),
+                title: "A".into(),
+                progress: 10,
+                status: TrackStatus::Reading,
+            },
+        );
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(STORE_FILE);
+        std::fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
+        let endpoints = Endpoints {
+            bangumi: base,
+            ..Default::default()
+        };
+        // Chapter 9 read locally while the remote is at 80 → nothing is sent.
+        let events = run_command(
+            TrackCommand::ChapterDone { key: "book:x".into(), chapter: 9 },
+            &path,
+            &endpoints,
+        );
+        assert!(events.is_empty(), "{events:?} would regress the remote");
+        assert!(sent.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn rebind_moves_the_binding_to_the_new_key() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(STORE_FILE);
+        let mut store = Store::default();
+        store.bindings.insert(
+            "source:old.src\x1fm".into(),
+            Binding {
+                tracker: "bangumi".into(),
+                media_id: "99".into(),
+                library_id: None,
+                title: "A".into(),
+                progress: 12,
+                status: TrackStatus::Reading,
+            },
+        );
+        std::fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
+        run_command(
+            TrackCommand::Rebind {
+                old: "source:old.src\x1fm".into(),
+                new: "source:new.src\x1fm2".into(),
+            },
+            &path,
+            &Endpoints::default(),
+        );
+        let saved: Store = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(!saved.bindings.contains_key("source:old.src\x1fm"));
+        assert_eq!(saved.bindings["source:new.src\x1fm2"].media_id, "99");
     }
 }

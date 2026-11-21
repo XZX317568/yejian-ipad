@@ -330,6 +330,48 @@ impl Harness {
     }
 }
 
+/// Minimal fake Bangumi API for the tracker-bangumi capture: serves
+/// `/v0/me` and 404s user collections (nothing collected yet).
+fn fake_bangumi() -> (String, std::thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || loop {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut buffer = vec![0u8; 64 * 1024];
+        let mut request = Vec::new();
+        let read = stream.read(&mut buffer).unwrap_or(0);
+        request.extend_from_slice(&buffer[..read]);
+        let text = String::from_utf8_lossy(&request).to_string();
+        let head = text.split("\r\n\r\n").next().unwrap_or("");
+        let line = head.lines().next().unwrap_or("");
+        let (status, reply) = if line.starts_with("GET /v0/me") {
+            (
+                "200",
+                r#"{"username":"tester","nickname":"测试者","avatar":{"large":""}}"#,
+            )
+        } else if line.starts_with("POST /v0/users/-/collections/") {
+            ("200", r#"{"id":99,"type":3,"ep_status":0}"#)
+        } else if line.starts_with("POST /v0/search/subjects") {
+            (
+                "200",
+                r#"{"data":[{"id":99,"name":"作品A","name_cn":"作品A","volumes":120,"images":{"large":""}}]}"#,
+            )
+        } else {
+            ("404", r#"{"title":"Not Found"}"#)
+        };
+        let response = format!(
+            "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+            reply.len()
+        );
+        let _ = stream.write_all(response.as_bytes());
+    });
+    (format!("http://{addr}"), handle)
+}
+
 fn collect_text(
     shape: &Shape,
     clip: Rect,
@@ -458,10 +500,11 @@ fn design_label_visible(h: &Harness, label: &str) -> bool {
 /// above or below the fold (the online detail header is taller than a phone
 /// or landscape viewport).
 fn scroll_page(h: &mut Harness, delta: f32) -> Result<()> {
+    let center = pos2(h.size[0] as f32 / 2., (h.size[1] as f32 / 2.).min(400.));
     for _ in 0..6 {
         h.frame(
             vec![
-                Event::PointerMoved(pos2(600., 400.)),
+                Event::PointerMoved(center),
                 Event::MouseWheel {
                     unit: MouseWheelUnit::Point,
                     delta: vec2(0., delta),
@@ -1083,8 +1126,129 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
     h.click_text("取消")?;
     h.frames(3)?;
 
+    // Round B: the 追更 settings group exposes the auto-download mode with
+    // its mobile-data note.
+    h.click("nav-settings")?;
+    h.frames(4)?;
+    // Sweep the full settings page in small steps (each scroll_page call is
+    // six wheel events, so large deltas jump past whole sections).
+    for _ in 0..24 {
+        if design_label_visible(h, "自动下载新章节（会使用移动网络）") {
+            break;
+        }
+        scroll_page(h, -120.)?;
+    }
+    for _ in 0..24 {
+        if design_label_visible(h, "自动下载新章节（会使用移动网络）") {
+            break;
+        }
+        scroll_page(h, 120.)?;
+    }
+    anyhow::ensure!(
+        design_label_visible(h, "自动下载新章节（会使用移动网络）"),
+        "roundB: 自动下载新章节 row is missing from settings"
+    );
+    design_capture(h, "settings-auto-download", &mut captures)?;
+
+    // Round B: a followed work with queued auto-downloads reports
+    // "自动下载中 N 章" in 我的追更.
+    h.app.prepare_auto_follow_acceptance();
+    h.frames(4)?;
+    anyhow::ensure!(
+        h.painted_text
+            .iter()
+            .any(|text| text.text.contains("自动下载中 2 章")),
+        "roundB: 自动下载中 row is missing from 我的追更"
+    );
+    design_capture(h, "follows-auto-downloading", &mut captures)?;
+
+    // Round B: the 换源 panel — grouped candidates, one expanded with its
+    // chapter count, the opaque confirm card, then the new detail page.
+    h.app.prepare_migrate_acceptance("candidates");
+    h.frames(4)?;
+    anyhow::ensure!(
+        h.painted_text
+            .iter()
+            .any(|text| text.text.contains("共 3 话")),
+        "roundB: candidate expansion did not render"
+    );
+    design_capture(h, "migrate-candidates", &mut captures)?;
+    assert_opaque_card(h, "migrate-candidates.png", "migrate-card")?;
+    h.app.prepare_migrate_acceptance("confirm");
+    h.frames(4)?;
+    anyhow::ensure!(
+        design_label_visible(h, "同时删除旧书源已下载的章节"),
+        "roundB: migrate confirm did not render"
+    );
+    design_capture(h, "migrate-confirm", &mut captures)?;
+    assert_opaque_card(h, "migrate-confirm.png", "migrate-card")?;
+    h.app.prepare_migrate_acceptance("done");
+    h.frames(5)?;
+    anyhow::ensure!(
+        h.app.hitboxes.contains_key("source-detail-read"),
+        "roundB: migration did not land on the new source's detail page"
+    );
+    design_capture(h, "migrate-done", &mut captures)?;
+
+    // Round B: Bangumi login + binding against a local fake API, then the
+    // 进度跟踪 settings row shows the account.
+    let (bangumi_base, _bangumi_server) = fake_bangumi();
+    h.app.set_bangumi_endpoint(h.ctx.clone(), bangumi_base);
+    let key = "source:local.filter-acceptance\u{1f}fx-pop-1".to_string();
+    h.app.tracker_command(yejian::trackers::TrackCommand::BangumiToken(
+        "acceptance-token".into(),
+    ));
+    let report_key = key.clone();
+    h.wait(move |app| {
+        app.tracker_report(&report_key)["bangumi"].is_string()
+    })?;
+    h.app.tracker_command(yejian::trackers::TrackCommand::Bind {
+        tracker: yejian::trackers::TrackerKind::Bangumi,
+        key: key.clone(),
+        pick: yejian::trackers::TrackSearch {
+            media_id: "99".into(),
+            title: "作品A".into(),
+            cover: String::new(),
+            total_chapters: 120,
+            status: String::new(),
+        },
+        progress: 0,
+    });
+    h.wait(move |app| app.tracker_report(&key)["bound"] == true)?;
+    h.click("nav-settings")?;
+    h.frames(4)?;
+    let bangumi_row = |h: &Harness| {
+        let safe = design_safe_rect(h).expand(0.5);
+        h.painted_text.iter().any(|text| {
+            text.text.starts_with("Bangumi ·")
+                && safe.contains_rect(text.bounds)
+                && text.clip.expand(0.5).contains_rect(text.bounds)
+        })
+    };
+    for _ in 0..24 {
+        if bangumi_row(h) {
+            break;
+        }
+        scroll_page(h, -120.)?;
+    }
+    for _ in 0..24 {
+        if bangumi_row(h) {
+            break;
+        }
+        scroll_page(h, 120.)?;
+    }
+    anyhow::ensure!(
+        bangumi_row(h),
+        "roundB: the Bangumi tracker row is missing from settings"
+    );
+    design_capture(h, "tracker-bangumi", &mut captures)?;
+    h.click("nav-library")?;
+    h.frames(3)?;
+
     // Reopen the real saved settings, preserving the source and reading
-    // history. Only the temporary acceptance library is changed.
+    // history. Only the temporary acceptance library is changed. Preview
+    // follows/tasks must not be persisted into the real library on exit.
+    h.app.clear_acceptance_previews();
     eframe::App::on_exit(&mut h.app);
     library.set_setting("font-scale", "2")?;
     library.set_setting("theme", "light")?;
@@ -1168,6 +1332,17 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
     );
     h.click("nav-settings")?;
     h.frames(5)?;
+    // The settings ScrollArea offset persists in egui memory, so make sure
+    // the page is back at the top before asserting the theme row.
+    for _ in 0..24 {
+        if design_label_visible(h, "跟随系统")
+            && design_label_visible(h, "浅色")
+            && design_label_visible(h, "深色")
+        {
+            break;
+        }
+        scroll_page(h, 120.)?;
+    }
     for label in ["跟随系统", "浅色", "深色"] {
         anyhow::ensure!(
             design_label_visible(h, label),

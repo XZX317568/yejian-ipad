@@ -7,7 +7,7 @@ use anyhow::Context as _;
 use egui::*;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
@@ -260,6 +260,22 @@ fn plan_covers(queue: &mut VecDeque<CoverReq>, want: Vec<CoverReq>, skip: &HashS
         queue.pop_front();
     }
 }
+/// Chapter number used by 换源 resume: the source's own number, else the
+/// first integer parsed from the chapter title.
+fn chapter_number_value(chapter: &Chapter) -> Option<f64> {
+    chapter
+        .chapter_number
+        .filter(|number| number.is_finite())
+        .map(|number| number as f64)
+        .or_else(|| {
+            chapter
+                .title
+                .as_deref()
+                .and_then(crate::trackers::chapter_number)
+                .map(|number| number as f64)
+        })
+}
+
 fn chapter_list(chapters: &[Chapter], query: &str, newest_first: bool) -> Vec<Chapter> {
     let first_volume = chapters
         .iter()
@@ -516,6 +532,10 @@ struct DownloadTask {
 
     #[serde(default)]
     linked: bool,
+    /// Queued by 自动下载新章节 — the 我的追更 row reports these as
+    /// "自动下载中 N 章" while they wait or run.
+    #[serde(default)]
+    auto: bool,
 }
 impl DownloadTask {
     fn from_chapter(source: &str, manga: &Manga, chapter: &Chapter) -> Self {
@@ -534,8 +554,8 @@ impl DownloadTask {
             manga_cover: manga.cover.clone(),
             chapter_id: chapter.key.clone(),
             chapter_title,
-            chapter_number: chapter.chapter_number.map(f64::from),
-            volume_number: chapter.volume_number.map(f64::from),
+            chapter_number: chapter.chapter_number.map(|number| number as f64),
+            volume_number: chapter.volume_number.map(|number| number as f64),
             chapter_url: chapter.url.clone(),
             chapter_language: chapter.language.clone(),
             manga_snapshot: None,
@@ -549,6 +569,7 @@ impl DownloadTask {
             pages_signature: None,
             cbz: None,
             linked: false,
+            auto: false,
         }
     }
     fn manga(&self) -> Manga {
@@ -1618,6 +1639,16 @@ pub struct Sources {
     stale_engines: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Origin a Cloudflare challenge blocked, until the user verifies.
     challenge: Option<String>,
+    /// `auto-download` setting: "off" (default), "all", "latest1", "latest3".
+    auto_download: String,
+    /// 换源 panel state; while `Some` it owns the global-generation events.
+    migrate: Option<MigrateState>,
+    /// Background migration completions (one-shot threads report here).
+    migrate_tx: mpsc::Sender<anyhow::Result<MigrateOutcome>>,
+    migrate_rx: mpsc::Receiver<anyhow::Result<MigrateOutcome>>,
+    /// Migration side-effects the host still owes the user once (tracker
+    /// re-key + optional old-download purge + opening the new detail).
+    migrate_post: Option<MigratePost>,
     /// The in-flight verification/login page — an in-app WebView on mobile
 
     /// or the system-browser + paste dialog on desktop.
@@ -1989,20 +2020,39 @@ const GLOBAL_SEARCH_LIMIT: usize = 4;
 const GLOBAL_SEARCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// A global search request; retries reuse the generation of their run.
-struct GlobalCmd {
-    generation: u64,
-    query: String,
-    sources: Vec<String>,
+enum GlobalCmd {
+    Search {
+        generation: u64,
+        query: String,
+        sources: Vec<String>,
+    },
+    /// 换源 candidate expansion: one manga's chapter list, fetched once on
+    /// the engine thread and cached panel-side per candidate.
+    Chapters {
+        generation: u64,
+        source: String,
+        manga: Manga,
+    },
 }
-/// One source's answer to a global search, streamed as soon as it lands.
-struct GlobalEvent {
-    generation: u64,
-    source: String,
-    result: Result<Vec<Manga>, String>,
+/// One source's answer to a global search or a 换源 chapter expansion,
+/// streamed as soon as it lands.
+enum GlobalEvent {
+    Search {
+        generation: u64,
+        source: String,
+        result: Result<Vec<Manga>, String>,
+    },
+    Chapters {
+        generation: u64,
+        source: String,
+        manga: Manga,
+        result: Result<Vec<Chapter>, String>,
+    },
 }
-/// Test seam: the search call the worker makes for one source.
+/// Test seam: the calls the worker makes for one source.
 trait GlobalEngine: Send + Sync {
     fn search(&self, query: &str) -> Result<Vec<Manga>, String>;
+    fn chapters(&self, manga: Manga) -> Result<Vec<Chapter>, String>;
 }
 struct RealGlobalEngine(Arc<SourceEngine>);
 impl GlobalEngine for RealGlobalEngine {
@@ -2010,6 +2060,9 @@ impl GlobalEngine for RealGlobalEngine {
         pollster::block_on(self.0.search_page(query, 1, vec![]))
             .map(|result| result.entries)
             .map_err(|error| format!("{error}"))
+    }
+    fn chapters(&self, manga: Manga) -> Result<Vec<Chapter>, String> {
+        pollster::block_on(self.0.chapters_with(manga)).map_err(|error| format!("{error}"))
     }
 }
 
@@ -2030,11 +2083,19 @@ fn global_search_run(
     let mut engines: std::collections::HashMap<String, Arc<dyn GlobalEngine>> =
         std::collections::HashMap::new();
     let (done_tx, done_rx) = mpsc::channel::<(u64, String, Result<Vec<Manga>, String>)>();
+    let (done_ch_tx, done_ch_rx) =
+        mpsc::channel::<(u64, String, Manga, Result<Vec<Chapter>, String>)>();
     let mut generation = 0u64;
     let mut query = String::new();
     let mut pending: VecDeque<String> = VecDeque::new();
     let mut inflight: std::collections::HashMap<String, std::time::Instant> =
         std::collections::HashMap::new();
+    // Chapter-expansion jobs keyed `(source, manga key)`; they share the
+    // timeout and detached-thread policy but never block search slots.
+    let mut chapters_inflight: std::collections::HashMap<
+        (String, String),
+        (std::time::Instant, Manga, u64),
+    > = std::collections::HashMap::new();
     // When the UI drops its sender, keep draining already-started jobs so
     // their completions/timeouts are still delivered before the loop exits.
     let mut closed = false;
@@ -2042,17 +2103,20 @@ fn global_search_run(
         for id in stale.lock().unwrap().drain() {
             engines.remove(&id);
         }
-        while inflight.len() < GLOBAL_SEARCH_LIMIT && let Some(source) = pending.pop_front() {
-            let engine = match engines.entry(source.clone()) {
-                std::collections::hash_map::Entry::Occupied(entry) => {
-                    Ok(entry.get().clone())
-                }
-                std::collections::hash_map::Entry::Vacant(entry) => match load(&source) {
+        let engine_for = |engines: &mut std::collections::HashMap<String, Arc<dyn GlobalEngine>>,
+                              source: &str,
+                              load: &dyn Fn(&str) -> Result<Arc<dyn GlobalEngine>, String>|
+         -> Result<Arc<dyn GlobalEngine>, String> {
+            match engines.entry(source.to_string()) {
+                std::collections::hash_map::Entry::Occupied(entry) => Ok(entry.get().clone()),
+                std::collections::hash_map::Entry::Vacant(entry) => match load(source) {
                     Ok(engine) => Ok(entry.insert(engine).clone()),
                     Err(error) => Err(error),
                 },
-            };
-            match engine {
+            }
+        };
+        while inflight.len() < GLOBAL_SEARCH_LIMIT && let Some(source) = pending.pop_front() {
+            match engine_for(&mut engines, &source, &load) {
                 Ok(engine) => {
                     inflight.insert(source.clone(), std::time::Instant::now());
                     let (tx, query, generation, source) =
@@ -2063,7 +2127,7 @@ fn global_search_run(
                     });
                 }
                 Err(error) => {
-                    let _ = event_tx.send(GlobalEvent {
+                    let _ = event_tx.send(GlobalEvent::Search {
                         generation,
                         source,
                         result: Err(error),
@@ -2074,7 +2138,7 @@ fn global_search_run(
         }
         for (done_gen, source, result) in done_rx.try_iter() {
             if done_gen == generation && inflight.remove(&source).is_some() {
-                let _ = event_tx.send(GlobalEvent {
+                let _ = event_tx.send(GlobalEvent::Search {
                     generation: done_gen,
                     source,
                     result,
@@ -2082,7 +2146,39 @@ fn global_search_run(
                 ctx.request_repaint();
             }
         }
+        for (done_gen, source, manga, result) in done_ch_rx.try_iter() {
+            let key = (source.clone(), manga.key.clone());
+            if chapters_inflight
+                .get(&key)
+                .is_some_and(|(_, _, job_gen)| *job_gen == done_gen)
+                && chapters_inflight.remove(&key).is_some()
+            {
+                let _ = event_tx.send(GlobalEvent::Chapters {
+                    generation: done_gen,
+                    source,
+                    manga,
+                    result,
+                });
+                ctx.request_repaint();
+            }
+        }
         let now = std::time::Instant::now();
+        let expired_ch: Vec<(String, String)> = chapters_inflight
+            .iter()
+            .filter(|(_, (started, _, _))| now.duration_since(*started) > timeout)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in expired_ch {
+            if let Some((_, manga, job_gen)) = chapters_inflight.remove(&key) {
+                let _ = event_tx.send(GlobalEvent::Chapters {
+                    generation: job_gen,
+                    source: key.0,
+                    manga,
+                    result: Err("超时".into()),
+                });
+                ctx.request_repaint();
+            }
+        }
         let expired: Vec<String> = inflight
             .iter()
             .filter(|(_, started)| now.duration_since(**started) > timeout)
@@ -2090,7 +2186,7 @@ fn global_search_run(
             .collect();
         for source in expired {
             inflight.remove(&source);
-            let _ = event_tx.send(GlobalEvent {
+            let _ = event_tx.send(GlobalEvent::Search {
                 generation,
                 source,
                 result: Err("超时".into()),
@@ -2098,28 +2194,66 @@ fn global_search_run(
             ctx.request_repaint();
         }
         match rx.recv_timeout(std::time::Duration::from_millis(50)) {
-            Ok(cmd) => {
-                if cmd.generation < generation {
+            Ok(GlobalCmd::Search {
+                generation: cmd_gen,
+                query: cmd_query,
+                sources,
+            }) => {
+                if cmd_gen < generation {
                     continue;
                 }
-                if cmd.generation > generation {
-                    generation = cmd.generation;
-                    query = cmd.query.clone();
+                if cmd_gen > generation {
+                    generation = cmd_gen;
+                    query = cmd_query.clone();
                     pending.clear();
                     // The slots clear conceptually; the detached workers may
                     // still run, but their results no longer match.
                     inflight.clear();
                 }
-                for source in cmd.sources {
+                for source in sources {
                     if !inflight.contains_key(&source) && !pending.contains(&source) {
                         pending.push_back(source);
+                    }
+                }
+            }
+            Ok(GlobalCmd::Chapters {
+                generation: cmd_gen,
+                source,
+                manga,
+            }) => {
+                let key = (source.clone(), manga.key.clone());
+                if chapters_inflight.contains_key(&key) {
+                    continue;
+                }
+                match engine_for(&mut engines, &source, &load) {
+                    Ok(engine) => {
+                        chapters_inflight
+                            .insert(key, (std::time::Instant::now(), manga.clone(), cmd_gen));
+                        let tx = done_ch_tx.clone();
+                        thread::spawn(move || {
+                            let result = engine.chapters(manga.clone());
+                            let _ = tx.send((cmd_gen, source, manga, result));
+                        });
+                    }
+                    Err(error) => {
+                        let _ = event_tx.send(GlobalEvent::Chapters {
+                            generation: cmd_gen,
+                            source,
+                            manga,
+                            result: Err(error),
+                        });
+                        ctx.request_repaint();
                     }
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => closed = true,
         }
-        if closed && pending.is_empty() && inflight.is_empty() {
+        if closed
+            && pending.is_empty()
+            && inflight.is_empty()
+            && chapters_inflight.is_empty()
+        {
             return;
         }
     }
@@ -2129,6 +2263,81 @@ fn global_search_run(
 struct GlobalGroup {
     source: String,
     state: GlobalState,
+}
+
+/// One source's candidate list inside the 换源 panel.
+pub(crate) struct MigrateGroup {
+    pub(crate) source: String,
+    pub(crate) state: GlobalState,
+}
+impl Clone for MigrateGroup {
+    fn clone(&self) -> Self {
+        Self {
+            source: self.source.clone(),
+            state: self.state.clone(),
+        }
+    }
+}
+/// 换源 panel state. While `Some`, this panel owns the global-search
+/// generation: `GlobalEvent::Search` routes to `groups` and
+/// `GlobalEvent::Chapters` feeds `expanded`.
+pub(crate) struct MigrateState {
+    /// The generation this panel's search was launched with.
+    pub(crate) generation: u64,
+    /// Source the work migrates away from — excluded from the search.
+    pub(crate) old_source: String,
+    /// The work's manga key on the old source.
+    pub(crate) old_manga: String,
+    /// Candidate groups in installed order.
+    pub(crate) groups: Vec<MigrateGroup>,
+    /// Candidate whose chapter list is being fetched: (source, manga key).
+    pub(crate) expanding: Option<(String, String)>,
+    /// Chapter lists fetched once per candidate, keyed (source, manga key).
+    pub(crate) expanded: HashMap<(String, String), Result<Vec<Chapter>, String>>,
+    /// Chosen candidate + migration options, set once 换到这里 is clicked.
+    pub(crate) confirm: Option<MigrateConfirm>,
+    /// Off-thread migration in flight — blocks a second confirm and closing.
+    pub(crate) running: bool,
+    /// Migration failure to show inside the panel.
+    pub(crate) error: Option<String>,
+}
+/// The confirm stage of a migration: the chosen candidate and its chapters
+/// in reading order (oldest first).
+#[derive(Clone)]
+pub(crate) struct MigrateConfirm {
+    pub(crate) source: String,
+    pub(crate) manga: Manga,
+    pub(crate) chapters: Vec<Chapter>,
+    /// 同时删除旧书源已下载的章节 — off by default.
+    pub(crate) purge_old: bool,
+}
+/// What the off-thread migration produced, applied on the UI thread.
+struct MigrateOutcome {
+    /// Re-keyed follow record, when the work was followed.
+    follow: Option<Follow>,
+    /// Position of the old record inside `self.follows`.
+    follow_index: Option<usize>,
+    source: String,
+    manga: Manga,
+    /// Chapters of the new work, in listing order.
+    chapters: Vec<Chapter>,
+    old_source: String,
+    old_manga: String,
+    purge_old: bool,
+    /// True when no chapter number could be parsed from the old reading
+    /// record — the detail page resumes at chapter one and the user is told.
+    resume_unparsed: bool,
+}
+/// Migration side-effects the host still owes once: the tracker binding
+/// re-key (one binding covers whichever service is bound) and the optional
+/// old-download purge, which needs the library's book ids.
+pub(crate) struct MigratePost {
+    /// `binding_key` for the old work, then the new one.
+    pub(crate) rebind: (String, String),
+    /// Old source + manga the host should map to book ids before purging.
+    pub(crate) purge: Option<(String, String)>,
+    /// User-visible notice when no chapter number could be parsed.
+    pub(crate) resume_unparsed: bool,
 }
 
 /// Bytes held under the sources root, split by where the space goes.
@@ -2281,7 +2490,7 @@ fn storage_worker_run(
     }
 }
 #[derive(Clone)]
-enum GlobalState {
+pub(crate) enum GlobalState {
     Searching,
     Done(Vec<Manga>),
     Failed(String),
@@ -2393,6 +2602,192 @@ impl Sources {
         self.preview_mode = Some("filters".into());
         self.select_source(id);
         Ok(())
+    }
+
+    /// Acceptance seed: a followed work with auto-download tasks in flight,
+    /// so 我的追更 renders "自动下载中 N 章".
+    #[cfg(debug_assertions)]
+    pub(crate) fn preview_auto_download(&mut self) {
+        // 我的追更 only renders on the sources root, not inside a source.
+        self.selected_source.clear();
+        self.selected_manga = None;
+        let manga = Manga {
+            source_key: "local.filter-acceptance".into(),
+            key: "fx-pop-1".into(),
+            title: "自动下载示例".into(),
+            ..Default::default()
+        };
+        if self
+            .follow_index(&manga.source_key, &manga.key)
+            .is_none()
+        {
+            let snapshot = save_manga_snapshot(&self.root, &manga).unwrap_or_default();
+            self.follows.insert(
+                0,
+                Follow {
+                    source_id: manga.source_key.clone(),
+                    manga_id: manga.key.clone(),
+                    title: manga.title.clone(),
+                    snapshot,
+                    fresh: vec!["d4".into(), "d5".into()],
+                    total: 5,
+                    followed_at: Some(1),
+                    ..Default::default()
+                },
+            );
+        }
+        for (key, number) in [("d4", 4.), ("d5", 5.)] {
+            if self
+                .tasks
+                .iter()
+                .any(|task| task.manga_id == manga.key && task.chapter_id == key)
+            {
+                continue;
+            }
+            let chapter = Chapter {
+                key: key.into(),
+                title: Some(format!("第 {number} 话")),
+                chapter_number: Some(number),
+                ..Default::default()
+            };
+            let mut task = DownloadTask::from_chapter(&manga.source_key, &manga, &chapter);
+            task.auto = true;
+            task.status = DownloadStatus::Queued;
+            self.tasks.push(task);
+        }
+    }
+
+    /// Acceptance teardown: drop every preview follow/task so nothing the
+    /// captures seeded leaks into the real saved follows/tasks on exit.
+    #[cfg(debug_assertions)]
+    pub(crate) fn clear_acceptance_previews(&mut self) {
+        const PREVIEW_SOURCES: [&str; 3] = [
+            "local.filter-acceptance",
+            "local.second-source",
+            "local.mirror-b",
+        ];
+        let before = self.follows.len();
+        self.follows
+            .retain(|f| !PREVIEW_SOURCES.contains(&f.source_id.as_str()));
+        self.tasks
+            .retain(|t| !PREVIEW_SOURCES.contains(&t.source_id.as_str()));
+        if self.follows.len() != before {
+            self.save_follows();
+        }
+        let _ = self.persist();
+        self.migrate = None;
+        self.migrate_post = None;
+    }
+
+    /// Acceptance seed: the 换源 panel at a chosen stage — candidates with
+    /// one expanded row, the confirm card, or the finished new detail page.
+    #[cfg(debug_assertions)]
+    pub(crate) fn preview_migrate(&mut self, stage: &str) {
+        let old = Manga {
+            source_key: "local.filter-acceptance".into(),
+            key: "fx-pop-1".into(),
+            title: "自动下载示例".into(),
+            authors: Some(vec!["示例作者".into()]),
+            ..Default::default()
+        };
+        let chapter = |key: &str, number: f32| Chapter {
+            key: key.into(),
+            title: Some(format!("第 {number} 话")),
+            chapter_number: Some(number),
+            ..Default::default()
+        };
+        self.selected_source = old.source_key.clone();
+        self.selected_manga = Some(old.clone());
+        self.chapters = vec![chapter("d1", 1.), chapter("d2", 2.)];
+        let new_source = "local.second-source".to_string();
+        let cand = Manga {
+            source_key: new_source.clone(),
+            key: "m-new".into(),
+            title: old.title.clone(),
+            authors: old.authors.clone(),
+            ..Default::default()
+        };
+        let cand_chapters = vec![chapter("x1", 1.), chapter("x2", 2.), chapter("x3", 3.)];
+        let mut expanded = HashMap::new();
+        expanded.insert(
+            (new_source.clone(), cand.key.clone()),
+            Ok(cand_chapters.clone()),
+        );
+        self.migrate = Some(MigrateState {
+            generation: self.global_gen,
+            old_source: old.source_key.clone(),
+            old_manga: old.key.clone(),
+            groups: vec![
+                MigrateGroup {
+                    source: new_source.clone(),
+                    state: GlobalState::Done(vec![cand.clone()]),
+                },
+                MigrateGroup {
+                    source: "local.mirror-b".into(),
+                    state: GlobalState::Done(Vec::new()),
+                },
+                MigrateGroup {
+                    source: "local.mirror-c".into(),
+                    state: GlobalState::Failed("网络错误".into()),
+                },
+            ],
+            expanding: None,
+            expanded: if stage == "candidates" {
+                expanded
+            } else {
+                HashMap::new()
+            },
+            confirm: (stage == "confirm").then(|| MigrateConfirm {
+                source: new_source.clone(),
+                manga: cand.clone(),
+                chapters: chapter_list(&cand_chapters, "", false),
+                purge_old: false,
+            }),
+            running: false,
+            error: None,
+        });
+        if stage == "done" {
+            if self.follow_index(&old.source_key, &old.key).is_none() {
+                let snapshot = save_manga_snapshot(&self.root, &old).unwrap_or_default();
+                self.follows.insert(
+                    0,
+                    Follow {
+                        source_id: old.source_key.clone(),
+                        manga_id: old.key.clone(),
+                        title: old.title.clone(),
+                        snapshot,
+                        known: vec!["d1".into()],
+                        followed_at: Some(1),
+                        ..Default::default()
+                    },
+                );
+            }
+            let mut cand_snapshot = cand.clone();
+            cand_snapshot.source_key = new_source.clone();
+            let snapshot = save_manga_snapshot(&self.root, &cand_snapshot).unwrap_or_default();
+            self.apply_migrate(Ok(MigrateOutcome {
+                follow: Some(Follow {
+                    source_id: new_source.clone(),
+                    manga_id: cand.key.clone(),
+                    title: cand.title.clone(),
+                    snapshot,
+                    known: cand_chapters.iter().map(|c| c.key.clone()).collect(),
+                    reading_order: cand_chapters.iter().map(|c| c.key.clone()).collect(),
+                    total: cand_chapters.len(),
+                    followed_at: Some(1),
+                    resume_number: Some(2.),
+                    ..Default::default()
+                }),
+                follow_index: Some(0),
+                source: new_source,
+                manga: cand,
+                chapters: cand_chapters,
+                old_source: old.source_key.clone(),
+                old_manga: old.key.clone(),
+                purge_old: false,
+                resume_unparsed: false,
+            }));
+        }
     }
 
     #[cfg(debug_assertions)]
@@ -2919,6 +3314,7 @@ impl Sources {
                 .expect("Unable to start storage worker");
         }
 
+        let (migrate_tx, migrate_rx) = mpsc::channel();
         let (tasks, load_warning) = load_queue(&root);
         let ready: VecDeque<String> = pending_imports(&tasks).into();
         let sources = Self {
@@ -3013,6 +3409,11 @@ impl Sources {
             source_settings,
             stale_engines,
             challenge: None,
+            auto_download: "off".into(),
+            migrate: None,
+            migrate_tx,
+            migrate_rx,
+            migrate_post: None,
             web_session: None,
             login_user: String::new(),
             login_pass: String::new(),
@@ -3466,14 +3867,41 @@ impl Sources {
                     (Some(chapter.clone()), true)
                 }
             }
-            None => (
-                ordered
+            None => {
+                // A migrated work with no reading record on this source yet
+                // resumes by chapter number: the chapter equal to the carried
+                // number (it was not finished) or the first one past it.
+                if let Some(follow) = self
+                    .follows
                     .iter()
-                    .find(|chapter| !chapter.locked)
-                    .or_else(|| ordered.first())
-                    .cloned(),
-                false,
-            ),
+                    .find(|follow| follow.source_id == source && follow.manga_id == manga.key)
+                    && let Some(number) = follow.resume_number
+                {
+                    let target = ordered
+                        .iter()
+                        .find(|chapter| {
+                            let value = chapter_number_value(chapter);
+                            value.is_some_and(|value| {
+                                if follow.resume_done {
+                                    value > number
+                                } else {
+                                    value >= number
+                                }
+                            })
+                        })
+                        .or_else(|| ordered.iter().find(|chapter| !chapter.locked))
+                        .or_else(|| ordered.first());
+                    return (target.cloned(), true);
+                }
+                (
+                    ordered
+                        .iter()
+                        .find(|chapter| !chapter.locked)
+                        .or_else(|| ordered.first())
+                        .cloned(),
+                    false,
+                )
+            }
         }
     }
     /// `background` marks a scheduler run: it keeps the same single-flight
@@ -3526,21 +3954,36 @@ impl Sources {
         };
         self.checking = self.checking.saturating_sub(1);
         if let Some(index) = self.follow_index(&event.source, &event.manga) {
-            let follow = &mut self.follows[index];
-            match chapters {
-                Ok(list) => {
-                    follow.reading_order = chapter_list(&list, "", false)
-                        .iter()
-                        .map(|chapter| chapter.key.clone())
-                        .collect();
-                    let keys: Vec<String> =
-                        list.iter().map(|chapter| chapter.key.clone()).collect();
-                    follow.apply_check(&keys, follows::now());
+            let mut added = Vec::new();
+            let mut ok_list = None;
+            {
+                let follow = &mut self.follows[index];
+                match chapters {
+                    Ok(list) => {
+                        follow.reading_order = chapter_list(&list, "", false)
+                            .iter()
+                            .map(|chapter| chapter.key.clone())
+                            .collect();
+                        let keys: Vec<String> =
+                            list.iter().map(|chapter| chapter.key.clone()).collect();
+                        let seen: HashSet<&String> =
+                            follow.known.iter().chain(follow.fresh.iter()).collect();
+                        added = keys
+                            .iter()
+                            .filter(|key| !seen.contains(key))
+                            .cloned()
+                            .collect();
+                        follow.apply_check(&keys, follows::now());
+                        ok_list = Some(list);
+                    }
+                    Err(error) => {
+                        follow.error = Some(error);
+                        follow.checked_at = Some(follows::now());
+                    }
                 }
-                Err(error) => {
-                    follow.error = Some(error);
-                    follow.checked_at = Some(follows::now());
-                }
+            }
+            if let Some(list) = ok_list {
+                self.auto_download_added(index, &list, &added);
             }
         }
         if self.checking == 0 {
@@ -3598,13 +4041,17 @@ impl Sources {
                     || follow.source_id.clone(),
                     |source| source.manifest.name.clone(),
                 );
-            let detail = if let Some(error) = &follow.error {
+            let mut detail = if let Some(error) = &follow.error {
                 format!("{source} · 检查失败：{error}")
             } else if !follow.fresh.is_empty() {
                 format!("{source} · {} 话更新", follow.fresh.len())
             } else {
                 format!("{source} · 共 {} 话", follow.total)
             };
+            let auto_n = self.auto_downloading(&follow.source_id, &follow.manga_id);
+            if auto_n > 0 {
+                detail = format!("{detail} · 自动下载中 {auto_n} 章");
+            }
             let snapshot = follow.snapshot.clone();
             let top = ui.cursor().top();
             let left = ui.cursor().left();
@@ -4395,7 +4842,7 @@ impl Sources {
             .iter()
             .map(|group| group.source.clone())
             .collect();
-        let _ = self.global_tx.send(GlobalCmd {
+        let _ = self.global_tx.send(GlobalCmd::Search {
             generation: self.global_gen,
             query,
             sources,
@@ -4410,12 +4857,332 @@ impl Sources {
         {
             group.state = GlobalState::Searching;
         }
-        let _ = self.global_tx.send(GlobalCmd {
+        let _ = self.global_tx.send(GlobalCmd::Search {
             generation: self.global_gen,
             query: self.global_query.clone(),
             sources: vec![source.into()],
         });
     }
+
+    // -- 换源 (source migration) -------------------------------------------
+
+    /// Detail-page 换源 button: searches the work's title across every
+    /// installed source except the current one and opens the panel.
+    pub(crate) fn open_migrate(&mut self) {
+        let Some(manga) = self.selected_manga.clone() else {
+            return;
+        };
+        let old_source = self.source_for(&manga);
+        self.global_gen += 1;
+        let generation = self.global_gen;
+        let groups: Vec<MigrateGroup> = self
+            .installed
+            .iter()
+            .filter(|source| source.manifest.id != old_source)
+            .map(|source| MigrateGroup {
+                source: source.manifest.id.clone(),
+                state: GlobalState::Searching,
+            })
+            .collect();
+        let sources: Vec<String> = groups.iter().map(|group| group.source.clone()).collect();
+        self.migrate = Some(MigrateState {
+            generation,
+            old_source,
+            old_manga: manga.key.clone(),
+            groups,
+            expanding: None,
+            expanded: HashMap::new(),
+            confirm: None,
+            running: false,
+            error: None,
+        });
+        let _ = self.global_tx.send(GlobalCmd::Search {
+            generation,
+            query: manga.title.clone(),
+            sources,
+        });
+    }
+
+    /// Closes the panel unless a migration is still running off-thread.
+    pub(crate) fn close_migrate(&mut self) {
+        if self.migrate.as_ref().is_some_and(|state| state.running) {
+            return;
+        }
+        self.migrate = None;
+    }
+
+    /// Expands one candidate: fetches its chapter list once through the
+    /// global worker and caches it inside the panel.
+    pub(crate) fn migrate_expand(&mut self, source: &str, manga: &Manga) {
+        let Some(state) = self.migrate.as_mut() else {
+            return;
+        };
+        let key = (source.to_string(), manga.key.clone());
+        if state.expanded.contains_key(&key) || state.expanding.is_some() {
+            return;
+        }
+        state.expanding = Some(key);
+        let _ = self.global_tx.send(GlobalCmd::Chapters {
+            generation: state.generation,
+            source: source.to_string(),
+            manga: manga.clone(),
+        });
+    }
+
+    /// 换到这里: opens the confirm stage once the chapter list has landed.
+    pub(crate) fn migrate_choose(&mut self, source: &str, manga: &Manga) {
+        let Some(state) = self.migrate.as_mut() else {
+            return;
+        };
+        let key = (source.to_string(), manga.key.clone());
+        let Some(Ok(chapters)) = state.expanded.get(&key) else {
+            return;
+        };
+        state.confirm = Some(MigrateConfirm {
+            source: source.to_string(),
+            manga: manga.clone(),
+            chapters: chapter_list(chapters, "", false),
+            purge_old: false,
+        });
+    }
+
+    pub(crate) fn migrate_set_purge(&mut self, on: bool) {
+        if let Some(confirm) = self.migrate.as_mut().and_then(|s| s.confirm.as_mut()) {
+            confirm.purge_old = on;
+        }
+    }
+
+    pub(crate) fn migrate_cancel_confirm(&mut self) {
+        if let Some(state) = self.migrate.as_mut()
+            && !state.running
+        {
+            state.confirm = None;
+        }
+    }
+
+    /// Runs the migration off the UI thread: the new snapshot + re-keyed
+    /// follow record are written there, then applied back here.
+    pub(crate) fn migrate_run(&mut self) {
+        let Some(state) = self.migrate.as_mut() else {
+            return;
+        };
+        if state.running {
+            return;
+        }
+        let Some(confirm) = state.confirm.clone() else {
+            return;
+        };
+        state.running = true;
+        state.error = None;
+        // Resume point: the most recently read task on the old source.
+        let latest = self
+            .tasks
+            .iter()
+            .filter(|task| {
+                task.source_id == state.old_source
+                    && task.manga_id == state.old_manga
+                    && task.read_at.is_some()
+            })
+            .max_by_key(|task| task.read_at)
+            .cloned();
+        let had_record = latest.is_some();
+        let (resume_number, resume_done) = latest.map_or((None, false), |task| {
+            let number = task
+                .chapter_number
+                .or_else(|| {
+                    crate::trackers::chapter_number(&task.chapter_title).map(|number| number as f64)
+                });
+            let done = task.pages_total > 0
+                && task.read_page.is_some_and(|page| page + 1 >= task.pages_total);
+            (number, done)
+        });
+        let (old_source, old_manga) = (state.old_source.clone(), state.old_manga.clone());
+        let follow_index = self.follow_index(&old_source, &old_manga);
+        let old_follow = follow_index.and_then(|index| self.follows.get(index).cloned());
+        let root = self.root.clone();
+        let tx = self.migrate_tx.clone();
+        let ctx = self.ctx.clone();
+        thread::spawn(move || {
+            let outcome = (|| -> anyhow::Result<MigrateOutcome> {
+                let mut manga = confirm.manga.clone();
+                manga.source_key = confirm.source.clone();
+                let snapshot = save_manga_snapshot(&root, &manga)?;
+                let follow = old_follow.map(|mut follow| {
+                    // 追更记录改指向新书源: ids + snapshot move over, known and
+                    // reading_order use the new source's chapters, fresh is
+                    // cleared, followed_at kept.
+                    follow.source_id = confirm.source.clone();
+                    follow.manga_id = manga.key.clone();
+                    follow.title = manga.title.clone();
+                    follow.snapshot = snapshot;
+                    let keys: Vec<String> =
+                        confirm.chapters.iter().map(|c| c.key.clone()).collect();
+                    follow.known = keys.clone();
+                    follow.reading_order = keys;
+                    follow.fresh.clear();
+                    follow.total = confirm.chapters.len();
+                    follow.error = None;
+                    follow.resume_number = resume_number;
+                    follow.resume_done = resume_done;
+                    follow.checked_at = Some(follows::now());
+                    follow
+                });
+                Ok(MigrateOutcome {
+                    follow,
+                    follow_index,
+                    source: confirm.source.clone(),
+                    manga,
+                    chapters: confirm.chapters.clone(),
+                    old_source,
+                    old_manga,
+                    purge_old: confirm.purge_old,
+                    resume_unparsed: had_record && resume_number.is_none(),
+                })
+            })();
+            let _ = tx.send(outcome);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Applies a finished migration on the UI thread: follow re-keyed,
+    /// detail page switched to the new source, tracker/purge side-effects
+    /// queued for the host.
+    fn apply_migrate(&mut self, done: anyhow::Result<MigrateOutcome>) {
+        match done {
+            Ok(outcome) => {
+                if let Some(follow) = outcome.follow {
+                    match outcome.follow_index {
+                        Some(index) => self.follows[index] = follow,
+                        None => self.follows.insert(0, follow),
+                    }
+                    self.save_follows();
+                }
+                self.migrate_post = Some(MigratePost {
+                    rebind: (
+                        crate::trackers::binding_key(
+                            Some((&outcome.old_source, &outcome.old_manga)),
+                            None,
+                        ),
+                        crate::trackers::binding_key(
+                            Some((&outcome.source, &outcome.manga.key)),
+                            None,
+                        ),
+                    ),
+                    purge: outcome
+                        .purge_old
+                        .then(|| (outcome.old_source.clone(), outcome.old_manga.clone())),
+                    resume_unparsed: outcome.resume_unparsed,
+                });
+                self.selected_manga = Some(outcome.manga);
+                self.chapters = outcome.chapters;
+                self.chapter_query.clear();
+                self.migrate = None;
+                self.status = if outcome.resume_unparsed {
+                    "已换源；旧阅读记录里解析不出话数，将从第一章开始".into()
+                } else {
+                    "已换源".into()
+                };
+            }
+            Err(error) => {
+                if let Some(state) = self.migrate.as_mut() {
+                    state.running = false;
+                    state.error = Some(format!("{error:#}"));
+                }
+            }
+        }
+    }
+
+    /// The host consumes the post-migration side-effects once.
+    pub(crate) fn take_migrate_post(&mut self) -> Option<MigratePost> {
+        self.migrate_post.take()
+    }
+
+    // -- 自动下载新章节 -----------------------------------------------------
+
+    pub(crate) fn set_auto_download(&mut self, mode: &str) {
+        self.auto_download = if matches!(mode, "all" | "latest1" | "latest3") {
+            mode.to_string()
+        } else {
+            "off".into()
+        };
+    }
+
+    pub(crate) fn auto_download(&self) -> &str {
+        &self.auto_download
+    }
+
+    /// Queues freshly found chapters per the `auto-download` setting: at
+    /// most 5 per work per check, newest = last in reading order, skipping
+    /// anything already downloaded or queued. Never touches `fresh`.
+    fn auto_download_added(&mut self, index: usize, list: &[Chapter], added: &[String]) {
+        if self.auto_download == "off" || added.is_empty() {
+            return;
+        }
+        let take = match self.auto_download.as_str() {
+            "latest1" => 1,
+            "latest3" => 3,
+            _ => 5,
+        };
+        let added: std::collections::HashSet<&str> =
+            added.iter().map(|key| key.as_str()).collect();
+        let ordered = chapter_list(list, "", false);
+        let mut pick: Vec<Chapter> = ordered
+            .iter()
+            .filter(|chapter| added.contains(chapter.key.as_str()))
+            .rev()
+            .take(take)
+            .cloned()
+            .collect();
+        // Queue oldest-first so the download order matches reading order.
+        pick.reverse();
+        let Some(follow) = self.follows.get(index).cloned() else {
+            return;
+        };
+        let Ok(mut manga) = self.follow_manga(&follow) else {
+            return;
+        };
+        manga.source_key = follow.source_id.clone();
+        let snapshot_key = match save_manga_snapshot(&self.root, &manga) {
+            Ok(key) => key,
+            Err(_) => return,
+        };
+        let mut queued = false;
+        for chapter in pick {
+            if !self.chapter_needs_download(&follow.source_id, &manga.key, &chapter) {
+                continue;
+            }
+            let mut task = DownloadTask::from_chapter(&follow.source_id, &manga, &chapter);
+            task.manga_snapshot = Some(snapshot_key.clone());
+            task.auto = true;
+            if matches!(
+                enqueue_task(&mut self.tasks, task),
+                EnqueueOutcome::Added
+            ) {
+                queued = true;
+            }
+        }
+        if queued {
+            let _ = self.persist();
+            self.pump();
+        }
+    }
+
+    /// 自动下载 tasks still in the queue for one followed work.
+    fn auto_downloading(&self, source: &str, manga: &str) -> usize {
+        self.tasks
+            .iter()
+            .filter(|task| {
+                task.auto
+                    && task.source_id == source
+                    && task.manga_id == manga
+                    && matches!(
+                        task.status,
+                        DownloadStatus::Queued | DownloadStatus::Running | DownloadStatus::Paused
+                    )
+            })
+            .count()
+    }
+
     /// Group header: jump into that source and run the normal search.
     fn dive_into(&mut self, source: &str) {
         self.select_source(source);
@@ -5109,24 +5876,71 @@ impl Sources {
             self.handle_update(event);
         }
         while let Ok(event) = self.global_rx.try_recv() {
-            if event.generation != self.global_gen {
-                continue;
-            }
-            if let Some(group) = self
-                .global_groups
-                .iter_mut()
-                .find(|group| group.source == event.source)
-            {
-                group.state = match event.result {
-                    Ok(mut entries) => {
-                        for manga in &mut entries {
-                            manga.source_key = event.source.clone();
-                        }
-                        GlobalState::Done(entries)
+            match event {
+                GlobalEvent::Search {
+                    generation,
+                    source,
+                    result,
+                } => {
+                    if generation != self.global_gen {
+                        continue;
                     }
-                    Err(reason) => GlobalState::Failed(reason),
-                };
+                    // The 换源 panel owns this generation's events while open.
+                    if let Some(migrate) = self.migrate.as_mut()
+                        && migrate.generation == generation
+                    {
+                        if let Some(group) = migrate
+                            .groups
+                            .iter_mut()
+                            .find(|group| group.source == source)
+                        {
+                            group.state = match result {
+                                Ok(mut entries) => {
+                                    for manga in &mut entries {
+                                        manga.source_key = source.clone();
+                                    }
+                                    GlobalState::Done(entries)
+                                }
+                                Err(reason) => GlobalState::Failed(reason),
+                            };
+                        }
+                        continue;
+                    }
+                    if let Some(group) = self
+                        .global_groups
+                        .iter_mut()
+                        .find(|group| group.source == source)
+                    {
+                        group.state = match result {
+                            Ok(mut entries) => {
+                                for manga in &mut entries {
+                                    manga.source_key = source.clone();
+                                }
+                                GlobalState::Done(entries)
+                            }
+                            Err(reason) => GlobalState::Failed(reason),
+                        };
+                    }
+                }
+                GlobalEvent::Chapters {
+                    generation,
+                    source,
+                    manga,
+                    result,
+                } => {
+                    let Some(migrate) = self.migrate.as_mut() else {
+                        continue;
+                    };
+                    if generation != migrate.generation {
+                        continue;
+                    }
+                    migrate.expanding = None;
+                    migrate.expanded.insert((source, manga.key.clone()), result);
+                }
             }
+        }
+        while let Ok(done) = self.migrate_rx.try_recv() {
+            self.apply_migrate(done);
         }
         while let Ok(event) = self.storage_rx.try_recv() {
             match event {
@@ -6308,6 +7122,7 @@ impl Sources {
         let mut read = false;
         let mut follow = false;
         let mut download_missing = false;
+        let mut migrate = false;
         let mut meta = |ui: &mut Ui, this: &mut Self| {
             ui.add(Label::new(RichText::new(&manga.title).heading().strong()).wrap());
             if let Some(authors) = manga.authors.as_ref().filter(|list| !list.is_empty()) {
@@ -6378,6 +7193,12 @@ impl Sources {
                 if button.clicked() {
                     download_missing = true;
                 }
+                let button = ui.add(quiet_action("换源").min_size(vec2(0., 48.)));
+                this.hitboxes
+                    .insert("source-detail-migrate".into(), button.rect);
+                if button.clicked() {
+                    migrate = true;
+                }
             });
         };
         if wide {
@@ -6421,6 +7242,9 @@ impl Sources {
         }
         if download_missing {
             self.enqueue_missing(&manga);
+        }
+        if migrate {
+            self.open_migrate();
         }
         // Description collapses to three lines; longer text offers 展开/收起.
 
@@ -7314,6 +8138,241 @@ impl Sources {
             });
         }
         self.history_confirm_ui(ui.ctx());
+        self.migrate_ui(ui.ctx());
+    }
+
+    /// 换源 panel: opaque scrim + card (same recipe as the other modals).
+    /// Shows grouped candidates → confirm listing every effect → run.
+    fn migrate_ui(&mut self, ctx: &Context) {
+        let Some(state) = self.migrate.as_ref() else {
+            return;
+        };
+        let _ = state;
+        let screen = ctx.content_rect();
+        let scrim = Area::new(egui::Id::unique("migrate-scrim"))
+            .order(Order::Foreground)
+            .fade_in(false)
+            .interactable(true)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                ui.painter()
+                    .rect_filled(screen, 0., Color32::from_black_alpha(96));
+                ui.allocate_rect(screen, Sense::click())
+            });
+        if scrim.inner.clicked() {
+            self.close_migrate();
+            return;
+        }
+        let mut card_rect = Rect::NOTHING;
+        Area::new(egui::Id::unique("migrate"))
+            .order(Order::Foreground)
+            .fade_in(false)
+            .interactable(true)
+            .movable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                let frame = crate::design::surface(ui).show(ui, |ui| {
+                    ui.set_width((screen.width() - 56.).clamp(280., 560.));
+                    ui.set_max_height((screen.height() - 80.).clamp(240., 640.));
+                    self.migrate_card(ui);
+                });
+                card_rect = frame.response.rect;
+            });
+        self.hitboxes.insert("migrate-card".into(), card_rect);
+    }
+
+    /// Card body: header, candidate groups or the confirm stage.
+    fn migrate_card(&mut self, ui: &mut Ui) {
+        let dark = ui.visuals().dark_mode;
+        let palette = design::palette(dark);
+        let running = self.migrate.as_ref().is_some_and(|s| s.running);
+        ui.horizontal(|ui| {
+            ui.heading("换源");
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let close = ui.add_enabled(!running, quiet_action("关闭"));
+                self.hitboxes.insert("migrate-close".into(), close.rect);
+                if close.clicked() {
+                    self.close_migrate();
+                }
+            });
+        });
+        ui.label(
+            RichText::new("把这部作品迁到别的书源；旧书源已下载的章节仍留在书架")
+                .color(palette.muted)
+                .small(),
+        );
+        if let Some(error) = self
+            .migrate
+            .as_ref()
+            .and_then(|state| state.error.clone())
+        {
+            ui.label(RichText::new(format!("迁移失败：{error}")).color(palette.danger));
+        }
+        if running {
+            ui.add_space(10.);
+            ui.horizontal(|ui| {
+                ui.add(Spinner::new());
+                ui.label("正在迁移…");
+            });
+            return;
+        }
+        if self
+            .migrate
+            .as_ref()
+            .is_some_and(|state| state.confirm.is_some())
+        {
+            self.migrate_confirm_card(ui, &palette);
+            return;
+        }
+        let groups = match self.migrate.as_ref() {
+            Some(state) => state.groups.clone(),
+            None => return,
+        };
+        ui.add_space(6.);
+        ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.set_max_width(ui.available_width());
+                let mut expand: Option<(String, Manga)> = None;
+                let mut choose: Option<(String, Manga)> = None;
+                for group in &groups {
+                    let name = self.source_display_name(&group.source);
+                    design::section(ui, &name);
+                    match &group.state {
+                        GlobalState::Searching => {
+                            ui.label(RichText::new("正在搜索…").color(palette.muted).small());
+                        }
+                        GlobalState::Failed(reason) => {
+                            ui.label(
+                                RichText::new(format!("搜索失败：{reason}"))
+                                    .color(palette.muted)
+                                    .small(),
+                            );
+                        }
+                        GlobalState::Done(entries) => {
+                            if entries.is_empty() {
+                                ui.label(
+                                    RichText::new("无结果").color(palette.muted).small(),
+                                );
+                            }
+                            for (i, manga) in entries.iter().enumerate() {
+                                let key = (group.source.clone(), manga.key.clone());
+                                let expanding =
+                                    self.migrate.as_ref().is_some_and(|s| s.expanding == Some(key.clone()));
+                                let expanded = self
+                                    .migrate
+                                    .as_ref()
+                                    .and_then(|s| s.expanded.get(&key).cloned());
+                                let row = ui.add(
+                                    quiet_action(&manga.title).min_size(vec2(0., 44.)),
+                                );
+                                self.hitboxes.insert(
+                                    format!("migrate-candidate-{}-{i}", group.source),
+                                    row.rect,
+                                );
+                                if row.clicked() && expanded.is_none() {
+                                    expand = Some((group.source.clone(), manga.clone()));
+                                }
+                                if expanding {
+                                    ui.label(
+                                        RichText::new("　加载章节…")
+                                            .color(palette.muted)
+                                            .small(),
+                                    );
+                                }
+                                if let Some(result) = &expanded {
+                                    match result {
+                                        Ok(chapters) => {
+                                            let latest = chapter_list(chapters, "", false)
+                                                .last()
+                                                .map(|c| chapter_name(c))
+                                                .unwrap_or_else(|| "—".into());
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "　共 {} 话 · 最新 {latest}",
+                                                    chapters.len()
+                                                ))
+                                                .color(palette.muted)
+                                                .small(),
+                                            );
+                                            let button = ui.add(
+                                                quiet_action("换到这里")
+                                                    .min_size(vec2(0., 40.)),
+                                            );
+                                            self.hitboxes.insert(
+                                                format!(
+                                                    "migrate-choose-{}-{i}",
+                                                    group.source
+                                                ),
+                                                button.rect,
+                                            );
+                                            if button.clicked() {
+                                                choose =
+                                                    Some((group.source.clone(), manga.clone()));
+                                            }
+                                        }
+                                        Err(error) => {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "　章节列表失败：{error}"
+                                                ))
+                                                .color(palette.muted)
+                                                .small(),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some((source, manga)) = expand {
+                    self.migrate_expand(&source, &manga);
+                }
+                if let Some((source, manga)) = choose {
+                    self.migrate_choose(&source, &manga);
+                }
+            });
+    }
+
+    /// Confirm stage: lists every migration effect + the optional purge.
+    fn migrate_confirm_card(&mut self, ui: &mut Ui, palette: &crate::design::Palette) {
+        let dark = ui.visuals().dark_mode;
+        let Some(confirm) = self
+            .migrate
+            .as_ref()
+            .and_then(|state| state.confirm.clone())
+        else {
+            return;
+        };
+        let source_name = self.source_display_name(&confirm.source);
+        ui.label(format!("换到 {source_name} 的《{}》", confirm.manga.title));
+        ui.add_space(4.);
+        for line in [
+            "追更记录改指向新书源，新章节提醒重新开始",
+            "阅读进度按话数近似对应（解析不出话数时从第一章开始并提示）",
+            "跟踪绑定（AniList / Kitsu / Bangumi）改到新书源",
+            "旧书源已下载的章节仍作为本地作品留在书架",
+        ] {
+            ui.label(RichText::new(format!("· {line}")).color(palette.muted).small());
+        }
+        let mut purge = confirm.purge_old;
+        let check = ui.checkbox(&mut purge, "同时删除旧书源已下载的章节");
+        self.hitboxes.insert("migrate-purge".into(), check.rect);
+        if check.changed() {
+            self.migrate_set_purge(purge);
+        }
+        ui.add_space(6.);
+        ui.horizontal(|ui| {
+            if ui.button("取消").clicked() {
+                self.migrate_cancel_confirm();
+            }
+            let go = ui.add(design::primary("换源", dark));
+            self.hitboxes.insert("migrate-go".into(), go.rect);
+            if go.clicked() {
+                self.migrate_run();
+            }
+        });
     }
 
     /// Opaque scrim + card, matching the shelf delete confirmations.
@@ -7754,6 +8813,7 @@ mod tests {
         // next task in tests. The task itself is exercised directly.
 
         std::mem::forget(dl_cmd_rx);
+        let (migrate_tx, migrate_rx) = mpsc::channel();
         Sources {
             root: root.to_path_buf(),
             tx: mpsc::channel().0,
@@ -7853,6 +8913,11 @@ mod tests {
             source_settings: Default::default(),
             stale_engines: Default::default(),
             challenge: None,
+            auto_download: "off".into(),
+            migrate: None,
+            migrate_tx,
+            migrate_rx,
+            migrate_post: None,
             web_session: None,
             login_user: String::new(),
             login_pass: String::new(),
@@ -10062,6 +11127,22 @@ mod tests {
         fn search(&self, query: &str) -> Result<Vec<Manga>, String> {
             Ok((self.0)(query))
         }
+        fn chapters(&self, _manga: Manga) -> Result<Vec<Chapter>, String> {
+            Ok(Vec::new())
+        }
+    }
+    /// Test-side view of a `GlobalEvent::Search` the way the old struct read.
+    fn search_event(
+        event: &GlobalEvent,
+    ) -> Option<(u64, &str, &Result<Vec<Manga>, String>)> {
+        match event {
+            GlobalEvent::Search {
+                generation,
+                source,
+                result,
+            } => Some((*generation, source.as_str(), result)),
+            _ => None,
+        }
     }
 
     #[test]
@@ -10099,7 +11180,7 @@ mod tests {
             (0..9).map(|i| format!("s{i}")).chain(["err".into()]).collect();
         let count = sources.len();
         cmd_tx
-            .send(GlobalCmd {
+            .send(GlobalCmd::Search {
                 generation: 1,
                 query: "q".into(),
                 sources,
@@ -10110,11 +11191,14 @@ mod tests {
         assert!(peak.load(Ordering::SeqCst) <= GLOBAL_SEARCH_LIMIT);
         let events: Vec<GlobalEvent> = event_rx.iter().collect();
         assert_eq!(events.len(), count);
-        let err = events
+        let (.., result) = events
             .iter()
-            .find(|event| event.source == "err")
+            .find_map(|event| {
+                let (event_gen, source, result) = search_event(event)?;
+                (source == "err" && event_gen == 1).then_some((event_gen, source, result))
+            })
             .expect("load failures still produce an event");
-        assert_eq!(err.result.as_ref().err().unwrap(), "boom");
+        assert_eq!(result.as_ref().err().unwrap(), "boom");
     }
 
     #[test]
@@ -10145,7 +11229,7 @@ mod tests {
             );
         });
         cmd_tx
-            .send(GlobalCmd {
+            .send(GlobalCmd::Search {
                 generation: 1,
                 query: "q".into(),
                 sources: vec!["hang".into(), "fast".into()],
@@ -10161,15 +11245,18 @@ mod tests {
                 events.push(event);
             }
         }
-        let timeout = events
+        let result = events
             .iter()
-            .find(|event| event.source == "hang")
+            .find_map(|event| {
+                let (_, source, result) = search_event(event)?;
+                (source == "hang").then_some(result)
+            })
             .expect("hung source reports a timeout");
-        assert_eq!(timeout.result.as_ref().err().unwrap(), "超时");
+        assert_eq!(result.as_ref().err().unwrap(), "超时");
         // A new generation starts while `hang` is still sleeping: the worker
         // is not joining it, so the next search proceeds immediately.
         cmd_tx
-            .send(GlobalCmd {
+            .send(GlobalCmd::Search {
                 generation: 2,
                 query: "q".into(),
                 sources: vec!["fast".into()],
@@ -10179,7 +11266,7 @@ mod tests {
         handle.join().unwrap();
         let events: Vec<GlobalEvent> = event_rx.iter().collect();
         assert!(events.iter().any(|event| {
-            event.generation == 2 && event.source == "fast" && event.result.is_ok()
+            matches!(search_event(event), Some((2, "fast", result)) if result.is_ok())
         }));
     }
 
@@ -10193,17 +11280,18 @@ mod tests {
             state: GlobalState::Searching,
         }];
         // Same generation check poll() applies.
-        let stale_event = GlobalEvent {
+        let stale_event = GlobalEvent::Search {
             generation: 1,
             source: "x".into(),
             result: Ok(vec![Manga::default()]),
         };
-        assert_ne!(stale_event.generation, sources.global_gen);
-        if stale_event.generation == sources.global_gen {
+        let (event_gen, source, _) = search_event(&stale_event).unwrap();
+        assert_ne!(event_gen, sources.global_gen);
+        if event_gen == sources.global_gen {
             if let Some(group) = sources
                 .global_groups
                 .iter_mut()
-                .find(|group| group.source == stale_event.source)
+                .find(|group| group.source == source)
             {
                 group.state = GlobalState::Done(vec![]);
             }
@@ -10213,16 +11301,17 @@ mod tests {
             GlobalState::Searching
         ));
         // Same-source event at the current generation updates the group.
-        let fresh = GlobalEvent {
+        let fresh = GlobalEvent::Search {
             generation: 2,
             source: "x".into(),
             result: Err("超时".into()),
         };
-        if fresh.generation == sources.global_gen {
+        let (event_gen, source, _) = search_event(&fresh).unwrap();
+        if event_gen == sources.global_gen {
             if let Some(group) = sources
                 .global_groups
                 .iter_mut()
-                .find(|group| group.source == fresh.source)
+                .find(|group| group.source == source)
             {
                 group.state = GlobalState::Failed("超时".into());
             }
@@ -10373,6 +11462,275 @@ mod tests {
         let stream = sources.take_stream().unwrap();
         assert_eq!(stream.id, "aaaaaaaaaaaaaaaa");
         assert_eq!(stream.metadata.chapter_id, "c1");
+    }
+
+    fn numbered(key: &str, number: f32) -> Chapter {
+        Chapter {
+            key: key.into(),
+            title: Some(format!("第 {number} 话")),
+            chapter_number: Some(number),
+            ..Default::default()
+        }
+    }
+
+    fn update(source: &str, manga: &str, chapters: Vec<Chapter>) -> UpdateEvent {
+        UpdateEvent {
+            source: source.into(),
+            manga: manga.into(),
+            chapters: Some(Ok(chapters)),
+            cover: None,
+        }
+    }
+
+    #[test]
+    fn auto_download_enqueues_up_to_five_and_keeps_the_fresh_badge() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sources = test_sources(root.path());
+        sources.set_auto_download("all");
+        sources.selected_source = "source.a".into();
+        sources.toggle_follow(&manga("source.a", "m"));
+        sources.follows[0].mark_seen(&["c1".to_string()]);
+        sources.checking = 1;
+        let chapters: Vec<Chapter> = (1..=7)
+            .map(|n| numbered(&format!("c{n}"), n as f32))
+            .collect();
+        sources.handle_update(update("source.a", "m", chapters));
+        // Six new chapters, but at most five queue per work per check — the
+        // newest five in reading order, all flagged `auto`.
+        let queued: Vec<&str> = sources
+            .tasks
+            .iter()
+            .map(|task| task.chapter_id.as_str())
+            .collect();
+        assert_eq!(queued, ["c3", "c4", "c5", "c6", "c7"]);
+        assert!(sources.tasks.iter().all(|task| task.auto));
+        assert_eq!(
+            sources.follows[0].fresh.len(),
+            6,
+            "auto-download must not clear the new-chapter badge"
+        );
+        assert_eq!(sources.auto_downloading("source.a", "m"), 5);
+        // Nothing else enqueued on the next check of an unchanged list.
+        sources.checking = 1;
+        sources.handle_update(update(
+            "source.a",
+            "m",
+            (1..=7)
+                .map(|n| numbered(&format!("c{n}"), n as f32))
+                .collect(),
+        ));
+        assert_eq!(sources.tasks.len(), 5);
+    }
+
+    #[test]
+    fn auto_download_latest_modes_pick_the_newest_chapters() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sources = test_sources(root.path());
+        sources.set_auto_download("latest1");
+        sources.selected_source = "source.a".into();
+        sources.toggle_follow(&manga("source.a", "m"));
+        sources.follows[0].mark_seen(&["c1".to_string()]);
+        sources.checking = 1;
+        sources.handle_update(update(
+            "source.a",
+            "m",
+            vec![numbered("c1", 1.), numbered("c2", 2.), numbered("c3", 3.)],
+        ));
+        assert_eq!(
+            sources
+                .tasks
+                .iter()
+                .map(|task| task.chapter_id.as_str())
+                .collect::<Vec<_>>(),
+            ["c3"]
+        );
+        // latest3 picks the newest three; off queues nothing.
+        sources.tasks.clear();
+        sources.set_auto_download("latest3");
+        sources.follows[0].mark_seen(
+            &["c1", "c2", "c3"].iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        );
+        sources.checking = 1;
+        sources.handle_update(update(
+            "source.a",
+            "m",
+            (1..=7)
+                .map(|n| numbered(&format!("c{n}"), n as f32))
+                .collect(),
+        ));
+        assert_eq!(
+            sources
+                .tasks
+                .iter()
+                .map(|task| task.chapter_id.as_str())
+                .collect::<Vec<_>>(),
+            ["c5", "c6", "c7"]
+        );
+        sources.tasks.clear();
+        sources.set_auto_download("off");
+        sources.follows[0].mark_seen(&[]);
+        sources.follows[0].known.clear();
+        sources.checking = 1;
+        sources.handle_update(update(
+            "source.a",
+            "m",
+            vec![numbered("c8", 8.)],
+        ));
+        assert!(sources.tasks.is_empty());
+    }
+
+    #[test]
+    fn migrate_rekeys_the_follow_and_posts_side_effects() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sources = test_sources(root.path());
+        sources.selected_source = "source.a".into();
+        sources.chapters = vec![numbered("c1", 1.), numbered("c2", 2.)];
+        sources.toggle_follow(&manga("source.a", "m"));
+        sources.follows[0].fresh = vec!["c2".into()];
+        let new_manga = manga("source.b", "m2");
+        let outcome = MigrateOutcome {
+            follow: Some(Follow {
+                source_id: "source.b".into(),
+                manga_id: "m2".into(),
+                title: "m2".into(),
+                snapshot: "snap".into(),
+                known: vec!["x1".into(), "x2".into()],
+                fresh: vec![],
+                total: 2,
+                followed_at: sources.follows[0].followed_at,
+                reading_order: vec!["x1".into(), "x2".into()],
+                resume_number: Some(7.),
+                resume_done: true,
+                ..Default::default()
+            }),
+            follow_index: Some(0),
+            source: "source.b".into(),
+            manga: new_manga.clone(),
+            chapters: vec![numbered("x1", 1.), numbered("x2", 2.)],
+            old_source: "source.a".into(),
+            old_manga: "m".into(),
+            purge_old: true,
+            resume_unparsed: false,
+        };
+        sources.apply_migrate(Ok(outcome));
+        let follow = &sources.follows[0];
+        assert_eq!(
+            (follow.source_id.as_str(), follow.manga_id.as_str()),
+            ("source.b", "m2")
+        );
+        assert!(follow.fresh.is_empty(), "fresh is cleared by migration");
+        assert_eq!(follow.reading_order, ["x1", "x2"]);
+        assert!(follow.followed_at.is_some(), "followed_at is kept");
+        let post = sources.take_migrate_post().expect("host side-effects");
+        assert_eq!(
+            post.rebind,
+            (
+                "source:source.a\x1fm".to_string(),
+                "source:source.b\x1fm2".to_string()
+            )
+        );
+        assert_eq!(
+            post.purge,
+            Some(("source.a".to_string(), "m".to_string())),
+            "purge checkbox asks the host to purge the old work"
+        );
+        assert_eq!(
+            sources.selected_manga.as_ref().map(|m| m.key.as_str()),
+            Some("m2"),
+            "finishing opens the new source's detail page"
+        );
+    }
+
+    #[test]
+    fn migrate_run_computes_resume_number_from_the_last_read_task() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sources = test_sources(root.path());
+        sources.selected_source = "source.a".into();
+        sources.chapters = vec![numbered("c9", 9.)];
+        sources.toggle_follow(&manga("source.a", "m"));
+        let mut download = task("source.a", "m", "c9");
+        download.read_at = Some(10);
+        download.read_page = Some(4);
+        download.pages_total = 10;
+        download.chapter_number = Some(9.);
+        sources.tasks.push(download);
+        sources.migrate = Some(MigrateState {
+            generation: 0,
+            old_source: "source.a".into(),
+            old_manga: "m".into(),
+            groups: Vec::new(),
+            expanding: None,
+            expanded: HashMap::new(),
+            confirm: Some(MigrateConfirm {
+                source: "source.b".into(),
+                manga: manga("source.b", "m2"),
+                chapters: vec![numbered("x1", 1.), numbered("x2", 2.)],
+                purge_old: false,
+            }),
+            running: false,
+            error: None,
+        });
+        sources.migrate_run();
+        let outcome = sources
+            .migrate_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        let follow = outcome.follow.expect("work is followed");
+        assert_eq!(follow.resume_number, Some(9.));
+        assert!(!follow.resume_done, "page 5 of 10 is unfinished");
+        assert!(!outcome.resume_unparsed);
+        // A record exists but its title/number cannot be parsed → the user
+        // is told the resume could not be carried over.
+        sources.migrate.as_mut().unwrap().running = false;
+        let mut untitled = task("source.a", "m", "cX");
+        untitled.chapter_title = "外传".into();
+        untitled.read_at = Some(20);
+        sources.tasks.push(untitled);
+        sources.migrate_run();
+        let outcome = sources
+            .migrate_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert!(outcome.resume_unparsed);
+        assert!(outcome.follow.unwrap().resume_number.is_none());
+    }
+
+    #[test]
+    fn resume_chapter_uses_the_migrated_resume_number_without_records() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sources = test_sources(root.path());
+        let manga = manga("source.a", "m");
+        let ordered = vec![
+            numbered("c1", 1.),
+            numbered("c2", 2.),
+            numbered("c3", 3.),
+            numbered("c4", 4.),
+        ];
+        // Chapter 2 was mid-read on the old source → resume lands on it.
+        sources.follows.push(Follow {
+            source_id: "source.a".into(),
+            manga_id: "m".into(),
+            resume_number: Some(2.),
+            resume_done: false,
+            ..Default::default()
+        });
+        let (resume, started) =
+            sources.resume_chapter("source.a", &manga, &ordered, &Default::default());
+        assert!(started);
+        assert_eq!(resume.unwrap().key, "c2");
+        // Chapter 2 was finished → resume lands on the next numbered chapter.
+        sources.follows[0].resume_done = true;
+        let (resume, _) =
+            sources.resume_chapter("source.a", &manga, &ordered, &Default::default());
+        assert_eq!(resume.unwrap().key, "c3");
+        // No carried number → the normal first-chapter behaviour.
+        sources.follows[0].resume_number = None;
+        let (resume, started) =
+            sources.resume_chapter("source.a", &manga, &ordered, &Default::default());
+        assert!(!started);
+        assert_eq!(resume.unwrap().key, "c1");
     }
 }
 
