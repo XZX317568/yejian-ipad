@@ -213,6 +213,9 @@ pub struct ReaderApp {
     reduced: bool,
     theme: String,
     color_scheme: String,
+    library_grid: bool,
+    shelf_reserve: f32,
+    shelf_stage: Rect,
     font_scale: f32,
     widget_font_scale: f32,
     error: Option<String>,
@@ -323,6 +326,9 @@ impl ReaderApp {
             reduced: false,
             theme: "system".into(),
             color_scheme: "ink".into(),
+            library_grid: false,
+            shelf_reserve: 0.,
+            shelf_stage: Rect::NOTHING,
             font_scale: 1.,
             widget_font_scale: 0.,
             error: None,
@@ -1190,6 +1196,7 @@ impl ReaderApp {
                         match key.as_str() {
                             "theme" => self.theme = value,
                             "palette" => self.color_scheme = value,
+                            "shelf-grid" => self.library_grid = value == "open",
                             "reduce-motion" => self.reduced = value == "true",
                             "reading-direction" => {
                                 self.reader_globals.rtl = value == "rtl";
@@ -1964,6 +1971,54 @@ impl ReaderApp {
         } else {
             Rect::from_min_size(stage.min + vec2(8., 6.), vec2(width - 16., 212.))
         };
+        let (stage, books, browse) = if self.library_grid {
+            (
+                stage,
+                books,
+                Rect::from_min_size(
+                    pos2(stage.left(), stage.bottom() + 28.),
+                    vec2(
+                        width,
+                        if side_by_side {
+                            236. + tall_extra * 0.5
+                        } else {
+                            170.
+                        } + 28. * (self.font_scale - 1.),
+                    ),
+                ),
+            )
+        } else {
+            // Collapsed: a single toggle row replaces the thumbnail strip and
+            // the freed height grows the 3D shelf stage.
+            let row = (24. * self.font_scale + 20.).max(44.);
+            let avail =
+                self.shelf_viewport.height() - top - 20. - row - self.shelf_reserve - 12.;
+            let stage_h = if side_by_side {
+                avail.clamp(height, 760.)
+            } else {
+                avail.clamp(height, 900.)
+            };
+            let stage = Rect::from_min_size(stage.min, vec2(width, stage_h));
+            let books = if side_by_side {
+                Rect::from_min_size(
+                    stage.min + vec2(12., 12.),
+                    vec2(width * 0.55 - 12., stage_h - 24.),
+                )
+            } else {
+                Rect::from_min_size(
+                    stage.min + vec2(8., 6.),
+                    vec2(
+                        width - 16.,
+                        (stage_h - 172. - 112. * (self.font_scale - 1.)).clamp(212., 520.),
+                    ),
+                )
+            };
+            let browse = Rect::from_min_size(
+                pos2(stage.left(), stage.bottom() + 20.),
+                vec2(width, row),
+            );
+            (stage, books, browse)
+        };
         let info = if side_by_side {
             Rect::from_min_max(
                 pos2(
@@ -1978,17 +2033,6 @@ impl ReaderApp {
                 stage.max - vec2(20., 20.),
             )
         };
-        let browse = Rect::from_min_size(
-            pos2(stage.left(), stage.bottom() + 28.),
-            vec2(
-                width,
-                if side_by_side {
-                    236. + tall_extra * 0.5
-                } else {
-                    170.
-                } + 28. * (self.font_scale - 1.),
-            ),
-        );
         ShelfLayout {
             stage,
             books,
@@ -2511,12 +2555,13 @@ impl ReaderApp {
     }
     fn library_viewport(&mut self, ui: &mut Ui, area: Rect, now: f64, entrance: f32) {
         self.shelf_viewport = area;
-        let height = self.shelf_layout(area).browse.bottom() - area.top() + 24.;
         let bottom = if Self::side_navigation(ui.ctx().content_rect()) {
             16.
         } else {
             80.
         };
+        self.shelf_reserve = bottom;
+        let height = self.shelf_layout(area).browse.bottom() - area.top() + 24.;
         if area.height() >= height + bottom {
             self.shelf_shift = 0.;
             self.library_ui(ui, area, now, entrance);
@@ -2681,6 +2726,7 @@ impl ReaderApp {
             return;
         }
         let layout = self.shelf_layout(area);
+        self.shelf_stage = layout.stage;
         let shelf_area = layout.books;
         let palette = crate::design::palette(self.dark);
         ui.painter().rect_filled(layout.stage, 22., palette.soft);
@@ -2985,7 +3031,7 @@ impl ReaderApp {
         now: f64,
     ) {
         let palette = crate::design::palette(self.dark);
-        ui.painter().text(
+        let title = ui.painter().text(
             area.min,
             Align2::LEFT_TOP,
             "藏书一览",
@@ -2993,12 +3039,61 @@ impl ReaderApp {
             palette.ink,
         );
         ui.painter().text(
-            pos2(area.right(), area.top() + 4.),
-            Align2::RIGHT_TOP,
-            format!("{} 本", books.len()),
+            pos2(title.right() + 6., area.top() + 5.),
+            Align2::LEFT_TOP,
+            format!("· {} 本", books.len()),
             FontId::proportional(12. * self.font_scale),
             palette.muted,
         );
+        let label = if self.library_grid { "收起" } else { "展开" };
+        let galley = ui.painter().layout_no_wrap(
+            label.to_owned(),
+            FontId::proportional(12. * self.font_scale),
+            palette.muted,
+        );
+        ui.painter().galley(
+            pos2(area.right() - 14. - galley.size().x, area.top() + 5.),
+            galley.clone(),
+            palette.muted,
+        );
+        // A painted triangle is font-independent where a chevron glyph would
+        // depend on the bundled faces covering it.
+        let tip = pos2(area.right() - 6., area.top() + 4. + galley.size().y / 2.);
+        let tri = if self.library_grid {
+            [
+                tip + vec2(-4., -2.5),
+                tip + vec2(4., -2.5),
+                tip + vec2(0., 3.),
+            ]
+        } else {
+            [
+                tip + vec2(-4., 2.5),
+                tip + vec2(4., 2.5),
+                tip + vec2(0., -3.),
+            ]
+        };
+        ui.painter().add(Shape::convex_polygon(
+            tri.to_vec(),
+            palette.muted,
+            Stroke::NONE,
+        ));
+        let row = Rect::from_min_size(
+            area.min,
+            vec2(area.width(), (34. * self.font_scale).max(44.)),
+        );
+        self.hitboxes.insert("shelf-grid-toggle".into(), row);
+        let response = ui.interact(row, Id::unique("shelf-grid-toggle"), Sense::click());
+        response.widget_info(|| WidgetInfo::labeled(Role::Button, true, "藏书一览"));
+        if response.clicked() {
+            self.library_grid = !self.library_grid;
+            self.setting(
+                "shelf-grid",
+                if self.library_grid { "open" } else { "closed" }.to_owned(),
+            );
+        }
+        if !self.library_grid {
+            return;
+        }
         let top = area.top() + 34. * self.font_scale;
         let canvas = Rect::from_min_max(pos2(area.left(), top), area.max);
         let cover_height = if area.width() >= 660. {
@@ -5159,6 +5254,10 @@ impl ReaderApp {
     }
     pub fn covers_loaded(&self) -> bool {
         self.cover_pending.is_empty()
+    }
+    /// Height of the painted 3D shelf stage, for layout verification.
+    pub fn shelf_stage_height(&self) -> f32 {
+        self.shelf_stage.height()
     }
 }
 

@@ -628,6 +628,24 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
         initial_title.bounds.height() > 20.,
         "design: expected selected title above the thumbnails"
     );
+    // The thumbnail strip starts collapsed: a taller stage and no targets.
+    anyhow::ensure!(
+        !h.app
+            .hitboxes
+            .keys()
+            .any(|id| id.starts_with("shelf-thumbnail-")),
+        "design: thumbnail strip should start collapsed"
+    );
+    let collapsed_stage = h.app.shelf_stage_height();
+    h.click("shelf-grid-toggle")?;
+    h.frames(6)?;
+    anyhow::ensure!(
+        h.app.shelf_stage_height() < collapsed_stage,
+        "design: collapsed stage {} did not exceed expanded {}",
+        collapsed_stage,
+        h.app.shelf_stage_height()
+    );
+    design_capture(h, "design-phone-shelf-expanded", &mut captures)?;
     let thumbnail = h
         .app
         .hitboxes
@@ -665,6 +683,9 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
         h.app.rendered_book_nodes < 45,
         "design: unbounded shelf rendering"
     );
+    // Collapse again so the remaining captures show the default shelf.
+    h.click("shelf-grid-toggle")?;
+    h.frames(6)?;
 
     h.size = [834, 1194];
     h.frames(6)?;
