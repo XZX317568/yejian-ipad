@@ -1259,6 +1259,13 @@ fn ipad_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
             "ipad {name}: {}x{} pt, insets top {top} bottom {bottom}",
             size[0], size[1]
         );
+        if name == "ipad-11-portrait" {
+            anyhow::ensure!(
+                h.app.shelf_books_fraction() >= 0.9,
+                "{name}: collapsed books rect is {:.2} of the stage width, expected the stacked arrangement",
+                h.app.shelf_books_fraction()
+            );
+        }
         for (tab, label) in [
             ("search", "sources"),
             ("settings", "settings"),

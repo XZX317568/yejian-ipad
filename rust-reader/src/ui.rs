@@ -216,6 +216,7 @@ pub struct ReaderApp {
     library_grid: bool,
     shelf_reserve: f32,
     shelf_stage: Rect,
+    shelf_books: Rect,
     font_scale: f32,
     widget_font_scale: f32,
     error: Option<String>,
@@ -329,6 +330,7 @@ impl ReaderApp {
             library_grid: false,
             shelf_reserve: 0.,
             shelf_stage: Rect::NOTHING,
+            shelf_books: Rect::NOTHING,
             font_scale: 1.,
             widget_font_scale: 0.,
             error: None,
@@ -1971,7 +1973,7 @@ impl ReaderApp {
         } else {
             Rect::from_min_size(stage.min + vec2(8., 6.), vec2(width - 16., 212.))
         };
-        let (stage, books, browse) = if self.library_grid {
+        let (stage, books, browse, arranged_side_by_side) = if self.library_grid {
             (
                 stage,
                 books,
@@ -1986,40 +1988,42 @@ impl ReaderApp {
                         } + 28. * (self.font_scale - 1.),
                     ),
                 ),
+                side_by_side,
             )
         } else {
             // Collapsed: a single toggle row replaces the thumbnail strip and
-            // the freed height grows the 3D shelf stage.
+            // the freed height grows the 3D shelf stage. Portrait-ish widths
+            // switch to the stacked arrangement so the books get the height.
             let row = (24. * self.font_scale + 20.).max(44.);
             let avail =
                 self.shelf_viewport.height() - top - 20. - row - self.shelf_reserve - 12.;
-            let stage_h = if side_by_side {
-                avail.clamp(height, 760.)
-            } else {
-                avail.clamp(height, 900.)
-            };
-            let stage = Rect::from_min_size(stage.min, vec2(width, stage_h));
-            let books = if side_by_side {
-                Rect::from_min_size(
+            let collapsed_side_by_side = side_by_side && avail < width * 0.78;
+            let (stage, books) = if collapsed_side_by_side {
+                let stage_h = avail.clamp(height, 760.);
+                let stage = Rect::from_min_size(stage.min, vec2(width, stage_h));
+                let books = Rect::from_min_size(
                     stage.min + vec2(12., 12.),
                     vec2(width * 0.55 - 12., stage_h - 24.),
-                )
+                );
+                (stage, books)
             } else {
-                Rect::from_min_size(
+                let info_h = 172. + 112. * (self.font_scale - 1.);
+                let books_h = (avail - info_h).clamp(212., 600.);
+                let stage_h = books_h + info_h;
+                let stage = Rect::from_min_size(stage.min, vec2(width, stage_h));
+                let books = Rect::from_min_size(
                     stage.min + vec2(8., 6.),
-                    vec2(
-                        width - 16.,
-                        (stage_h - 172. - 112. * (self.font_scale - 1.)).clamp(212., 520.),
-                    ),
-                )
+                    vec2(width - 16., books_h),
+                );
+                (stage, books)
             };
             let browse = Rect::from_min_size(
                 pos2(stage.left(), stage.bottom() + 20.),
                 vec2(width, row),
             );
-            (stage, books, browse)
+            (stage, books, browse, collapsed_side_by_side)
         };
-        let info = if side_by_side {
+        let info = if arranged_side_by_side {
             Rect::from_min_max(
                 pos2(
                     books.right() + 28.,
@@ -2038,8 +2042,8 @@ impl ReaderApp {
             books,
             info,
             browse,
-            side_by_side,
-            short_landscape,
+            side_by_side: arranged_side_by_side,
+            short_landscape: short_landscape && arranged_side_by_side,
         }
     }
     fn detail_cover_rect(&self, area: Rect) -> Rect {
@@ -2727,6 +2731,7 @@ impl ReaderApp {
         }
         let layout = self.shelf_layout(area);
         self.shelf_stage = layout.stage;
+        self.shelf_books = layout.books;
         let shelf_area = layout.books;
         let palette = crate::design::palette(self.dark);
         ui.painter().rect_filled(layout.stage, 22., palette.soft);
@@ -3031,16 +3036,12 @@ impl ReaderApp {
         now: f64,
     ) {
         let palette = crate::design::palette(self.dark);
-        let title = ui.painter().text(
-            area.min,
-            Align2::LEFT_TOP,
-            "藏书一览",
+        let title = ui.painter().layout_no_wrap(
+            "藏书一览".into(),
             crate::typography::display(19. * self.font_scale),
             palette.ink,
         );
-        ui.painter().text(
-            pos2(title.right() + 6., area.top() + 5.),
-            Align2::LEFT_TOP,
+        let count = ui.painter().layout_no_wrap(
             format!("· {} 本", books.len()),
             FontId::proportional(12. * self.font_scale),
             palette.muted,
@@ -3051,25 +3052,39 @@ impl ReaderApp {
             FontId::proportional(12. * self.font_scale),
             palette.muted,
         );
+        // A painted triangle is font-independent where a chevron glyph would
+        // depend on the bundled faces covering it.
+        let s = self.font_scale;
+        let tri_w = 8. * s;
+        let right_block = galley.size().x + 4. * s + tri_w + 6.;
+        let show_count =
+            title.size().x + 6. + count.size().x + 24. + right_block <= area.width();
+        ui.painter().galley(area.min, title.clone(), palette.ink);
+        if show_count {
+            ui.painter().galley(
+                pos2(area.left() + title.size().x + 6., area.top() + 5.),
+                count,
+                palette.muted,
+            );
+        }
         ui.painter().galley(
-            pos2(area.right() - 14. - galley.size().x, area.top() + 5.),
+            pos2(area.right() - right_block, area.top() + 5.),
             galley.clone(),
             palette.muted,
         );
-        // A painted triangle is font-independent where a chevron glyph would
-        // depend on the bundled faces covering it.
-        let tip = pos2(area.right() - 6., area.top() + 4. + galley.size().y / 2.);
+        let cy = area.top() + 5. + galley.size().y / 2.;
+        let cx = area.right() - 6. - tri_w / 2.;
         let tri = if self.library_grid {
             [
-                tip + vec2(-4., 2.5),
-                tip + vec2(4., 2.5),
-                tip + vec2(0., -3.),
+                pos2(cx - 4. * s, cy + 2.5 * s),
+                pos2(cx + 4. * s, cy + 2.5 * s),
+                pos2(cx, cy - 3. * s),
             ]
         } else {
             [
-                tip + vec2(-4., -2.5),
-                tip + vec2(4., -2.5),
-                tip + vec2(0., 3.),
+                pos2(cx - 4. * s, cy - 2.5 * s),
+                pos2(cx + 4. * s, cy - 2.5 * s),
+                pos2(cx, cy + 3. * s),
             ]
         };
         ui.painter().add(Shape::convex_polygon(
@@ -3083,7 +3098,17 @@ impl ReaderApp {
         );
         self.hitboxes.insert("shelf-grid-toggle".into(), row);
         let response = ui.interact(row, Id::unique("shelf-grid-toggle"), Sense::click());
-        response.widget_info(|| WidgetInfo::labeled(Role::Button, true, "藏书一览"));
+        response.widget_info(|| {
+            WidgetInfo::labeled(
+                Role::Button,
+                true,
+                if show_count {
+                    "藏书一览".to_owned()
+                } else {
+                    format!("藏书一览，{} 本", books.len())
+                },
+            )
+        });
         if response.clicked() {
             self.library_grid = !self.library_grid;
             self.setting(
@@ -5258,6 +5283,11 @@ impl ReaderApp {
     /// Height of the painted 3D shelf stage, for layout verification.
     pub fn shelf_stage_height(&self) -> f32 {
         self.shelf_stage.height()
+    }
+    /// Fraction of the stage width given to the 3D books, for layout
+    /// verification.
+    pub fn shelf_books_fraction(&self) -> f32 {
+        self.shelf_books.width() / self.shelf_stage.width()
     }
 }
 
