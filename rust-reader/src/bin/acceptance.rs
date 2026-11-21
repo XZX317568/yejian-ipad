@@ -551,6 +551,22 @@ fn design_capture(
     Ok(())
 }
 
+/// Asserts a dialog card painted its surface fully opaque in `png`:
+/// a pixel inside the top-left padding must equal the light surface.
+fn assert_opaque_card(h: &Harness, png: &str, hitbox: &str) -> Result<()> {
+    let rect = h.app.hitboxes[hitbox];
+    let shot = image::open(h.output.join(png))?.to_rgba8();
+    let x = ((rect.left() + 12.) as u32).min(shot.width() - 1);
+    let y = ((rect.top() + 12.) as u32).min(shot.height() - 1);
+    let px = shot.get_pixel(x, y);
+    let surface = [255u8, 253, 249];
+    anyhow::ensure!(
+        (0..3).all(|i| (px[i] as i32 - surface[i] as i32).abs() <= 8),
+        "{png}: card is translucent at {x},{y}: {px:?} (expected {surface:?})"
+    );
+    Ok(())
+}
+
 fn design_read_clear_of_shelf(h: &Harness) -> Result<()> {
     let action = *h
         .app
@@ -896,6 +912,13 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
         "design: 存储 group rows are missing"
     );
     design_capture(h, "settings-storage", &mut captures)?;
+    // Every cleanup asks first; the confirm card is fully opaque.
+    h.click("storage-removed-clean")?;
+    h.frames(4)?;
+    design_capture(h, "settings-storage-confirm", &mut captures)?;
+    assert_opaque_card(h, "settings-storage-confirm.png", "storage-confirm-card")?;
+    h.click_text("取消")?;
+    h.frames(3)?;
     scroll_page(h, 1400.)?;
     h.frames(3)?;
     h.click_text("深色")?;
@@ -1967,6 +1990,7 @@ fn daily_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
         "daily: deleting a chapter did not ask for confirmation"
     );
     design_capture(h, "chapters-delete-confirm", &mut captures)?;
+    assert_opaque_card(h, "chapters-delete-confirm.png", "storage-confirm-card")?;
     h.click_text("取消")?;
     h.frames(3)?;
     h.click_text("关闭")?;

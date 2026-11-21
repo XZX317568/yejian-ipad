@@ -5406,35 +5406,73 @@ impl ReaderApp {
                 ),
             ),
         };
-        let response = Modal::new(Id::unique("storage-confirm")).show(ctx, |ui| {
-            ui.set_width((ctx.content_rect().width() - 56.).clamp(220., 420.));
-            ui.heading(title);
-            ui.label(copy);
-            ui.horizontal(|ui| {
-                if ui.button("取消").clicked() {
-                    self.storage_confirm = None;
-                }
-                let confirm = ui.add(crate::design::primary("删除", self.dark));
-                self.hitboxes
-                    .insert("storage-confirm-go".into(), confirm.rect);
-                if confirm.clicked() {
-                    match action {
-                        StorageConfirm::RemovedBooks => self.send(Command::PurgeRemoved),
-                        StorageConfirm::Staging => self.sources.clean_staging(),
-                        StorageConfirm::Covers => self.sources.clear_cover_cache(),
-                        StorageConfirm::Chapters(ids) => {
-                            self.send(Command::PurgeBooks(ids));
-                            self.chapter_selected.clear();
-                            self.chapter_manage = false;
-                        }
-                    }
-                    self.storage_confirm = None;
-                }
+        let screen = ctx.content_rect();
+        // Dim everything under the card and swallow the tap so it can only
+        // close the dialog — nothing beneath is clickable.
+        let scrim = Area::new(Id::unique("storage-confirm-scrim"))
+            .order(Order::Foreground)
+            .fade_in(false)
+            .interactable(true)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                ui.painter()
+                    .rect_filled(screen, 0., Color32::from_black_alpha(96));
+                ui.allocate_rect(screen, Sense::click())
             });
-        });
-        if response.should_close() {
+        if scrim.inner.clicked() {
             self.storage_confirm = None;
+            return;
         }
+        // fade_in(false) + surface fill: the card is opaque from the first
+        // frame, nothing behind it can bleed through.
+        let mut card_rect = Rect::NOTHING;
+        Area::new(Id::unique("storage-confirm"))
+            .order(Order::Foreground)
+            .fade_in(false)
+            .interactable(true)
+            .movable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                let frame = crate::design::surface(ui).show(ui, |ui| {
+                    ui.set_width(
+                        (screen.width() - 56.).clamp(220., 420.),
+                    );
+                    ui.heading(title);
+                    ui.label(copy);
+                    ui.add_space(6.);
+                    ui.horizontal(|ui| {
+                        if ui.button("取消").clicked() {
+                            self.storage_confirm = None;
+                        }
+                        let confirm =
+                            ui.add(crate::design::danger("删除", self.dark));
+                        self.hitboxes
+                            .insert("storage-confirm-go".into(), confirm.rect);
+                        if confirm.clicked() {
+                            match action {
+                                StorageConfirm::RemovedBooks => {
+                                    self.send(Command::PurgeRemoved)
+                                }
+                                StorageConfirm::Staging => {
+                                    self.sources.clean_staging()
+                                }
+                                StorageConfirm::Covers => {
+                                    self.sources.clear_cover_cache()
+                                }
+                                StorageConfirm::Chapters(ids) => {
+                                    self.send(Command::PurgeBooks(ids));
+                                    self.chapter_selected.clear();
+                                    self.chapter_manage = false;
+                                }
+                            }
+                            self.storage_confirm = None;
+                        }
+                    });
+                });
+                card_rect = frame.response.rect;
+            });
+        self.hitboxes
+            .insert("storage-confirm-card".into(), card_rect);
     }
     fn tracker_login_row(&mut self, ui: &mut Ui, tracker: crate::trackers::TrackerKind) {
         let idle = self.trackers.idle();

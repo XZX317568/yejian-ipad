@@ -558,6 +558,17 @@ pub(crate) fn primary(label: &str, dark: bool) -> Button<'_> {
         .wrap()
 }
 
+/// Destructive confirm action — danger fill, on_primary stays light on
+/// the dark red in light mode and dark on the pale red in dark mode.
+pub(crate) fn danger(label: &str, dark: bool) -> Button<'_> {
+    let p = palette(dark);
+    Button::new(RichText::new(label).color(p.on_primary))
+        .fill(p.danger)
+        .corner_radius(12)
+        .min_size(vec2(88., 48.))
+        .wrap()
+}
+
 pub(crate) fn toggle(ui: &mut Ui, value: &mut bool, title: &str, description: &str) -> bool {
     let p = palette(ui.visuals().dark_mode);
     let text_width = (ui.available_width() - 68.).max(80.);
@@ -635,6 +646,7 @@ mod tests {
                     (p.muted, p.surface, 4.5, "muted on surface"),
                     (p.muted, p.paper, 4.5, "muted on paper"),
                     (p.on_primary, p.primary, 4.5, "on_primary on primary"),
+                    (p.on_primary, p.danger, 4.5, "on_primary on danger"),
                     (p.accent, p.surface, 3., "accent on surface"),
                     (p.accent, p.paper, 3., "accent on paper"),
                 ] {
