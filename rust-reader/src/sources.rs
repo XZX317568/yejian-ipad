@@ -1551,6 +1551,10 @@ pub struct Sources {
     preview_mode: Option<String>,
     busy: bool,
     status: String,
+    /// When the current status string was first observed by the UI. Success
+    /// notices fade out four seconds later; errors stay until the next
+    /// action replaces them.
+    status_seen: Option<(String, std::time::Instant)>,
     tasks: Vec<DownloadTask>,
     running: Option<String>,
     ready: VecDeque<String>,
@@ -2547,6 +2551,7 @@ impl Clone for GlobalGroup {
 impl Sources {
     #[cfg(debug_assertions)]
     pub(crate) fn preview_community(&mut self) {
+        self.clear_status();
         self.url = COMMUNITY_INDEX.into();
         self.submit(Task::Fetch(COMMUNITY_INDEX.into()));
     }
@@ -2560,6 +2565,7 @@ impl Sources {
 
     #[cfg(debug_assertions)]
     pub(crate) fn preview_browser(&mut self, mode: &str) -> anyhow::Result<()> {
+        self.clear_status();
         // Only explicit debug snapshot/acceptance flags install this labelled,
 
         // local WASM fixture. Release apps never embed it.
@@ -2596,6 +2602,7 @@ impl Sources {
     /// search reports one success group and one failure group.
     #[cfg(debug_assertions)]
     pub(crate) fn preview_global_search(&mut self) -> anyhow::Result<()> {
+        self.clear_status();
         self.preview_browser("browse")?;
         let broken = self.root.join("sources/local.broken-acceptance");
         std::fs::create_dir_all(&broken)?;
@@ -2634,6 +2641,7 @@ impl Sources {
 
     #[cfg(debug_assertions)]
     pub(crate) fn preview_installed_source(&mut self, id: &str) -> anyhow::Result<()> {
+        self.clear_status();
         self.installed = SourceCatalog::new(self.root.join("sources")).list()?;
         anyhow::ensure!(
             self.installed.iter().any(|source| source.manifest.id == id),
@@ -2648,6 +2656,7 @@ impl Sources {
     /// so 我的追更 renders "自动下载中 N 章".
     #[cfg(debug_assertions)]
     pub(crate) fn preview_auto_download(&mut self) {
+        self.clear_status();
         // 我的追更 only renders on the sources root, not inside a source.
         self.selected_source.clear();
         self.selected_manga = None;
@@ -2701,6 +2710,7 @@ impl Sources {
     /// the 阅读足迹 page renders an 在线 row.
     #[cfg(debug_assertions)]
     pub(crate) fn preview_history(&mut self) {
+        self.clear_status();
         let manga = Manga {
             source_key: "local.filter-acceptance".into(),
             key: "fx-history-1".into(),
@@ -2729,6 +2739,7 @@ impl Sources {
     /// index so the list and language chips render.
     #[cfg(debug_assertions)]
     pub(crate) fn preview_sources_manage(&mut self) {
+        self.clear_status();
         self.selected_source.clear();
         self.selected_manga = None;
         for (id, name, version, languages) in [
@@ -2875,6 +2886,7 @@ impl Sources {
     /// one expanded row, the confirm card, or the finished new detail page.
     #[cfg(debug_assertions)]
     pub(crate) fn preview_migrate(&mut self, stage: &str) {
+        self.clear_status();
         let old = Manga {
             source_key: "local.filter-acceptance".into(),
             key: "fx-pop-1".into(),
@@ -3583,6 +3595,7 @@ impl Sources {
             preview_mode: None,
             busy: false,
             status: load_warning.clone().unwrap_or_default(),
+            status_seen: None,
             tasks,
             running: None,
             ready,
@@ -4771,6 +4784,7 @@ impl Sources {
     /// A paused online chapter with no staged pages — the acceptance
     /// share-disabled state needs bytes that never arrive.
     pub(crate) fn preview_share_stream(&mut self) -> Option<StreamChapter> {
+        self.clear_status();
         let manga = Manga {
             source_key: "acceptance".into(),
             key: "share-preview".into(),
@@ -7348,7 +7362,8 @@ impl Sources {
                 ui.set_max_width(ui.available_width());
                 design::section(ui, "书源设置");
                 ui.label(RichText::new("修改后返回书源即生效。").small());
-                if self.busy || !self.status.is_empty() {
+                let status_visible = self.status_fresh(ui.ctx());
+                if self.busy || status_visible {
                     ui.add(
                         Label::new(
                             RichText::new(&self.status)
@@ -7714,17 +7729,30 @@ impl Sources {
             title(ui);
             ui.add_enabled(!self.busy && !installed, action()).clicked()
         } else {
-            ui.horizontal(|ui| {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let clicked = ui.add_enabled(!self.busy && !installed, action()).clicked();
-                    ui.allocate_ui_with_layout(
-                        vec2(ui.available_width(), 0.),
-                        Layout::top_down(Align::Min),
-                        title,
-                    );
-                    clicked
-                })
-                .inner
+            // Manual two-slot row: title vertically centred on the left,
+            // ≥44pt action vertically centred on the right.
+            let line = ui.text_style_height(&TextStyle::Body);
+            let title_h =
+                (if metadata.is_empty() { line + 8. } else { line * 2. + 14. }).max(44.);
+            let (rect, _) = ui.allocate_exact_size(
+                vec2(ui.available_width(), title_h),
+                Sense::hover(),
+            );
+            let mut title_ui = ui.new_child(
+                UiBuilder::new()
+                    .max_rect(Rect::from_min_size(
+                        rect.min + vec2(0., (title_h - line * if metadata.is_empty() { 1. } else { 2. } - 8.) / 2.),
+                        vec2((rect.width() - 72.).max(40.), title_h),
+                    ))
+                    .layout(Layout::top_down(Align::Min)),
+            );
+            title(&mut title_ui);
+            let button = Rect::from_center_size(
+                pos2(rect.right() - 32., rect.center().y),
+                vec2(60., 44.),
+            );
+            ui.scope_builder(UiBuilder::new().max_rect(button), |ui| {
+                ui.add_enabled(!self.busy && !installed, action()).clicked()
             })
             .inner
         };
@@ -8765,6 +8793,58 @@ impl Sources {
         }
     }
 
+    /// How long a success notice stays on the status line before it fades.
+    const STATUS_TTL: std::time::Duration = std::time::Duration::from_secs(4);
+    /// Errors stay until the next action replaces them; everything else is
+    /// a transient success notice that fades after `STATUS_TTL`.
+    fn status_is_error(text: &str) -> bool {
+        [
+            "失败", "错误", "无法", "未安装", "已丢失", "已停止", "损坏", "过期", "被拒绝",
+            "超时", "请先", "暂不可", "不支持", "不正确",
+        ]
+        .iter()
+        .any(|mark| text.contains(mark))
+    }
+    /// True while the status line should render. Tracks when the current
+    /// string was first observed and schedules the repaint that fades it.
+    fn status_fresh(&mut self, ctx: &Context) -> bool {
+        if self.status.is_empty() {
+            self.status_seen = None;
+            return false;
+        }
+        let now = std::time::Instant::now();
+        if self.status_seen.as_ref().map(|(seen, _)| seen) != Some(&self.status) {
+            self.status_seen = Some((self.status.clone(), now));
+        }
+        if Self::status_is_error(&self.status) {
+            return true;
+        }
+        let elapsed = self
+            .status_seen
+            .as_ref()
+            .map(|(_, seen)| now.duration_since(*seen))
+            .unwrap_or_default();
+        if elapsed < Self::STATUS_TTL {
+            ctx.request_repaint_after(Self::STATUS_TTL - elapsed);
+            true
+        } else {
+            false
+        }
+    }
+    /// Leaving the sources tab drops transient success notices.
+    pub(crate) fn clear_transient_status(&mut self) {
+        if !Self::status_is_error(&self.status) {
+            self.status.clear();
+            self.status_seen = None;
+        }
+    }
+    /// A status string set by acceptance previews must not leak into the
+    /// next capture.
+    #[cfg(debug_assertions)]
+    pub(crate) fn clear_status(&mut self) {
+        self.status.clear();
+        self.status_seen = None;
+    }
     pub fn ui(&mut self, ui: &mut Ui) {
         self.hitboxes.clear();
         self.poll();
@@ -8802,8 +8882,9 @@ impl Sources {
         // clipping the last content line mid-glyph.
         // "正在加载…" is only honest while a request is in flight; a stale
         // copy left by a finished reply must not render a phantom footer.
-        let status_visible =
-            !self.status.is_empty() && (self.busy || self.status != "正在加载…");
+        let status_visible = self.status_fresh(ui.ctx())
+            && (self.busy || self.status != "正在加载…");
+
         let footer_height =
             if self.busy || self.failed.is_some() || status_visible {
                 40.
@@ -8823,9 +8904,12 @@ impl Sources {
             .show(ui, |ui| {
                 // Never let one long row stretch the page beyond the viewport; rows
 
-                // truncate or wrap inside this width instead.
+                // truncate or wrap inside this width instead. The floating
+                // scroll bar overlays the content — reserve a right gutter.
 
-                ui.set_max_width(ui.available_width());
+                ui.set_max_width(
+                    ui.available_width() - ui.spacing().scroll.bar_width - 8.,
+                );
                 if self.selected_manga.is_none() {
                     let unfinished: Vec<DownloadTask> = self
                         .tasks
@@ -9661,6 +9745,7 @@ mod tests {
             preview_mode: None,
             busy: false,
             status: String::new(),
+            status_seen: None,
             tasks: Vec::new(),
             running: None,
             ready: VecDeque::new(),

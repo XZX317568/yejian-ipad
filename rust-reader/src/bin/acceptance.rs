@@ -1570,6 +1570,18 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
     // or the row overshoots the safe area in both directions.
     scroll_until_row_visible(h, &resume, "继续")?;
     design_touch(h, &resume, Some("继续"))?;
+    // 移除 is a real quiet button with a ≥44pt hit area, not a text link.
+    let hide = h
+        .app
+        .hitboxes
+        .keys()
+        .find(|key| {
+            key.starts_with("history-hide-")
+                && h.app.hitboxes[*key].intersects(h.app.hitboxes[&resume])
+        })
+        .cloned()
+        .context("design: 移除 button is missing on the resume row")?;
+    design_touch(h, &hide, None)?;
     h.click(&resume)?;
     h.wait(ReaderApp::page_loaded)?;
     h.frame(vec![], None)?;

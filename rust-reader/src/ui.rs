@@ -3638,6 +3638,9 @@ impl ReaderApp {
                 )
                 .clicked();
             if clicked || row_clicked || text_clicked {
+                if tab != Tab::Sources {
+                    self.sources.clear_transient_status();
+                }
                 self.tab = tab;
                 self.screen = Screen::Library;
                 self.flight = None;
@@ -5781,8 +5784,11 @@ impl ReaderApp {
                 .show(ui, |ui| {
                     // egui hands the inner content an unconstrained max
                     // width here; clamp every child to the column so 320pt
-                    // splits never paint off-screen.
-                    ui.set_max_width(column.width());
+                    // splits never paint off-screen. The floating scroll
+                    // bar overlays the content, so reserve a right gutter.
+                    ui.set_max_width(
+                        column.width() - ui.spacing().scroll.bar_width - 8.,
+                    );
                     // Stats card: 今天/本周 minutes, streak, month chapters,
                     // painted 7-day bar chart.
                     crate::design::surface(ui).show(ui, |ui| {
@@ -5918,12 +5924,27 @@ impl ReaderApp {
                                 continue;
                             }
                             // The row continues reading; the action zone
-                            // (继续/移除) on the right is left to its widgets.
-                            let open = ui.interact(
+                            // (移除/继续) is left to its widgets. Narrow rows
+                            // stack the buttons at the bottom, so the open
+                            // area is everything above them.
+                            let button_y = if narrow {
+                                rect.bottom() - 58.
+                            } else {
+                                rect.center().y - 24.
+                            };
+                            let open_rect = if narrow {
                                 Rect::from_min_max(
                                     rect.min,
-                                    pos2(rect.right() - 110., rect.max.y),
-                                ),
+                                    pos2(rect.right(), button_y - 4.),
+                                )
+                            } else {
+                                Rect::from_min_max(
+                                    rect.min,
+                                    pos2(rect.right() - 180., rect.max.y),
+                                )
+                            };
+                            let open = ui.interact(
+                                open_rect,
                                 ui.scope_id().with(("history-row", &row.key)),
                                 Sense::click(),
                             );
@@ -5995,11 +6016,6 @@ impl ReaderApp {
                                     palette.accent,
                                 );
                             }
-                            let button_y = if narrow {
-                                rect.bottom() - 58.
-                            } else {
-                                rect.center().y - 24.
-                            };
                             let continue_clicked = self.button(
                                 ui,
                                 &format!("history-go-{}", row.key),
@@ -6024,30 +6040,19 @@ impl ReaderApp {
                                 }
                             }
                             // 从足迹移除 hides the row; progress is untouched
-                            // and a later read reappears it.
+                            // and a later read reappears it. A quiet button
+                            // in a fixed slot left of 继续.
                             let hide_rect = Rect::from_min_size(
-                                pos2(rect.right() - 60., rect.top() + 8.),
-                                vec2(52., 30.),
+                                pos2(rect.right() - 172., button_y),
+                                vec2(60., 48.),
                             );
-                            let hide = ui.interact(
+                            if self.button(
+                                ui,
+                                &format!("history-hide-{}", row.key),
                                 hide_rect,
-                                ui.scope_id().with(("history-hide", &row.key)),
-                                Sense::click(),
-                            );
-                            self.hitboxes
-                                .insert(format!("history-hide-{}", row.key), hide_rect);
-                            ui.painter().text(
-                                hide_rect.center(),
-                                Align2::CENTER_CENTER,
                                 "移除",
-                                FontId::proportional(12. * self.font_scale),
-                                if hide.hovered() {
-                                    palette.ink
-                                } else {
-                                    palette.muted
-                                },
-                            );
-                            if hide.clicked() {
+                                false,
+                            ) {
                                 self.history_hidden.insert(row.key.clone(), now);
                                 self.save_history_hidden();
                             }
