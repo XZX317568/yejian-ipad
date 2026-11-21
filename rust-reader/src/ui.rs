@@ -13,6 +13,18 @@ use std::{
 };
 use yejian_core::{Book, ChapterLink, ChapterMetadata};
 
+/// A destructive storage cleanup waiting on the 存储 confirm dialog.
+#[derive(Clone)]
+enum StorageConfirm {
+    /// Delete files of all removed books; rows + progress stay.
+    RemovedBooks,
+    /// Delete finished/failed/orphaned download staging.
+    Staging,
+    /// Delete the source cover cache (re-downloads on demand).
+    Covers,
+    /// Delete these downloaded chapter books (files + rows kept progress).
+    Chapters(Vec<String>),
+}
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Library,
@@ -275,6 +287,17 @@ pub struct ReaderApp {
     notice: Option<(String, f64)>,
     pending_notice: Option<String>,
     confirm_remove: bool,
+    /// 移出书架 confirm: also delete archive/cover files (default on).
+    remove_files: bool,
+    /// Library storage report for the 存储 settings group.
+    storage: Option<yejian_core::StorageReport>,
+    /// Re-requests storage numbers each time the settings tab opens.
+    storage_opened: bool,
+    /// Pending destructive storage action awaiting confirmation.
+    storage_confirm: Option<StorageConfirm>,
+    /// Chapter-picker manage mode: multi-select for deletion.
+    chapter_manage: bool,
+    chapter_selected: std::collections::HashSet<String>,
     import_text: String,
     backup_path: String,
     sources: crate::sources::Sources,
@@ -392,6 +415,12 @@ impl ReaderApp {
             notice: None,
             pending_notice: None,
             confirm_remove: false,
+            remove_files: true,
+            storage: None,
+            storage_opened: false,
+            storage_confirm: None,
+            chapter_manage: false,
+            chapter_selected: Default::default(),
             import_text: String::new(),
             backup_path,
             hitboxes: BTreeMap::new(),
@@ -1663,6 +1692,7 @@ impl ReaderApp {
                     }
                 }
                 Event::Notice(text) => self.pending_notice = Some(text),
+                Event::Storage(report) => self.storage = Some(report),
                 Event::Error(text) => self.error = Some(text),
                 Event::StartupError(text) => self.startup_error = Some(text),
                 Event::ProgressSaved { id, page, fraction } => {
@@ -2702,12 +2732,20 @@ impl ReaderApp {
                 });
             } else {
                 match self.screen.clone() {
-                    Screen::Library => match self.tab {
-                        Tab::Library => self.library_viewport(ui, content, now, entrance),
-                        Tab::History => self.history_ui(ui, content),
-                        Tab::Settings => self.settings_ui(ui, content),
-                        Tab::Sources => self.sources_ui(ui, content),
-                    },
+                    Screen::Library => {
+                        // Opening 设置 re-runs the storage scan once.
+                        if self.tab != Tab::Settings {
+                            self.storage_opened = false;
+                        }
+                        match self.tab {
+                            Tab::Library => {
+                                self.library_viewport(ui, content, now, entrance)
+                            }
+                            Tab::History => self.history_ui(ui, content),
+                            Tab::Settings => self.settings_ui(ui, content),
+                            Tab::Sources => self.sources_ui(ui, content),
+                        }
+                    }
                     Screen::Detail(id) => self.detail_ui(ui, content, &id),
                     _ => {}
                 }
@@ -3639,6 +3677,7 @@ impl ReaderApp {
                 false,
             ) {
                 self.confirm_remove = true;
+                self.remove_files = true;
             }
         }
     }
@@ -4919,6 +4958,11 @@ impl ReaderApp {
         });
     }
     fn settings_ui(&mut self, ui: &mut Ui, area: Rect) {
+        if !self.storage_opened {
+            self.storage_opened = true;
+            self.send(Command::StorageReport);
+            self.sources.request_storage();
+        }
         let palette = crate::design::palette(self.dark);
         let column = Self::page_column(area, 92., 88.);
         ui.scope_builder(UiBuilder::new().max_rect(column), |ui| {
@@ -5166,6 +5210,15 @@ impl ReaderApp {
                         .inner_margin(Margin::symmetric(2, 16))
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
+                            crate::design::section(ui, "存储");
+                            self.storage_group_ui(ui, palette);
+                        });
+                    ui.add_space(10.);
+                    ui.separator();
+                    Frame::new()
+                        .inner_margin(Margin::symmetric(2, 16))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
                             crate::design::section(ui, "书库与备份");
                             ui.horizontal_wrapped(|ui| {
                                 if ui.button("选择漫画文件").clicked() {
@@ -5248,6 +5301,140 @@ impl ReaderApp {
                     });
                 });
         });
+    }
+    /// The 存储 settings group: per-bucket sizes plus confirmed cleanups.
+    fn storage_group_ui(&mut self, ui: &mut Ui, palette: crate::design::Palette) {
+        let library = self.storage.clone();
+        let sources = self.sources.storage().cloned();
+        let total = library.as_ref().map(|r| r.total_bytes()).unwrap_or(0)
+            + sources.as_ref().map(|r| r.total_bytes()).unwrap_or(0);
+        ui.label(
+            RichText::new(format!("共 {}", Self::format_bytes(total))).strong(),
+        );
+        ui.add_space(8.);
+        let size = |bytes: Option<u64>| match bytes {
+            Some(bytes) => Self::format_bytes(bytes),
+            None => "统计中…".into(),
+        };
+        let mut row = |ui: &mut Ui, label: &str, bytes: Option<u64>, hitbox: Option<&str>| {
+            ui.horizontal(|ui| {
+                ui.label(label);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(RichText::new(size(bytes)).color(palette.muted));
+                    if let Some(key) = hitbox {
+                        let button = ui.add(Button::new("清理").min_size(vec2(64., 36.)));
+                        self.hitboxes.insert(key.into(), button.rect);
+                        if button.clicked() {
+                            self.storage_confirm = Some(match key {
+                                "storage-removed-clean" => StorageConfirm::RemovedBooks,
+                                "storage-staging-clean" => StorageConfirm::Staging,
+                                _ => StorageConfirm::Covers,
+                            });
+                        }
+                    }
+                });
+            });
+        };
+        row(ui, "书架漫画", library.as_ref().map(|r| r.shelf_bytes), None);
+        row(
+            ui,
+            "已移出的书",
+            library.as_ref().map(|r| r.removed_bytes),
+            Some("storage-removed-clean"),
+        );
+        let staging = sources
+            .as_ref()
+            .map(|r| r.staging_active + r.staging_done);
+        row(ui, "下载暂存", staging, Some("storage-staging-clean"));
+        row(
+            ui,
+            "封面缓存",
+            sources.as_ref().map(|r| r.covers),
+            Some("storage-covers-clean"),
+        );
+        ui.add_space(4.);
+        ui.label(
+            RichText::new("清理只删除文件，阅读进度与书架记录都会保留。")
+                .small()
+                .color(palette.muted),
+        );
+    }
+    /// Both storage workers have answered at least once.
+    #[cfg(debug_assertions)]
+    pub fn storage_ready(&self) -> bool {
+        self.storage.is_some() && self.sources.storage().is_some()
+    }
+    /// Human size like `1.2 GB`.
+    fn format_bytes(bytes: u64) -> String {
+        const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+        let mut value = bytes as f64;
+        let mut unit = 0;
+        while value >= 1024. && unit + 1 < UNITS.len() {
+            value /= 1024.;
+            unit += 1;
+        }
+        if unit == 0 {
+            format!("{bytes} B")
+        } else {
+            format!("{value:.1} {}", UNITS[unit])
+        }
+    }
+    /// Confirmation dialog for every destructive 存储 / chapter delete.
+    fn storage_confirm_ui(&mut self, ctx: &Context) {
+        let Some(action) = self.storage_confirm.clone() else {
+            return;
+        };
+        let (title, copy) = match &action {
+            StorageConfirm::RemovedBooks => (
+                "清理已移出的书",
+                "删除所有已移出书籍的漫画和封面文件。阅读进度保留，重新导入同一文件即可恢复。"
+                    .to_string(),
+            ),
+            StorageConfirm::Staging => (
+                "清理下载暂存",
+                "删除已完成或失败任务的暂存文件，进行中的下载不受影响。".to_string(),
+            ),
+            StorageConfirm::Covers => (
+                "清理封面缓存",
+                "删除书源封面缓存文件，封面会在需要时重新下载。".to_string(),
+            ),
+            StorageConfirm::Chapters(ids) => (
+                "删除已下载章节",
+                format!(
+                    "删除 {} 个已下载章节的文件。章节的阅读进度保留，重新下载可恢复。",
+                    ids.len()
+                ),
+            ),
+        };
+        let response = Modal::new(Id::unique("storage-confirm")).show(ctx, |ui| {
+            ui.set_width((ctx.content_rect().width() - 56.).clamp(220., 420.));
+            ui.heading(title);
+            ui.label(copy);
+            ui.horizontal(|ui| {
+                if ui.button("取消").clicked() {
+                    self.storage_confirm = None;
+                }
+                let confirm = ui.add(crate::design::primary("删除", self.dark));
+                self.hitboxes
+                    .insert("storage-confirm-go".into(), confirm.rect);
+                if confirm.clicked() {
+                    match action {
+                        StorageConfirm::RemovedBooks => self.send(Command::PurgeRemoved),
+                        StorageConfirm::Staging => self.sources.clean_staging(),
+                        StorageConfirm::Covers => self.sources.clear_cover_cache(),
+                        StorageConfirm::Chapters(ids) => {
+                            self.send(Command::PurgeBooks(ids));
+                            self.chapter_selected.clear();
+                            self.chapter_manage = false;
+                        }
+                    }
+                    self.storage_confirm = None;
+                }
+            });
+        });
+        if response.should_close() {
+            self.storage_confirm = None;
+        }
     }
     fn tracker_login_row(&mut self, ui: &mut Ui, tracker: crate::trackers::TrackerKind) {
         let idle = self.trackers.idle();
@@ -5750,43 +5937,122 @@ impl ReaderApp {
                 .map(|m| m.manga_title.clone())
                 .unwrap_or_else(|| "已下载章节".into());
             let chapters = self.chapters_for(&id);
+            // Keep only selections that still resolve to downloaded chapters.
+            let ids: std::collections::HashSet<String> =
+                chapters.iter().map(|book| book.id.clone()).collect();
+            self.chapter_selected.retain(|id| ids.contains(id));
+            if chapters.is_empty() {
+                self.chapter_manage = false;
+            }
             let response = Modal::new(Id::unique("chapter-picker")).show(ctx, |ui| {
                 ui.set_width((ctx.content_rect().width() - 56.).clamp(200., 460.));
-                ui.heading(title);
+                ui.horizontal(|ui| {
+                    ui.heading(title);
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            let manage =
+                                ui.button(if self.chapter_manage { "完成" } else { "管理" });
+                            self.hitboxes
+                                .insert("chapter-manage".into(), manage.rect);
+                            if manage.clicked() {
+                                self.chapter_manage = !self.chapter_manage;
+                                if !self.chapter_manage {
+                                    self.chapter_selected.clear();
+                                }
+                            }
+                        },
+                    );
+                });
                 ScrollArea::vertical().max_height(380.).show(ui, |ui| {
-                    for book in chapters {
+                    for book in &chapters {
                         let name = self
                             .chapter(&book.id)
                             .map(|m| m.chapter_title.clone())
                             .unwrap_or_else(|| book.title.clone());
-                        let label = format!(
-                            "{}{}\n第 {} / {} 页",
-                            if book.id == id {
-                                "正在阅读 · "
-                            } else {
-                                ""
-                            },
-                            name,
-                            book.current_page + 1,
-                            book.page_count
-                        );
-                        let response = ui.add_sized(
-                            [ui.available_width(), 58. * self.font_scale.sqrt()],
-                            Button::new(label).wrap(),
-                        );
-                        self.hitboxes
-                            .insert(format!("chapter-{}", book.id), response.rect);
-                        if response.clicked() {
-                            self.open_reader(&book);
+                        let done = book.last_read_at.is_some()
+                            && book.current_page + 1 >= book.page_count;
+                        if self.chapter_manage {
+                            let mut checked = self.chapter_selected.contains(&book.id);
+                            let label = format!("{}{}", name, if done { " · 已读完" } else { "" });
+                            let response = ui.checkbox(&mut checked, label);
+                            self.hitboxes
+                                .insert(format!("chapter-check-{}", book.id), response.rect);
+                            if response.changed() {
+                                if checked {
+                                    self.chapter_selected.insert(book.id.clone());
+                                } else {
+                                    self.chapter_selected.remove(&book.id);
+                                }
+                            }
+                        } else {
+                            let label = format!(
+                                "{}{}\n第 {} / {} 页",
+                                if book.id == id {
+                                    "正在阅读 · "
+                                } else {
+                                    ""
+                                },
+                                name,
+                                book.current_page + 1,
+                                book.page_count
+                            );
+                            let response = ui.add_sized(
+                                [ui.available_width(), 58. * self.font_scale.sqrt()],
+                                Button::new(label).wrap(),
+                            );
+                            self.hitboxes
+                                .insert(format!("chapter-{}", book.id), response.rect);
+                            if response.clicked() {
+                                self.open_reader(book);
+                            }
                         }
                     }
                 });
+                if self.chapter_manage {
+                    let finished: Vec<String> = chapters
+                        .iter()
+                        .filter(|book| {
+                            book.last_read_at.is_some()
+                                && book.current_page + 1 >= book.page_count
+                        })
+                        .map(|book| book.id.clone())
+                        .collect();
+                    ui.horizontal(|ui| {
+                        let delete_selected = ui.add_enabled(
+                            !self.chapter_selected.is_empty(),
+                            Button::new("删除所选"),
+                        );
+                        self.hitboxes
+                            .insert("chapter-delete".into(), delete_selected.rect);
+                        if delete_selected.clicked() {
+                            self.storage_confirm = Some(StorageConfirm::Chapters(
+                                self.chapter_selected.iter().cloned().collect(),
+                            ));
+                        }
+                        let delete_done = ui.add_enabled(
+                            !finished.is_empty(),
+                            Button::new("删除已读完的章节"),
+                        );
+                        self.hitboxes
+                            .insert("chapter-delete-done".into(), delete_done.rect);
+                        if delete_done.clicked() {
+                            self.storage_confirm =
+                                Some(StorageConfirm::Chapters(finished));
+                        }
+                    });
+                    ui.add_space(6.);
+                }
                 if ui.button("关闭").clicked() {
                     self.chapter_dialog = None;
+                    self.chapter_manage = false;
+                    self.chapter_selected.clear();
                 }
             });
             if response.should_close() {
                 self.chapter_dialog = None;
+                self.chapter_manage = false;
+                self.chapter_selected.clear();
             }
         }
         if let Some(text) = self.error.clone() {
@@ -5833,21 +6099,35 @@ impl ReaderApp {
                         .collect();
                     let local = self.selected.len() - online.len();
                     ui.label(if online.is_empty() {
-                        format!("将 {} 本书移出书架。原漫画文件保留。", self.selected.len())
+                        if self.remove_files {
+                            format!("将 {} 本书移出书架并删除文件。阅读进度保留。", self.selected.len())
+                        } else {
+                            format!("将 {} 本书移出书架。原漫画文件保留。", self.selected.len())
+                        }
                     } else if local == 0 {
                         format!(
                             "将 {} 部作品移出书架。会取消追更，已下载的章节不受影响。",
                             online.len()
                         )
                     } else {
-                        "本地漫画文件保留；在线作品会取消追更，已下载的章节不受影响。".into()
+                        "在线作品会取消追更；本地章节的文件处理见下方选项。".into()
                     });
+                    if local > 0 {
+                        let checkbox = ui.checkbox(&mut self.remove_files, "同时删除文件");
+                        self.hitboxes
+                            .insert("remove-files".into(), checkbox.rect);
+                    }
                     ui.horizontal(|ui| {
                         if ui.button("取消").clicked() {
                             self.confirm_remove = false;
                         }
                         if ui.button("移出").clicked() {
-                            self.send(Command::Remove(self.selected_books()));
+                            let local_ids = self.selected_books();
+                            if self.remove_files {
+                                self.send(Command::PurgeBooks(local_ids));
+                            } else {
+                                self.send(Command::Remove(local_ids));
+                            }
                             for id in online {
                                 if let Some((source, manga)) = Self::online_parts(&id) {
                                     self.sources.unfollow(source, manga);
@@ -5855,10 +6135,12 @@ impl ReaderApp {
                             }
                             self.selected.clear();
                             self.confirm_remove = false;
+                            self.remove_files = true;
                         }
                     });
                 });
         }
+        self.storage_confirm_ui(ctx);
         if let Some(key) = self.track_panel.clone() {
             let response = Modal::new(Id::unique("track-panel")).show(ctx, |ui| {
                 ui.set_width((ctx.content_rect().width() - 48.).clamp(220., 460.));

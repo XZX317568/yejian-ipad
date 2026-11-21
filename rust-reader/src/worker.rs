@@ -35,6 +35,12 @@ pub enum Command {
     Setting(String, String),
     Category(Vec<String>, String),
     Remove(Vec<String>),
+    /// Storage sizes for the 存储 settings group.
+    StorageReport,
+    /// Delete archive/cover files + soft-remove, progress kept.
+    PurgeBooks(Vec<String>),
+    /// Delete files of every removed book; rows stay.
+    PurgeRemoved,
     Backup(PathBuf),
     Restore(PathBuf),
     Flush(mpsc::Sender<Result<(), String>>),
@@ -55,6 +61,7 @@ pub enum Event {
         result: Result<DecodedPage, String>,
     },
     Notice(String),
+    Storage(yejian_core::StorageReport),
     Error(String),
     StartupError(String),
     BackupReady(PathBuf),
@@ -312,6 +319,27 @@ impl Worker {
                                     library.list_books("")?,
                                     library.list_chapter_links()?,
                                 ));
+                            }
+                            Command::StorageReport => {
+                                notify(Event::Storage(library.storage_report()?));
+                            }
+                            Command::PurgeBooks(ids) => {
+                                for id in ids {
+                                    library.purge_book(&id)?;
+                                }
+                                notify(Event::Library(
+                                    library.list_books("")?,
+                                    library.list_chapter_links()?,
+                                ));
+                                notify(Event::Storage(library.storage_report()?));
+                            }
+                            Command::PurgeRemoved => {
+                                library.purge_removed()?;
+                                notify(Event::Library(
+                                    library.list_books("")?,
+                                    library.list_chapter_links()?,
+                                ));
+                                notify(Event::Storage(library.storage_report()?));
                             }
                             Command::Backup(path) => {
                                 wait_for_positions()?;

@@ -883,6 +883,21 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
         );
     }
     design_capture(h, "design-settings", &mut captures)?;
+    // Round 3: the 存储 group reports managed bytes with confirmed cleanups.
+    h.wait(ReaderApp::storage_ready)?;
+    for _ in 0..5 {
+        if design_label_visible(h, "书架漫画") && design_label_visible(h, "封面缓存") {
+            break;
+        }
+        scroll_page(h, -800.)?;
+    }
+    anyhow::ensure!(
+        design_label_visible(h, "书架漫画") && design_label_visible(h, "封面缓存"),
+        "design: 存储 group rows are missing"
+    );
+    design_capture(h, "settings-storage", &mut captures)?;
+    scroll_page(h, 1400.)?;
+    h.frames(3)?;
     h.click_text("深色")?;
     h.frames(5)?;
     h.click("nav-library")?;
@@ -1938,7 +1953,23 @@ fn daily_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
         "daily: chapter picker allowed navigation behind the popup"
     );
     design_capture(h, "daily-chapter-picker", &mut captures)?;
-    h.key(Key::BrowserBack)?;
+    // Round 3: manage mode multi-selects chapters and confirms deletion —
+    // cancel here keeps the fixture books for the remaining captures.
+    h.click("chapter-manage")?;
+    h.frames(4)?;
+    h.click(&format!("chapter-check-{}", two.id))?;
+    h.frames(3)?;
+    design_capture(h, "chapters-delete", &mut captures)?;
+    h.click("chapter-delete")?;
+    h.frames(4)?;
+    anyhow::ensure!(
+        h.app.hitboxes.contains_key("storage-confirm-go"),
+        "daily: deleting a chapter did not ask for confirmation"
+    );
+    design_capture(h, "chapters-delete-confirm", &mut captures)?;
+    h.click_text("取消")?;
+    h.frames(3)?;
+    h.click_text("关闭")?;
     h.frames(4)?;
     anyhow::ensure!(
         h.app.screen_name() == "reader",
