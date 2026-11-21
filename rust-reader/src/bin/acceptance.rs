@@ -2499,7 +2499,11 @@ fn main() -> Result<()> {
     h.size = [844, 390];
     h.frames(3)?;
     let screen = Rect::from_min_size(Pos2::ZERO, vec2(844., 390.));
-    anyhow::ensure!(screen.contains_rect(h.app.hitboxes["shelf-read"]));
+    anyhow::ensure!(
+        screen.contains_rect(h.app.hitboxes["shelf-read"]),
+        "landscape shelf-read {:?} outside {screen:?}",
+        h.app.hitboxes["shelf-read"]
+    );
     h.frame(vec![], Some("phone-landscape-shelf"))?;
     h.click("shelf-center")?;
     h.frames(65)?;

@@ -2296,6 +2296,7 @@ impl ReaderApp {
         // collection label, and to a third when it cannot share the
         // stacked second row with the category button.
         let sort_second_row = !stacked_header
+            && !short_landscape
             && 24. + 140. * self.font_scale + 12. + sort_w + 10. + category_width + 24.
                 > area.width();
         let sort_third_row = stacked_header
@@ -2354,7 +2355,8 @@ impl ReaderApp {
             let row = (24. * self.font_scale + 20.).max(44.);
             let avail =
                 self.shelf_viewport.height() - top - 20. - row - self.shelf_reserve - 12.;
-            let collapsed_side_by_side = side_by_side && avail < width * 0.78;
+            let collapsed_side_by_side =
+                side_by_side && (short_landscape || avail < width * 0.78);
             let (stage, books) = if collapsed_side_by_side {
                 let stage_h = avail.clamp(height, 760.);
                 let stage = Rect::from_min_size(stage.min, vec2(width, stage_h));
@@ -2364,8 +2366,11 @@ impl ReaderApp {
                 );
                 (stage, books)
             } else {
+                // The info column keeps its content height so the action row
+                // never paints over the toggle; the books shrink to make room
+                // and the page scrolls for the toggle if it still overflows.
                 let info_h = 172. + 112. * (self.font_scale - 1.);
-                let books_h = (avail - info_h).clamp(212., 600.);
+                let books_h = (avail - info_h).clamp(80., 600.);
                 let stage_h = books_h + info_h;
                 let stage = Rect::from_min_size(stage.min, vec2(width, stage_h));
                 let books = Rect::from_min_size(
@@ -3013,7 +3018,11 @@ impl ReaderApp {
             let palette = crate::design::palette(self.dark);
             let row_h = (24. * self.font_scale + 20.).max(44.);
             let sort_w = 150. * self.font_scale + 40.;
+            let margin = if area.width() >= 700. { 32. } else { 16. };
+            let short = (area.width() - margin * 2.).min(1200.) >= 660.
+                && self.shelf_viewport.height() < 600.;
             let sort_second_row = !stacked
+                && !short
                 && 24. + 140. * self.font_scale + 12. + sort_w + 10. + category_width
                     + 24.
                     > area.width();

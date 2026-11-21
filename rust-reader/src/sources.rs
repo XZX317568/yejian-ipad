@@ -3971,6 +3971,102 @@ impl Sources {
     pub(crate) fn take_scope_change(&mut self) -> Option<String> {
         self.scope_dirty.take()
     }
+    /// Width of the two-segment scope control, so the search row can budget.
+    fn scope_segment_width(&self, ui: &Ui) -> f32 {
+        let font = TextStyle::Body.resolve(ui.style());
+        let mut widest = 0f32;
+        for label in ["当前书源", "全部书源"] {
+            let galley = ui.painter().layout_no_wrap(
+                label.into(),
+                font.clone(),
+                Color32::BLACK,
+            );
+            widest = widest.max(galley.size().x);
+        }
+        (widest + 28.) * 2.
+    }
+    /// Joined two-segment toggle: selected segment is soft-filled and stroked.
+    fn scope_segment(&mut self, ui: &mut Ui) {
+        let palette = design::palette(ui.visuals().dark_mode);
+        let font = TextStyle::Body.resolve(ui.style());
+        let width = self.scope_segment_width(ui);
+        let (rect, _) = ui.allocate_exact_size(vec2(width, 44.), Sense::hover());
+        let seg_w = width / 2.;
+        let mut choose = None;
+        for (index, (scope, label)) in
+            [("current", "当前书源"), ("global", "全部书源")].iter().enumerate()
+        {
+            let seg = Rect::from_min_size(
+                rect.min + vec2(index as f32 * seg_w, 0.),
+                vec2(seg_w, 44.),
+            );
+            let hit = ui.interact(
+                seg,
+                ui.scope_id().with(("search-scope", index)),
+                Sense::click(),
+            );
+            hit.widget_info(|| WidgetInfo::labeled(Role::Button, true, *label));
+            self.hitboxes.insert(format!("scope-{scope}"), seg);
+            let selected = self.search_scope == *scope;
+            let painter = ui.painter();
+            if selected {
+                painter.rect_filled(seg, 10., palette.soft);
+                painter.rect_stroke(
+                    seg,
+                    10.,
+                    Stroke::new(1.5, palette.ink),
+                    StrokeKind::Inside,
+                );
+            } else if hit.hovered() {
+                painter.rect_filled(seg, 10., palette.soft);
+            }
+            let color = if selected { palette.ink } else { palette.muted };
+            painter.text(
+                seg.center(),
+                Align2::CENTER_CENTER,
+                *label,
+                font.clone(),
+                color,
+            );
+            if hit.clicked() {
+                choose = Some(*scope);
+            }
+        }
+        ui.painter().vline(
+            rect.center().x,
+            rect.shrink(10.).y_range(),
+            Stroke::new(1., palette.line),
+        );
+        ui.painter().rect_stroke(
+            rect,
+            10.,
+            Stroke::new(1., palette.line),
+            StrokeKind::Inside,
+        );
+        if let Some(scope) = choose {
+            self.choose_scope(scope);
+        }
+    }
+    /// Short Chinese reason for a global-search failure, plus whether the
+    /// existing web-verification flow applies.
+    fn global_error_label(reason: &str) -> (&'static str, bool) {
+        if reason == "超时" {
+            ("超时", false)
+        } else if reason.contains("cloudflare")
+            || reason.contains("Cloudflare")
+            || reason.contains("verify")
+            || reason.contains("验证")
+        {
+            ("需要网页验证", true)
+        } else if reason.contains("load")
+            || reason.contains("加载")
+            || reason.contains("WebAssembly")
+        {
+            ("书源无法加载", false)
+        } else {
+            ("网络错误", false)
+        }
+    }
     /// Fires one search per installed source; results stream back by group.
     fn global_search(&mut self) {
         self.listing = None;
@@ -4963,14 +5059,18 @@ impl Sources {
                 if ui.add(quiet_action("‹ 我的书源")).clicked() {
                     self.select_source("");
                 }
-                let name = self
-                    .installed
-                    .iter()
-                    .find(|source| source.manifest.id == self.selected_source)
-                    .map(|source| source.manifest.name.as_str())
-                    .unwrap_or("");
+                let name = if self.global_mode() {
+                    "全部书源".to_string()
+                } else {
+                    self.installed
+                        .iter()
+                        .find(|source| source.manifest.id == self.selected_source)
+                        .map(|source| source.manifest.name.clone())
+                        .unwrap_or_default()
+                };
                 ui.add(Label::new(RichText::new(name).strong().color(palette.ink)).wrap());
-                if !self.selected_source.is_empty()
+                if !self.global_mode()
+                    && !self.selected_source.is_empty()
                     && !self.current_settings().is_empty()
                     && ui.add(quiet_action("书源设置")).clicked()
                 {
@@ -4981,7 +5081,8 @@ impl Sources {
                     .iter()
                     .find(|source| source.manifest.id == self.selected_source)
                     .and_then(|source| source.manifest.primary_url().map(str::to_string));
-                if let Some(site) = site.filter(|_| cfg!(target_os = "ios")) {
+                if let Some(site) = site.filter(|_| cfg!(target_os = "ios") && !self.global_mode())
+                {
                     if ui.add(quiet_action("网页验证")).clicked() {
                         self.open_web(&site, None);
                     }
@@ -4991,22 +5092,36 @@ impl Sources {
                 return;
             }
             ui.add_space(2.);
-            let input = ui.add(
-                TextEdit::singleline(&mut self.query)
-                    .hint_text("在此书源搜索漫画")
-                    .desired_width(ui.available_width()),
-            );
-            let enter = input.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
-            self.hitboxes.insert("source-search".into(), input.rect);
+            let narrow = ui.available_width() < 520.;
+            let mut enter = false;
+            if narrow {
+                let input = ui.add(
+                    TextEdit::singleline(&mut self.query)
+                        .hint_text("搜索漫画")
+                        .desired_width(ui.available_width()),
+                );
+                enter = input.lost_focus()
+                    && ui.input(|input| input.key_pressed(Key::Enter));
+                self.hitboxes.insert("source-search".into(), input.rect);
+            }
             ui.horizontal_wrapped(|ui| {
-                for (scope, label) in [("current", "当前书源"), ("global", "全部书源")] {
-                    let selected = self.search_scope == scope;
-                    if ui.selectable_label(selected, label).clicked() {
-                        self.choose_scope(scope);
-                    }
+                if !narrow {
+                    let rest = self.scope_segment_width(ui)
+                        + 12.
+                        + (56. + 16.) // 搜索 button + spacing
+                        ;
+                    let input = ui.add(
+                        TextEdit::singleline(&mut self.query)
+                            .hint_text("搜索漫画")
+                            .desired_width(
+                                (ui.available_width() - rest).max(120.),
+                            ),
+                    );
+                    enter = input.lost_focus()
+                        && ui.input(|input| input.key_pressed(Key::Enter));
+                    self.hitboxes.insert("source-search".into(), input.rect);
                 }
-            });
-            ui.horizontal_wrapped(|ui| {
+                self.scope_segment(ui);
                 if ui
                     .add_enabled(
                         self.metadata_loaded,
@@ -5017,6 +5132,8 @@ impl Sources {
                 {
                     self.start_search();
                 }
+            });
+            ui.horizontal_wrapped(|ui| {
                 if !self.global_mode() {
                     let hidden = self.filters_hidden();
                     let label = if self.applied_filters.is_empty() {
@@ -5050,24 +5167,29 @@ impl Sources {
             {
                 ui.label("此书源未提供筛选选项。");
             }
-            if let Some(error) = self.filter_error.clone() {
+            if !self.global_mode()
+                && let Some(error) = self.filter_error.clone()
+            {
                 disclosure(ui, "部分筛选未能加载 · 查看原因", false, |ui| {
                     ui.add(Label::new(error).wrap());
                 });
             }
-            if let Some(error) = self.listing_error.clone() {
+            if !self.global_mode()
+                && let Some(error) = self.listing_error.clone()
+            {
                 disclosure(ui, "部分列表未能加载 · 查看原因", false, |ui| {
                     ui.add(Label::new(error).wrap());
                 });
             }
-            if (self.filter_error.is_some() || self.listing_error.is_some())
+            if !self.global_mode()
+                && (self.filter_error.is_some() || self.listing_error.is_some())
                 && ui
                     .add_enabled(!self.busy, quiet_action("重新加载书源选项"))
                     .clicked()
             {
                 self.submit(Task::Metadata(self.selected_source.clone()));
             }
-            if self.listings.len() > 4 {
+            if !self.global_mode() && self.listings.len() > 4 {
                 let label = self
                     .listings
                     .iter()
@@ -5095,7 +5217,7 @@ impl Sources {
                         self.start_search();
                     }
                 }
-            } else {
+            } else if !self.global_mode() {
                 ui.horizontal_wrapped(|ui| {
                     if ui
                         .add_enabled(
@@ -5124,7 +5246,7 @@ impl Sources {
                     }
                 });
             }
-            if self.listing.is_some() && !self.applied_filters.is_empty() {
+            if !self.global_mode() && self.listing.is_some() && !self.applied_filters.is_empty() {
                 ui.label("当前显示书源列表；应用筛选后切换到搜索结果。");
             }
         });
@@ -6424,6 +6546,7 @@ impl Sources {
             TextStyle::Heading.resolve(ui.style()),
             &palette,
         );
+        let body_h = ui.text_style_height(&TextStyle::Body);
         let mut title_job = egui::text::LayoutJob::simple(
             manga.title.clone(),
             TextStyle::Body.resolve(ui.style()),
@@ -6437,6 +6560,31 @@ impl Sources {
             title_galley,
             palette.ink,
         );
+        let meta = manga
+            .authors
+            .as_ref()
+            .filter(|values| !values.is_empty())
+            .map(|values| values.join(" / "))
+            .or_else(|| {
+                manga
+                    .tags
+                    .as_ref()
+                    .and_then(|values| values.first().cloned())
+            })
+            .unwrap_or_default();
+        let mut meta_job = egui::text::LayoutJob::simple(
+            meta,
+            TextStyle::Small.resolve(ui.style()),
+            palette.muted,
+            cell.width(),
+        );
+        meta_job.wrap.max_rows = 1;
+        let meta_galley = painter.layout_job(meta_job);
+        painter.galley(
+            pos2(cell.left(), cover_rect.bottom() + 6. + body_h * 2. + 2.),
+            meta_galley,
+            palette.muted,
+        );
     }
 
     /// 全部书源 results: one group per installed source, covers in a row.
@@ -6446,7 +6594,18 @@ impl Sources {
         let mut open = None;
         let mut dive = None;
         let mut retry = None;
-        for (g, group) in self.global_groups.clone().iter().enumerate() {
+        // Results with entries first (installed order), then still-searching,
+        // empty groups, and failures last — stable while events stream in.
+        let mut order: Vec<usize> = (0..self.global_groups.len()).collect();
+        let rank = |state: &GlobalState| match state {
+            GlobalState::Done(entries) if !entries.is_empty() => 0,
+            GlobalState::Searching => 1,
+            GlobalState::Done(_) => 2,
+            GlobalState::Failed(_) => 3,
+        };
+        order.sort_by_key(|index| rank(&self.global_groups[*index].state));
+        for g in order {
+            let group = self.global_groups[g].clone();
             let name = self
                 .installed
                 .iter()
@@ -6462,8 +6621,19 @@ impl Sources {
                         );
                         continue;
                     }
+                    // Section-size header; the chevron stays muted at the
+                    // right edge and the label wraps before it ever clips.
+                    let size = ui.text_style_height(&TextStyle::Body) * 17. / 15.;
+                    let font = FontId::proportional(size);
+                    let galley = ui.painter().layout(
+                        format!("{name} · {} 条", entries.len()),
+                        font.clone(),
+                        palette.ink,
+                        ui.available_width() - size - 16.,
+                    );
+                    let row_h = (galley.size().y + 14.).max(44.);
                     let (rect, _) = ui.allocate_exact_size(
-                        vec2(ui.available_width(), 44.),
+                        vec2(ui.available_width(), row_h),
                         Sense::hover(),
                     );
                     let hit = ui.interact(
@@ -6485,20 +6655,29 @@ impl Sources {
                     if hit.clicked() {
                         dive = Some(group.source.clone());
                     }
-                    ui.painter().text(
-                        rect.left_center(),
-                        Align2::LEFT_CENTER,
-                        format!("{name} · {} 条 ›", entries.len()),
-                        TextStyle::Heading.resolve(ui.style()),
+                    ui.painter().galley(
+                        rect.left_center() - vec2(0., galley.size().y / 2.),
+                        galley,
                         palette.ink,
+                    );
+                    ui.painter().text(
+                        pos2(rect.right() - size * 0.5, rect.center().y),
+                        Align2::CENTER_CENTER,
+                        "›",
+                        font,
+                        palette.muted,
                     );
                     let gap = 12.;
                     let cell_w = 120_f32.min(ui.available_width());
                     let cover_h = cell_w * 1.5;
+                    // Same cell recipe as the results grid: 2-line title plus
+                    // a one-line meta row under the cover.
                     let cell_h = cover_h
                         + 6.
                         + ui.text_style_height(&TextStyle::Body) * 2.
-                        + 4.;
+                        + 2.
+                        + ui.text_style_height(&TextStyle::Small)
+                        + 6.;
                     ScrollArea::horizontal()
                         .id_salt(("global-row", g))
                         .max_height(cell_h + 16.)
@@ -6533,23 +6712,26 @@ impl Sources {
                     ui.label(format!("{name} · 搜索中…"));
                 }
                 GlobalState::Failed(reason) => {
+                    let (label, verify) = Self::global_error_label(reason);
                     ui.add_space(6.);
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new(format!("{name} · {reason}")).color(palette.muted));
+                        ui.label(RichText::new(format!("{name} · {label}")).color(palette.muted));
+                        if verify && ui.add(quiet_action("网页验证")).clicked() {
+                            self.open_web(&group.source.clone(), None);
+                        }
                         if ui.add(quiet_action("重试")).clicked() {
                             retry = Some(group.source.clone());
                         }
-                        if reason.contains("cloudflare")
-                            || reason.contains("验证")
-                        {
-                            if ui
-                                .add(quiet_action("网页验证"))
-                                .clicked()
-                            {
-                                self.open_web(&group.source.clone(), None);
-                            }
-                        }
                     });
+                    // Raw error as a single muted, ellipsised line.
+                    let mut job = egui::text::LayoutJob::simple(
+                        reason.clone(),
+                        TextStyle::Small.resolve(ui.style()),
+                        palette.muted,
+                        ui.available_width(),
+                    );
+                    job.wrap.max_rows = 1;
+                    ui.add(Label::new(job).selectable(false));
                 }
             }
         }
