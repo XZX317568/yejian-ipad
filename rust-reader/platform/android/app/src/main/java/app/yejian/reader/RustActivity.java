@@ -1038,6 +1038,55 @@ public class RustActivity extends NativeActivity {
         nativeImportFinished();
     }
 
+    /**
+     * Toggles {@code FLAG_KEEP_SCREEN_ON} on the activity window. Runs on the
+     * UI thread; a null activity is a no-op so Rust can call it any time.
+     */
+    public static void setKeepAwake(boolean awake) {
+        RustActivity activity = instance;
+        if (activity == null) {
+            return;
+        }
+        activity.runOnUiThread(() -> {
+            try {
+                if (awake) {
+                    activity.getWindow().addFlags(
+                            android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                } else {
+                    activity.getWindow().clearFlags(
+                            android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                }
+            } catch (Throwable error) {
+                Log.w(TAG, "setKeepAwake failed", error);
+            }
+        });
+    }
+
+    /**
+     * Battery charge in percent (0–100), or -1 when the device cannot report
+     * one. {@code BATTERY_PROPERTY_CAPACITY} is a cheap system read, safe to
+     * call from any thread.
+     */
+    public static float batteryLevel() {
+        RustActivity activity = instance;
+        if (activity == null) {
+            return -1f;
+        }
+        try {
+            android.os.BatteryManager manager =
+                    (android.os.BatteryManager) activity.getSystemService(
+                            android.content.Context.BATTERY_SERVICE);
+            if (manager == null) {
+                return -1f;
+            }
+            int level = manager.getIntProperty(
+                    android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY);
+            return level < 0 ? -1f : level;
+        } catch (Throwable error) {
+            return -1f;
+        }
+    }
+
     private static String describe(Throwable error) {
         String message = error.getMessage();
         return message == null || message.isEmpty()

@@ -38,15 +38,20 @@ pub fn configure_fonts(ctx: &egui::Context) {
 fn text_styles(scale: f32) -> std::collections::BTreeMap<egui::TextStyle, egui::FontId> {
     let mut fonts = egui::Style::default().text_styles;
     for (style, size) in [
-        (egui::TextStyle::Body, 17.),
-        (egui::TextStyle::Button, 16.),
-        (egui::TextStyle::Heading, 23.),
-        (egui::TextStyle::Small, 13.),
+        (egui::TextStyle::Body, 15.),
+        (egui::TextStyle::Button, 15.),
+        (egui::TextStyle::Heading, 28.),
+        (egui::TextStyle::Small, 12.5),
         (egui::TextStyle::Monospace, 15.),
     ] {
         let font = fonts.get_mut(&style).expect("standard text style");
         font.size = size * scale;
     }
+    // Page titles use the serif title face; section headers stay sans.
+    fonts
+        .get_mut(&egui::TextStyle::Heading)
+        .expect("standard text style")
+        .family = egui::FontFamily::Name("reading-title".into());
     fonts
 }
 

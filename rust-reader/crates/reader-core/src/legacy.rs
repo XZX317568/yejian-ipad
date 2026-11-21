@@ -311,7 +311,8 @@ impl Library {
                 .execute(
                     "UPDATE books
                      SET title = ?1, author = ?2, category = ?3, current_page = ?4,
-                         page_fraction = ?5, last_read_at = ?6, updated_at = ?7, progress_at = ?8
+                         page_fraction = ?5, last_read_at = ?6, updated_at = ?7, progress_at = ?8,
+                         added_at = ?7
                      WHERE id = ?9",
                     params![
                         title,

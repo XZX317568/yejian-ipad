@@ -35,6 +35,12 @@ pub enum Command {
     Setting(String, String),
     Category(Vec<String>, String),
     Remove(Vec<String>),
+    /// Storage sizes for the 存储 settings group.
+    StorageReport,
+    /// Delete archive/cover files + soft-remove, progress kept.
+    PurgeBooks(Vec<String>),
+    /// Delete files of every removed book; rows stay.
+    PurgeRemoved,
     Backup(PathBuf),
     Restore(PathBuf),
     Flush(mpsc::Sender<Result<(), String>>),
@@ -55,6 +61,7 @@ pub enum Event {
         result: Result<DecodedPage, String>,
     },
     Notice(String),
+    Storage(yejian_core::StorageReport),
     Error(String),
     StartupError(String),
     BackupReady(PathBuf),
@@ -313,6 +320,27 @@ impl Worker {
                                     library.list_chapter_links()?,
                                 ));
                             }
+                            Command::StorageReport => {
+                                notify(Event::Storage(library.storage_report()?));
+                            }
+                            Command::PurgeBooks(ids) => {
+                                for id in ids {
+                                    library.purge_book(&id)?;
+                                }
+                                notify(Event::Library(
+                                    library.list_books("")?,
+                                    library.list_chapter_links()?,
+                                ));
+                                notify(Event::Storage(library.storage_report()?));
+                            }
+                            Command::PurgeRemoved => {
+                                library.purge_removed()?;
+                                notify(Event::Library(
+                                    library.list_books("")?,
+                                    library.list_chapter_links()?,
+                                ));
+                                notify(Event::Storage(library.storage_report()?));
+                            }
                             Command::Backup(path) => {
                                 wait_for_positions()?;
                                 let report = library.export_backup(&path)?;
@@ -534,6 +562,7 @@ fn read_settings(library: &Library) -> anyhow::Result<Vec<(String, String)>> {
     let mut settings = Vec::new();
     for key in [
         "theme",
+        "palette",
         "reduce-motion",
         "reading-direction",
         "private",
@@ -543,7 +572,13 @@ fn read_settings(library: &Library) -> anyhow::Result<Vec<(String, String)>> {
         "reader-fit",
         "reader-brightness",
         "reader-spread-offset",
+        "keep-awake",
+        "tap-zones",
+        "reader-status",
         "follow-interval",
+        "shelf-grid",
+        "shelf-sort",
+        "search-scope",
     ] {
         if let Some(value) = library.get_setting(key)? {
             settings.push((key.to_string(), value));
@@ -1059,7 +1094,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let original = yejian_core::Library::open(&tmp.path().join("original")).unwrap();
         original.set_setting("theme", "dark").unwrap();
+        original.set_setting("palette", "sepia").unwrap();
+        original.set_setting("shelf-grid", "open").unwrap();
+        original.set_setting("shelf-sort", "progress").unwrap();
+        original.set_setting("search-scope", "global").unwrap();
         original.set_setting("reading-direction", "rtl").unwrap();
+        original.set_setting("keep-awake", "false").unwrap();
+        original.set_setting("tap-zones", "next").unwrap();
+        original.set_setting("reader-status", "false").unwrap();
         let backup = tmp.path().join("settings.zip");
         original.export_backup(&backup).unwrap();
         let worker = super::Worker::start(tmp.path().join("destination"), egui::Context::default());
@@ -1072,7 +1114,14 @@ mod tests {
         match worker.rx.recv_timeout(deadline).unwrap() {
             super::Event::Ready(_, settings, _) => {
                 assert!(settings.contains(&("theme".into(), "dark".into())));
+                assert!(settings.contains(&("palette".into(), "sepia".into())));
+                assert!(settings.contains(&("shelf-grid".into(), "open".into())));
+                assert!(settings.contains(&("shelf-sort".into(), "progress".into())));
+                assert!(settings.contains(&("search-scope".into(), "global".into())));
                 assert!(settings.contains(&("reading-direction".into(), "rtl".into())));
+                assert!(settings.contains(&("keep-awake".into(), "false".into())));
+                assert!(settings.contains(&("tap-zones".into(), "next".into())));
+                assert!(settings.contains(&("reader-status".into(), "false".into())));
             }
             _ => panic!("restore must refresh settings together with the library"),
         }

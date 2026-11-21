@@ -86,6 +86,66 @@ impl Volume {
     }
 }
 
+impl Volume {
+    fn shifted(&self, delta: Vec2) -> Self {
+        let mut v = self.clone();
+        v.front.origin += delta;
+        v.face.origin += delta;
+        v.cover.origin += delta;
+        for point in &mut v.cap {
+            *point += delta;
+        }
+        v.floor += delta;
+        v
+    }
+}
+
+fn lerp_pos(a: Pos2, b: Pos2, t: f32) -> Pos2 {
+    a + (b - a) * t
+}
+fn lerp_plane(a: &Plane, b: &Plane, t: f32) -> Plane {
+    Plane {
+        origin: lerp_pos(a.origin, b.origin, t),
+        horizontal: a.horizontal + (b.horizontal - a.horizontal) * t,
+        vertical: a.vertical + (b.vertical - a.vertical) * t,
+    }
+}
+/// Blends one book's old position into its new one, lifting it on screen in
+/// the middle of the move so it never slides through a neighbour.
+pub fn lerp_volume(a: &Volume, b: &Volume, t: f32, lift: f32) -> Volume {
+    let mut volume = Volume {
+        lane: b.lane,
+        index: b.index,
+        front: lerp_plane(&a.front, &b.front, t),
+        face: lerp_plane(&a.face, &b.face, t),
+        cover: lerp_plane(&a.cover, &b.cover, t),
+        cap: [
+            lerp_pos(a.cap[0], b.cap[0], t),
+            lerp_pos(a.cap[1], b.cap[1], t),
+            lerp_pos(a.cap[2], b.cap[2], t),
+            lerp_pos(a.cap[3], b.cap[3], t),
+        ],
+        thickness: a.thickness + (b.thickness - a.thickness) * t,
+        height: a.height + (b.height - a.height) * t,
+        scale: a.scale + (b.scale - a.scale) * t,
+        ink: a.ink + (b.ink - a.ink) * t,
+        opacity: a.opacity + (b.opacity - a.opacity) * t,
+        floor: lerp_pos(a.floor, b.floor, t),
+    };
+    let rise = -(std::f32::consts::PI * t).sin() * lift * volume.scale;
+    if rise != 0. {
+        volume = volume.shifted(vec2(0., rise));
+    }
+    volume
+}
+/// An invisible copy parked off to one side, used as the entry point for
+/// books that had no rendered slot before a reorder.
+pub fn offstage(v: &Volume, dx: f32) -> Volume {
+    let mut v = v.shifted(vec2(dx, 0.));
+    v.opacity = 0.;
+    v
+}
+
 pub fn foreground(volumes: &[Volume], lane: i32, cover: Plane) -> Vec<Volume> {
     volumes
         .iter()
@@ -275,11 +335,7 @@ fn gradient(p: &Painter, points: &[Pos2], direction: Vec2, first: Color32, last:
 }
 
 pub fn paint_floor(p: &Painter, volumes: &[Volume], dark: bool) {
-    let ink = if dark {
-        Color32::from_rgb(254, 253, 248)
-    } else {
-        Color32::from_rgb(138, 128, 107)
-    };
+    let ink = crate::design::palette(dark).floor;
     for volume in volumes {
         let origin = volume.floor;
         let front = volume.front.horizontal;
@@ -420,6 +476,7 @@ pub fn paint_volume(
     dark: bool,
     hide_cover: bool,
     selected: bool,
+    badge: Option<usize>,
 ) {
     let mut faded = p.clone();
     faded.multiply_opacity(volume.opacity);
@@ -435,33 +492,16 @@ pub fn paint_volume(
         horizontal: vec2(1., 0.10) * scale,
         vertical: Vec2::Y * scale,
     };
-    let ink = if dark {
-        Color32::from_gray(238)
-    } else {
-        Color32::from_rgb(33, 44, 50)
-    };
-    let muted = if dark {
-        Color32::from_gray(168)
-    } else {
-        Color32::from_rgb(99, 111, 119)
-    };
-    let paper = if dark {
-        Color32::from_gray(36)
-    } else {
-        Color32::from_rgb(254, 253, 248)
-    };
-    let spine = if dark {
-        Color32::from_gray(45)
-    } else {
-        Color32::from_rgb(242, 240, 233)
-    };
+    let scheme = crate::design::palette(dark);
+    let ink = scheme.ink;
+    let muted = scheme.muted;
+    let paper = scheme.page;
+    let spine = scheme.spine;
     // A hairline edge along the slanted paper and spine planes lets egui's
     // anti-aliased stroke hide the pixel stairs `Stroke::NONE` left behind.
-    let edge_line = if dark {
-        Color32::from_gray(88).gamma_multiply(0.55)
-    } else {
-        Color32::from_rgb(198, 190, 172).gamma_multiply(0.9)
-    };
+    let edge_line = scheme
+        .muted
+        .gamma_multiply(if dark { 0.35 } else { 0.45 });
     flat_stroked(p, volume.face, paper, Stroke::new(0.8, edge_line));
     let mut print = p.clone();
     print.multiply_opacity(volume.ink);
@@ -523,11 +563,7 @@ pub fn paint_volume(
             true,
         );
     }
-    let edge = if dark {
-        Color32::from_gray(60)
-    } else {
-        Color32::from_rgb(227, 223, 211)
-    };
+    let edge = scheme.edge;
     gradient(
         p,
         &volume.cap,
@@ -571,16 +607,27 @@ pub fn paint_volume(
             false,
         );
     }
+    // A vermillion marker on the spine's top edge carries the fresh-chapter
+    // count for followed works.
+    if let Some(count) = badge {
+        let radius = (10. * scale).clamp(7., 11.);
+        let center = volume.front.point(0.5, 0.03) + vec2(radius * 0.4, 0.);
+        print.circle_filled(center, radius, scheme.accent);
+        print.circle_stroke(center, radius, Stroke::new(1., scheme.paper));
+        print.text(
+            center,
+            Align2::CENTER_CENTER,
+            if count > 99 { "99+".into() } else { count.to_string() },
+            FontId::proportional((9.5 * scale).clamp(7., 10.)),
+            scheme.on_accent,
+        );
+    }
     p.circle_stroke(volume.front.point(0.5, 0.94), 2.2, Stroke::new(0.6, muted));
     if selected {
         p.circle_filled(
             volume.front.point(0.5, 0.94),
             3.,
-            if dark {
-                Color32::from_rgb(156, 199, 177)
-            } else {
-                Color32::from_rgb(44, 90, 70)
-            },
+            crate::design::palette(dark).accent,
         );
     }
 }
@@ -620,11 +667,7 @@ pub fn paint_flight(
     paint_paper_mesh(
         p,
         mesh,
-        if dark {
-            Color32::from_gray(36)
-        } else {
-            Color32::from_rgb(254, 253, 248)
-        },
+        crate::design::palette(dark).page,
     );
 }
 
@@ -709,5 +752,27 @@ mod tests {
                 }
             }
         }
+    }
+    #[test]
+    fn reorder_lerp_hits_both_ends_lifts_midway_and_offstage_is_untappable() {
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(740., 560.));
+        let a = geometry(rect, 5, 0., 1.)[0].clone();
+        let b = geometry(rect, 5, 2., 1.)[0].clone();
+        for (t, want) in [(0., &a), (1., &b)] {
+            let v = lerp_volume(&a, &b, t, 20.);
+            assert!((v.front.origin.x - want.front.origin.x).abs() < 0.001);
+            assert!((v.front.origin.y - want.front.origin.y).abs() < 0.001);
+            assert!((v.opacity - want.opacity).abs() < 0.001);
+        }
+        let mid = lerp_volume(&a, &b, 0.5, 20.);
+        let straight = (a.front.origin.y + b.front.origin.y) / 2.;
+        assert!(
+            mid.front.origin.y < straight - 5.,
+            "mid-flight books must lift off their straight path"
+        );
+        let off = offstage(&a, 400.);
+        assert_eq!(off.opacity, 0.);
+        assert!(!off.contains(off.front.point(0.5, 0.5)));
+        assert!((off.front.origin.x - a.front.origin.x - 400.).abs() < 0.001);
     }
 }

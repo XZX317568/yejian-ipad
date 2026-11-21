@@ -27,6 +27,7 @@ mod progress;
 mod rar;
 mod restore;
 mod sort;
+mod storage;
 mod util;
 
 pub use backup::{BackupFailure, BackupImportReport, BackupReport, BackupSkip};
@@ -36,6 +37,7 @@ pub use legacy::{LegacyImportReport, LegacyImportedBook, LegacySkippedBook};
 pub use progress::{ProgressApplyReport, ProgressRecord, ProgressSkip};
 pub use restore::{RestoreEntry, RestoreSource, RestoreSummary};
 pub use sort::natural_cmp;
+pub use storage::StorageReport;
 
 /// Category used when neither the caller nor a legacy backup supplies one.
 pub const DEFAULT_CATEGORY: &str = "未分类";

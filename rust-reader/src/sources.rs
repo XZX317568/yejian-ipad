@@ -36,9 +36,8 @@ fn language_label(language: &str) -> &str {
 }
 fn quiet_action(label: &str) -> Button<'_> {
     Button::new(label)
-        .frame_when_inactive(false)
         .min_size(vec2(44., 44.))
-        .wrap()
+        .wrap_mode(egui::TextWrapMode::Extend)
 }
 fn disclosure(ui: &mut Ui, label: &str, default_open: bool, body: impl FnOnce(&mut Ui)) {
     let mut state = collapsing_header::CollapsingState::load_with_default_open(
@@ -108,7 +107,7 @@ fn source_item(
     response.widget_info(|| WidgetInfo::labeled(Role::Button, enabled, title));
     let painter = ui.painter().with_clip_rect(ui.clip_rect().intersect(rect));
     if response.hovered() && enabled {
-        painter.rect_filled(rect, 8., palette.accent_soft);
+        painter.rect_filled(rect, 8., palette.soft);
     }
     if initial {
         let badge =
@@ -374,7 +373,7 @@ fn chapter_state_lines(
 
 /// result grid and the detail header. Both get a 1px `line` border so tiles
 
-/// stay visible on the page; the placeholder uses the tinted `accent_soft`
+/// stay visible on the page; the placeholder uses the tinted `soft`
 
 /// surface rather than blending into the background.
 
@@ -396,7 +395,7 @@ fn paint_cover(
             );
         }
         None => {
-            painter.rect_filled(rect, 8., palette.accent_soft);
+            painter.rect_filled(rect, 8., palette.soft);
             if let Some(initial) = title.chars().next() {
                 painter.text(
                     rect.center(),
@@ -1484,6 +1483,19 @@ pub struct Sources {
     selected_manga: Option<Manga>,
     url: String,
     query: String,
+    /// "current" or "global": whether the search field covers one or all sources.
+    search_scope: String,
+    global_gen: u64,
+    global_query: String,
+    global_groups: Vec<GlobalGroup>,
+    /// New scope choice for `ReaderApp` to persist under `search-scope`.
+    scope_dirty: Option<String>,
+    global_tx: mpsc::Sender<GlobalCmd>,
+    global_rx: mpsc::Receiver<GlobalEvent>,
+    storage_tx: mpsc::Sender<StorageCmd>,
+    storage_rx: mpsc::Receiver<StorageEvent>,
+    /// Latest sizes from `yejian-source-storage`; all scans run off-thread.
+    storage: Option<SourceStorage>,
     request_id: u64,
     current_request: Arc<AtomicU64>,
     pending: Option<Task>,
@@ -1522,6 +1534,12 @@ pub struct Sources {
     follows: Vec<Follow>,
     /// A followed manga to open once its source has finished loading.
     pending_open: Option<Manga>,
+    /// Detail was opened from the shelf: 返回 pops back to 书架 instead of
+    /// the source browser.
+    shelf_origin: bool,
+    shelf_return: bool,
+    /// A shelf 继续阅读 asked for the resume action once chapters arrive.
+    pending_resume: bool,
     checking: usize,
     /// Whether the in-flight batch came from the scheduler — its completion
 
@@ -1949,10 +1967,325 @@ struct UpdateEvent {
     source: String,
     manga: String,
     /// `None`: only the cover arrived, after the batch's chapter results.
-    chapters: Option<Result<Vec<String>, String>>,
+    chapters: Option<Result<Vec<Chapter>, String>>,
     /// `source-covers` key + decoded image delivered with `chapters: None`.
     cover: Option<(String, ColorImage)>,
 }
+
+// -- global (all-sources) search ------------------------------------------
+
+/// How many sources may search at once in the global scope.
+const GLOBAL_SEARCH_LIMIT: usize = 4;
+/// One source's slice of a global search; longer means "超时".
+const GLOBAL_SEARCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// A global search request; retries reuse the generation of their run.
+struct GlobalCmd {
+    generation: u64,
+    query: String,
+    sources: Vec<String>,
+}
+/// One source's answer to a global search, streamed as soon as it lands.
+struct GlobalEvent {
+    generation: u64,
+    source: String,
+    result: Result<Vec<Manga>, String>,
+}
+/// Test seam: the search call the worker makes for one source.
+trait GlobalEngine: Send + Sync {
+    fn search(&self, query: &str) -> Result<Vec<Manga>, String>;
+}
+struct RealGlobalEngine(Arc<SourceEngine>);
+impl GlobalEngine for RealGlobalEngine {
+    fn search(&self, query: &str) -> Result<Vec<Manga>, String> {
+        pollster::block_on(self.0.search_page(query, 1, vec![]))
+            .map(|result| result.entries)
+            .map_err(|error| format!("{error}"))
+    }
+}
+
+/// `yejian-global-search` loop. Per-source workers are detached threads that
+/// send completions over a channel: a hung `search_page` can keep its thread
+/// forever, but the loop never joins it — after `timeout` the slot is freed,
+/// marked "超时", and any late answer is dropped by the generation/inflight
+/// check. That keeps a wedged source from stalling the next generation the
+/// way `std::thread::scope` (which joins) would.
+fn global_search_run(
+    rx: mpsc::Receiver<GlobalCmd>,
+    event_tx: mpsc::Sender<GlobalEvent>,
+    load: impl Fn(&str) -> Result<Arc<dyn GlobalEngine>, String>,
+    timeout: std::time::Duration,
+    stale: Arc<std::sync::Mutex<HashSet<String>>>,
+    ctx: Context,
+) {
+    let mut engines: std::collections::HashMap<String, Arc<dyn GlobalEngine>> =
+        std::collections::HashMap::new();
+    let (done_tx, done_rx) = mpsc::channel::<(u64, String, Result<Vec<Manga>, String>)>();
+    let mut generation = 0u64;
+    let mut query = String::new();
+    let mut pending: VecDeque<String> = VecDeque::new();
+    let mut inflight: std::collections::HashMap<String, std::time::Instant> =
+        std::collections::HashMap::new();
+    // When the UI drops its sender, keep draining already-started jobs so
+    // their completions/timeouts are still delivered before the loop exits.
+    let mut closed = false;
+    loop {
+        for id in stale.lock().unwrap().drain() {
+            engines.remove(&id);
+        }
+        while inflight.len() < GLOBAL_SEARCH_LIMIT && let Some(source) = pending.pop_front() {
+            let engine = match engines.entry(source.clone()) {
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    Ok(entry.get().clone())
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => match load(&source) {
+                    Ok(engine) => Ok(entry.insert(engine).clone()),
+                    Err(error) => Err(error),
+                },
+            };
+            match engine {
+                Ok(engine) => {
+                    inflight.insert(source.clone(), std::time::Instant::now());
+                    let (tx, query, generation, source) =
+                        (done_tx.clone(), query.clone(), generation, source);
+                    thread::spawn(move || {
+                        let result = engine.search(&query);
+                        let _ = tx.send((generation, source, result));
+                    });
+                }
+                Err(error) => {
+                    let _ = event_tx.send(GlobalEvent {
+                        generation,
+                        source,
+                        result: Err(error),
+                    });
+                    ctx.request_repaint();
+                }
+            }
+        }
+        for (done_gen, source, result) in done_rx.try_iter() {
+            if done_gen == generation && inflight.remove(&source).is_some() {
+                let _ = event_tx.send(GlobalEvent {
+                    generation: done_gen,
+                    source,
+                    result,
+                });
+                ctx.request_repaint();
+            }
+        }
+        let now = std::time::Instant::now();
+        let expired: Vec<String> = inflight
+            .iter()
+            .filter(|(_, started)| now.duration_since(**started) > timeout)
+            .map(|(source, _)| source.clone())
+            .collect();
+        for source in expired {
+            inflight.remove(&source);
+            let _ = event_tx.send(GlobalEvent {
+                generation,
+                source,
+                result: Err("超时".into()),
+            });
+            ctx.request_repaint();
+        }
+        match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok(cmd) => {
+                if cmd.generation < generation {
+                    continue;
+                }
+                if cmd.generation > generation {
+                    generation = cmd.generation;
+                    query = cmd.query.clone();
+                    pending.clear();
+                    // The slots clear conceptually; the detached workers may
+                    // still run, but their results no longer match.
+                    inflight.clear();
+                }
+                for source in cmd.sources {
+                    if !inflight.contains_key(&source) && !pending.contains(&source) {
+                        pending.push_back(source);
+                    }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => closed = true,
+        }
+        if closed && pending.is_empty() && inflight.is_empty() {
+            return;
+        }
+    }
+}
+
+/// One source's slice of the grouped global results.
+struct GlobalGroup {
+    source: String,
+    state: GlobalState,
+}
+
+/// Bytes held under the sources root, split by where the space goes.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SourceStorage {
+    /// Staging for queued/running/paused tasks plus page snapshots —
+    /// everything an in-flight or resumable download still needs.
+    pub staging_active: u64,
+    /// Staging left behind by finished/failed tasks or orphaned dirs —
+    /// the only part 清理 may delete.
+    pub staging_done: u64,
+    /// Number of task directories `staging_done` is made of.
+    pub staging_done_count: usize,
+    /// Imported archives still sitting under `downloads/`.
+    pub downloads: u64,
+    /// Cached source cover images.
+    pub covers: u64,
+}
+impl SourceStorage {
+    pub fn total_bytes(&self) -> u64 {
+        self.staging_active + self.staging_done + self.downloads + self.covers
+    }
+}
+enum StorageAction {
+    Report,
+    CleanStaging,
+    ClearCovers,
+}
+/// Task ids snapshotted on the UI thread: `all` knows every queued task,
+/// `finished` the Done/Failed subset whose staging is safe to remove.
+struct StorageCmd {
+    action: StorageAction,
+    all: HashSet<String>,
+    finished: HashSet<String>,
+}
+enum StorageEvent {
+    Report(SourceStorage),
+    /// `source-covers/` was wiped; the in-memory caches must go too.
+    CoversCleared,
+    Failed(String),
+}
+
+fn tree_size(path: &Path) -> u64 {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(_) => return 0,
+    };
+    if meta.is_file() {
+        meta.len()
+    } else if meta.is_dir() {
+        let mut total = 0;
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                total += tree_size(&entry.path());
+            }
+        }
+        total
+    } else {
+        0
+    }
+}
+fn source_storage(root: &Path, all: &HashSet<String>, finished: &HashSet<String>) -> SourceStorage {
+    let mut report = SourceStorage::default();
+    if let Ok(entries) = std::fs::read_dir(work_root(root)) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if let Some(id) = name.strip_prefix("task-") {
+                // A task-* dir with no queue entry is orphaned staging —
+                // nothing can still be writing to it.
+                if finished.contains(id) || !all.contains(id) {
+                    report.staging_done += tree_size(&entry.path());
+                    report.staging_done_count += 1;
+                } else {
+                    report.staging_active += tree_size(&entry.path());
+                }
+            } else {
+                report.staging_active += tree_size(&entry.path());
+            }
+        }
+    }
+    report.downloads = tree_size(&root.join("downloads"));
+    report.covers = tree_size(&root.join("source-covers"));
+    report
+}
+/// Removes staging for finished/failed and orphaned task dirs only — the
+/// `task_dir`/`remove_task_cache` guards still validate every id, and any
+/// rejection is reported instead of followed.
+fn clean_finished_tasks(
+    root: &Path,
+    all: &HashSet<String>,
+    finished: &HashSet<String>,
+) -> anyhow::Result<usize> {
+    let mut removed = 0;
+    if let Ok(entries) = std::fs::read_dir(work_root(root)) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Some(id) = name.strip_prefix("task-") else {
+                continue;
+            };
+            if !(finished.contains(id) || !all.contains(id)) {
+                continue;
+            }
+            remove_task_cache(root, id)?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+/// `yejian-source-storage` loop: all disk walks and deletions happen here,
+/// never on the UI thread. Every action answers with a fresh report so the
+/// settings rows reflect the result immediately.
+fn storage_worker_run(
+    rx: mpsc::Receiver<StorageCmd>,
+    tx: mpsc::Sender<StorageEvent>,
+    root: PathBuf,
+    ctx: Context,
+) {
+    while let Ok(cmd) = rx.recv() {
+        match cmd.action {
+            StorageAction::CleanStaging => {
+                if let Err(error) =
+                    clean_finished_tasks(&root, &cmd.all, &cmd.finished)
+                {
+                    let _ = tx.send(StorageEvent::Failed(format!("{error:#}")));
+                    ctx.request_repaint();
+                    continue;
+                }
+            }
+            StorageAction::ClearCovers => {
+                let dir = root.join("source-covers");
+                if dir.exists()
+                    && let Err(error) = std::fs::remove_dir_all(&dir)
+                {
+                    let _ = tx.send(StorageEvent::Failed(format!(
+                        "清理封面缓存失败：{error}"
+                    )));
+                    ctx.request_repaint();
+                    continue;
+                }
+                let _ = tx.send(StorageEvent::CoversCleared);
+            }
+            StorageAction::Report => {}
+        }
+        let _ = tx.send(StorageEvent::Report(source_storage(
+            &root,
+            &cmd.all,
+            &cmd.finished,
+        )));
+        ctx.request_repaint();
+    }
+}
+#[derive(Clone)]
+enum GlobalState {
+    Searching,
+    Done(Vec<Manga>),
+    Failed(String),
+}
+impl Clone for GlobalGroup {
+    fn clone(&self) -> Self {
+        Self {
+            source: self.source.clone(),
+            state: self.state.clone(),
+        }
+    }
+}
+
 impl Sources {
     #[cfg(debug_assertions)]
     pub(crate) fn preview_community(&mut self) {
@@ -2001,6 +2334,25 @@ impl Sources {
         Ok(())
     }
 
+    /// Second acceptance source: valid manifest, corrupt WASM, so a global
+    /// search reports one success group and one failure group.
+    #[cfg(debug_assertions)]
+    pub(crate) fn preview_global_search(&mut self) -> anyhow::Result<()> {
+        self.preview_browser("browse")?;
+        let broken = self.root.join("sources/local.broken-acceptance");
+        std::fs::create_dir_all(&broken)?;
+        std::fs::write(
+            broken.join("source.json"),
+            r#"{"info":{"id":"local.broken-acceptance","name":"故障验收源","version":1,"languages":["zh"],"urls":["https://fixture.invalid"]}}"#,
+        )?;
+        std::fs::write(broken.join("main.wasm"), b"not a wasm module")?;
+        self.installed = SourceCatalog::new(self.root.join("sources")).list()?;
+        self.set_search_scope("global");
+        self.query = "冒险".into();
+        self.start_search();
+        Ok(())
+    }
+
     #[cfg(debug_assertions)]
     pub(crate) fn browser_report(&self) -> serde_json::Value {
         serde_json::json!({
@@ -2009,6 +2361,14 @@ impl Sources {
             "filter_editor":self.filter_editor.is_some(),"busy":self.busy,
             "results":self.results.entries.iter().map(|manga|manga.title.as_str()).collect::<Vec<_>>(),
             "applied":self.applied_filters,
+            "scope":self.search_scope,
+            "groups":self.global_groups.iter().map(|group|serde_json::json!({
+                "source":group.source,
+                "state":match &group.state{
+                    GlobalState::Searching=>"searching".into(),
+                    GlobalState::Done(entries)=>format!("done:{}",entries.len()),
+                    GlobalState::Failed(reason)=>format!("failed:{reason}"),
+                }})).collect::<Vec<_>>(),
         })
     }
 
@@ -2264,14 +2624,14 @@ impl Sources {
 
                     let mut engines = std::collections::HashMap::<String, SourceEngine>::new();
                     for (source, manga) in batch.iter().cloned() {
-                        let chapters = (|| -> anyhow::Result<Vec<String>> {
+                        let chapters = (|| -> anyhow::Result<Vec<Chapter>> {
                             if !engines.contains_key(&source) {
                                 engines
                                     .insert(source.clone(), SourceEngine::load(&catalog, &source)?);
                             }
-                            let list =
-                                pollster::block_on(engines[&source].chapters_with(manga.clone()))?;
-                            Ok(list.into_iter().map(|chapter| chapter.key).collect())
+                            Ok(pollster::block_on(
+                                engines[&source].chapters_with(manga.clone()),
+                            )?)
                         })()
                         .map_err(|error| format!("{error:#}"));
                         let event = UpdateEvent {
@@ -2507,6 +2867,46 @@ impl Sources {
                 })
                 .expect("Unable to start download worker");
         }
+        // Cross-source searches keep their own engine map so a source update
+        // invalidates them like every other worker.
+        let (global_tx, global_rx) = mpsc::channel::<GlobalEvent>();
+        let (global_cmd_tx, global_cmd_rx) = mpsc::channel::<GlobalCmd>();
+        {
+            let (catalog_root, stale, ctx) =
+                (root.clone(), stale_engines.clone(), ctx.clone());
+            thread::Builder::new()
+                .name("yejian-global-search".into())
+                .spawn(move || {
+                    let catalog = SourceCatalog::new(catalog_root.join("sources"));
+                    global_search_run(
+                        global_cmd_rx,
+                        global_tx,
+                        move |source| {
+                            SourceEngine::load(&catalog, source)
+                                .map(|engine| {
+                                    Arc::new(RealGlobalEngine(Arc::new(engine)))
+                                        as Arc<dyn GlobalEngine>
+                                })
+                                .map_err(|error| format!("{error:#}"))
+                        },
+                        GLOBAL_SEARCH_TIMEOUT,
+                        stale,
+                        ctx,
+                    );
+                })
+                .expect("Unable to start global search worker");
+        }
+        // Storage scans and cleanup run on their own worker so large
+        // download-work trees never stall a frame.
+        let (storage_tx, storage_cmd_rx) = mpsc::channel::<StorageCmd>();
+        let (storage_event_tx, storage_rx) = mpsc::channel::<StorageEvent>();
+        {
+            let (root, ctx) = (root.clone(), ctx.clone());
+            thread::Builder::new()
+                .name("yejian-source-storage".into())
+                .spawn(move || storage_worker_run(storage_cmd_rx, storage_event_tx, root, ctx))
+                .expect("Unable to start storage worker");
+        }
 
         let (tasks, load_warning) = load_queue(&root);
         let ready: VecDeque<String> = pending_imports(&tasks).into();
@@ -2526,6 +2926,16 @@ impl Sources {
             selected_manga: None,
             url: String::new(),
             query: String::new(),
+            search_scope: "current".into(),
+            global_gen: 0,
+            global_query: String::new(),
+            global_groups: Vec::new(),
+            scope_dirty: None,
+            global_tx: global_cmd_tx,
+            global_rx,
+            storage_tx,
+            storage_rx,
+            storage: None,
             request_id: 0,
             current_request,
             pending: None,
@@ -2555,6 +2965,9 @@ impl Sources {
             preempted: None,
             follows: Vec::new(),
             pending_open: None,
+            shelf_origin: false,
+            shelf_return: false,
+            pending_resume: false,
             checking: 0,
             checking_background: false,
             auto_checked: false,
@@ -2700,8 +3113,13 @@ impl Sources {
             .iter()
             .map(|chapter| chapter.key.clone())
             .collect();
+        follow.reading_order = chapter_list(&self.chapters, "", false)
+            .iter()
+            .map(|chapter| chapter.key.clone())
+            .collect();
         follow.mark_seen(&keys);
         follow.checked_at = Some(follows::now());
+        follow.followed_at = Some(follows::now());
         self.follows.insert(0, follow);
         self.status = "已加入追更，有新章节会在书源页顶部提示".into();
         self.save_follows();
@@ -2717,9 +3135,9 @@ impl Sources {
         Ok(manga)
     }
 
-    fn open_follow(&mut self, index: usize) {
+    fn open_follow(&mut self, index: usize) -> bool {
         let Some(follow) = self.follows.get(index).cloned() else {
-            return;
+            return false;
         };
         if !self
             .installed
@@ -2730,13 +3148,13 @@ impl Sources {
                 "书源 {} 未安装，无法打开《{}》",
                 follow.source_id, follow.title
             );
-            return;
+            return false;
         }
         let manga = match self.follow_manga(&follow) {
             Ok(manga) => manga,
             Err(error) => {
                 self.status = format!("无法打开《{}》：{error:#}", follow.title);
-                return;
+                return false;
             }
         };
         if self.selected_source == follow.source_id {
@@ -2745,6 +3163,111 @@ impl Sources {
             self.select_source(&follow.source_id);
             self.pending_open = Some(manga);
         }
+        true
+    }
+
+    /// Opens a followed work's detail page, remembering whether it came from
+    /// the shelf so 返回 can hand back to 书架. `resume` makes the chapter
+    /// list auto-fire the existing 继续阅读 once it lands.
+    pub(crate) fn open_work(&mut self, source: &str, manga: &str, resume: bool) -> bool {
+        let Some(index) = self.follow_index(source, manga) else {
+            return false;
+        };
+        if !self.open_follow(index) {
+            return false;
+        }
+        self.shelf_origin = true;
+        self.pending_resume = resume;
+        true
+    }
+    /// `open_work` marked this visit as shelf-originated: 返回 pops to 书架.
+    pub(crate) fn take_shelf_return(&mut self) -> bool {
+        std::mem::take(&mut self.shelf_return)
+    }
+    /// A resume queued by the shelf is still waiting for the chapter list.
+    pub(crate) fn resume_pending(&self) -> bool {
+        self.pending_resume
+    }
+    /// The followed works, in follow order (newest first).
+    pub(crate) fn follows(&self) -> &[Follow] {
+        &self.follows
+    }
+    /// Display name of an installed source; falls back to its id.
+    pub(crate) fn source_display_name(&self, source_id: &str) -> String {
+        self.installed
+            .iter()
+            .find(|source| source.manifest.id == source_id)
+            .map_or_else(|| source_id.to_string(), |source| source.manifest.name.clone())
+    }
+    /// Latest chapter read state for a work: (chapter key, display name, read_at).
+    pub(crate) fn work_last_read(
+        &self,
+        source: &str,
+        manga: &str,
+    ) -> Option<(String, String, i64)> {
+        self.tasks
+            .iter()
+            .filter(|task| task.source_id == source && task.manga_id == manga)
+            .filter_map(|task| {
+                task.read_at
+                    .map(|at| (task.chapter_id.clone(), task.chapter_title.clone(), at))
+            })
+            .max_by_key(|(_, _, at)| *at)
+    }
+    #[cfg(test)]
+    pub(crate) fn seed_read_at(
+        &mut self,
+        source: &str,
+        manga: &str,
+        chapter: &str,
+        title: &str,
+        at: i64,
+    ) {
+        let mut task = DownloadTask::from_chapter(
+            source,
+            &Manga {
+                key: manga.into(),
+                title: manga.into(),
+                ..Default::default()
+            },
+            &Chapter {
+                key: chapter.into(),
+                title: Some(title.into()),
+                ..Default::default()
+            },
+        );
+        task.read_at = Some(at);
+        self.tasks.push(task);
+    }
+    /// Drops a follow; used when an online shelf entry is 移出'd.
+    pub(crate) fn unfollow(&mut self, source: &str, manga: &str) -> bool {
+        let Some(index) = self.follow_index(source, manga) else {
+            return false;
+        };
+        self.follows.remove(index);
+        self.status = "已取消追更".into();
+        self.save_follows();
+        true
+    }
+    /// Cover texture for a followed work via the `source-covers` pipeline;
+    /// queues a fetch while it is still missing.
+    pub(crate) fn work_cover(
+        &mut self,
+        ctx: &Context,
+        source: &str,
+        manga: &str,
+    ) -> Option<TextureHandle> {
+        let index = self.follow_index(source, manga)?;
+        let url = self.follow_cover_url(index)?;
+        let texture = self.cover_image(ctx, source, &url);
+        if texture.is_none() {
+            self.plan_covers(vec![CoverReq {
+                key: cover_key(source, &url),
+                source: source.to_string(),
+                url,
+            }]);
+        }
+        texture
     }
     /// The followed manga's cover URL, read from its snapshot once per
 
@@ -2990,7 +3513,13 @@ impl Sources {
         if let Some(index) = self.follow_index(&event.source, &event.manga) {
             let follow = &mut self.follows[index];
             match chapters {
-                Ok(keys) => {
+                Ok(list) => {
+                    follow.reading_order = chapter_list(&list, "", false)
+                        .iter()
+                        .map(|chapter| chapter.key.clone())
+                        .collect();
+                    let keys: Vec<String> =
+                        list.iter().map(|chapter| chapter.key.clone()).collect();
                     follow.apply_check(&keys, follows::now());
                 }
                 Err(error) => {
@@ -3259,6 +3788,17 @@ impl Sources {
             delta,
         )
         .map(|chapter| chapter.key)
+    }
+
+    /// Display name of the neighbouring chapter in reading order.
+    pub fn adjacent_online_name(&self, metadata: &ChapterMetadata, delta: i32) -> Option<String> {
+        self.adjacent_online(
+            &metadata.source_id,
+            &metadata.manga_id,
+            &metadata.chapter_id,
+            delta,
+        )
+        .map(|chapter| chapter_name(&chapter))
     }
 
     pub fn has_adjacent_online(&self, metadata: &ChapterMetadata, delta: i32) -> bool {
@@ -3582,9 +4122,198 @@ impl Sources {
             self.submit(Task::Metadata(id.into()));
         }
     }
+    /// True while the search field targets every installed source.
+    fn global_mode(&self) -> bool {
+        self.search_scope == "global"
+    }
+    /// Restored from the `search-scope` setting at startup.
+    pub(crate) fn set_search_scope(&mut self, scope: &str) {
+        self.search_scope = if scope == "global" {
+            "global"
+        } else {
+            "current"
+        }
+        .into();
+    }
+    /// UI toggle; the change is queued for the app to persist.
+    fn choose_scope(&mut self, scope: &str) {
+        if self.search_scope == scope {
+            return;
+        }
+        self.set_search_scope(scope);
+        self.scope_dirty = Some(self.search_scope.clone());
+        if !self.query.trim().is_empty() {
+            self.start_search();
+        }
+    }
+    /// `ReaderApp` persists the pending scope under `search-scope`.
+    pub(crate) fn take_scope_change(&mut self) -> Option<String> {
+        self.scope_dirty.take()
+    }
+    /// Width of the two-segment scope control, so the search row can budget.
+    fn scope_segment_width(&self, ui: &Ui) -> f32 {
+        let font = TextStyle::Body.resolve(ui.style());
+        let mut widest = 0f32;
+        for label in ["当前书源", "全部书源"] {
+            let galley = ui.painter().layout_no_wrap(
+                label.into(),
+                font.clone(),
+                Color32::BLACK,
+            );
+            widest = widest.max(galley.size().x);
+        }
+        (widest + 28.) * 2.
+    }
+    /// Joined two-segment toggle: selected segment is soft-filled and stroked.
+    /// `width` is the natural measured width, or the full row on narrow
+    /// layouts so the control never overflows its row.
+    fn scope_segment(&mut self, ui: &mut Ui, width: f32) {
+        let palette = design::palette(ui.visuals().dark_mode);
+        let font = TextStyle::Body.resolve(ui.style());
+        let (rect, _) = ui.allocate_exact_size(vec2(width, 44.), Sense::hover());
+        let seg_w = width / 2.;
+        let mut choose = None;
+        for (index, (scope, label)) in
+            [("current", "当前书源"), ("global", "全部书源")].iter().enumerate()
+        {
+            let seg = Rect::from_min_size(
+                rect.min + vec2(index as f32 * seg_w, 0.),
+                vec2(seg_w, 44.),
+            );
+            let hit = ui.interact(
+                seg,
+                ui.scope_id().with(("search-scope", index)),
+                Sense::click(),
+            );
+            hit.widget_info(|| WidgetInfo::labeled(Role::Button, true, *label));
+            self.hitboxes.insert(format!("scope-{scope}"), seg);
+            let selected = self.search_scope == *scope;
+            let painter = ui.painter();
+            if selected {
+                painter.rect_filled(seg, 10., palette.soft);
+                painter.rect_stroke(
+                    seg,
+                    10.,
+                    Stroke::new(1.5, palette.ink),
+                    StrokeKind::Inside,
+                );
+            } else if hit.hovered() {
+                painter.rect_filled(seg, 10., palette.soft);
+            }
+            let color = if selected { palette.ink } else { palette.muted };
+            painter.text(
+                seg.center(),
+                Align2::CENTER_CENTER,
+                *label,
+                font.clone(),
+                color,
+            );
+            if hit.clicked() {
+                choose = Some(*scope);
+            }
+        }
+        ui.painter().vline(
+            rect.center().x,
+            rect.shrink(10.).y_range(),
+            Stroke::new(1., palette.line),
+        );
+        ui.painter().rect_stroke(
+            rect,
+            10.,
+            Stroke::new(1., palette.line),
+            StrokeKind::Inside,
+        );
+        if let Some(scope) = choose {
+            self.choose_scope(scope);
+        }
+    }
+    /// Short Chinese reason for a global-search failure, plus whether the
+    /// existing web-verification flow applies.
+    fn global_error_label(reason: &str) -> (&'static str, bool) {
+        if reason == "超时" {
+            ("超时", false)
+        } else if reason.contains("cloudflare")
+            || reason.contains("Cloudflare")
+            || reason.contains("verify")
+            || reason.contains("验证")
+        {
+            ("需要网页验证", true)
+        } else if reason.contains("load")
+            || reason.contains("加载")
+            || reason.contains("WebAssembly")
+        {
+            ("书源无法加载", false)
+        } else {
+            ("网络错误", false)
+        }
+    }
+    /// Fires one search per installed source; results stream back by group.
+    fn global_search(&mut self) {
+        self.listing = None;
+        self.selected_manga = None;
+        self.chapters.clear();
+        let query = self.query.trim().to_string();
+        self.query = query.clone();
+        self.global_query = query.clone();
+        self.global_gen += 1;
+        self.global_groups = self
+            .installed
+            .iter()
+            .map(|source| GlobalGroup {
+                source: source.manifest.id.clone(),
+                state: GlobalState::Searching,
+            })
+            .collect();
+        let sources: Vec<String> = self
+            .global_groups
+            .iter()
+            .map(|group| group.source.clone())
+            .collect();
+        let _ = self.global_tx.send(GlobalCmd {
+            generation: self.global_gen,
+            query,
+            sources,
+        });
+    }
+    /// Re-runs one source inside the current generation.
+    fn retry_global(&mut self, source: &str) {
+        if let Some(group) = self
+            .global_groups
+            .iter_mut()
+            .find(|group| group.source == source)
+        {
+            group.state = GlobalState::Searching;
+        }
+        let _ = self.global_tx.send(GlobalCmd {
+            generation: self.global_gen,
+            query: self.global_query.clone(),
+            sources: vec![source.into()],
+        });
+    }
+    /// Group header: jump into that source and run the normal search.
+    fn dive_into(&mut self, source: &str) {
+        self.select_source(source);
+        self.search_scope = "current".into();
+        self.scope_dirty = Some("current".into());
+        self.start_search();
+    }
+    /// A cover from another source opens under that source, like 我的追更.
+    fn open_global_manga(&mut self, manga: Manga) {
+        if manga.source_key == self.selected_source {
+            self.open_manga(manga);
+        } else {
+            self.select_source(&manga.source_key.clone());
+            self.pending_open = Some(manga);
+        }
+    }
+
     /// New search from the text field: page one of this source and query.
 
     fn start_search(&mut self) {
+        if self.global_mode() {
+            self.global_search();
+            return;
+        }
         let source = self.selected_source.clone();
         if source.is_empty() {
             return;
@@ -4090,6 +4819,7 @@ impl Sources {
                         _ => format!("加载失败：{error}"),
                     };
                     self.failed = completed;
+                    self.pending_resume = false;
                     if let Some(manga) = self.pending_open.take() {
                         self.open_manga(manga);
                     }
@@ -4222,6 +4952,11 @@ impl Sources {
                         if let Some(index) = self.follow_index(&source, &manga.key) {
                             let keys: Vec<String> =
                                 list.iter().map(|chapter| chapter.key.clone()).collect();
+                            self.follows[index].reading_order =
+                                chapter_list(&list, "", false)
+                                    .iter()
+                                    .map(|chapter| chapter.key.clone())
+                                    .collect();
                             self.follows[index].mark_seen(&keys);
                             self.follows[index].title = manga.title.clone();
                             self.save_follows();
@@ -4229,6 +4964,10 @@ impl Sources {
                         self.selected_manga = Some(manga);
                         self.chapters = list;
                         self.status.clear();
+                        if self.pending_resume {
+                            self.pending_resume = false;
+                            self.auto_resume();
+                        }
                     }
                 }
                 Reply::Notified => {
@@ -4242,11 +4981,90 @@ impl Sources {
         while let Ok(event) = self.up_rx.try_recv() {
             self.handle_update(event);
         }
+        while let Ok(event) = self.global_rx.try_recv() {
+            if event.generation != self.global_gen {
+                continue;
+            }
+            if let Some(group) = self
+                .global_groups
+                .iter_mut()
+                .find(|group| group.source == event.source)
+            {
+                group.state = match event.result {
+                    Ok(mut entries) => {
+                        for manga in &mut entries {
+                            manga.source_key = event.source.clone();
+                        }
+                        GlobalState::Done(entries)
+                    }
+                    Err(reason) => GlobalState::Failed(reason),
+                };
+            }
+        }
+        while let Ok(event) = self.storage_rx.try_recv() {
+            match event {
+                StorageEvent::Report(report) => self.storage = Some(report),
+                // Disk cache is gone; drop decoded textures and the
+                // failure set so covers fetch again on demand.
+                StorageEvent::CoversCleared => {
+                    self.cover_textures.clear();
+                    self.cover_failed.clear();
+                    self.cover_ready.clear();
+                    self.cover_missing_disk.clear();
+                }
+                StorageEvent::Failed(error) => self.status = error,
+            }
+        }
         if !self.auto_checked && !self.installed.is_empty() {
             self.auto_checked = true;
             self.check_updates(false);
         }
         self.poll_follow_schedule();
+    }
+    /// Task-id snapshot the storage worker classifies staging with:
+    /// `all` covers every known task, `finished` the Done/Failed subset.
+    fn storage_snapshot(&self) -> (HashSet<String>, HashSet<String>) {
+        let mut all = HashSet::new();
+        let mut finished = HashSet::new();
+        for task in &self.tasks {
+            all.insert(task.id.clone());
+            if matches!(task.status, DownloadStatus::Done | DownloadStatus::Failed) {
+                finished.insert(task.id.clone());
+            }
+        }
+        (all, finished)
+    }
+    /// Asks the storage worker for fresh sizes.
+    pub fn request_storage(&mut self) {
+        let (all, finished) = self.storage_snapshot();
+        let _ = self.storage_tx.send(StorageCmd {
+            action: StorageAction::Report,
+            all,
+            finished,
+        });
+    }
+    /// 清理已完成任务的暂存 — only Done/Failed or orphaned task dirs.
+    pub fn clean_staging(&mut self) {
+        let (all, finished) = self.storage_snapshot();
+        let _ = self.storage_tx.send(StorageCmd {
+            action: StorageAction::CleanStaging,
+            all,
+            finished,
+        });
+    }
+    /// 清理封面缓存 — disk files; the texture caches clear when the
+    /// worker confirms the delete.
+    pub fn clear_cover_cache(&mut self) {
+        let (all, finished) = self.storage_snapshot();
+        let _ = self.storage_tx.send(StorageCmd {
+            action: StorageAction::ClearCovers,
+            all,
+            finished,
+        });
+    }
+    /// Latest storage numbers, if the worker has answered once.
+    pub fn storage(&self) -> Option<&SourceStorage> {
+        self.storage.as_ref()
     }
     /// Minutes between scheduled checks; `0` disables the timer.
     pub fn follow_interval(&self) -> u64 {
@@ -4459,6 +5277,10 @@ impl Sources {
         }
         if self.selected_manga.take().is_some() {
             self.chapters.clear();
+            if self.shelf_origin {
+                self.shelf_origin = false;
+                self.shelf_return = true;
+            }
             return true;
         }
         if !self.selected_source.is_empty() {
@@ -4476,14 +5298,18 @@ impl Sources {
                 if ui.add(quiet_action("‹ 我的书源")).clicked() {
                     self.select_source("");
                 }
-                let name = self
-                    .installed
-                    .iter()
-                    .find(|source| source.manifest.id == self.selected_source)
-                    .map(|source| source.manifest.name.as_str())
-                    .unwrap_or("");
+                let name = if self.global_mode() {
+                    "全部书源".to_string()
+                } else {
+                    self.installed
+                        .iter()
+                        .find(|source| source.manifest.id == self.selected_source)
+                        .map(|source| source.manifest.name.clone())
+                        .unwrap_or_default()
+                };
                 ui.add(Label::new(RichText::new(name).strong().color(palette.ink)).wrap());
-                if !self.selected_source.is_empty()
+                if !self.global_mode()
+                    && !self.selected_source.is_empty()
                     && !self.current_settings().is_empty()
                     && ui.add(quiet_action("书源设置")).clicked()
                 {
@@ -4494,7 +5320,8 @@ impl Sources {
                     .iter()
                     .find(|source| source.manifest.id == self.selected_source)
                     .and_then(|source| source.manifest.primary_url().map(str::to_string));
-                if let Some(site) = site.filter(|_| cfg!(target_os = "ios")) {
+                if let Some(site) = site.filter(|_| cfg!(target_os = "ios") && !self.global_mode())
+                {
                     if ui.add(quiet_action("网页验证")).clicked() {
                         self.open_web(&site, None);
                     }
@@ -4504,71 +5331,107 @@ impl Sources {
                 return;
             }
             ui.add_space(2.);
-            let input = ui.add(
-                TextEdit::singleline(&mut self.query)
-                    .hint_text("在此书源搜索漫画")
-                    .desired_width(ui.available_width()),
-            );
-            let enter = input.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
+            let narrow = ui.available_width() < 520.;
+            let mut enter = false;
+            if narrow {
+                let input = ui.add(
+                    TextEdit::singleline(&mut self.query)
+                        .hint_text("搜索漫画")
+                        .desired_width(ui.available_width()),
+                );
+                enter = input.lost_focus()
+                    && ui.input(|input| input.key_pressed(Key::Enter));
+                self.hitboxes.insert("source-search".into(), input.rect);
+            }
+            let gap = ui.spacing().item_spacing.x;
             ui.horizontal_wrapped(|ui| {
-                if ui
-                    .add_enabled(
-                        self.metadata_loaded,
-                        design::primary("搜索", ui.visuals().dark_mode),
-                    )
-                    .clicked()
-                    || enter && self.metadata_loaded
-                {
-                    self.start_search();
+                if !narrow {
+                    // Field takes whatever the segmented control and the
+                    // 搜索 button (min 88pt) leave behind.
+                    let rest = self.scope_segment_width(ui) + 88. + gap * 4.;
+                    let input = ui.add(
+                        TextEdit::singleline(&mut self.query)
+                            .hint_text("搜索漫画")
+                            .desired_width(
+                                (ui.available_width() - rest).max(120.),
+                            ),
+                    );
+                    enter = input.lost_focus()
+                        && ui.input(|input| input.key_pressed(Key::Enter));
+                    self.hitboxes.insert("source-search".into(), input.rect);
                 }
-                let hidden = self.filters_hidden();
-                let label = if self.applied_filters.is_empty() {
-                    "筛选与排序".into()
+                let seg_width = if narrow {
+                    ui.available_width()
                 } else {
-                    format!("筛选（{}）", self.applied_filters.len())
+                    self.scope_segment_width(ui)
                 };
-                if ui
-                    .add_enabled(
-                        self.metadata_loaded && !hidden && !self.filters.is_empty(),
-                        quiet_action(&label),
-                    )
-                    .clicked()
-                {
-                    self.filter_editor =
-                        Some(FilterEditor::new(&self.filters, &self.applied_filters));
-                }
-                if !self.applied_filters.is_empty()
-                    && !hidden
-                    && ui.add(quiet_action("清除筛选")).clicked()
-                {
-                    self.applied_filters.clear();
+                self.scope_segment(ui, seg_width);
+                let go = ui.add_enabled(
+                    self.metadata_loaded,
+                    design::primary("搜索", ui.visuals().dark_mode),
+                );
+                self.hitboxes.insert("source-search-go".into(), go.rect);
+                if go.clicked() || enter && self.metadata_loaded {
                     self.start_search();
                 }
             });
-            if self.filters_hidden() {
+            ui.horizontal_wrapped(|ui| {
+                if !self.global_mode() {
+                    let hidden = self.filters_hidden();
+                    let label = if self.applied_filters.is_empty() {
+                        "筛选与排序".into()
+                    } else {
+                        format!("筛选（{}）", self.applied_filters.len())
+                    };
+                    if ui
+                        .add_enabled(
+                            self.metadata_loaded && !hidden && !self.filters.is_empty(),
+                            quiet_action(&label),
+                        )
+                        .clicked()
+                    {
+                        self.filter_editor =
+                            Some(FilterEditor::new(&self.filters, &self.applied_filters));
+                    }
+                    if !self.applied_filters.is_empty()
+                        && !hidden
+                        && ui.add(quiet_action("清除筛选")).clicked()
+                    {
+                        self.applied_filters.clear();
+                        self.start_search();
+                    }
+                }
+            });
+            if self.global_mode() {
+            } else if self.filters_hidden() {
                 ui.label("此书源的关键词搜索不使用筛选；清空关键词后可筛选。");
             } else if self.metadata_loaded && self.filters.is_empty() && self.filter_error.is_none()
             {
                 ui.label("此书源未提供筛选选项。");
             }
-            if let Some(error) = self.filter_error.clone() {
+            if !self.global_mode()
+                && let Some(error) = self.filter_error.clone()
+            {
                 disclosure(ui, "部分筛选未能加载 · 查看原因", false, |ui| {
                     ui.add(Label::new(error).wrap());
                 });
             }
-            if let Some(error) = self.listing_error.clone() {
+            if !self.global_mode()
+                && let Some(error) = self.listing_error.clone()
+            {
                 disclosure(ui, "部分列表未能加载 · 查看原因", false, |ui| {
                     ui.add(Label::new(error).wrap());
                 });
             }
-            if (self.filter_error.is_some() || self.listing_error.is_some())
+            if !self.global_mode()
+                && (self.filter_error.is_some() || self.listing_error.is_some())
                 && ui
                     .add_enabled(!self.busy, quiet_action("重新加载书源选项"))
                     .clicked()
             {
                 self.submit(Task::Metadata(self.selected_source.clone()));
             }
-            if self.listings.len() > 4 {
+            if !self.global_mode() && self.listings.len() > 4 {
                 let label = self
                     .listings
                     .iter()
@@ -4596,7 +5459,7 @@ impl Sources {
                         self.start_search();
                     }
                 }
-            } else {
+            } else if !self.global_mode() {
                 ui.horizontal_wrapped(|ui| {
                     if ui
                         .add_enabled(
@@ -4625,7 +5488,7 @@ impl Sources {
                     }
                 });
             }
-            if self.listing.is_some() && !self.applied_filters.is_empty() {
+            if !self.global_mode() && self.listing.is_some() && !self.applied_filters.is_empty() {
                 ui.label("当前显示书源列表；应用筛选后切换到搜索结果。");
             }
         });
@@ -4946,7 +5809,7 @@ impl Sources {
                         } => {
                             let palette = design::palette(ui.visuals().dark_mode);
                             let label = RichText::new(&item.title).color(if *destructive {
-                                Color32::from_rgb(190, 64, 55)
+                                palette.danger
                             } else {
                                 palette.ink
                             });
@@ -5229,33 +6092,25 @@ impl Sources {
         let source = self.source_for(&manga);
         let width = ui.available_width();
 
-        let back = ui.add(quiet_action("返回搜索结果").min_size(vec2(88., 44.)));
+        let back_label = if self.shelf_origin {
+            "返回书架"
+        } else {
+            "返回搜索结果"
+        };
+        let back = ui.add(quiet_action(back_label).min_size(vec2(88., 44.)));
         self.hitboxes.insert("source-detail-back".into(), back.rect);
         if back.clicked() {
             self.selected_manga = None;
             self.chapters.clear();
+            if self.shelf_origin {
+                self.shelf_origin = false;
+                self.shelf_return = true;
+            }
             return;
         }
         ui.add_space(8.);
 
-        let states: std::collections::HashMap<String, ChapterQueueState> = self
-            .tasks
-            .iter()
-            .filter(|task| task.source_id == source && task.manga_id == manga.key)
-            .map(|task| {
-                (
-                    task.chapter_id.clone(),
-                    ChapterQueueState {
-                        status: task.status,
-                        has_archive: task.cbz.is_some(),
-                        done: task.pages_done,
-                        total: task.pages_total,
-                        read_page: task.read_page,
-                        read_at: task.read_at,
-                    },
-                )
-            })
-            .collect();
+        let states = self.chapter_states(&source, &manga.key);
         let ordered = chapter_list(&self.chapters, "", false);
         let (resume, started) = self.resume_chapter(&source, &manga, &ordered, &states);
         let resume_key = resume.as_ref().map(|chapter| chapter.key.clone());
@@ -5351,9 +6206,9 @@ impl Sources {
                     read = true;
                 }
                 let button = if followed {
-                    ui.add(quiet_action("已追更 · 取消追更").min_size(vec2(0., 48.)))
+                    ui.add(quiet_action("已在书架 · 移出").min_size(vec2(0., 48.)))
                 } else {
-                    ui.add(quiet_action("追更").min_size(vec2(0., 48.)))
+                    ui.add(quiet_action("加入书架").min_size(vec2(0., 48.)))
                 };
                 this.hitboxes
                     .insert("source-detail-follow".into(), button.rect);
@@ -5621,8 +6476,15 @@ impl Sources {
             if response.clicked() {
                 open = Some(chapter.clone());
             }
-            if response.hovered() || resume_key.as_deref() == Some(chapter.key.as_str()) {
-                painter.rect_filled(row_rect, 6., palette.accent_soft);
+            if response.hovered() {
+                painter.rect_filled(row_rect, 6., palette.soft);
+            }
+            if resume_key.as_deref() == Some(chapter.key.as_str()) {
+                painter.rect_filled(
+                    Rect::from_min_size(row_rect.min, vec2(3., row_rect.height())),
+                    1.5,
+                    palette.accent,
+                );
             }
             let text_top = row_rect.top() + (row_h - text_h) / 2.;
             painter.galley(
@@ -5689,6 +6551,44 @@ impl Sources {
     /// copy when linked, import when the download only waits for the shelf,
 
     /// otherwise online streaming.
+
+    /// Queue state per chapter key, as the detail page collects it.
+    fn chapter_states(
+        &self,
+        source: &str,
+        manga: &str,
+    ) -> std::collections::HashMap<String, ChapterQueueState> {
+        self.tasks
+            .iter()
+            .filter(|task| task.source_id == source && task.manga_id == manga)
+            .map(|task| {
+                (
+                    task.chapter_id.clone(),
+                    ChapterQueueState {
+                        status: task.status,
+                        has_archive: task.cbz.is_some(),
+                        done: task.pages_done,
+                        total: task.pages_total,
+                        read_page: task.read_page,
+                        read_at: task.read_at,
+                    },
+                )
+            })
+            .collect()
+    }
+    /// The shelf asked to resume as soon as the chapter list landed.
+    fn auto_resume(&mut self) {
+        let Some(manga) = self.selected_manga.clone() else {
+            return;
+        };
+        let source = self.source_for(&manga);
+        let states = self.chapter_states(&source, &manga.key);
+        let ordered = chapter_list(&self.chapters, "", false);
+        let (resume, _) = self.resume_chapter(&source, &manga, &ordered, &states);
+        if let Some(chapter) = resume {
+            self.read_detail_chapter(&manga, &chapter, &states);
+        }
+    }
 
     fn read_detail_chapter(
         &mut self,
@@ -5768,7 +6668,7 @@ impl Sources {
                     None
                 };
                 if response.hovered() && !self.busy {
-                    ui.painter().rect_filled(cell, 8., palette.accent_soft);
+                    ui.painter().rect_filled(cell, 8., palette.soft);
                 }
                 let cover_rect = Rect::from_min_size(cell.min, vec2(cell_w, cover_h));
                 let painter = ui.painter().with_clip_rect(ui.clip_rect().intersect(cell));
@@ -5834,6 +6734,261 @@ impl Sources {
         }
     }
 
+    /// One global-search cover cell, sharing the result-grid card styling.
+    fn global_cell(
+        &mut self,
+        ui: &mut Ui,
+        group: usize,
+        index: usize,
+        manga: &Manga,
+        cell: Rect,
+        cover_rect: Rect,
+        want: &mut Vec<CoverReq>,
+        open: &mut Option<Manga>,
+    ) {
+        let palette = design::palette(ui.visuals().dark_mode);
+        let response = ui.interact(
+            cell,
+            ui.scope_id().with(("global-result", group, index)),
+            if self.busy {
+                Sense::hover()
+            } else {
+                Sense::click()
+            },
+        );
+        response.widget_info(|| WidgetInfo::labeled(Role::Button, !self.busy, &manga.title));
+        self.hitboxes
+            .insert(format!("global-result-{group}-{index}"), cell);
+        if response.clicked() {
+            *open = Some(manga.clone());
+        }
+        let url = manga.cover.clone().unwrap_or_default();
+        let texture = if ui.clip_rect().expand(cell.height() + 16.).intersects(cell) {
+            let texture = self.cover_image(ui.ctx(), &manga.source_key, &url);
+            if texture.is_none() && !url.is_empty() {
+                want.push(CoverReq {
+                    key: cover_key(&manga.source_key, &url),
+                    source: manga.source_key.clone(),
+                    url,
+                });
+            }
+            texture
+        } else {
+            None
+        };
+        if response.hovered() && !self.busy {
+            ui.painter().rect_filled(cell, 8., palette.soft);
+        }
+        let painter = ui.painter().with_clip_rect(ui.clip_rect().intersect(cell));
+        paint_cover(
+            &painter,
+            cover_rect,
+            texture.as_ref(),
+            &manga.title,
+            TextStyle::Heading.resolve(ui.style()),
+            &palette,
+        );
+        let body_h = ui.text_style_height(&TextStyle::Body);
+        let mut title_job = egui::text::LayoutJob::simple(
+            manga.title.clone(),
+            TextStyle::Body.resolve(ui.style()),
+            palette.ink,
+            cell.width(),
+        );
+        title_job.wrap.max_rows = 2;
+        let title_galley = painter.layout_job(title_job);
+        painter.galley(
+            pos2(cell.left(), cover_rect.bottom() + 6.),
+            title_galley,
+            palette.ink,
+        );
+        let meta = manga
+            .authors
+            .as_ref()
+            .filter(|values| !values.is_empty())
+            .map(|values| values.join(" / "))
+            .or_else(|| {
+                manga
+                    .tags
+                    .as_ref()
+                    .and_then(|values| values.first().cloned())
+            })
+            .unwrap_or_default();
+        let mut meta_job = egui::text::LayoutJob::simple(
+            meta,
+            TextStyle::Small.resolve(ui.style()),
+            palette.muted,
+            cell.width(),
+        );
+        meta_job.wrap.max_rows = 1;
+        let meta_galley = painter.layout_job(meta_job);
+        painter.galley(
+            pos2(cell.left(), cover_rect.bottom() + 6. + body_h * 2. + 2.),
+            meta_galley,
+            palette.muted,
+        );
+    }
+
+    /// 全部书源 results: one group per installed source, covers in a row.
+    fn global_results_ui(&mut self, ui: &mut Ui) {
+        let palette = design::palette(ui.visuals().dark_mode);
+        let mut want = Vec::new();
+        let mut open = None;
+        let mut dive = None;
+        let mut retry = None;
+        // Results with entries first (installed order), then still-searching,
+        // empty groups, and failures last — stable while events stream in.
+        let mut order: Vec<usize> = (0..self.global_groups.len()).collect();
+        let rank = |state: &GlobalState| match state {
+            GlobalState::Done(entries) if !entries.is_empty() => 0,
+            GlobalState::Searching => 1,
+            GlobalState::Done(_) => 2,
+            GlobalState::Failed(_) => 3,
+        };
+        order.sort_by_key(|index| rank(&self.global_groups[*index].state));
+        for g in order {
+            let group = self.global_groups[g].clone();
+            let name = self
+                .installed
+                .iter()
+                .find(|source| source.manifest.id == group.source)
+                .map(|source| source.manifest.name.clone())
+                .unwrap_or_else(|| group.source.clone());
+            match &group.state {
+                GlobalState::Done(entries) => {
+                    if entries.is_empty() {
+                        ui.add_space(6.);
+                        ui.label(
+                            RichText::new(format!("{name} · 无结果")).color(palette.muted),
+                        );
+                        continue;
+                    }
+                    // Section-size header; the chevron stays muted at the
+                    // right edge and the label wraps before it ever clips.
+                    let size = ui.text_style_height(&TextStyle::Body) * 17. / 15.;
+                    let font = FontId::proportional(size);
+                    let galley = ui.painter().layout(
+                        format!("{name} · {} 条", entries.len()),
+                        font.clone(),
+                        palette.ink,
+                        ui.available_width() - size - 16.,
+                    );
+                    let row_h = (galley.size().y + 14.).max(44.);
+                    let (rect, _) = ui.allocate_exact_size(
+                        vec2(ui.available_width(), row_h),
+                        Sense::hover(),
+                    );
+                    let hit = ui.interact(
+                        rect,
+                        ui.scope_id().with(("global-group", g)),
+                        Sense::click(),
+                    );
+                    hit.widget_info(|| {
+                        WidgetInfo::labeled(
+                            Role::Button,
+                            true,
+                            format!("{name} · {} 条", entries.len()),
+                        )
+                    });
+                    self.hitboxes.insert(format!("global-group-{g}"), rect);
+                    if hit.hovered() {
+                        ui.painter().rect_filled(rect, 8., palette.soft);
+                    }
+                    if hit.clicked() {
+                        dive = Some(group.source.clone());
+                    }
+                    ui.painter().galley(
+                        rect.left_center() - vec2(0., galley.size().y / 2.),
+                        galley,
+                        palette.ink,
+                    );
+                    ui.painter().text(
+                        pos2(rect.right() - size * 0.5, rect.center().y),
+                        Align2::CENTER_CENTER,
+                        "›",
+                        font,
+                        palette.muted,
+                    );
+                    let gap = 12.;
+                    let cell_w = 120_f32.min(ui.available_width());
+                    let cover_h = cell_w * 1.5;
+                    // Same cell recipe as the results grid: 2-line title plus
+                    // a one-line meta row under the cover.
+                    let cell_h = cover_h
+                        + 6.
+                        + ui.text_style_height(&TextStyle::Body) * 2.
+                        + 2.
+                        + ui.text_style_height(&TextStyle::Small)
+                        + 6.;
+                    ScrollArea::horizontal()
+                        .id_salt(("global-row", g))
+                        .max_height(cell_h + 16.)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                for (i, manga) in entries.iter().enumerate() {
+                                    let (cell, _) = ui.allocate_exact_size(
+                                        vec2(cell_w, cell_h),
+                                        Sense::hover(),
+                                    );
+                                    self.global_cell(
+                                        ui,
+                                        g,
+                                        i,
+                                        manga,
+                                        cell,
+                                        Rect::from_min_size(
+                                            cell.min,
+                                            vec2(cell_w, cover_h),
+                                        ),
+                                        &mut want,
+                                        &mut open,
+                                    );
+                                    ui.add_space(gap);
+                                }
+                            });
+                        });
+                    ui.add_space(6.);
+                }
+                GlobalState::Searching => {
+                    ui.add_space(6.);
+                    ui.label(format!("{name} · 搜索中…"));
+                }
+                GlobalState::Failed(reason) => {
+                    let (label, verify) = Self::global_error_label(reason);
+                    ui.add_space(6.);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(format!("{name} · {label}")).color(palette.muted));
+                        if verify && ui.add(quiet_action("网页验证")).clicked() {
+                            self.open_web(&group.source.clone(), None);
+                        }
+                        if ui.add(quiet_action("重试")).clicked() {
+                            retry = Some(group.source.clone());
+                        }
+                    });
+                    // Raw error as a single muted, ellipsised line.
+                    let mut job = egui::text::LayoutJob::simple(
+                        reason.clone(),
+                        TextStyle::Small.resolve(ui.style()),
+                        palette.muted,
+                        ui.available_width(),
+                    );
+                    job.wrap.max_rows = 1;
+                    ui.add(Label::new(job).selectable(false));
+                }
+            }
+        }
+        self.plan_covers(want);
+        if let Some(manga) = open {
+            self.open_global_manga(manga);
+        }
+        if let Some(source) = dive {
+            self.dive_into(&source);
+        }
+        if let Some(source) = retry {
+            self.retry_global(&source);
+        }
+    }
+
     pub fn ui(&mut self, ui: &mut Ui) {
         self.hitboxes.clear();
         self.poll();
@@ -5866,7 +7021,19 @@ impl Sources {
                 return;
             }
         }
+        // The status footer is painted below the viewport — reserve its
+        // height so the scroll area uses the full remaining height without
+        // clipping the last content line mid-glyph.
+        let footer_height =
+            if !self.status.is_empty() || self.busy || self.failed.is_some() {
+                40.
+            } else {
+                0.
+            };
+        let scroll_height = (ui.available_height() - footer_height).max(40.);
         ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .max_height(scroll_height)
             .id_salt((
                 "source-content",
                 &self.selected_source,
@@ -5903,6 +7070,9 @@ impl Sources {
                         self.follows_ui(ui);
                         self.repository_ui(ui);
                     }
+                    if self.global_mode() && !self.global_groups.is_empty() {
+                        self.global_results_ui(ui);
+                    } else {
                     if !self.results.entries.is_empty() {
                         let label = self
                             .listing
@@ -5928,6 +7098,7 @@ impl Sources {
                         {
                             self.load_next_page();
                         }
+                    }
                     }
                 } else {
                     self.detail_ui(ui);
@@ -5964,19 +7135,23 @@ impl Sources {
                         }
                     }
                 }
-                if !self.status.is_empty() {
-                    ui.add_space(12.);
-                    ui.add(Label::new(&self.status).wrap());
-                }
+            });
+        if !self.status.is_empty() || self.busy || self.failed.is_some() {
+            ui.add_space(6.);
+            ui.horizontal(|ui| {
                 if self.busy {
                     ui.spinner();
                 }
-                if let Some(task) = self.failed.clone() {
-                    if ui.add(quiet_action("重试")).clicked() {
-                        self.submit(task);
-                    }
+                if !self.status.is_empty() {
+                    ui.add(Label::new(&self.status).wrap());
+                }
+                if let Some(task) = self.failed.clone()
+                    && ui.add(quiet_action("重试")).clicked()
+                {
+                    self.submit(task);
                 }
             });
+        }
     }
 }
 impl Drop for Sources {
@@ -6322,6 +7497,37 @@ mod tests {
             },
         )
     }
+    #[test]
+    fn update_checks_flip_newest_first_lists_into_reading_order() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sources = test_sources(root.path());
+        sources.selected_source = "source.a".into();
+        sources.toggle_follow(&manga("source.a", "m"));
+        sources.checking = 1;
+        // Many sources hand chapters back newest-first; the persisted order
+        // must match the detail page's reading order, oldest first.
+        sources.handle_update(UpdateEvent {
+            source: "source.a".into(),
+            manga: "m".into(),
+            chapters: Some(Ok(
+                [("c3", 3.), ("c1", 1.), ("c2", 2.)]
+                    .iter()
+                    .map(|(key, number)| Chapter {
+                        key: (*key).into(),
+                        chapter_number: Some((*number) as f32),
+                        ..Default::default()
+                    })
+                    .collect(),
+            )),
+            cover: None,
+        });
+        assert_eq!(
+            sources.follows[0].reading_order,
+            ["c1", "c2", "c3"],
+            "update checks store chapters in reading order"
+        );
+    }
+
     fn test_sources(root: &Path) -> Sources {
         let (dl_tx, dl_cmd_rx) = mpsc::channel();
         // Keep the command receiver alive so `pump()` can actually dispatch the
@@ -6345,6 +7551,16 @@ mod tests {
             selected_manga: None,
             url: String::new(),
             query: String::new(),
+            search_scope: "current".into(),
+            global_gen: 0,
+            global_query: String::new(),
+            global_groups: Vec::new(),
+            scope_dirty: None,
+            global_tx: mpsc::channel().0,
+            global_rx: mpsc::channel().1,
+            storage_tx: mpsc::channel().0,
+            storage_rx: mpsc::channel().1,
+            storage: None,
             request_id: 0,
             current_request: Arc::new(AtomicU64::new(0)),
             pending: None,
@@ -6374,6 +7590,9 @@ mod tests {
             preempted: None,
             follows: Vec::new(),
             pending_open: None,
+            shelf_origin: false,
+            shelf_return: false,
+            pending_resume: false,
             checking: 0,
             checking_background: false,
             auto_checked: true,
@@ -6552,7 +7771,15 @@ mod tests {
         sources.handle_update(UpdateEvent {
             source: "source.a".into(),
             manga: "m".into(),
-            chapters: Some(Ok(vec!["c1".into(), "c2".into(), "c3".into()])),
+            chapters: Some(Ok(
+                ["c1", "c2", "c3"]
+                    .iter()
+                    .map(|key| Chapter {
+                        key: (*key).into(),
+                        ..Default::default()
+                    })
+                    .collect(),
+            )),
             cover: None,
         });
         assert_eq!(sources.checking, 0);
@@ -6560,6 +7787,12 @@ mod tests {
         assert_eq!(
             follows::load(root.path()).unwrap()[0].fresh,
             vec!["c3".to_string()]
+        );
+        // The stored reading order is oldest-first even though the source
+        // listed chapters in its own order.
+        assert_eq!(
+            follows::load(root.path()).unwrap()[0].reading_order,
+            ["c1", "c2", "c3"]
         );
 
         sources.request_id = 7;
@@ -8519,7 +9752,15 @@ mod tests {
         sources.handle_update(UpdateEvent {
             source: "source.a".into(),
             manga: "m".into(),
-            chapters: Some(Ok(vec!["c1".into(), "c2".into()])),
+            chapters: Some(Ok(
+                ["c1", "c2"]
+                    .iter()
+                    .map(|key| Chapter {
+                        key: (*key).into(),
+                        ..Default::default()
+                    })
+                    .collect(),
+            )),
             cover: None,
         });
         assert_eq!(sources.checking, 0);
@@ -8592,4 +9833,270 @@ mod tests {
             cover_key(&sources.follows[0].source_id, &url.unwrap()),
         );
     }
+
+    struct FakeEngine<F>(F);
+    impl<F: Fn(&str) -> Vec<Manga> + Send + Sync> GlobalEngine for FakeEngine<F> {
+        fn search(&self, query: &str) -> Result<Vec<Manga>, String> {
+            Ok((self.0)(query))
+        }
+    }
+
+    #[test]
+    fn global_worker_never_exceeds_the_concurrency_cap() {
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (run, pk) = (running.clone(), peak.clone());
+        let (cmd_tx, cmd_rx) = mpsc::channel::<GlobalCmd>();
+        let (event_tx, event_rx) = mpsc::channel::<GlobalEvent>();
+        let stale: Arc<std::sync::Mutex<HashSet<String>>> = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let ctx = Context::default();
+        let handle = thread::spawn(move || {
+            global_search_run(
+                cmd_rx,
+                event_tx,
+                move |source| {
+                    if source == "err" {
+                        return Err("boom".into());
+                    }
+                    let (run, pk) = (run.clone(), pk.clone());
+                    Ok(Arc::new(FakeEngine(move |_: &str| {
+                        let now = run.fetch_add(1, Ordering::SeqCst) + 1;
+                        pk.fetch_max(now, Ordering::SeqCst);
+                        thread::sleep(std::time::Duration::from_millis(30));
+                        run.fetch_sub(1, Ordering::SeqCst);
+                        vec![Manga::default()]
+                    })) as Arc<dyn GlobalEngine>)
+                },
+                std::time::Duration::from_secs(5),
+                stale,
+                ctx,
+            );
+        });
+        let sources: Vec<String> =
+            (0..9).map(|i| format!("s{i}")).chain(["err".into()]).collect();
+        let count = sources.len();
+        cmd_tx
+            .send(GlobalCmd {
+                generation: 1,
+                query: "q".into(),
+                sources,
+            })
+            .unwrap();
+        drop(cmd_tx);
+        handle.join().unwrap();
+        assert!(peak.load(Ordering::SeqCst) <= GLOBAL_SEARCH_LIMIT);
+        let events: Vec<GlobalEvent> = event_rx.iter().collect();
+        assert_eq!(events.len(), count);
+        let err = events
+            .iter()
+            .find(|event| event.source == "err")
+            .expect("load failures still produce an event");
+        assert_eq!(err.result.as_ref().err().unwrap(), "boom");
+    }
+
+    #[test]
+    fn global_worker_times_out_and_discards_the_late_result() {
+        let (cmd_tx, cmd_rx) = mpsc::channel::<GlobalCmd>();
+        let (event_tx, event_rx) = mpsc::channel::<GlobalEvent>();
+        let stale: Arc<std::sync::Mutex<HashSet<String>>> = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let ctx = Context::default();
+        let handle = thread::spawn(move || {
+            global_search_run(
+                cmd_rx,
+                event_tx,
+                |source| {
+                    if source == "hang" {
+                        Ok(Arc::new(FakeEngine(|_: &str| {
+                            thread::sleep(std::time::Duration::from_secs(2));
+                            vec![Manga::default()]
+                        })) as Arc<dyn GlobalEngine>)
+                    } else {
+                        Ok(Arc::new(FakeEngine(|_: &str| {
+                            vec![Manga::default()]
+                        })) as Arc<dyn GlobalEngine>)
+                    }
+                },
+                std::time::Duration::from_millis(80),
+                stale,
+                ctx,
+            );
+        });
+        cmd_tx
+            .send(GlobalCmd {
+                generation: 1,
+                query: "q".into(),
+                sources: vec!["hang".into(), "fast".into()],
+            })
+            .unwrap();
+        // Wait for the timeout + fast result while the hung thread still runs.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut events = Vec::new();
+        while events.len() < 2 && std::time::Instant::now() < deadline {
+            if let Ok(event) =
+                event_rx.recv_timeout(std::time::Duration::from_millis(200))
+            {
+                events.push(event);
+            }
+        }
+        let timeout = events
+            .iter()
+            .find(|event| event.source == "hang")
+            .expect("hung source reports a timeout");
+        assert_eq!(timeout.result.as_ref().err().unwrap(), "超时");
+        // A new generation starts while `hang` is still sleeping: the worker
+        // is not joining it, so the next search proceeds immediately.
+        cmd_tx
+            .send(GlobalCmd {
+                generation: 2,
+                query: "q".into(),
+                sources: vec!["fast".into()],
+            })
+            .unwrap();
+        drop(cmd_tx);
+        handle.join().unwrap();
+        let events: Vec<GlobalEvent> = event_rx.iter().collect();
+        assert!(events.iter().any(|event| {
+            event.generation == 2 && event.source == "fast" && event.result.is_ok()
+        }));
+    }
+
+    #[test]
+    fn global_worker_discards_stale_generation_events() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sources = test_sources(root.path());
+        sources.global_gen = 2;
+        sources.global_groups = vec![GlobalGroup {
+            source: "x".into(),
+            state: GlobalState::Searching,
+        }];
+        // Same generation check poll() applies.
+        let stale_event = GlobalEvent {
+            generation: 1,
+            source: "x".into(),
+            result: Ok(vec![Manga::default()]),
+        };
+        assert_ne!(stale_event.generation, sources.global_gen);
+        if stale_event.generation == sources.global_gen {
+            if let Some(group) = sources
+                .global_groups
+                .iter_mut()
+                .find(|group| group.source == stale_event.source)
+            {
+                group.state = GlobalState::Done(vec![]);
+            }
+        }
+        assert!(matches!(
+            sources.global_groups[0].state,
+            GlobalState::Searching
+        ));
+        // Same-source event at the current generation updates the group.
+        let fresh = GlobalEvent {
+            generation: 2,
+            source: "x".into(),
+            result: Err("超时".into()),
+        };
+        if fresh.generation == sources.global_gen {
+            if let Some(group) = sources
+                .global_groups
+                .iter_mut()
+                .find(|group| group.source == fresh.source)
+            {
+                group.state = GlobalState::Failed("超时".into());
+            }
+        }
+        assert!(matches!(
+            &sources.global_groups[0].state,
+            GlobalState::Failed(reason) if reason == "超时"
+        ));
+    }
+
+    #[test]
+    fn search_scope_persists_and_reverts_to_current() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sources = test_sources(root.path());
+        assert_eq!(sources.search_scope, "current");
+        sources.choose_scope("global");
+        assert_eq!(sources.take_scope_change().as_deref(), Some("global"));
+        assert!(sources.take_scope_change().is_none(), "change is consumed once");
+        sources.choose_scope("current");
+        assert_eq!(sources.take_scope_change().as_deref(), Some("current"));
+        sources.set_search_scope("global");
+        assert!(sources.global_mode());
+        sources.set_search_scope("junk");
+        assert!(!sources.global_mode(), "unknown values fall back to current");
+    }
+
+    /// One `task-*` staging dir with payload bytes.
+    fn stage_task(root: &Path, id: &str, bytes: usize) {
+        let dir = work_root(root).join(format!("task-{id}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("page-1.img"), vec![7u8; bytes]).unwrap();
+    }
+    #[test]
+    fn storage_report_splits_active_and_finished_staging() {
+        let root = tempfile::tempdir().unwrap();
+        stage_task(root.path(), "aaaaaaaaaaaaaaaa", 100);
+        stage_task(root.path(), "bbbbbbbbbbbbbbbb", 200);
+        stage_task(root.path(), "cccccccccccccccc", 50);
+        std::fs::create_dir_all(root.path().join("downloads")).unwrap();
+        std::fs::write(root.path().join("downloads/done.zip"), vec![9u8; 30]).unwrap();
+        std::fs::create_dir_all(root.path().join("source-covers")).unwrap();
+        std::fs::write(root.path().join("source-covers/a.img"), vec![1u8; 20]).unwrap();
+
+        let all: HashSet<String> = ["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let finished: HashSet<String> = ["bbbbbbbbbbbbbbbb".to_string()].into_iter().collect();
+        let report = source_storage(root.path(), &all, &finished);
+        assert_eq!(report.staging_active, 100);
+        // ccccc… is an orphan dir — finished bucket, cleanable.
+        assert_eq!(report.staging_done, 250);
+        assert_eq!(report.staging_done_count, 2);
+        assert_eq!(report.downloads, 30);
+        assert_eq!(report.covers, 20);
+    }
+    #[test]
+    fn clean_finished_tasks_never_touches_active_or_queued() {
+        let root = tempfile::tempdir().unwrap();
+        stage_task(root.path(), "aaaaaaaaaaaaaaaa", 10);
+        stage_task(root.path(), "bbbbbbbbbbbbbbbb", 10);
+        stage_task(root.path(), "dddddddddddddddd", 10);
+        let all: HashSet<String> = ["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb", "dddddddddddddddd"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let finished: HashSet<String> = ["bbbbbbbbbbbbbbbb".to_string()].into_iter().collect();
+
+        assert_eq!(
+            clean_finished_tasks(root.path(), &all, &finished).unwrap(),
+            1
+        );
+        assert!(!work_root(root.path())
+            .join("task-bbbbbbbbbbbbbbbb")
+            .exists());
+        // Queued/in-progress dirs and everything else are untouched.
+        assert!(work_root(root.path())
+            .join("task-aaaaaaaaaaaaaaaa")
+            .exists());
+        assert!(work_root(root.path())
+            .join("task-dddddddddddddddd")
+            .exists());
+    }
+    #[test]
+    fn clean_finished_tasks_removes_orphan_dirs_but_not_snapshots() {
+        let root = tempfile::tempdir().unwrap();
+        stage_task(root.path(), "eeeeeeeeeeeeeeee", 10);
+        let snapshots = snapshot_root(root.path());
+        std::fs::create_dir_all(&snapshots).unwrap();
+        std::fs::write(snapshots.join("a".repeat(16) + ".manga"), b"x").unwrap();
+        let all = HashSet::new();
+        let finished = HashSet::new();
+        assert_eq!(
+            clean_finished_tasks(root.path(), &all, &finished).unwrap(),
+            1
+        );
+        assert!(snapshots.join("a".repeat(16) + ".manga").exists());
+    }
 }
+

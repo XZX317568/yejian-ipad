@@ -492,14 +492,21 @@ fn design_touch(h: &Harness, id: &str, label: Option<&str>) -> Result<()> {
         "design: {id} is outside the safe area: {rect:?}"
     );
     if let Some(label) = label {
-        anyhow::ensure!(
-            h.painted_text.iter().any(|text| {
-                text.text == label
-                    && rect.expand(0.5).contains_rect(text.bounds)
-                    && text.clip.expand(0.5).contains_rect(rect)
-            }),
-            "design: {id} / {label} is clipped or detached from its touch target"
-        );
+        if !h.painted_text.iter().any(|text| {
+            text.text == label
+                && rect.expand(0.5).contains_rect(text.bounds)
+                && text.clip.expand(0.5).contains_rect(rect)
+        }) {
+            let candidates: Vec<String> = h
+                .painted_text
+                .iter()
+                .filter(|t| t.text.contains("阅读") || t.text == label || t.bounds.intersects(rect))
+                .map(|t| format!("{:?}@{:?} clip{:?}", t.text, t.bounds, t.clip))
+                .collect();
+            anyhow::bail!(
+                "design: {id} / {label} is clipped or detached from its touch target {rect:?}; candidates: {candidates:?}"
+            );
+        }
     }
     Ok(())
 }
@@ -541,6 +548,22 @@ fn design_capture(
             "clip": coordinates(image.clip),
         })).collect::<Vec<_>>(),
     }));
+    Ok(())
+}
+
+/// Asserts a dialog card painted its surface fully opaque in `png`:
+/// a pixel inside the top-left padding must equal the light surface.
+fn assert_opaque_card(h: &Harness, png: &str, hitbox: &str) -> Result<()> {
+    let rect = h.app.hitboxes[hitbox];
+    let shot = image::open(h.output.join(png))?.to_rgba8();
+    let x = ((rect.left() + 12.) as u32).min(shot.width() - 1);
+    let y = ((rect.top() + 12.) as u32).min(shot.height() - 1);
+    let px = shot.get_pixel(x, y);
+    let surface = [255u8, 253, 249];
+    anyhow::ensure!(
+        (0..3).all(|i| (px[i] as i32 - surface[i] as i32).abs() <= 8),
+        "{png}: card is translucent at {x},{y}: {px:?} (expected {surface:?})"
+    );
     Ok(())
 }
 
@@ -628,6 +651,50 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
         initial_title.bounds.height() > 20.,
         "design: expected selected title above the thumbnails"
     );
+    // The thumbnail strip starts collapsed: a taller stage and no targets.
+    anyhow::ensure!(
+        !h.app
+            .hitboxes
+            .keys()
+            .any(|id| id.starts_with("shelf-thumbnail-")),
+        "design: thumbnail strip should start collapsed"
+    );
+    let collapsed_stage = h.app.shelf_stage_height();
+    h.click("shelf-grid-toggle")?;
+    h.frames(6)?;
+    anyhow::ensure!(
+        h.app.shelf_stage_height() < collapsed_stage,
+        "design: collapsed stage {} did not exceed expanded {}",
+        collapsed_stage,
+        h.app.shelf_stage_height()
+    );
+    // On narrow widths the expanded strip sits below the fold now that the
+    // header has a second row; scroll the library column down to reach it.
+    for _ in 0..6 {
+        if h
+            .app
+            .hitboxes
+            .keys()
+            .any(|id| id.starts_with("shelf-thumbnail-"))
+        {
+            break;
+        }
+        h.frame(
+            vec![
+                Event::PointerMoved(pos2(h.size[0] as f32 - 18., h.size[1] as f32 * 0.67)),
+                Event::MouseWheel {
+                    unit: MouseWheelUnit::Point,
+                    delta: vec2(0., -180.),
+                    source: MouseWheelSource::Wheel,
+                    modifiers: Modifiers::NONE,
+                    phase: TouchPhase::Move,
+                },
+            ],
+            None,
+        )?;
+        h.frames(4)?;
+    }
+    design_capture(h, "design-phone-shelf-expanded", &mut captures)?;
     let thumbnail = h
         .app
         .hitboxes
@@ -665,6 +732,73 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
         h.app.rendered_book_nodes < 45,
         "design: unbounded shelf rendering"
     );
+    // Collapse again so the remaining captures show the default shelf.
+    h.click("shelf-grid-toggle")?;
+    h.frames(6)?;
+
+    // The sort menu and the book-swap animation on the collapsed shelf.
+    h.click("shelf-sort")?;
+    h.frames(4)?;
+    design_capture(h, "shelf-sort-menu", &mut captures)?;
+    for id in ["shelf-sort-recent", "shelf-sort-progress", "shelf-sort-added"] {
+        anyhow::ensure!(
+            h.app.hitboxes.contains_key(id),
+            "design: sort menu row {id} is missing"
+        );
+    }
+    // The popover must be an opaque card: nothing on the shelf may show
+    // through it. Sample a pixel in the panel padding above the first row.
+    {
+        let row = h.app.hitboxes["shelf-sort-progress"];
+        let shot = image::open(h.output.join("shelf-sort-menu.png"))?.to_rgba8();
+        let x = (row.center().x as u32).min(shot.width() - 1);
+        let y = ((row.top() - 10.).max(0.) as u32).min(shot.height() - 1);
+        let px = shot.get_pixel(x, y);
+        let surface = [255u8, 253, 249];
+        anyhow::ensure!(
+            (0..3).all(|i| (px[i] as i32 - surface[i] as i32).abs() <= 8),
+            "design: sort popover is translucent at {x},{y}: {px:?} (expected {surface:?})"
+        );
+    }
+    for (first, row, name) in [
+        (true, "shelf-sort-added", "added"),
+        (false, "shelf-sort-progress", "progress"),
+        (false, "shelf-sort-recent", "recent"),
+    ] {
+        if !first {
+            h.click("shelf-sort")?;
+            h.frames(4)?;
+        }
+        h.click(row)?;
+        if name == "added" {
+            h.frames(16)?;
+            design_capture(h, "shelf-sort-moving", &mut captures)?;
+            h.frames(30)?;
+        } else {
+            h.frames(46)?;
+        }
+        // The tap landed on the popover row, not a shelf book beneath it.
+        anyhow::ensure!(
+            h.app.shelf_sort_key() == name,
+            "design: selecting {name} from the popover did not change the sort"
+        );
+        design_capture(h, &format!("shelf-sort-{name}"), &mut captures)?;
+        anyhow::ensure!(
+            h.app.focus_index() == 0,
+            "design: focus should land on the first book of the {name} order"
+        );
+        let expected = h.app.focused_book_title();
+        anyhow::ensure!(
+            h.painted_text
+                .iter()
+                .any(|text| text.text == expected && text.bounds.height() > 20.),
+            "design: central book after {name} sorting is not the first of the new order ({expected})"
+        );
+    }
+    // Sorting lands on the first book, which is the one read above; move on
+    // so the next stage shows an unread book's 开始阅读 again.
+    h.click("shelf-next")?;
+    h.frames(40)?;
 
     h.size = [834, 1194];
     h.frames(6)?;
@@ -765,6 +899,28 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
         );
     }
     design_capture(h, "design-settings", &mut captures)?;
+    // Round 3: the 存储 group reports managed bytes with confirmed cleanups.
+    h.wait(ReaderApp::storage_ready)?;
+    for _ in 0..5 {
+        if design_label_visible(h, "书架漫画") && design_label_visible(h, "封面缓存") {
+            break;
+        }
+        scroll_page(h, -800.)?;
+    }
+    anyhow::ensure!(
+        design_label_visible(h, "书架漫画") && design_label_visible(h, "封面缓存"),
+        "design: 存储 group rows are missing"
+    );
+    design_capture(h, "settings-storage", &mut captures)?;
+    // Every cleanup asks first; the confirm card is fully opaque.
+    h.click("storage-removed-clean")?;
+    h.frames(4)?;
+    design_capture(h, "settings-storage-confirm", &mut captures)?;
+    assert_opaque_card(h, "settings-storage-confirm.png", "storage-confirm-card")?;
+    h.click_text("取消")?;
+    h.frames(3)?;
+    scroll_page(h, 1400.)?;
+    h.frames(3)?;
     h.click_text("深色")?;
     h.frames(5)?;
     h.click("nav-library")?;
@@ -810,6 +966,47 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
     h.wait(|app| app.source_browser_report()["results"][0] == "筛选:冒险题材")?;
     h.frames(5)?;
     design_capture(h, "design-filtered-results", &mut captures)?;
+
+    // Round 2: one working fixture source and one corrupt fixture source
+    // produce a success group and a failure group in installed order.
+    h.app.prepare_global_search_acceptance()?;
+    h.wait(ReaderApp::global_search_done)?;
+    h.frames(5)?;
+    {
+        let groups = h.app.source_browser_report()["groups"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        anyhow::ensure!(
+            groups.iter().any(|group| {
+                group["source"] == "local.filter-acceptance"
+                    && group["state"]
+                        .as_str()
+                        .is_some_and(|state| state.starts_with("done:"))
+            }),
+            "global: the filter fixture group did not finish with results"
+        );
+        anyhow::ensure!(
+            groups.iter().any(|group| {
+                group["source"] == "local.broken-acceptance"
+                    && group["state"]
+                        .as_str()
+                        .is_some_and(|state| state.starts_with("failed:"))
+            }),
+            "global: the broken fixture group did not report its failure"
+        );
+    }
+    design_capture(h, "design-global-search", &mut captures)?;
+    // The scope control and search action stay fully on screen.
+    let screen =
+        Rect::from_min_size(Pos2::ZERO, vec2(h.size[0] as f32, h.size[1] as f32));
+    for id in ["scope-current", "scope-global", "source-search-go"] {
+        anyhow::ensure!(
+            screen.contains_rect(h.app.hitboxes[id]),
+            "global: {id} {:?} overflows {screen:?}",
+            h.app.hitboxes[id]
+        );
+    }
 
     // Reopen the real saved settings, preserving the source and reading
     // history. Only the temporary acceptance library is changed.
@@ -921,7 +1118,21 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
         h.app.source_browser_report()["filter_editor"] == false,
         "design: large-text filter cancel did not leave the form"
     );
+    h.app.prepare_global_search_acceptance()?;
+    h.wait(ReaderApp::global_search_done)?;
+    h.frames(5)?;
+    design_capture(h, "design-large-text-global-search", &mut captures)?;
+    let screen =
+        Rect::from_min_size(Pos2::ZERO, vec2(h.size[0] as f32, h.size[1] as f32));
+    for id in ["scope-current", "scope-global", "source-search-go"] {
+        anyhow::ensure!(
+            screen.contains_rect(h.app.hitboxes[id]),
+            "global 200 percent: {id} {:?} overflows {screen:?}",
+            h.app.hitboxes[id]
+        );
+    }
     library.set_setting("font-scale", "1")?;
+    online_shelf_pass(h, library_root, &mut captures)?;
     let report = serde_json::json!({
         "result": "PASS",
         "library": library_root,
@@ -951,6 +1162,129 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
         captures.len(),
         h.output.display()
     );
+    Ok(())
+}
+
+/// Round 1 online shelf: a followed work with no local chapters appears on
+/// the shelf, a fresh chapter badges its locally-linked book, and the shelf
+/// resume opens the online detail page and enters the reader by itself.
+fn online_shelf_pass(
+    h: &mut Harness,
+    library_root: &Path,
+    captures: &mut Vec<serde_json::Value>,
+) -> Result<()> {
+    let library = yejian_core::Library::open(library_root)?;
+    let books = library.list_books("")?;
+    let linked = books
+        .iter()
+        .find(|book| book.title == "山海之间")
+        .context("online: first fixture is missing")?;
+    library.link_chapter(
+        &linked.id,
+        &yejian_core::ChapterMetadata {
+            source_id: "local.filter-acceptance".into(),
+            manga_id: "fx-pop-1".into(),
+            manga_title: "热门-第1页".into(),
+            chapter_id: "daily-1".into(),
+            chapter_title: "第 1 话".into(),
+            chapter_number: Some(1.),
+            volume_number: None,
+        },
+    )?;
+    h.size = [834, 1194];
+    h.app = ReaderApp::new(library_root.to_path_buf(), h.ctx.clone());
+    h.wait(ReaderApp::ready)?;
+    h.app.prepare_source_acceptance("browse")?;
+    h.wait(ReaderApp::source_browser_ready)?;
+    // Follow the linked work and a second work with no local chapters.
+    for (listing, title) in [(None, "热门-第1页"), (Some("最新"), "最新-第1页")] {
+        if let Some(listing) = listing {
+            h.click_text(listing)?;
+            h.wait(|app| app.source_browser_report()["results"][0] == title)?;
+        }
+        h.click("source-result-0")?;
+        h.wait(|app| {
+            app.hitboxes.contains_key("source-detail-follow")
+                && app.source_browser_report()["busy"] == false
+        })?;
+        h.click("source-detail-follow")?;
+        h.frames(3)?;
+        anyhow::ensure!(
+            h.painted_text
+                .iter()
+                .any(|text| text.text == "已在书架 · 移出"),
+            "online: 《{title}》 did not land on the shelf"
+        );
+        h.click("source-detail-back")?;
+        h.frames(3)?;
+    }
+    h.click("nav-library")?;
+    h.wait(ReaderApp::covers_loaded)?;
+    h.frames(6)?;
+    anyhow::ensure!(
+        h.app.visible_count() == 6,
+        "online: followed work did not synthesise a shelf entry"
+    );
+    design_capture(h, "shelf-online", captures)?;
+    // A check that finds a fresh chapter badges the locally-linked book.
+    let follows_path = library_root.join("follows.json");
+    let mut store: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&follows_path)?)?;
+    for follow in store["follows"]
+        .as_array_mut()
+        .context("online: follows store is corrupt")?
+    {
+        if follow["manga_id"] == "fx-pop-1" {
+            follow["known"] = serde_json::json!(["daily-1"]);
+            follow["fresh"] = serde_json::json!(["daily-2"]);
+        }
+    }
+    std::fs::write(&follows_path, serde_json::to_vec(&store)?)?;
+    h.app = ReaderApp::new(library_root.to_path_buf(), h.ctx.clone());
+    h.wait(ReaderApp::ready)?;
+    h.wait(ReaderApp::covers_loaded)?;
+    h.frames(8)?;
+    // Centre the linked book — its spine carries the manga title — so the
+    // fresh-chapter badge is visible.
+    for _ in 0..6 {
+        if h.app.focused_book_title() == "热门-第1页" {
+            break;
+        }
+        h.click("shelf-prev")?;
+        h.wait(|app| !app.frame_is_animating)?;
+    }
+    anyhow::ensure!(
+        h.app.focused_book_title() == "热门-第1页",
+        "online: shelf could not focus the linked book"
+    );
+    design_capture(h, "shelf-online-badge", captures)?;
+    // Focus the online entry and resume it.
+    for _ in 0..6 {
+        if h.app.focused_book_title() == "最新-第1页" {
+            break;
+        }
+        h.click("shelf-next")?;
+        h.wait(|app| !app.frame_is_animating)?;
+    }
+    for _ in 0..6 {
+        if h.app.focused_book_title() == "最新-第1页" {
+            break;
+        }
+        h.click("shelf-prev")?;
+        h.wait(|app| !app.frame_is_animating)?;
+    }
+    anyhow::ensure!(
+        h.app.focused_book_title() == "最新-第1页",
+        "online: shelf could not focus the followed work"
+    );
+    h.click("shelf-read")?;
+    // The fixture exports no get_page_list, so the stream stays pending;
+    // entering the online reader is the observable outcome.
+    h.wait(|app| app.screen_name() == "reader")?;
+    h.frames(4)?;
+    design_capture(h, "shelf-online-reader", captures)?;
+    h.click("reader-back")?;
+    h.frames(6)?;
     Ok(())
 }
 
@@ -1141,6 +1475,21 @@ fn filters_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
     h.size = [507, 1024];
     h.frames(5)?;
     h.frame(vec![], Some("source-detail-narrow"))?;
+    // Dark-theme sweep of the grid and detail pages.
+    library.set_setting("theme", "dark")?;
+    h.app = ReaderApp::new(library_root.into(), h.ctx.clone());
+    h.wait(ReaderApp::ready)?;
+    h.app.prepare_source_acceptance("browse")?;
+    h.wait(ReaderApp::source_browser_ready)?;
+    h.size = [1024, 1366];
+    h.frames(5)?;
+    h.frame(vec![], Some("source-grid-portrait-dark"))?;
+    h.click_text("热门-第1页")?;
+    h.wait(|app| app.source_browser_report()["busy"] == false)?;
+    h.size = [1366, 1024];
+    h.frames(5)?;
+    h.frame(vec![], Some("source-detail-wide-dark"))?;
+    library.set_setting("theme", "system")?;
     set_insets_override(None);
     println!(
         "PASS: source listing + pagination + real WASM filtered result + cancel/reset + iPad/200 percent filters"
@@ -1223,6 +1572,13 @@ fn ipad_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
             "ipad {name}: {}x{} pt, insets top {top} bottom {bottom}",
             size[0], size[1]
         );
+        if name == "ipad-11-portrait" {
+            anyhow::ensure!(
+                h.app.shelf_books_fraction() >= 0.9,
+                "{name}: collapsed books rect is {:.2} of the stage width, expected the stacked arrangement",
+                h.app.shelf_books_fraction()
+            );
+        }
         for (tab, label) in [
             ("search", "sources"),
             ("settings", "settings"),
@@ -1310,10 +1666,67 @@ fn ipad_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
         }
     }
     library.set_setting("font-scale", "1")?;
+    // Dark-theme sweep on the iPad 11 portrait profile.
+    library.set_setting("theme", "dark")?;
+    h.app = ReaderApp::new(library_root.into(), h.ctx.clone());
+    h.wait(ReaderApp::ready)?;
+    h.wait(ReaderApp::covers_loaded)?;
+    h.size = [834, 1194];
+    h.frames(8)?;
+    h.frame(vec![], Some("ipad-11-portrait-dark"))?;
+    for (tab, label) in [
+        ("search", "sources"),
+        ("settings", "settings"),
+        ("history", "history"),
+    ] {
+        h.click(&format!("nav-{tab}"))?;
+        h.frames(4)?;
+        h.frame(vec![], Some(&format!("ipad-11-portrait-dark-{label}")))?;
+    }
+    h.click("nav-library")?;
+    h.frames(4)?;
+    library.set_setting("theme", "system")?;
     set_insets_override(None);
     println!(
         "PASS: iPad profiles rendered with real UI at 1024x1366, 1366x1024, 1194x834, 744x1133, 507x1024 and 320x1024"
     );
+    Ok(())
+}
+
+/// One iPad-11 portrait sweep per colour scheme: shelf in light and dark,
+/// plus a settings capture with that scheme selected in the picker.
+fn schemes_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
+    use yejian_platform::{Insets, set_insets_override};
+    set_insets_override(Some(Insets {
+        left: 0,
+        top: 24,
+        right: 0,
+        bottom: 20,
+    }));
+    let library = yejian_core::Library::open(library_root)?;
+    for key in ["ink", "mist", "sepia", "mono", "sakura", "dusk"] {
+        library.set_setting("palette", key)?;
+        for theme in ["light", "dark"] {
+            library.set_setting("theme", theme)?;
+            h.app = ReaderApp::new(library_root.into(), h.ctx.clone());
+            h.wait(ReaderApp::ready)?;
+            h.wait(ReaderApp::covers_loaded)?;
+            h.size = [834, 1194];
+            h.frames(8)?;
+            h.frame(vec![], Some(&format!("shelf-{key}-{theme}")))?;
+            if theme == "light" {
+                h.click("nav-settings")?;
+                h.frames(4)?;
+                h.frame(vec![], Some(&format!("settings-{key}")))?;
+                h.click("nav-library")?;
+                h.frames(4)?;
+            }
+        }
+    }
+    library.set_setting("theme", "system")?;
+    library.set_setting("palette", "ink")?;
+    set_insets_override(None);
+    println!("PASS: six colour schemes on iPad 11 portrait, light and dark");
     Ok(())
 }
 
@@ -1563,7 +1976,24 @@ fn daily_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
         "daily: chapter picker allowed navigation behind the popup"
     );
     design_capture(h, "daily-chapter-picker", &mut captures)?;
-    h.key(Key::BrowserBack)?;
+    // Round 3: manage mode multi-selects chapters and confirms deletion —
+    // cancel here keeps the fixture books for the remaining captures.
+    h.click("chapter-manage")?;
+    h.frames(4)?;
+    h.click(&format!("chapter-check-{}", two.id))?;
+    h.frames(3)?;
+    design_capture(h, "chapters-delete", &mut captures)?;
+    h.click("chapter-delete")?;
+    h.frames(4)?;
+    anyhow::ensure!(
+        h.app.hitboxes.contains_key("storage-confirm-go"),
+        "daily: deleting a chapter did not ask for confirmation"
+    );
+    design_capture(h, "chapters-delete-confirm", &mut captures)?;
+    assert_opaque_card(h, "chapters-delete-confirm.png", "storage-confirm-card")?;
+    h.click_text("取消")?;
+    h.frames(3)?;
+    h.click_text("关闭")?;
     h.frames(4)?;
     anyhow::ensure!(
         h.app.screen_name() == "reader",
@@ -1857,8 +2287,15 @@ fn main() -> Result<()> {
     if std::env::var_os("YEJIAN_DESIGN_ONLY").is_some() {
         return design_pass(&mut h, &data.join("library"));
     }
+    if std::env::var_os("YEJIAN_SCHEMES_ONLY").is_some() {
+        return schemes_pass(&mut h, &data.join("library"));
+    }
     if std::env::var_os("YEJIAN_DAILY_ONLY").is_some() {
         return daily_pass(&mut h, &data.join("library"));
+    }
+    if std::env::var_os("YEJIAN_ONLINE_ONLY").is_some() {
+        let mut captures = Vec::new();
+        return online_shelf_pass(&mut h, &data.join("library"), &mut captures);
     }
     h.frame(vec![], Some("phone-shelf"))?;
     anyhow::ensure!(h.app.rendered_book_nodes < 45);
@@ -2136,7 +2573,11 @@ fn main() -> Result<()> {
     h.size = [844, 390];
     h.frames(3)?;
     let screen = Rect::from_min_size(Pos2::ZERO, vec2(844., 390.));
-    anyhow::ensure!(screen.contains_rect(h.app.hitboxes["shelf-read"]));
+    anyhow::ensure!(
+        screen.contains_rect(h.app.hitboxes["shelf-read"]),
+        "landscape shelf-read {:?} outside {screen:?}",
+        h.app.hitboxes["shelf-read"]
+    );
     h.frame(vec![], Some("phone-landscape-shelf"))?;
     h.click("shelf-center")?;
     h.frames(65)?;
@@ -2275,14 +2716,32 @@ fn main() -> Result<()> {
     h.read_from_beginning()?;
     h.wait(ReaderApp::page_loaded)?;
     for _ in 0..6 {
+        if h.app.chapter_end() {
+            break;
+        }
         h.click("reader-next")?;
         h.wait(ReaderApp::page_loaded)?;
     }
+    anyhow::ensure!(
+        h.app.chapter_end() && h.app.current_book_id() == Some(one.id.as_str()),
+        "last page did not show the chapter end card"
+    );
+    // The end card sits past the last page; progress stays on it.
+    h.frame(vec![], Some("reader-chapter-end"))?;
+    h.click("chapter-end-continue")?;
+    h.wait(ReaderApp::page_loaded)?;
     anyhow::ensure!(
         h.app.current_book_id() == Some(two.id.as_str()) && h.app.current_page() == 0,
         "end-of-chapter did not continue into the next downloaded chapter"
     );
     h.frame(vec![], Some("reader-next-chapter"))?;
+    // Time/battery pill shows only while the controls are hidden. Taps
+    // resolve after the double-click delay, so let them fire first.
+    h.click("reader-canvas")?;
+    h.frames(20)?;
+    h.frame(vec![], Some("reader-status"))?;
+    h.click("reader-canvas")?;
+    h.frames(20)?;
     h.click("reader-chapters")?;
     h.frames(12)?;
     h.frame(vec![], Some("chapter-picker"))?;
@@ -2349,6 +2808,77 @@ fn main() -> Result<()> {
             && (closing_saved.page_fraction - closing_fraction).abs() < 0.0001,
         "normal exit returned before the final reading position was committed"
     );
+
+    // The vertical strip draws a labelled separator where one chapter hands
+    // off to the next — scroll the first chapter down until it appears.
+    h.app = ReaderApp::new(data.join("library"), h.ctx.clone());
+    h.wait(ReaderApp::ready)?;
+    h.frames(30)?;
+    h.wait(ReaderApp::covers_loaded)?;
+    h.click("search")?;
+    h.frames(2)?;
+    h.click("search-field")?;
+    h.frame(vec![Event::Text("山海之间".into())], None)?;
+    h.frames(4)?;
+    h.click("open-book")?;
+    h.frames(65)?;
+    h.read_from_beginning()?;
+    h.wait(ReaderApp::page_loaded)?;
+    // The paged run above stored per-work prefs; switch this work to the
+    // strip through the reader options like a user would.
+    h.click("reader-settings")?;
+    h.frames(3)?;
+    h.click("reader-mode-vertical")?;
+    h.frames(3)?;
+    h.click("reader-options-close")?;
+    h.frames(4)?;
+    let separator = |app: &ReaderApp| {
+        app.hitboxes
+            .keys()
+            .any(|key| key.starts_with("vertical-separator-"))
+    };
+    // Page to the last page of the first chapter, then ease over the seam:
+    // each step waits for the strip to load before scrolling on.
+    for _ in 0..one.page_count {
+        if h.app.current_page() + 1 == one.page_count {
+            break;
+        }
+        h.click("reader-next")?;
+        h.wait(ReaderApp::page_loaded)?;
+        h.frames(2)?;
+    }
+    let canvas = h.app.hitboxes["reader-canvas"];
+    let wheel = || {
+        vec![
+            Event::PointerMoved(canvas.center()),
+            Event::MouseWheel {
+                unit: MouseWheelUnit::Point,
+                delta: vec2(0., -220.),
+                source: MouseWheelSource::Wheel,
+                modifiers: Modifiers::NONE,
+                phase: TouchPhase::Move,
+            },
+        ]
+    };
+    let mut crossed = false;
+    for _ in 0..300 {
+        if separator(&h.app) {
+            crossed = true;
+            break;
+        }
+        h.frame(wheel(), None)?;
+        h.wait(ReaderApp::page_loaded)?;
+    }
+    anyhow::ensure!(
+        crossed,
+        "vertical strip never showed a chapter separator (book={:?} page={} end={} keys={:?})",
+        h.app.current_book_id(),
+        h.app.current_page(),
+        h.app.chapter_end(),
+        h.app.hitboxes.keys().collect::<Vec<_>>()
+    );
+    h.frame(vec![], Some("reader-vertical-separator"))?;
+
     // A persisted, interrupted queue is visible without repeating a search.
     // These records are labelled fixture data; the queue execution itself is
     // covered by the real WASM/HTTP and recovery tests in sources.rs.

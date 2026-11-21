@@ -726,6 +726,28 @@ public func yejian_ios_poll_web() -> UnsafeMutablePointer<CChar>? {
     return duplicate(json)
 }
 
+@_cdecl("yejian_ios_set_keep_awake")
+public func yejian_ios_set_keep_awake(_ awake: Bool) {
+    DispatchQueue.main.async {
+        UIApplication.shared.isIdleTimerDisabled = awake
+    }
+}
+
+/// Battery level in percent, or -1 when the device cannot report one.
+/// Monitoring is enabled on the first query.
+@_cdecl("yejian_ios_battery_level")
+public func yejian_ios_battery_level() -> Float {
+    if !Thread.isMainThread {
+        return DispatchQueue.main.sync { yejian_ios_battery_level() }
+    }
+    let device = UIDevice.current
+    if !device.isBatteryMonitoringEnabled {
+        device.isBatteryMonitoringEnabled = true
+    }
+    let level = device.batteryLevel
+    return level < 0 ? -1 : Float(level * 100)
+}
+
 @_cdecl("yejian_ios_open_external_url")
 public func yejian_ios_open_external_url(_ url: UnsafePointer<CChar>?) -> Int64 {
     guard let url else { return -1 }
