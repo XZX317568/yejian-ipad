@@ -19,8 +19,32 @@ pub struct Follow {
     pub total: usize,
     #[serde(default)]
     pub checked_at: Option<u64>,
+    /// When the work was followed; older records fall back to `checked_at`.
+    #[serde(default)]
+    pub followed_at: Option<u64>,
+    /// Chapter keys in reading order (oldest first), from the same ordering
+    /// the detail page uses. Empty for records written before the order was
+    /// kept — their progress is unknown rather than reversed.
+    #[serde(default)]
+    pub reading_order: Vec<String>,
+    /// Chapter number carried over by a source migration (换源): the chapter
+    /// the user was reading on the old source. `None` when no readable
+    /// number could be parsed — the new source then resumes at chapter one.
+    #[serde(default)]
+    pub resume_number: Option<f64>,
+    /// Whether the chapter `resume_number` points at was already finished;
+    /// finished means the resume target is the first chapter *after* it.
+    #[serde(default)]
+    pub resume_done: bool,
     #[serde(default)]
     pub error: Option<String>,
+}
+
+impl Follow {
+    /// Join date for shelf sorting: `followed_at`, else `checked_at`, else 0.
+    pub fn followed(&self) -> u64 {
+        self.followed_at.or(self.checked_at).unwrap_or(0)
+    }
 }
 
 impl Follow {

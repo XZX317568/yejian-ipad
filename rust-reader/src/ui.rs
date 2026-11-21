@@ -1,4 +1,5 @@
 use crate::{
+    follows,
     motion::{self, ShelfMotion},
     shelf::{self, Plane},
     sources::{STREAM_PREFIX, StreamChapter},
@@ -12,6 +13,20 @@ use std::{
 };
 use yejian_core::{Book, ChapterLink, ChapterMetadata};
 
+/// A destructive storage cleanup waiting on the 存储 confirm dialog.
+#[derive(Clone)]
+enum StorageConfirm {
+    /// Delete files of all removed books; rows + progress stay.
+    RemovedBooks,
+    /// Delete finished/failed/orphaned download staging.
+    Staging,
+    /// Delete the source cover cache (re-downloads on demand).
+    Covers,
+    /// Delete these downloaded chapter books (files + rows kept progress).
+    Chapters(Vec<String>),
+    /// Delete a category; its books move back to 未分类.
+    Category(String),
+}
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Library,
@@ -131,6 +146,54 @@ struct StreamBook {
     waiting: HashSet<usize>,
 }
 
+/// The library shelf's book ordering; "recent" is the library order.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShelfSort {
+    Recent,
+    Progress,
+    Added,
+}
+impl ShelfSort {
+    fn key(self) -> &'static str {
+        match self {
+            ShelfSort::Recent => "recent",
+            ShelfSort::Progress => "progress",
+            ShelfSort::Added => "added",
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            ShelfSort::Recent => "最近阅读",
+            ShelfSort::Progress => "阅读进度",
+            ShelfSort::Added => "加入时间",
+        }
+    }
+    fn hitbox(self) -> &'static str {
+        match self {
+            ShelfSort::Recent => "shelf-sort-recent",
+            ShelfSort::Progress => "shelf-sort-progress",
+            ShelfSort::Added => "shelf-sort-added",
+        }
+    }
+    fn from_key(key: &str) -> Self {
+        match key {
+            "progress" => ShelfSort::Progress,
+            "added" => ShelfSort::Added,
+            _ => ShelfSort::Recent,
+        }
+    }
+}
+const SHELF_SORTS: [ShelfSort; 3] = [ShelfSort::Recent, ShelfSort::Progress, ShelfSort::Added];
+
+/// A mid-flight book swap on the 3D shelf: `from_ids` is the visible order
+/// the animation started from and `from_focus` the lane it was centred on.
+struct Reorder {
+    from_ids: Vec<String>,
+    from_focus: f32,
+    started: f64,
+}
+const REORDER_SECONDS: f64 = 0.560;
+
 #[derive(Clone, Copy)]
 struct ShelfLayout {
     stage: Rect,
@@ -153,7 +216,25 @@ pub struct ReaderApp {
     query: String,
     search: bool,
     category: String,
-    category_edit: String,
+    /// User-created categories in stored order (the `categories` setting).
+    user_categories: Vec<String>,
+    /// The 分类管理 panel (opaque card) is open.
+    category_manage: bool,
+    /// Multi-select 分类 picker is open.
+    category_pick: bool,
+    /// 新建分类 input inside the manage/pick panels.
+    category_new: String,
+    /// Category being renamed inside the manage panel.
+    category_renaming: Option<String>,
+    /// Draft name for the row being renamed.
+    category_rename_edit: String,
+    bookmarks: crate::bookmarks::Bookmarks,
+    /// Chapter dialog shows the 书签 tab instead of 章节.
+    dialog_bookmarks: bool,
+    /// Page to land on when a bookmarked online chapter's stream opens.
+    pending_bookmark_page: Option<usize>,
+    /// Last page bytes staged under `share/` (acceptance asserts on it).
+    last_shared: Option<PathBuf>,
     selected: HashSet<String>,
     tab: Tab,
     screen: Screen,
@@ -196,6 +277,20 @@ pub struct ReaderApp {
     zoom: f32,
     pan: Vec2,
     controls: bool,
+    /// Showing the 本章完 end card past the last page.
+    chapter_end: bool,
+    /// "lr" | "next" | "off" — tap-zone behaviour (`tap-zones` setting).
+    tap_zones: String,
+    /// 阅读时屏幕常亮 setting; `awake` mirrors the platform flag.
+    keep_awake_setting: bool,
+    awake: bool,
+    /// Calls made to `set_keep_awake`, asserted by tests.
+    #[cfg(test)]
+    awake_log: Vec<bool>,
+    /// 显示时间和电量 setting + cached battery (refreshed ≤1/min).
+    reader_status: bool,
+    battery: Option<f32>,
+    battery_at: Option<std::time::Instant>,
     reader_drag: f32,
     reader_drag_y: f32,
     reader_fit_limit: f32,
@@ -212,12 +307,31 @@ pub struct ReaderApp {
     dark: bool,
     reduced: bool,
     theme: String,
+    color_scheme: String,
+    library_grid: bool,
+    shelf_sort: ShelfSort,
+    sort_menu: bool,
+    shelf_reorder: Option<Reorder>,
+    shelf_reserve: f32,
+    shelf_stage: Rect,
+    shelf_books: Rect,
     font_scale: f32,
     widget_font_scale: f32,
     error: Option<String>,
     notice: Option<(String, f64)>,
     pending_notice: Option<String>,
     confirm_remove: bool,
+    /// 移出书架 confirm: also delete archive/cover files (default on).
+    remove_files: bool,
+    /// Library storage report for the 存储 settings group.
+    storage: Option<yejian_core::StorageReport>,
+    /// Re-requests storage numbers each time the settings tab opens.
+    storage_opened: bool,
+    /// Pending destructive storage action awaiting confirmation.
+    storage_confirm: Option<StorageConfirm>,
+    /// Chapter-picker manage mode: multi-select for deletion.
+    chapter_manage: bool,
+    chapter_selected: std::collections::HashSet<String>,
     import_text: String,
     backup_path: String,
     sources: crate::sources::Sources,
@@ -227,12 +341,15 @@ pub struct ReaderApp {
     tracker_anilist_token: String,
     tracker_kitsu_user: String,
     tracker_kitsu_pass: String,
+    tracker_bangumi_token: String,
     track_panel: Option<String>,
     track_query: String,
     /// Unsaved status/progress edits in the tracking panel, by binding key.
     /// Keyed by binding key and remote media id so a rebind starts fresh.
     /// Each field is `Some` only while the user has edited it.
     track_draft: Option<(String, String, Option<crate::trackers::TrackStatus>, Option<i64>)>,
+    /// 应用锁 state; the lock itself is in-memory, never persisted.
+    applock: crate::applock::AppLock,
     pub hitboxes: BTreeMap<String, Rect>,
     pub rendered_book_nodes: usize,
     pub frame_is_animating: bool,
@@ -243,6 +360,9 @@ impl ReaderApp {
     pub fn new(root: PathBuf, ctx: Context) -> Self {
         let backup_path = root.join("backup.yejian.zip").to_string_lossy().to_string();
         let reader_prefs = crate::reader_prefs::load(&root).unwrap_or_default();
+        // Page files staged for the share sheet are one-shot temp files.
+        let _ = std::fs::remove_dir_all(root.join("share"));
+        let bookmarks = crate::bookmarks::Bookmarks::load(&root);
         Self {
             worker: Worker::start(root.clone(), ctx.clone()),
             sync: crate::sync::ProgressSync::new(root.clone(), ctx.clone()),
@@ -250,9 +370,11 @@ impl ReaderApp {
             tracker_anilist_token: String::new(),
             tracker_kitsu_user: String::new(),
             tracker_kitsu_pass: String::new(),
+            tracker_bangumi_token: String::new(),
             track_panel: None,
             track_query: String::new(),
             track_draft: None,
+            applock: crate::applock::AppLock::default(),
             sources: crate::sources::Sources::new(root.clone(), ctx),
             root,
             stream: None,
@@ -265,7 +387,16 @@ impl ReaderApp {
             query: String::new(),
             search: false,
             category: String::new(),
-            category_edit: String::new(),
+            user_categories: Vec::new(),
+            category_manage: false,
+            category_pick: false,
+            category_new: String::new(),
+            category_renaming: None,
+            category_rename_edit: String::new(),
+            bookmarks,
+            dialog_bookmarks: false,
+            pending_bookmark_page: None,
+            last_shared: None,
             selected: HashSet::new(),
             tab: Tab::Library,
             screen: Screen::Library,
@@ -305,6 +436,15 @@ impl ReaderApp {
             zoom: 1.,
             pan: Vec2::ZERO,
             controls: true,
+            chapter_end: false,
+            tap_zones: "lr".into(),
+            keep_awake_setting: true,
+            awake: false,
+            #[cfg(test)]
+            awake_log: Vec::new(),
+            reader_status: true,
+            battery: None,
+            battery_at: None,
             reader_drag: 0.,
             reader_drag_y: 0.,
             reader_fit_limit: 0.,
@@ -321,12 +461,26 @@ impl ReaderApp {
             dark: false,
             reduced: false,
             theme: "system".into(),
+            color_scheme: "ink".into(),
+            library_grid: false,
+            shelf_sort: ShelfSort::Recent,
+            sort_menu: false,
+            shelf_reorder: None,
+            shelf_reserve: 0.,
+            shelf_stage: Rect::NOTHING,
+            shelf_books: Rect::NOTHING,
             font_scale: 1.,
             widget_font_scale: 0.,
             error: None,
             notice: None,
             pending_notice: None,
             confirm_remove: false,
+            remove_files: true,
+            storage: None,
+            storage_opened: false,
+            storage_confirm: None,
+            chapter_manage: false,
+            chapter_selected: Default::default(),
             import_text: String::new(),
             backup_path,
             hitboxes: BTreeMap::new(),
@@ -360,10 +514,147 @@ impl ReaderApp {
         self.sources.browser_ready("browse")
     }
     #[cfg(debug_assertions)]
+    pub fn prepare_global_search_acceptance(&mut self) -> anyhow::Result<()> {
+        self.tab = Tab::Sources;
+        self.screen = Screen::Library;
+        self.sources.preview_global_search()
+    }
+    #[cfg(debug_assertions)]
+    pub fn global_search_done(&self) -> bool {
+        let groups = &self.source_browser_report()["groups"];
+        groups
+            .as_array()
+            .map(|list| {
+                !list.is_empty()
+                    && list
+                        .iter()
+                        .all(|group| group["state"] != "searching")
+            })
+            .unwrap_or(false)
+    }
+    #[cfg(debug_assertions)]
+    pub fn seed_search_history(&mut self, history: Vec<String>) {
+        self.sources.set_search_history(history);
+        self.sources.clear_query();
+    }
+    #[cfg(debug_assertions)]
+    pub fn seed_categories(&mut self, categories: Vec<String>) {
+        self.user_categories = categories;
+    }
+    #[cfg(debug_assertions)]
+    pub fn open_category_manage(&mut self) {
+        self.category_manage = true;
+    }
+    #[cfg(debug_assertions)]
+    pub fn category_order(&self) -> &[String] {
+        &self.user_categories
+    }
+    #[cfg(debug_assertions)]
+    pub fn pick_categories(&mut self, ids: Vec<String>) {
+        self.selected = ids.into_iter().collect();
+        self.category_pick = true;
+    }
+    #[cfg(debug_assertions)]
+    pub fn first_book_id(&self) -> Option<String> {
+        self.books.first().map(|book| book.id.clone())
+    }
+    #[cfg(debug_assertions)]
+    pub fn share_ready_now(&self) -> bool {
+        matches!(&self.screen, Screen::Reader(id) if self.share_enabled(id))
+    }
+    #[cfg(debug_assertions)]
+    pub fn last_shared(&self) -> Option<&std::path::Path> {
+        self.last_shared.as_deref()
+    }
+    #[cfg(debug_assertions)]
+    pub fn bookmark_count(&self) -> usize {
+        self.bookmarks.entries().len()
+    }
+    #[cfg(debug_assertions)]
+    pub fn add_bookmark_here(&mut self) {
+        if let Screen::Reader(id) = self.screen.clone() {
+            self.bookmark_toggle(&id);
+        }
+    }
+    #[cfg(debug_assertions)]
+    pub fn open_bookmark_dialog(&mut self) {
+        if let Screen::Reader(id) = self.screen.clone() {
+            self.dialog_bookmarks = true;
+            self.chapter_dialog = Some(id);
+        }
+    }
+    #[cfg(debug_assertions)]
+    pub fn prepare_share_stream(&mut self) {
+        if let Some(chapter) = self.sources.preview_share_stream() {
+            self.open_stream(chapter);
+        }
+    }
+    #[cfg(debug_assertions)]
     pub fn prepare_installed_source_acceptance(&mut self, id: &str) -> anyhow::Result<()> {
         self.tab = Tab::Sources;
         self.screen = Screen::Library;
         self.sources.preview_installed_source(id)
+    }
+    #[cfg(debug_assertions)]
+    pub fn prepare_auto_follow_acceptance(&mut self) {
+        self.tab = Tab::Sources;
+        self.screen = Screen::Library;
+        self.sources.preview_auto_download();
+    }
+    #[cfg(debug_assertions)]
+    pub fn prepare_migrate_acceptance(&mut self, stage: &str) {
+        self.tab = Tab::Sources;
+        self.screen = Screen::Library;
+        self.sources.preview_migrate(stage);
+    }
+    /// Acceptance teardown: remove preview follows/tasks before the app is
+    /// dropped so they never leak into the real saved state.
+    #[cfg(debug_assertions)]
+    pub fn clear_acceptance_previews(&mut self) {
+        self.sources.clear_acceptance_previews();
+    }
+    /// Acceptance seam: fake device-owner support/auth results on desktop.
+    #[cfg(debug_assertions)]
+    pub fn set_app_lock_fake(
+        &mut self,
+        supported: bool,
+        auth: Option<std::result::Result<(), String>>,
+    ) {
+        yejian_platform::set_app_lock_fake(supported, auth);
+    }
+    #[cfg(debug_assertions)]
+    pub fn debug_lock(&mut self) {
+        self.applock.lock();
+    }
+    #[cfg(debug_assertions)]
+    pub fn app_lock_locked(&self) -> bool {
+        self.applock.locked()
+    }
+    #[cfg(debug_assertions)]
+    pub fn app_lock_enabled(&self) -> bool {
+        self.applock.enabled()
+    }
+    /// Acceptance seam: Bangumi requests go to a local fake server.
+    #[cfg(debug_assertions)]
+    pub fn set_bangumi_endpoint(&mut self, ctx: Context, base: String) {
+        self.trackers
+            .replace_for_test(self.root.clone(), ctx, base);
+    }
+    #[cfg(debug_assertions)]
+    pub fn tracker_command(&mut self, command: crate::trackers::TrackCommand) {
+        self.trackers.submit(command);
+    }
+    #[cfg(debug_assertions)]
+    pub fn tracker_report(&self, key: &str) -> serde_json::Value {
+        let binding = self.trackers.binding(key);
+        serde_json::json!({
+            "bangumi": self
+                .trackers
+                .account(crate::trackers::TrackerKind::Bangumi)
+                .map(|account| account.name.clone()),
+            "bound": binding.is_some(),
+            "tracker": binding.map(|entry| entry.tracker.clone()),
+        })
     }
     #[cfg(debug_assertions)]
     fn apply_snapshot(&mut self, name: &str) {
@@ -525,13 +816,102 @@ impl ReaderApp {
                     .and_then(|task| self.sources.stream_metadata(task))
             })
     }
+    /// The page's original bytes exist locally — share stays grey until then.
+    fn share_enabled(&self, id: &str) -> bool {
+        if id.starts_with(STREAM_PREFIX) {
+            self.sources.page_ready(id, self.page)
+        } else {
+            true
+        }
+    }
+    /// Whether the currently shown page already has a bookmark.
+    fn bookmarked(&self, id: &str) -> bool {
+        if self.private {
+            return false;
+        }
+        let meta = self.reading_metadata(id);
+        let work = crate::bookmarks::work_key(id, meta.as_ref());
+        let chapter = crate::bookmarks::chapter_key(id, meta.as_ref());
+        self.bookmarks.has(&work, &chapter, self.page)
+    }
+    fn bookmark_toggle(&mut self, id: &str) {
+        if self.private {
+            self.pending_notice = Some("私密阅读时书签不可用".into());
+            return;
+        }
+        let meta = self.reading_metadata(id);
+        let work = crate::bookmarks::work_key(id, meta.as_ref());
+        let chapter = crate::bookmarks::chapter_key(id, meta.as_ref());
+        let title = meta
+            .as_ref()
+            .map(|meta| meta.chapter_title.clone())
+            .unwrap_or_else(|| "本页".into());
+        self.bookmarks.toggle(crate::bookmarks::Bookmark {
+            work,
+            chapter,
+            page: self.page,
+            title,
+            created_at: crate::follows::now(),
+        });
+        if let Err(error) = self.bookmarks.save(&self.root) {
+            self.error = Some(format!("书签保存失败：{error}"));
+        }
+    }
+    /// Local book for a bookmark's work+chapter, if it was downloaded.
+    fn bookmark_book(&self, mark: &crate::bookmarks::Bookmark) -> Option<Book> {
+        self.chapters
+            .iter()
+            .find(|link| {
+                crate::bookmarks::work_key(&link.book_id, Some(&link.metadata))
+                    == mark.work
+                    && link.metadata.chapter_id == mark.chapter
+            })
+            .and_then(|link| {
+                self.books
+                    .iter()
+                    .find(|book| book.id == link.book_id)
+                    .cloned()
+            })
+            .or_else(|| {
+                // Unlinked local books use the book id for both keys.
+                (mark.work == mark.chapter)
+                    .then(|| self.books.iter().find(|book| book.id == mark.work).cloned())
+                    .flatten()
+            })
+    }
+    fn bookmark_jump(&mut self, mark: crate::bookmarks::Bookmark, current: &str) {
+        if let Some(book) = self.bookmark_book(&mark) {
+            let id = book.id.clone();
+            self.open_reader(&book);
+            self.chapter_dialog = None;
+            let delta = mark.page as i32 - self.page as i32;
+            if delta != 0 {
+                self.next_page(&id, delta);
+            }
+            return;
+        }
+        // Online chapter with an existing download task: reopen the stream
+        // and land on the bookmarked page once it is open.
+        if let Some((source, manga)) = mark.work.split_once('\u{1f}')
+            && self.sources.open_bookmarked(source, manga, &mark.chapter)
+        {
+            self.pending_bookmark_page = Some(mark.page);
+            self.chapter_dialog = None;
+            let _ = current;
+        } else {
+            self.error = Some("书签的章节还没下载，请先从详情页打开".into());
+        }
+    }
     fn open_stream(&mut self, chapter: StreamChapter) {
         let id = format!("{STREAM_PREFIX}{}", chapter.id);
         let state = self.sources.stream_state(&chapter.id).unwrap_or_default();
         let wanted = if chapter.from_end {
             usize::MAX
         } else {
-            state.page.unwrap_or(0)
+            self.pending_bookmark_page
+                .take()
+                .or(state.page)
+                .unwrap_or(0)
         };
         let resume = (state.total == 0 && wanted > 0).then_some(wanted);
         let book = Book {
@@ -547,6 +927,7 @@ impl ReaderApp {
             current_page: wanted.min(state.total.saturating_sub(1)),
             page_fraction: 0.,
             updated_at: 0,
+            added_at: 0,
             last_read_at: None,
             category: String::new(),
         };
@@ -746,6 +1127,7 @@ impl ReaderApp {
                 current_page: 0,
                 page_fraction: 0.,
                 updated_at: 0,
+                added_at: 0,
                 last_read_at: None,
                 category: String::new(),
             },
@@ -970,6 +1352,17 @@ impl ReaderApp {
     /// Opens the previous/next chapter in the source's order when that list
     /// is known (library copy if present, online otherwise), else the
     /// neighbouring library chapter.
+    /// Display name of the next chapter (local or online) for the end card;
+    /// `None` when this is the latest chapter.
+    fn next_chapter_name(&self, id: &str) -> Option<String> {
+        if let Some(metadata) = self.reading_metadata(id) {
+            if let Some(name) = self.sources.adjacent_online_name(&metadata, 1) {
+                return Some(name);
+            }
+        }
+        self.adjacent_chapter(id, 1)
+            .map(|book| self.reading_title(&book))
+    }
     fn open_neighbor(&mut self, id: &str, delta: i32) -> bool {
         let start = |book: &mut Book| {
             book.current_page = if delta < 0 {
@@ -1071,7 +1464,7 @@ impl ReaderApp {
             }
             representatives.push(book);
         }
-        representatives
+        let mut entries: Vec<Book> = representatives
             .into_iter()
             .map(|book| {
                 let mut entry = book.clone();
@@ -1080,7 +1473,190 @@ impl ReaderApp {
                 }
                 entry
             })
-            .collect()
+            .collect();
+        // Followed works with no local chapters still belong on the shelf:
+        // synthesise one entry per follow so sorting, animation and hit
+        // testing all apply unchanged. Dedupe against every linked work —
+        // filtering must not resurrect a hidden local work's online twin.
+        let linked_works: HashSet<(&str, &str)> = self
+            .chapters
+            .iter()
+            .map(|link| {
+                (
+                    link.metadata.source_id.as_str(),
+                    link.metadata.manga_id.as_str(),
+                )
+            })
+            .collect();
+        for follow in self.sources.follows() {
+            let key = (follow.source_id.as_str(), follow.manga_id.as_str());
+            if linked_works.contains(&key) {
+                continue;
+            }
+            if (!self.category.is_empty() && self.category != "在线追更")
+                || (!query.is_empty() && !follow.title.to_lowercase().contains(&query))
+            {
+                continue;
+            }
+            let (mut current_page, mut last_read_at) = (0, None);
+            let mut progress_known = true;
+            if let Some((chapter_key, _name, at)) =
+                self.sources.work_last_read(&follow.source_id, &follow.manga_id)
+            {
+                last_read_at = Some(at);
+                match follow
+                    .reading_order
+                    .iter()
+                    .position(|key| key == &chapter_key)
+                {
+                    Some(index) => current_page = index,
+                    // Records saved before the reading order was kept can't be
+                    // placed; marking progress unknown keeps them behind works
+                    // whose progress is real rather than showing a flipped
+                    // index for newest-first sources.
+                    None => progress_known = false,
+                }
+            }
+            let added_at = follow.followed() as i64;
+            entries.push(Book {
+                id: format!("online:{}\u{1f}{}", follow.source_id, follow.manga_id),
+                title: follow.title.clone(),
+                author: String::new(),
+                archive_path: PathBuf::new(),
+                cover_path: None,
+                page_count: follow.total.max(1),
+                current_page,
+                page_fraction: if progress_known { 0. } else { -1. },
+                updated_at: last_read_at.unwrap_or(added_at),
+                added_at,
+                last_read_at,
+                category: "在线追更".into(),
+            });
+        }
+        self.sort_visible(&mut entries);
+        entries
+    }
+    /// A representative's position inside its series: `(ordinal, count)` in
+    /// `self.chapters` order, or `(0, 1)` for an unlinked book.
+    fn series_ordinals(&self) -> HashMap<&str, (usize, usize)> {
+        let mut groups: HashMap<(&str, &str), Vec<&str>> = HashMap::new();
+        for link in &self.chapters {
+            let m = &link.metadata;
+            groups
+                .entry((m.source_id.as_str(), m.manga_id.as_str()))
+                .or_default()
+                .push(link.book_id.as_str());
+        }
+        let mut ordinals = HashMap::new();
+        for ids in groups.values() {
+            for (ordinal, id) in ids.iter().enumerate() {
+                ordinals.insert(*id, (ordinal, ids.len()));
+            }
+        }
+        ordinals
+    }
+    /// `(group, fraction)`: 0 in progress, 1 finished, 2 not started. The
+    /// fraction blends the chapter ordinal with the page position inside it.
+    fn work_progress(&self, book: &Book, ordinals: &HashMap<&str, (usize, usize)>) -> (u8, f32) {
+        let page_progress = if book.page_fraction < 0. {
+            // Online entries whose reading order is unknown sort behind every
+            // work with a real in-progress fraction.
+            -1.
+        } else if book.last_read_at.is_none() {
+            0.
+        } else if book.current_page + 1 >= book.page_count {
+            1.
+        } else {
+            (book.current_page + 1) as f32 / book.page_count.max(1) as f32
+        };
+        let (ordinal, count) = ordinals.get(book.id.as_str()).copied().unwrap_or((0, 1));
+        let fraction = (ordinal as f32 + page_progress) / count as f32;
+        if book.last_read_at.is_none() {
+            (2, fraction)
+        } else if ordinal + 1 == count && page_progress >= 1. {
+            (1, fraction)
+        } else {
+            (0, fraction)
+        }
+    }
+    fn sort_visible(&self, books: &mut Vec<Book>) {
+        match self.shelf_sort {
+            ShelfSort::Recent => {}
+            ShelfSort::Added => {
+                // One pass over books and links: the earliest chapter's join
+                // date stands in for the work's.
+                let added: HashMap<&str, i64> = self
+                    .books
+                    .iter()
+                    .map(|book| (book.id.as_str(), book.added_at))
+                    .collect();
+                let mut series_added: HashMap<(&str, &str), i64> = HashMap::new();
+                for link in &self.chapters {
+                    let m = &link.metadata;
+                    let at = added.get(link.book_id.as_str()).copied().unwrap_or(0);
+                    series_added
+                        .entry((m.source_id.as_str(), m.manga_id.as_str()))
+                        .and_modify(|value| *value = (*value).min(at))
+                        .or_insert(at);
+                }
+                let work_added = |book: &Book| {
+                    self.chapter(&book.id)
+                        .and_then(|m| {
+                            series_added
+                                .get(&(m.source_id.as_str(), m.manga_id.as_str()))
+                                .copied()
+                        })
+                        .unwrap_or(book.added_at)
+                };
+                books.sort_by(|a, b| {
+                    work_added(b)
+                        .cmp(&work_added(a))
+                        .then_with(|| a.title.cmp(&b.title))
+                });
+            }
+            ShelfSort::Progress => {
+                let ordinals = self.series_ordinals();
+                books.sort_by(|a, b| {
+                    let (group_a, fraction_a) = self.work_progress(a, &ordinals);
+                    let (group_b, fraction_b) = self.work_progress(b, &ordinals);
+                    group_a
+                        .cmp(&group_b)
+                        .then_with(|| {
+                            if group_a == 0 {
+                                fraction_b
+                                    .partial_cmp(&fraction_a)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            } else {
+                                std::cmp::Ordering::Equal
+                            }
+                        })
+                        .then_with(|| b.last_read_at.cmp(&a.last_read_at))
+                        .then_with(|| a.title.cmp(&b.title))
+                });
+            }
+        }
+    }
+    /// Changes the shelf order; the books animate from their old slots and
+    /// the focus lands on the first book of the new order.
+    fn set_shelf_sort(&mut self, sort: ShelfSort, now: f64) {
+        self.sort_menu = false;
+        if self.shelf_sort == sort {
+            return;
+        }
+        if !self.reduced {
+            self.shelf_reorder = Some(Reorder {
+                from_ids: self
+                    .visible_books()
+                    .iter()
+                    .map(|book| book.id.clone())
+                    .collect(),
+                from_focus: self.motion.focus,
+                started: now,
+            });
+        }
+        self.shelf_sort = sort;
+        self.motion.jump(0.);
+        self.setting("shelf-sort", sort.key().to_string());
     }
     fn chapter(&self, id: &str) -> Option<&ChapterMetadata> {
         self.chapter_indices
@@ -1122,6 +1698,60 @@ impl ReaderApp {
         }
         chapters.get(index as usize).cloned()
     }
+    /// `online:{source}\u{1f}{manga}` entries synthesised for the shelf.
+    fn online_parts(id: &str) -> Option<(&str, &str)> {
+        id.strip_prefix("online:")?.split_once('\u{1f}')
+    }
+    fn online_follow(&self, id: &str) -> Option<&follows::Follow> {
+        let (source, manga) = Self::online_parts(id)?;
+        self.sources
+            .follows()
+            .iter()
+            .find(|follow| follow.source_id == source && follow.manga_id == manga)
+    }
+    /// Fresh-chapter count shown on the spine badge: online entries use their
+    /// own follow; local books borrow the follow of their work.
+    fn online_badge(&self, book: &Book) -> Option<usize> {
+        let follows = self.sources.follows();
+        let follow = if let Some((source, manga)) = Self::online_parts(&book.id) {
+            follows
+                .iter()
+                .find(|f| f.source_id == source && f.manga_id == manga)
+        } else {
+            let meta = self.chapter(&book.id)?;
+            follows
+                .iter()
+                .find(|f| f.source_id == meta.source_id && f.manga_id == meta.manga_id)
+        }?;
+        (follow.fresh.len() > 0).then(|| follow.fresh.len())
+    }
+    /// Info line under a followed work: fresh count, else the last-read
+    /// chapter's name, else just the source.
+    fn online_progress_label(&self, follow: &follows::Follow) -> String {
+        let name = self.sources.source_display_name(&follow.source_id);
+        if !follow.fresh.is_empty() {
+            return format!("在线 · {} · {} 话更新", name, follow.fresh.len());
+        }
+        match self
+            .sources
+            .work_last_read(&follow.source_id, &follow.manga_id)
+        {
+            Some((_, chapter, _)) => format!("在线 · 读到 {chapter}"),
+            None => format!("在线 · {name}"),
+        }
+    }
+    fn open_online(&mut self, id: &str, resume: bool) {
+        let Some((source, manga)) = Self::online_parts(id).map(|(s, m)| (s.to_string(), m.to_string()))
+        else {
+            return;
+        };
+        if self.sources.open_work(&source, &manga, resume) {
+            self.flight = None;
+            self.selected.clear();
+            self.tab = Tab::Sources;
+            self.screen = Screen::Library;
+        }
+    }
     fn cover_id(&self, id: &str) -> String {
         if self.chapter(id).is_none() {
             return id.to_string();
@@ -1148,7 +1778,7 @@ impl ReaderApp {
             .map(|book| book.id.clone())
             .collect()
     }
-    fn replace_books(&mut self, books: Vec<Book>) {
+    fn replace_books(&mut self, books: Vec<Book>, now: f64) {
         let previous = self.visible_books();
         let selected = if previous.is_empty() {
             None
@@ -1160,6 +1790,7 @@ impl ReaderApp {
                     .clone(),
             )
         };
+        let from_focus = self.motion.focus;
         self.books = books;
         let visible = self.visible_books();
         if let Some(id) = selected {
@@ -1174,25 +1805,51 @@ impl ReaderApp {
         {
             self.motion.focus = i as f32;
         }
+        // Same shelf in a new order (a finished book resorting itself):
+        // animate the swap instead of teleporting.
+        let from_ids: Vec<String> = previous.iter().map(|book| book.id.clone()).collect();
+        let to_ids: Vec<String> = visible.iter().map(|book| book.id.clone()).collect();
+        if !self.reduced && from_ids.len() == to_ids.len() && from_ids != to_ids {
+            let mut before = from_ids.clone();
+            let mut after = to_ids;
+            before.sort();
+            after.sort();
+            if before == after {
+                self.shelf_reorder = Some(Reorder {
+                    from_ids,
+                    from_focus,
+                    started: now,
+                });
+            }
+        }
         self.selected
-            .retain(|id| self.books.iter().any(|b| &b.id == id));
+            .retain(|id| Self::online_parts(id).is_some() || self.books.iter().any(|b| &b.id == id));
     }
     fn receive(&mut self, ctx: &Context) {
         while let Ok(event) = self.worker.rx.try_recv() {
             match event {
                 Event::Ready(books, settings, links) => {
                     self.replace_links(links);
-                    self.replace_books(books);
+                    self.replace_books(books, ctx.input(|i| i.time));
                     self.ready = true;
+                    let mut app_lock_enabled = self.applock.enabled();
+                    let mut app_lock_delay = self.applock.delay_secs();
                     for (key, value) in settings {
                         match key.as_str() {
                             "theme" => self.theme = value,
+                            "palette" => self.color_scheme = value,
+                            "shelf-grid" => self.library_grid = value == "open",
+                            "shelf-sort" => self.shelf_sort = ShelfSort::from_key(&value),
+                            "search-scope" => self.sources.set_search_scope(&value),
                             "reduce-motion" => self.reduced = value == "true",
                             "reading-direction" => {
                                 self.reader_globals.rtl = value == "rtl";
                                 self.rtl = self.reader_globals.rtl;
                             }
-                            "private" => self.private = value == "true",
+                            "private" => {
+                                self.private = value == "true";
+                                self.sources.set_private(self.private);
+                            }
                             "reading-mode" => {
                                 self.reader_globals.mode = match value.as_str() {
                                     "vertical" => crate::reader_prefs::Mode::Vertical,
@@ -1222,19 +1879,62 @@ impl ReaderApp {
                             "font-scale" => {
                                 self.font_scale = value.parse::<f32>().unwrap_or(1.).clamp(1., 2.)
                             }
+                            "keep-awake" => {
+                                self.keep_awake_setting = value != "false";
+                                if !self.keep_awake_setting {
+                                    self.keep_awake(false);
+                                }
+                            }
+                            "tap-zones" => {
+                                if matches!(value.as_str(), "lr" | "next" | "off") {
+                                    self.tap_zones = value;
+                                }
+                            }
+                            "reader-status" => {
+                                self.reader_status = value != "false";
+                            }
                             "follow-interval" => {
                                 let minutes: u64 = value
                                     .parse()
                                     .unwrap_or(crate::sources::DEFAULT_FOLLOW_INTERVAL_MIN);
                                 self.sources.set_follow_interval(minutes);
                             }
+                            "auto-download" => {
+                                self.sources.set_auto_download(&value);
+                            }
+                            "app-lock" => {
+                                app_lock_enabled = value == "true";
+                            }
+                            "app-lock-delay" => {
+                                app_lock_delay = value.parse().unwrap_or(0);
+                            }
+                            "search-history" => {
+                                if let Ok(history) =
+                                    serde_json::from_str::<Vec<String>>(&value)
+                                {
+                                    self.sources.set_search_history(history);
+                                }
+                            }
+                            "categories" => {
+                                if let Ok(categories) =
+                                    serde_json::from_str::<Vec<String>>(&value)
+                                {
+                                    self.user_categories = categories;
+                                }
+                            }
                             _ => {}
                         }
                     }
+                    // The lock is decided here — before the first painted
+                    // shelf frame — so an enabled app never flashes content.
+                    self.applock.apply_settings(app_lock_enabled, app_lock_delay);
+                    self.applock.cold_start();
+                    yejian_platform::set_privacy_shield(self.applock.enabled());
+                    self.sources.set_private(self.private);
                 }
                 Event::Library(books, links) => {
                     self.replace_links(links);
-                    self.replace_books(books);
+                    self.replace_books(books, ctx.input(|i| i.time));
                 }
                 Event::Image {
                     id,
@@ -1318,6 +2018,28 @@ impl ReaderApp {
                     }
                 }
                 Event::Notice(text) => self.pending_notice = Some(text),
+                Event::ShareReady(result) => match result {
+                    Ok(path) => {
+                        self.last_shared = Some(path.clone());
+                        match yejian_platform::share_file(&path) {
+                            Ok(()) => {}
+                            // Desktop has no share sheet; the staged file is
+                            // the acceptance-verifiable outcome there.
+                            Err(yejian_platform::PlatformError::Unsupported(_)) => {}
+                            Err(error) => {
+                                self.error = Some(format!("无法打开分享：{error}"))
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        self.error = Some(if error == PAGE_NOT_READY {
+                            "页面还没下载完，稍后再试".into()
+                        } else {
+                            format!("无法读取页面：{error}")
+                        });
+                    }
+                },
+                Event::Storage(report) => self.storage = Some(report),
                 Event::Error(text) => self.error = Some(text),
                 Event::StartupError(text) => self.startup_error = Some(text),
                 Event::ProgressSaved { id, page, fraction } => {
@@ -1441,10 +2163,20 @@ impl ReaderApp {
             }
         }
     }
-    fn ask_cover(&mut self, id: &str) {
+    fn ask_cover(&mut self, ctx: &Context, id: &str) {
         self.visible_covers.insert(id.into());
         self.cover_clock += 1;
         self.cover_usage.insert(id.into(), self.cover_clock);
+        if let Some((source, manga)) = Self::online_parts(id) {
+            // Online entries have no library archive; their cover comes from
+            // the followed snapshot through the source cover cache.
+            if !self.covers.contains_key(id)
+                && let Some(texture) = self.sources.work_cover(ctx, source, manga)
+            {
+                self.covers.insert(id.into(), texture);
+            }
+            return;
+        }
         if !self.covers.contains_key(id)
             && !self.cover_failed.contains(id)
             && self.cover_pending.insert(id.into())
@@ -1612,6 +2344,8 @@ impl ReaderApp {
             self.reader_return = self.screen.clone();
         }
         self.page = book.current_page.min(book.page_count.saturating_sub(1));
+        self.chapter_end = false;
+        self.keep_awake(self.keep_awake_setting);
         self.screen = Screen::Reader(book.id.clone());
         self.vertical_reader.reset(self.page, book.page_fraction);
         self.vertical_prev = None;
@@ -1648,8 +2382,31 @@ impl ReaderApp {
             .stream
             .as_ref()
             .is_some_and(|stream| stream.book.id == id && stream.done == 0 && book.page_count <= 1);
-        if (target < 0 || target >= book.page_count as i64) && !streaming_unknown {
-            if self.open_neighbor(id, if target < 0 { -1 } else { 1 }) {
+        if self.chapter_end {
+            // End card: forward continues into the next chapter, back
+            // returns to the real last page. Progress never leaves [0, count).
+            self.chapter_end = false;
+            if delta > 0 {
+                if self.open_neighbor(id, 1) {
+                    return;
+                }
+                self.chapter_end = true; // 已是最新一章 — stay on the card.
+            }
+            return;
+        }
+        if target >= book.page_count as i64 && !streaming_unknown {
+            // Paged mode shows the 本章完 card first; the vertical strip
+            // crosses chapters on its own separator path.
+            if !self.vertical {
+                self.chapter_end = true;
+                return;
+            }
+            if self.open_neighbor(id, 1) {
+                return;
+            }
+        }
+        if target < 0 && !streaming_unknown {
+            if self.open_neighbor(id, -1) {
                 return;
             }
         }
@@ -1681,6 +2438,8 @@ impl ReaderApp {
         match self.screen.clone() {
             Screen::Reader(_) => {
                 self.flush_position();
+                self.keep_awake(false);
+                self.chapter_end = false;
                 self.vertical_reader.stop();
                 self.vertical_prev = None;
                 self.vertical_next = None;
@@ -1759,6 +2518,9 @@ impl ReaderApp {
         }
         if matches!(self.screen, Screen::Library) && self.tab == Tab::Sources && self.sources.back()
         {
+            if self.sources.take_shelf_return() {
+                self.tab = Tab::Library;
+            }
             return;
         }
         let at_root = matches!(self.screen, Screen::Library)
@@ -1794,14 +2556,14 @@ impl ReaderApp {
         let palette = crate::design::palette(self.dark);
         let fill = if primary {
             if response.hovered() {
-                palette.accent.gamma_multiply(0.88)
+                palette.primary.gamma_multiply(0.88)
             } else {
-                palette.accent
+                palette.primary
             }
         } else if response.hovered() {
-            palette.accent_soft
-        } else {
             palette.soft
+        } else {
+            palette.surface
         };
         ui.painter().rect_filled(rect, 10., fill);
         if !primary {
@@ -1809,7 +2571,7 @@ impl ReaderApp {
                 .rect_stroke(rect, 10., Stroke::new(1., palette.line), StrokeKind::Inside);
         }
         let text_color = if primary {
-            palette.on_accent
+            palette.on_primary
         } else {
             palette.ink
         };
@@ -1824,6 +2586,119 @@ impl ReaderApp {
         ui.painter()
             .galley(rect.center() - galley.size() / 2., galley, text_color);
         response.clicked()
+    }
+    /// The shelf tab list: fixed entries, stored user categories in order,
+    /// then any category found on books that is not stored yet.
+    /// `None` marks the trailing 管理 tab.
+    fn category_tabs(&self) -> Vec<(String, Option<String>)> {
+        let mut tabs = vec![
+            ("全部".to_string(), Some(String::new())),
+            ("未分类".to_string(), Some("未分类".to_string())),
+            ("在线追更".to_string(), Some("在线追更".to_string())),
+        ];
+        let mut seen = std::collections::HashSet::from(["未分类", "在线追更"]);
+        for name in &self.user_categories {
+            if seen.insert(name.as_str()) {
+                tabs.push((name.clone(), Some(name.clone())));
+            }
+        }
+        let mut derived: Vec<String> = self
+            .books
+            .iter()
+            .map(|book| book.category.clone())
+            .filter(|name| !name.is_empty() && !seen.contains(name.as_str()))
+            .collect();
+        derived.sort();
+        derived.dedup();
+        for name in derived {
+            tabs.push((name.clone(), Some(name)));
+        }
+        tabs.push(("管理".to_string(), None));
+        tabs
+    }
+    /// Saves the user-category list under `categories`.
+    fn save_categories(&mut self) {
+        if let Ok(json) = serde_json::to_string(&self.user_categories) {
+            self.setting("categories", json);
+        }
+    }
+    /// Horizontally scrolling category tabs; the selected tab gets ink text
+    /// and a vermillion underline. Last tab opens the manage panel.
+    fn category_strip(&mut self, ui: &mut Ui, rect: Rect) {
+        let palette = crate::design::palette(self.dark);
+        let tabs = self.category_tabs();
+        let font_scale = self.font_scale;
+        ui.scope_builder(
+            UiBuilder::new()
+                .max_rect(rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            |ui| {
+                ScrollArea::horizontal()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for (index, (label, value)) in tabs.iter().enumerate() {
+                            let selected = value.as_deref() == Some(self.category.as_str());
+                            let galley = ui.painter().layout_no_wrap(
+                                label.clone(),
+                                FontId::proportional(15. * font_scale),
+                                if selected { palette.ink } else { palette.muted },
+                            );
+                            let width =
+                                (galley.size().x + 20. * font_scale).max(44.);
+                            let (tab_rect, response) = ui.allocate_exact_size(
+                                vec2(width, rect.height()),
+                                Sense::click(),
+                            );
+                            let id = value
+                                .as_ref()
+                                .map(|value| format!("category-tab-{index}-{value}"))
+                                .unwrap_or_else(|| "category-tabs-manage".into());
+                            self.hitboxes.insert(id, tab_rect);
+                            response.widget_info(|| {
+                                WidgetInfo::labeled(Role::Button, true, label.clone())
+                            });
+                            let text_color = if response.hovered() || selected {
+                                palette.ink
+                            } else {
+                                palette.muted
+                            };
+                            ui.painter().galley(
+                                pos2(
+                                    tab_rect.center().x - galley.size().x / 2.,
+                                    tab_rect.center().y - galley.size().y / 2.,
+                                ),
+                                galley.clone(),
+                                text_color,
+                            );
+                            if selected {
+                                ui.painter().rect_filled(
+                                    Rect::from_center_size(
+                                        pos2(
+                                            tab_rect.center().x,
+                                            tab_rect.bottom() - 3.,
+                                        ),
+                                        vec2(galley.size().x + 8., 3.),
+                                    ),
+                                    1.5,
+                                    palette.accent,
+                                );
+                            }
+                            if response.clicked() {
+                                match value {
+                                    Some(value) => {
+                                        self.category = value.clone();
+                                        self.motion.focus = 0.;
+                                    }
+                                    None => {
+                                        self.category_manage = true;
+                                        self.category_renaming = None;
+                                    }
+                                }
+                            }
+                        }
+                    });
+            },
+        );
     }
     fn icon(&mut self, ui: &mut Ui, id: &str, rect: Rect, kind: &str, label: &str) -> bool {
         self.hitboxes.insert(id.into(), rect);
@@ -1841,7 +2716,7 @@ impl ReaderApp {
         let color = if is_reader {
             Color32::from_gray(232)
         } else if active {
-            palette.accent
+            palette.ink
         } else {
             palette.muted
         };
@@ -1851,7 +2726,7 @@ impl ReaderApp {
                 rect,
                 12.,
                 if response.hovered() {
-                    palette.accent_soft
+                    palette.soft
                 } else {
                     // `soft` sits one step above the shelf stage so the pager
                     // buttons stay legible in dark mode without a heavy frame.
@@ -1916,6 +2791,32 @@ impl ReaderApp {
                     p.line_segment([c + vec2(-7., y), c + vec2(7., y)], stroke);
                 }
             }
+            "bookmark" => {
+                p.line_segment([c + vec2(-5., -7.), c + vec2(-5., 7.)], stroke);
+                p.line_segment([c + vec2(5., -7.), c + vec2(5., 7.)], stroke);
+                p.line_segment([c + vec2(-5., -7.), c + vec2(5., -7.)], stroke);
+                p.line_segment([c + vec2(-5., 7.), c + vec2(0., 3.)], stroke);
+                p.line_segment([c + vec2(5., 7.), c + vec2(0., 3.)], stroke);
+            }
+            "bookmark-on" => {
+                let pts = vec![
+                    c + vec2(-5., -7.),
+                    c + vec2(5., -7.),
+                    c + vec2(5., 7.),
+                    c + vec2(0., 3.),
+                    c + vec2(-5., 7.),
+                ];
+                p.add(Shape::convex_polygon(pts, color, stroke));
+            }
+            "share" => {
+                // Open box with an arrow rising out of it.
+                p.line_segment([c + vec2(-7., -1.), c + vec2(-7., 7.)], stroke);
+                p.line_segment([c + vec2(-7., 7.), c + vec2(7., 7.)], stroke);
+                p.line_segment([c + vec2(7., 7.), c + vec2(7., -1.)], stroke);
+                p.line_segment([c + vec2(0., 4.), c + vec2(0., -7.)], stroke);
+                p.line_segment([c + vec2(0., -7.), c + vec2(-4., -3.)], stroke);
+                p.line_segment([c + vec2(0., -7.), c + vec2(4., -3.)], stroke);
+            }
             _ => {
                 p.circle_stroke(c, 7., stroke);
             }
@@ -1931,11 +2832,23 @@ impl ReaderApp {
         let side_by_side = width >= 660.;
         let short_landscape = side_by_side && self.shelf_viewport.height() < 600.;
         let stacked_header = self.font_scale > 1.4 && area.width() < 520.;
+        let row_h = (24. * self.font_scale + 20.).max(44.);
+        let category_width = (80. * self.font_scale + 26.).min(area.width() - 48.);
+        let sort_w = 150. * self.font_scale + 40.;
+        // The sort button drops to a second row when it would cover the
+        // collection label, and to a third when it cannot share the
+        // stacked second row with the category button.
+        let sort_second_row = !stacked_header
+            && !short_landscape
+            && 24. + 140. * self.font_scale + 12. + sort_w + 10. + category_width + 24.
+                > area.width();
+        let sort_third_row = stacked_header
+            && 24. + category_width + 10. + sort_w + 24. > area.width();
         let top = 144.
             + if stacked_header {
-                84.
+                84. + if sort_third_row { row_h + 10. } else { 0. }
             } else {
-                14. * (self.font_scale - 1.)
+                14. * (self.font_scale - 1.) + if sort_second_row { row_h + 10. } else { 0. }
             };
         let tall_extra = if side_by_side {
             ((self.shelf_viewport.height() - 900.) * 0.30).clamp(0., 100.)
@@ -1961,7 +2874,61 @@ impl ReaderApp {
         } else {
             Rect::from_min_size(stage.min + vec2(8., 6.), vec2(width - 16., 212.))
         };
-        let info = if side_by_side {
+        let (stage, books, browse, arranged_side_by_side) = if self.library_grid {
+            (
+                stage,
+                books,
+                Rect::from_min_size(
+                    pos2(stage.left(), stage.bottom() + 28.),
+                    vec2(
+                        width,
+                        if side_by_side {
+                            236. + tall_extra * 0.5
+                        } else {
+                            170.
+                        } + 28. * (self.font_scale - 1.),
+                    ),
+                ),
+                side_by_side,
+            )
+        } else {
+            // Collapsed: a single toggle row replaces the thumbnail strip and
+            // the freed height grows the 3D shelf stage. Portrait-ish widths
+            // switch to the stacked arrangement so the books get the height.
+            let row = (24. * self.font_scale + 20.).max(44.);
+            let avail =
+                self.shelf_viewport.height() - top - 20. - row - self.shelf_reserve - 12.;
+            let collapsed_side_by_side =
+                side_by_side && (short_landscape || avail < width * 0.78);
+            let (stage, books) = if collapsed_side_by_side {
+                let stage_h = avail.clamp(height, 760.);
+                let stage = Rect::from_min_size(stage.min, vec2(width, stage_h));
+                let books = Rect::from_min_size(
+                    stage.min + vec2(12., 12.),
+                    vec2(width * 0.55 - 12., stage_h - 24.),
+                );
+                (stage, books)
+            } else {
+                // The info column keeps its content height so the action row
+                // never paints over the toggle; the books shrink to make room
+                // and the page scrolls for the toggle if it still overflows.
+                let info_h = 172. + 112. * (self.font_scale - 1.);
+                let books_h = (avail - info_h).clamp(80., 600.);
+                let stage_h = books_h + info_h;
+                let stage = Rect::from_min_size(stage.min, vec2(width, stage_h));
+                let books = Rect::from_min_size(
+                    stage.min + vec2(8., 6.),
+                    vec2(width - 16., books_h),
+                );
+                (stage, books)
+            };
+            let browse = Rect::from_min_size(
+                pos2(stage.left(), stage.bottom() + 20.),
+                vec2(width, row),
+            );
+            (stage, books, browse, collapsed_side_by_side)
+        };
+        let info = if arranged_side_by_side {
             Rect::from_min_max(
                 pos2(
                     books.right() + 28.,
@@ -1975,24 +2942,13 @@ impl ReaderApp {
                 stage.max - vec2(20., 20.),
             )
         };
-        let browse = Rect::from_min_size(
-            pos2(stage.left(), stage.bottom() + 28.),
-            vec2(
-                width,
-                if side_by_side {
-                    236. + tall_extra * 0.5
-                } else {
-                    170.
-                } + 28. * (self.font_scale - 1.),
-            ),
-        );
         ShelfLayout {
             stage,
             books,
             info,
             browse,
-            side_by_side,
-            short_landscape,
+            side_by_side: arranged_side_by_side,
+            short_landscape: short_landscape && arranged_side_by_side,
         }
     }
     fn detail_cover_rect(&self, area: Rect) -> Rect {
@@ -2090,6 +3046,42 @@ impl ReaderApp {
             }
         }
         self.sources.poll();
+        if let Some(scope) = self.sources.take_scope_change() {
+            self.setting("search-scope", scope);
+        }
+        if let Some(history) = self.sources.take_history_change() {
+            if let Ok(json) = serde_json::to_string(&history) {
+                self.setting("search-history", json);
+            }
+        }
+        if let Some(post) = self.sources.take_migrate_post() {
+            if post.resume_unparsed {
+                self.pending_notice =
+                    Some("已换源，但没能从旧阅读记录解析出话数，将从第一章开始".into());
+            }
+            // One binding key covers whichever tracker the work is bound to;
+            // the command moves it to the new source's key.
+            self.trackers.submit(crate::trackers::TrackCommand::Rebind {
+                old: post.rebind.0,
+                new: post.rebind.1,
+            });
+            if let Some((source, manga)) = post.purge {
+                let ids: Vec<String> = self
+                    .chapters
+                    .iter()
+                    .filter(|link| {
+                        link.metadata.source_id == source
+                            && link.metadata.manga_id == manga
+                    })
+                    .map(|link| link.book_id.clone())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                if !ids.is_empty() {
+                    self.send(Command::PurgeBooks(ids));
+                }
+            }
+        }
         if let Some(notice) = self.sources.follow_notice.take() {
             self.pending_notice = Some(notice);
         }
@@ -2137,6 +3129,27 @@ impl ReaderApp {
             }
         }
         let now = ctx.input(|i| i.time);
+        let now_secs = now as u64;
+        while let Some(event) = yejian_platform::take_foreground_event() {
+            match event {
+                yejian_platform::ForegroundEvent::Background => {
+                    self.applock.background(now_secs);
+                }
+                yejian_platform::ForegroundEvent::Foreground => {
+                    self.applock.foreground(now_secs);
+                }
+            }
+        }
+        while let Some(result) = yejian_platform::poll_auth() {
+            self.applock.auth_finished(result);
+            if let Some(on) = self.applock.take_toggle_applied() {
+                self.setting("app-lock", on.to_string());
+                yejian_platform::set_privacy_shield(on);
+            }
+        }
+        if self.applock.auth_in_flight() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
         let entrance = if self.books.is_empty() || self.reduced {
             1.
         } else {
@@ -2152,6 +3165,7 @@ impl ReaderApp {
             "light" => false,
             _ => ctx.input(|i| i.raw.system_theme == Some(Theme::Dark)),
         };
+        crate::design::set_scheme(crate::design::Scheme::from_key(&self.color_scheme));
         let visuals = crate::design::visuals(self.dark);
         ctx.set_visuals(visuals.clone());
         ui.style_mut().visuals = visuals;
@@ -2188,14 +3202,16 @@ impl ReaderApp {
         } else {
             full
         };
-        let system_back = yejian_platform::take_back_requested()
-            || ctx.input(|i| i.key_pressed(Key::BrowserBack));
-        if system_back || ctx.input(|i| i.key_pressed(Key::Escape)) {
+        let system_back = !self.applock.locked()
+            && (yejian_platform::take_back_requested()
+                || ctx.input(|i| i.key_pressed(Key::BrowserBack)));
+        if system_back || (!self.applock.locked() && ctx.input(|i| i.key_pressed(Key::Escape))) {
             self.request_back(now, content, system_back);
         }
         let is_reader = matches!(self.screen, Screen::Reader(_));
         let animating = self.motion.tick(now);
-        self.frame_is_animating = animating || entrance < 1. || self.flight.is_some();
+        self.frame_is_animating =
+            animating || entrance < 1. || self.flight.is_some() || self.shelf_reorder.is_some();
         if self.frame_is_animating {
             ctx.request_repaint();
         }
@@ -2284,12 +3300,20 @@ impl ReaderApp {
                 });
             } else {
                 match self.screen.clone() {
-                    Screen::Library => match self.tab {
-                        Tab::Library => self.library_viewport(ui, content, now, entrance),
-                        Tab::History => self.history_ui(ui, content),
-                        Tab::Settings => self.settings_ui(ui, content),
-                        Tab::Sources => self.sources_ui(ui, content),
-                    },
+                    Screen::Library => {
+                        // Opening 设置 re-runs the storage scan once.
+                        if self.tab != Tab::Settings {
+                            self.storage_opened = false;
+                        }
+                        match self.tab {
+                            Tab::Library => {
+                                self.library_viewport(ui, content, now, entrance)
+                            }
+                            Tab::History => self.history_ui(ui, content),
+                            Tab::Settings => self.settings_ui(ui, content),
+                            Tab::Sources => self.sources_ui(ui, content),
+                        }
+                    }
                     Screen::Detail(id) => self.detail_ui(ui, content, &id),
                     _ => {}
                 }
@@ -2331,6 +3355,7 @@ impl ReaderApp {
                                     self.dark,
                                     false,
                                     self.selected.contains(&book.id),
+                                    None,
                                 );
                             }
                         }
@@ -2358,6 +3383,9 @@ impl ReaderApp {
             }
         }
         self.dialogs(&ctx);
+        if self.applock.locked() {
+            self.lock_ui(ui, full);
+        }
         self.trim_covers();
         self.frame_is_animating = self.motion.active()
             || entrance < 1.
@@ -2407,7 +3435,7 @@ impl ReaderApp {
                 Align2::CENTER_CENTER,
                 "页间",
                 crate::typography::display(23.),
-                palette.accent,
+                palette.ink,
             );
         }
         for (i, (tab, label, kind)) in tabs.into_iter().enumerate() {
@@ -2431,8 +3459,16 @@ impl ReaderApp {
                 )
             };
             if tab == self.tab {
-                ui.painter()
-                    .rect_filled(rect.shrink2(vec2(5., 5.)), 16., palette.accent_soft);
+                // Selected item keeps ink ink + a small accent indicator
+                // instead of a tinted pill.
+                ui.painter().rect_filled(
+                    Rect::from_center_size(
+                        pos2(rect.center().x, rect.bottom() - 4.),
+                        vec2(18., 2.5),
+                    ),
+                    1.2,
+                    palette.accent,
+                );
             }
             // The whole item is the tap target: the glyph alone is only
             // 32x29 pt, below the 44 pt Apple asks for.
@@ -2452,13 +3488,13 @@ impl ReaderApp {
             let fresh = if tab == Tab::Sources { self.sources.fresh_follows() } else { 0 };
             if fresh > 0 {
                 let badge = Rect::from_center_size(icon_rect.right_top() + vec2(2., 2.), vec2(20., 18.));
-                ui.painter().rect_filled(badge, 9., Color32::from_rgb(214, 69, 65));
+                ui.painter().rect_filled(badge, 9., palette.accent);
                 ui.painter().text(
                     badge.center(),
                     Align2::CENTER_CENTER,
                     fresh.min(99).to_string(),
                     FontId::proportional(11.),
-                    Color32::WHITE,
+                    palette.on_accent,
                 );
             }
             ui.painter().text(
@@ -2475,7 +3511,7 @@ impl ReaderApp {
                 label,
                 FontId::proportional(if expanded { 16. } else { 12. }),
                 if tab == self.tab {
-                    palette.accent
+                    palette.ink
                 } else {
                     palette.muted
                 },
@@ -2499,12 +3535,13 @@ impl ReaderApp {
     }
     fn library_viewport(&mut self, ui: &mut Ui, area: Rect, now: f64, entrance: f32) {
         self.shelf_viewport = area;
-        let height = self.shelf_layout(area).browse.bottom() - area.top() + 24.;
         let bottom = if Self::side_navigation(ui.ctx().content_rect()) {
             16.
         } else {
             80.
         };
+        self.shelf_reserve = bottom;
+        let height = self.shelf_layout(area).browse.bottom() - area.top() + 24.;
         if area.height() >= height + bottom {
             self.shelf_shift = 0.;
             self.library_ui(ui, area, now, entrance);
@@ -2551,41 +3588,198 @@ impl ReaderApp {
                 muted,
             );
             let stacked = self.font_scale > 1.4 && area.width() < 520.;
-            let category_width = (80. * self.font_scale + 26.).min(area.width() - 48.);
-            let category_rect = Rect::from_min_size(
-                if stacked {
-                    area.min + vec2(24., 142.)
+            let palette = crate::design::palette(self.dark);
+            let row_h = (24. * self.font_scale + 20.).max(44.);
+            let sort_w = 150. * self.font_scale + 40.;
+            let margin = if area.width() >= 700. { 32. } else { 16. };
+            let short = (area.width() - margin * 2.).min(1200.) >= 660.
+                && self.shelf_viewport.height() < 600.;
+            // Layout: [我的收藏 label][category tab strip][排序]. The strip
+            // scrolls horizontally, so a modest footprint decides when the
+            // sort button wraps to its own row.
+            let strip_min = 120. * self.font_scale + 40.;
+            let sort_second_row = !stacked
+                && !short
+                && 24. + 140. * self.font_scale + 12. + strip_min + 10. + sort_w
+                    + 24.
+                    > area.width();
+            let sort_third_row = stacked
+                && 24. + strip_min + 10. + sort_w + 24. > area.width();
+            let strip_top = area.top()
+                + if stacked {
+                    142.
                 } else {
-                    pos2(area.right() - 24. - category_width, area.top() + 82.)
-                },
-                vec2(category_width, (24. * self.font_scale + 20.).max(44.)),
+                    82.
+                };
+            let strip_left = area.left() + 24.
+                + if !stacked {
+                    140. * self.font_scale + 12.
+                } else {
+                    0.
+                };
+            let strip_right = if sort_third_row || !stacked && sort_second_row {
+                area.right() - 24.
+            } else {
+                area.right() - 24. - sort_w - 10.
+            };
+            let strip_rect = Rect::from_min_max(
+                pos2(strip_left.min(strip_right - 44.), strip_top),
+                pos2(strip_right.max(strip_left + 44.), strip_top + row_h),
             );
-            if self.button(
-                ui,
-                "categories",
-                category_rect,
-                &if self.category.is_empty() {
-                    "全部分类".into()
+            let sort_rect = if !stacked && !sort_second_row || stacked && !sort_third_row {
+                Rect::from_min_size(
+                    pos2(strip_rect.right() + 10., strip_top),
+                    vec2(sort_w, row_h),
+                )
+            } else {
+                Rect::from_min_size(
+                    pos2(area.left() + 24., strip_rect.bottom() + 10.),
+                    vec2(sort_w, row_h),
+                )
+            };
+            self.hitboxes.insert("categories".into(), strip_rect);
+            self.category_strip(ui, strip_rect);
+            self.hitboxes.insert("shelf-sort".into(), sort_rect);
+            let sort_response =
+                ui.interact(sort_rect, Id::unique("shelf-sort"), Sense::click());
+            sort_response.widget_info(|| {
+                WidgetInfo::labeled(Role::Button, true, "排序")
+            });
+            ui.painter().rect_filled(
+                sort_rect,
+                10.,
+                if sort_response.hovered() || self.sort_menu {
+                    palette.soft
                 } else {
-                    self.category.clone()
+                    palette.surface
                 },
-                false,
-            ) {
-                let mut categories: Vec<_> = self
-                    .books
+            );
+            ui.painter().rect_stroke(
+                sort_rect,
+                10.,
+                Stroke::new(1., palette.line),
+                StrokeKind::Inside,
+            );
+            let sort_label =
+                ui.painter().layout_no_wrap(
+                    format!("排序 · {}", self.shelf_sort.label()),
+                    FontId::proportional(15. * self.font_scale),
+                    palette.ink,
+                );
+            let tri_w = 8. * self.font_scale;
+            let content = sort_label.size().x + 4. * self.font_scale + tri_w;
+            let text_x = (sort_rect.center().x - content / 2.).max(sort_rect.left() + 8.);
+            ui.painter().galley(
+                pos2(text_x, sort_rect.center().y - sort_label.size().y / 2.),
+                sort_label.clone(),
+                palette.ink,
+            );
+            let cx = text_x + sort_label.size().x + 4. * self.font_scale + tri_w / 2.;
+            let cy = sort_rect.center().y;
+            let s = self.font_scale;
+            ui.painter().add(Shape::convex_polygon(
+                vec![
+                    pos2(cx - 4. * s, cy - 2.5 * s),
+                    pos2(cx + 4. * s, cy - 2.5 * s),
+                    pos2(cx, cy + 3. * s),
+                ],
+                palette.muted,
+                Stroke::NONE,
+            ));
+            if sort_response.clicked() {
+                self.sort_menu = !self.sort_menu;
+            }
+            if self.sort_menu {
+                let menu_row = (28. * self.font_scale + 16.).max(44.);
+                let labels: Vec<_> = SHELF_SORTS
                     .iter()
-                    .map(|b| b.category.clone())
-                    .filter(|s| !s.is_empty())
+                    .map(|sort| {
+                        (
+                            *sort,
+                            ui.painter().layout_no_wrap(
+                                sort.label().to_owned(),
+                                FontId::proportional(15. * self.font_scale),
+                                palette.ink,
+                            ),
+                        )
+                    })
                     .collect();
-                categories.sort();
-                categories.dedup();
-                let next = categories
+                let inner_w = labels
                     .iter()
-                    .position(|x| x == &self.category)
-                    .map(|i| i + 1)
-                    .unwrap_or(0);
-                self.category = categories.get(next).cloned().unwrap_or_default();
-                self.motion.focus = 0.;
+                    .map(|(_, galley)| galley.size().x)
+                    .fold(0., f32::max)
+                    + 34.;
+                let panel_size = vec2(inner_w + 40., menu_row * 3. + 40.);
+                let left = (sort_rect.right() - panel_size.x)
+                    .clamp(area.left() + 8., (area.right() - panel_size.x - 8.).max(area.left() + 8.));
+                let panel = Rect::from_min_size(
+                    pos2(left, (sort_rect.bottom() + 8.).min(area.bottom() - panel_size.y - 8.)),
+                    panel_size,
+                );
+                let mut picked = None;
+                egui::Area::new(Id::unique("shelf-sort-menu"))
+                    .order(Order::Foreground)
+                    .fade_in(false)
+                    .movable(false)
+                    .fixed_pos(panel.min)
+                    .show(ui.ctx(), |ui| {
+                        crate::design::surface(ui).show(ui, |ui| {
+                            ui.set_width(inner_w);
+                            for (sort, galley) in &labels {
+                                let (rect, response) = ui.allocate_exact_size(
+                                    vec2(inner_w, menu_row),
+                                    Sense::click(),
+                                );
+                                response.widget_info(|| {
+                                    WidgetInfo::selected(
+                                        Role::RadioButton,
+                                        true,
+                                        self.shelf_sort == *sort,
+                                        sort.label(),
+                                    )
+                                });
+                                if response.hovered() {
+                                    ui.painter().rect_filled(rect, 8., palette.soft);
+                                }
+                                if self.shelf_sort == *sort {
+                                    ui.painter().rect_filled(
+                                        Rect::from_min_size(
+                                            rect.min + vec2(0., 10.),
+                                            vec2(3., menu_row - 20.),
+                                        ),
+                                        1.5,
+                                        palette.accent,
+                                    );
+                                }
+                                ui.painter().galley(
+                                    pos2(
+                                        rect.left() + 16.,
+                                        rect.center().y - galley.size().y / 2.,
+                                    ),
+                                    galley.clone(),
+                                    if self.shelf_sort == *sort {
+                                        palette.ink
+                                    } else {
+                                        palette.muted
+                                    },
+                                );
+                                self.hitboxes.insert(sort.hitbox().into(), rect);
+                                if response.clicked() {
+                                    picked = Some(*sort);
+                                }
+                            }
+                        });
+                    });
+                if ui.ctx().input(|i| i.pointer.primary_clicked())
+                    && let Some(pos) = ui.ctx().pointer_interact_pos()
+                    && !panel.contains(pos)
+                    && !sort_rect.contains(pos)
+                {
+                    self.sort_menu = false;
+                }
+                if let Some(sort) = picked {
+                    self.set_shelf_sort(sort, now);
+                }
             }
         }
         if let Some(error) = self.startup_error.clone() {
@@ -2669,14 +3863,11 @@ impl ReaderApp {
             return;
         }
         let layout = self.shelf_layout(area);
+        self.shelf_stage = layout.stage;
+        self.shelf_books = layout.books;
         let shelf_area = layout.books;
         let palette = crate::design::palette(self.dark);
-        let stage_color = if self.dark {
-            Color32::from_rgb(40, 43, 39)
-        } else {
-            Color32::from_rgb(235, 233, 223)
-        };
-        ui.painter().rect_filled(layout.stage, 22., stage_color);
+        ui.painter().rect_filled(layout.stage, 22., palette.soft);
         if layout.side_by_side {
             ui.painter().line_segment(
                 [
@@ -2688,20 +3879,71 @@ impl ReaderApp {
         }
         let volumes = shelf::geometry(shelf_area, books.len(), self.motion.focus, entrance);
         self.rendered_book_nodes = volumes.len();
+        // During a reorder each book slides from its old slot to the new one
+        // with a small lift; shelf input is suspended until it lands.
+        let reordering = self.shelf_reorder.is_some();
+        let draw_volumes: Vec<shelf::Volume> = if let Some(reorder) = &self.shelf_reorder {
+            let t = ((now - reorder.started) / REORDER_SECONDS).clamp(0., 1.) as f32;
+            if t >= 1. {
+                volumes.clone()
+            } else {
+                ui.ctx().request_repaint();
+                let eased = motion::cubic(t, 0.215, 0.61, 0.355, 1.);
+                let old = shelf::geometry(shelf_area, books.len(), reorder.from_focus, 1.);
+                let mut moved = Vec::with_capacity(volumes.len());
+                for volume in &volumes {
+                    let id = books[volume.index].id.as_str();
+                    let origin = old
+                        .iter()
+                        .filter(|v| reorder.from_ids[v.index] == id)
+                        .min_by(|a, b| {
+                            (a.lane - volume.lane)
+                                .abs()
+                                .cmp(&(b.lane - volume.lane).abs())
+                        });
+                    moved.push(match origin {
+                        Some(from) => {
+                            let lift = ((volume.lane - from.lane).abs() as f32 * 6.)
+                                .clamp(0., 22.);
+                            shelf::lerp_volume(from, volume, eased, lift)
+                        }
+                        None => {
+                            let dx = if (volume.lane as f32) < reorder.from_focus {
+                                -shelf_area.width()
+                            } else {
+                                shelf_area.width()
+                            };
+                            shelf::lerp_volume(&shelf::offstage(volume, dx), volume, eased, 0.)
+                        }
+                    });
+                }
+                moved.sort_by_key(|v| v.lane);
+                moved
+            }
+        } else {
+            volumes.clone()
+        };
+        if self
+            .shelf_reorder
+            .as_ref()
+            .is_some_and(|r| now - r.started >= REORDER_SECONDS)
+        {
+            self.shelf_reorder = None;
+        }
         let mut keep = HashSet::new();
         for volume in &volumes {
             if (volume.lane as f32 - self.motion.focus).abs() <= 3. {
                 let cover = self.cover_id(&books[volume.index].id);
                 keep.insert(cover.clone());
-                self.ask_cover(&cover);
+                self.ask_cover(ui.ctx(), &cover);
             }
         }
         if self.covers.len() > 40 {
             self.covers.retain(|id, _| keep.contains(id));
         }
         let p = ui.painter().with_clip_rect(shelf_area);
-        shelf::paint_floor(&p, &volumes, self.dark);
-        for volume in &volumes {
+        shelf::paint_floor(&p, &draw_volumes, self.dark);
+        for volume in &draw_volumes {
             let book = &books[volume.index];
             let is_central = volume.lane == self.motion.focus.round() as i32;
             let cover = self.cover_id(&book.id);
@@ -2714,6 +3956,7 @@ impl ReaderApp {
                 self.dark,
                 hidden,
                 self.selected.contains(&book.id),
+                self.online_badge(book),
             );
             if is_central {
                 self.hitboxes.insert("shelf-center".into(), volume.bounds());
@@ -2722,7 +3965,7 @@ impl ReaderApp {
         // The row is an endless shelf, so spines must dissolve into the page
         // instead of ending on a hard clip line.
         {
-            let background = stage_color;
+            let background = palette.soft;
             let clear =
                 Color32::from_rgba_unmultiplied(background.r(), background.g(), background.b(), 0);
             let fade = 30.;
@@ -2747,10 +3990,10 @@ impl ReaderApp {
             Sense::click_and_drag(),
         );
         let pitch = shelf::lane_pitch_for(shelf_area, books.len());
-        if gesture.dragged() && books.len() > 1 {
+        if gesture.dragged() && books.len() > 1 && !reordering {
             self.motion.drag(-ui.input(|i| i.pointer.delta().x) / pitch);
         }
-        if gesture.drag_stopped() && books.len() > 1 {
+        if gesture.drag_stopped() && books.len() > 1 && !reordering {
             self.motion.release(
                 -ui.input(|i| i.pointer.velocity().x) / pitch,
                 pitch,
@@ -2758,7 +4001,7 @@ impl ReaderApp {
                 self.reduced,
             );
         }
-        if gesture.hovered() && books.len() > 1 {
+        if gesture.hovered() && books.len() > 1 && !reordering {
             let scroll = ui.input(|i| i.smooth_scroll_delta);
             if scroll.x.abs() > 0.1 || scroll.y.abs() > 0.1 {
                 self.motion.select(
@@ -2770,6 +4013,7 @@ impl ReaderApp {
         }
         if (gesture.clicked() || gesture.secondary_clicked() || gesture.long_touched())
             && self.flight.is_none()
+            && !reordering
         {
             if let Some(pos) = gesture.interact_pointer_pos() {
                 if let Some(volume) = volumes.iter().rev().find(|v| v.contains(pos)) {
@@ -2783,6 +4027,8 @@ impl ReaderApp {
                         }
                     } else if volume.lane != self.motion.focus.round() as i32 {
                         self.motion.select(volume.lane as f32, now, self.reduced);
+                    } else if Self::online_parts(&book.id).is_some() {
+                        self.open_online(&book.id, false);
                     } else {
                         self.open_detail(book, volume, &volumes, area, now);
                     }
@@ -2812,15 +4058,19 @@ impl ReaderApp {
         let progress_pos = info + vec2(0., title.size().y + 10.);
         ui.painter().galley(info, title, ink);
         let has_progress = book.last_read_at.is_some();
-        let pages = if has_progress {
-            format!("第 {} / {} 页", book.current_page + 1, book.page_count)
+        let progress = if let Some(follow) = self.online_follow(&book.id) {
+            self.online_progress_label(follow)
         } else {
-            format!("共 {} 页", book.page_count)
-        };
-        let progress = if let Some(chapter) = self.chapter(&book.id) {
-            format!("{} · {pages}", chapter.chapter_title)
-        } else {
-            pages
+            let pages = if has_progress {
+                format!("第 {} / {} 页", book.current_page + 1, book.page_count)
+            } else {
+                format!("共 {} 页", book.page_count)
+            };
+            if let Some(chapter) = self.chapter(&book.id) {
+                format!("{} · {pages}", chapter.chapter_title)
+            } else {
+                pages
+            }
         };
         let mut progress = egui::text::LayoutJob::simple(
             progress,
@@ -2860,8 +4110,15 @@ impl ReaderApp {
             pos2(info.x + action_width + 12., action_y),
             vec2(detail_width, 50.),
         );
-        if self.selected.is_empty() && self.button(ui, "open-book", open_rect, "详情", false) {
-            if let Some(volume) = volumes
+        let online = Self::online_parts(&book.id).is_some();
+        // Controls stay painted (but inert) while books glide to their new
+        // order so the stage does not flicker mid-reorder.
+        let detail_clicked =
+            self.selected.is_empty() && self.button(ui, "open-book", open_rect, "详情", false);
+        if detail_clicked && !reordering {
+            if online {
+                self.open_online(&book.id, false);
+            } else if let Some(volume) = volumes
                 .iter()
                 .find(|v| v.lane == self.motion.focus.round() as i32)
             {
@@ -2869,20 +4126,26 @@ impl ReaderApp {
             }
         }
         let action = Rect::from_min_size(pos2(info.x, action_y), vec2(action_width, 50.));
-        if self.selected.is_empty()
+        let read_clicked = self.selected.is_empty()
             && self.button(
                 ui,
                 "shelf-read",
                 action,
-                if has_progress {
+                if online && self.sources.resume_pending() {
+                    "正在打开…"
+                } else if has_progress {
                     "继续阅读"
                 } else {
                     "开始阅读"
                 },
                 true,
-            )
-        {
-            self.open_reader(book);
+            );
+        if read_clicked && !reordering {
+            if online {
+                self.open_online(&book.id, true);
+            } else {
+                self.open_reader(book);
+            }
         }
         let pager_right = if layout.short_landscape {
             layout.books.right() - 8.
@@ -2895,15 +4158,15 @@ impl ReaderApp {
             .layout_no_wrap(tally, FontId::monospace(11.), muted);
         let pager_left = pager_right - 88. - tally.size().x - 4.;
         let y = layout.stage.top() + 12.;
-        if books.len() > 1
+        let prev_clicked = books.len() > 1
             && self.icon(
                 ui,
                 "shelf-prev",
                 Rect::from_min_size(pos2(pager_left, y), vec2(44., 44.)),
                 "prev",
                 "上一本",
-            )
-        {
+            );
+        if prev_clicked && !reordering {
             self.motion
                 .select(self.motion.focus.round() - 1., now, self.reduced);
         }
@@ -2914,15 +4177,15 @@ impl ReaderApp {
                 muted,
             );
         }
-        if books.len() > 1
+        let next_clicked = books.len() > 1
             && self.icon(
                 ui,
                 "shelf-next",
                 Rect::from_min_size(pos2(pager_right - 44., y), vec2(44., 44.)),
                 "next",
                 "下一本",
-            )
-        {
+            );
+        if next_clicked && !reordering {
             self.motion
                 .select(self.motion.focus.round() + 1., now, self.reduced);
         }
@@ -2932,15 +4195,8 @@ impl ReaderApp {
                 pos2(area.left() + 24., area.bottom() - 122.),
                 vec2(area.width() - 48., 48.),
             );
-            ui.painter().rect_filled(
-                rect,
-                8.,
-                if self.dark {
-                    Color32::from_gray(46)
-                } else {
-                    Color32::WHITE
-                },
-            );
+            ui.painter()
+                .rect_filled(rect, 8., crate::design::palette(self.dark).surface);
             self.label(
                 ui.painter(),
                 rect.min + vec2(10., 14.),
@@ -2948,22 +4204,21 @@ impl ReaderApp {
                 12.,
                 ink,
             );
-            ui.put(
-                Rect::from_min_size(rect.min + vec2(80., 6.), vec2(120., 34.)),
-                TextEdit::singleline(&mut self.category_edit).hint_text("分类名称"),
-            );
-            if self.button(
-                ui,
-                "set-category",
-                Rect::from_min_size(rect.min + vec2(205., 6.), vec2(58., 34.)),
-                "分类",
-                false,
-            ) {
-                self.send(Command::Category(
-                    self.selected_books(),
-                    self.category_edit.clone(),
-                ));
-                self.selected.clear();
+            // Online-only selections have no library row to categorize.
+            let has_local = self
+                .selected
+                .iter()
+                .any(|id| Self::online_parts(id).is_none());
+            if has_local
+                && self.button(
+                    ui,
+                    "set-category",
+                    Rect::from_min_size(rect.min + vec2(80., 6.), vec2(120., 34.)),
+                    "分类",
+                    false,
+                )
+            {
+                self.category_pick = true;
             }
             if self.button(
                 ui,
@@ -2973,6 +4228,7 @@ impl ReaderApp {
                 false,
             ) {
                 self.confirm_remove = true;
+                self.remove_files = true;
             }
         }
     }
@@ -2985,20 +4241,89 @@ impl ReaderApp {
         now: f64,
     ) {
         let palette = crate::design::palette(self.dark);
-        ui.painter().text(
-            area.min,
-            Align2::LEFT_TOP,
-            "藏书一览",
+        let title = ui.painter().layout_no_wrap(
+            "藏书一览".into(),
             crate::typography::display(19. * self.font_scale),
             palette.ink,
         );
-        ui.painter().text(
-            pos2(area.right(), area.top() + 4.),
-            Align2::RIGHT_TOP,
-            format!("{} 本", books.len()),
+        let count = ui.painter().layout_no_wrap(
+            format!("· {} 本", books.len()),
             FontId::proportional(12. * self.font_scale),
             palette.muted,
         );
+        let label = if self.library_grid { "收起" } else { "展开" };
+        let galley = ui.painter().layout_no_wrap(
+            label.to_owned(),
+            FontId::proportional(12. * self.font_scale),
+            palette.muted,
+        );
+        // A painted triangle is font-independent where a chevron glyph would
+        // depend on the bundled faces covering it.
+        let s = self.font_scale;
+        let tri_w = 8. * s;
+        let right_block = galley.size().x + 4. * s + tri_w + 6.;
+        let show_count =
+            title.size().x + 6. + count.size().x + 24. + right_block <= area.width();
+        ui.painter().galley(area.min, title.clone(), palette.ink);
+        if show_count {
+            ui.painter().galley(
+                pos2(area.left() + title.size().x + 6., area.top() + 5.),
+                count,
+                palette.muted,
+            );
+        }
+        ui.painter().galley(
+            pos2(area.right() - right_block, area.top() + 5.),
+            galley.clone(),
+            palette.muted,
+        );
+        let cy = area.top() + 5. + galley.size().y / 2.;
+        let cx = area.right() - 6. - tri_w / 2.;
+        let tri = if self.library_grid {
+            [
+                pos2(cx - 4. * s, cy + 2.5 * s),
+                pos2(cx + 4. * s, cy + 2.5 * s),
+                pos2(cx, cy - 3. * s),
+            ]
+        } else {
+            [
+                pos2(cx - 4. * s, cy - 2.5 * s),
+                pos2(cx + 4. * s, cy - 2.5 * s),
+                pos2(cx, cy + 3. * s),
+            ]
+        };
+        ui.painter().add(Shape::convex_polygon(
+            tri.to_vec(),
+            palette.muted,
+            Stroke::NONE,
+        ));
+        let row = Rect::from_min_size(
+            area.min,
+            vec2(area.width(), (34. * self.font_scale).max(44.)),
+        );
+        self.hitboxes.insert("shelf-grid-toggle".into(), row);
+        let response = ui.interact(row, Id::unique("shelf-grid-toggle"), Sense::click());
+        response.widget_info(|| {
+            WidgetInfo::labeled(
+                Role::Button,
+                true,
+                if show_count {
+                    "藏书一览".to_owned()
+                } else {
+                    format!("藏书一览，{} 本", books.len())
+                },
+            )
+        });
+        if response.clicked() {
+            self.library_grid = !self.library_grid;
+            self.setting(
+                "shelf-grid",
+                if self.library_grid { "open" } else { "closed" }.to_owned(),
+            );
+        }
+        if !self.library_grid {
+            return;
+        }
         let top = area.top() + 34. * self.font_scale;
         let canvas = Rect::from_min_max(pos2(area.left(), top), area.max);
         let cover_height = if area.width() >= 660. {
@@ -3064,7 +4389,7 @@ impl ReaderApp {
                             );
                         }
                         let cover_id = self.cover_id(&book.id);
-                        self.ask_cover(&cover_id);
+                        self.ask_cover(ui.ctx(), &cover_id);
                         if let Some(texture) = self.covers.get(&cover_id) {
                             shelf::paint_art(
                                 ui.painter(),
@@ -3140,6 +4465,10 @@ impl ReaderApp {
         area: Rect,
         now: f64,
     ) {
+        if Self::online_parts(&book.id).is_some() {
+            self.open_online(&book.id, false);
+            return;
+        }
         self.screen = Screen::Detail(book.id.clone());
         let cover = self.cover_id(&book.id);
         if !self.reduced && self.covers.contains_key(&cover) {
@@ -3160,7 +4489,7 @@ impl ReaderApp {
             return;
         };
         let cover_id = self.cover_id(id);
-        self.ask_cover(&cover_id);
+        self.ask_cover(ui.ctx(), &cover_id);
         let cover = self.detail_cover_rect(area);
         let palette = crate::design::palette(self.dark);
         ui.painter()
@@ -3353,13 +4682,134 @@ impl ReaderApp {
             self.setting("reading-mode", mode.into());
         }
     }
+    /// Transition-driven keep-awake calls (platform no-ops on desktop).
+    fn keep_awake(&mut self, on: bool) {
+        if self.awake == on {
+            return;
+        }
+        self.awake = on;
+        yejian_platform::set_keep_awake(on);
+        #[cfg(test)]
+        self.awake_log.push(on);
+    }
     fn reader_tap(&mut self, id: &str, relative: f32, step: i32) {
         if self.vertical || self.zoom > 1. || (0.27..=0.73).contains(&relative) {
             self.controls = !self.controls;
-        } else if relative < 0.27 {
-            self.next_page(id, if self.rtl { step } else { -step });
         } else {
-            self.next_page(id, if self.rtl { -step } else { step });
+            match self.tap_zones.as_str() {
+                "next" => self.next_page(id, step),
+                "off" => {}
+                _ => {
+                    if relative < 0.27 {
+                        self.next_page(id, if self.rtl { step } else { -step });
+                    } else {
+                        self.next_page(id, if self.rtl { -step } else { step });
+                    }
+                }
+            }
+        }
+    }
+    /// "第 X 话 · 标题" for the vertical chapter separator.
+    fn chapter_separator_label(&self, seg: &str) -> String {
+        let metadata = self
+            .chapter(seg)
+            .or_else(|| self.stream_for(seg).map(|stream| &stream.metadata));
+        metadata
+            .map(|meta| {
+                meta.chapter_number
+                    .map(|n| {
+                        let number = format!("第 {n} 话");
+                        if meta.chapter_title.starts_with(&number) {
+                            meta.chapter_title.clone()
+                        } else {
+                            format!("{number} · {}", meta.chapter_title)
+                        }
+                    })
+                    .unwrap_or_else(|| meta.chapter_title.clone())
+            })
+            .unwrap_or_else(|| seg.into())
+    }
+    /// "21:34 · 85%", or just the time when no battery reading exists.
+    fn status_text(time: &str, battery: Option<f32>) -> String {
+        match battery {
+            Some(level) => format!("{time} · {:.0}%", level.clamp(0., 1.) * 100.),
+            None => time.into(),
+        }
+    }
+    /// Battery charge 0.0–1.0, refreshed at most once per minute.
+    fn cached_battery(&mut self) -> Option<f32> {
+        let stale = self
+            .battery_at
+            .map(|at| at.elapsed().as_secs() >= 60)
+            .unwrap_or(true);
+        if stale {
+            self.battery = yejian_platform::battery_level();
+            self.battery_at = Some(std::time::Instant::now());
+        }
+        self.battery
+    }
+    /// The 本章完 card shown after the last page (one per chapter).
+    fn chapter_end_card(&mut self, ui: &mut Ui, content: Rect, id: &str) {
+        let palette = crate::design::palette(true);
+        let width = (content.width() - 48.).min(340.);
+        let card = Rect::from_center_size(content.center(), vec2(width, 220.));
+        ui.painter().rect_filled(card, 14., palette.soft);
+        ui.painter().rect_stroke(
+            card,
+            14.,
+            Stroke::new(1., palette.line),
+            StrokeKind::Inside,
+        );
+        ui.painter().text(
+            pos2(card.center().x, card.top() + 48.),
+            Align2::CENTER_CENTER,
+            "本章完",
+            FontId::proportional(24.),
+            palette.ink,
+        );
+        match self.next_chapter_name(id) {
+            Some(name) => {
+                ui.painter().text(
+                    pos2(card.center().x, card.top() + 92.),
+                    Align2::CENTER_CENTER,
+                    name,
+                    FontId::proportional(13.),
+                    palette.muted,
+                );
+                let button = Rect::from_center_size(
+                    pos2(card.center().x, card.bottom() - 48.),
+                    vec2(160., 44.),
+                );
+                self.hitboxes.insert("chapter-end-continue".into(), button);
+                let response =
+                    ui.interact(button, Id::unique("chapter-end-continue"), Sense::click());
+                response.widget_info(|| WidgetInfo::labeled(Role::Button, true, "继续"));
+                let fill = if response.hovered() {
+                    palette.primary.gamma_multiply(0.88)
+                } else {
+                    palette.primary
+                };
+                ui.painter().rect_filled(button, 10., fill);
+                ui.painter().text(
+                    button.center(),
+                    Align2::CENTER_CENTER,
+                    "继续",
+                    FontId::proportional(15.),
+                    palette.on_primary,
+                );
+                if response.clicked() {
+                    self.next_page(id, 1);
+                }
+            }
+            None => {
+                ui.painter().text(
+                    pos2(card.center().x, card.bottom() - 48.),
+                    Align2::CENTER_CENTER,
+                    "已是最新一章",
+                    FontId::proportional(14.),
+                    palette.muted,
+                );
+            }
         }
     }
     fn reader_ui(&mut self, ui: &mut Ui, area: Rect, id: &str, now: f64) {
@@ -3368,7 +4818,7 @@ impl ReaderApp {
         };
         let ctx = ui.ctx().clone();
         ui.painter()
-            .rect_filled(area, 0., Color32::from_rgb(18, 20, 22));
+            .rect_filled(area, 0., Color32::from_rgb(18, 17, 16));
         self.ask_page(id, self.page);
         let step = if self.spread && !self.vertical && area.width() > 700. {
             if self.spread_offset && self.page == 0 {
@@ -3519,7 +4969,9 @@ impl ReaderApp {
             return;
         }
         self.rendered_page_nodes = 0;
-        if self.vertical {
+        if self.chapter_end {
+            self.chapter_end_card(ui, content, id);
+        } else if self.vertical {
             self.vertical_ui(ui, content, id, book.page_count, now, &gesture);
         } else if let Some(error) = self.page_errors.get(&(id.into(), self.page)).cloned() {
             ui.put(
@@ -3733,36 +5185,66 @@ impl ReaderApp {
             ) {
                 self.back(now, area);
             }
+            let title_width = (area.width() - 56. - 216.).max(0.);
+            let mut job = egui::text::LayoutJob::simple(
+                self.reading_title(&book),
+                FontId::proportional(15.),
+                ink,
+                title_width,
+            );
+            job.wrap.max_rows = 1;
+            let galley = ui.painter().layout_job(job);
             ui.painter()
                 .with_clip_rect(Rect::from_min_max(
                     area.min + vec2(56., 0.),
-                    pos2(
-                        area.right()
-                            - if self.chapter(id).is_some() {
-                                110.
-                            } else {
-                                58.
-                            },
-                        area.top() + 56.,
-                    ),
+                    pos2(area.right() - 216., area.top() + 56.),
                 ))
-                .text(
-                    area.min + vec2(56., 20.),
-                    Align2::LEFT_TOP,
-                    self.reading_title(&book),
-                    FontId::proportional(15.),
-                    ink,
-                );
-            if self.chapter(id).is_some()
-                && self.icon(
-                    ui,
-                    "reader-chapters",
-                    Rect::from_min_size(pos2(area.right() - 104., area.top() + 8.), vec2(44., 44.)),
-                    "chapters",
-                    "已下载章节",
-                )
-            {
+                .galley(area.min + vec2(56., 20.), galley, ink);
+            if self.icon(
+                ui,
+                "reader-chapters",
+                Rect::from_min_size(pos2(area.right() - 104., area.top() + 8.), vec2(44., 44.)),
+                "chapters",
+                if self.chapter(id).is_some() {
+                    "章节与书签"
+                } else {
+                    "书签"
+                },
+            ) {
+                self.dialog_bookmarks = self.chapter(id).is_none();
                 self.chapter_dialog = Some(id.to_string());
+            }
+            let bookmarked = self.bookmarked(id);
+            if self.icon(
+                ui,
+                "reader-bookmark",
+                Rect::from_min_size(pos2(area.right() - 156., area.top() + 8.), vec2(44., 44.)),
+                if bookmarked { "bookmark-on" } else { "bookmark" },
+                if bookmarked { "取消书签" } else { "加书签" },
+            ) {
+                self.bookmark_toggle(id);
+            }
+            let share_rect =
+                Rect::from_min_size(pos2(area.right() - 208., area.top() + 8.), vec2(44., 44.));
+            if self.share_enabled(id) {
+                if self.icon(ui, "reader-share", share_rect, "share", "分享本页") {
+                    self.send(Command::SharePage {
+                        id: id.to_string(),
+                        page: self.page,
+                    });
+                }
+            } else {
+                self.hitboxes.insert("reader-share".into(), share_rect);
+                // Disabled until the page's original bytes exist.
+                let p = ui.painter();
+                let c = share_rect.center();
+                let stroke = Stroke::new(1.7, Color32::from_gray(140));
+                p.line_segment([c + vec2(-7., -1.), c + vec2(-7., 7.)], stroke);
+                p.line_segment([c + vec2(-7., 7.), c + vec2(7., 7.)], stroke);
+                p.line_segment([c + vec2(7., 7.), c + vec2(7., -1.)], stroke);
+                p.line_segment([c + vec2(0., 4.), c + vec2(0., -7.)], stroke);
+                p.line_segment([c + vec2(0., -7.), c + vec2(-4., -3.)], stroke);
+                p.line_segment([c + vec2(0., -7.), c + vec2(4., -3.)], stroke);
             }
             if self.icon(
                 ui,
@@ -3825,6 +5307,28 @@ impl ReaderApp {
                 FontId::monospace(10.),
                 muted,
             );
+        } else if self.reader_status {
+            // Bottom-right 时间 · 电量 pill while the controls are hidden;
+            // repaint once at each minute boundary, battery polled ≤1/min.
+            let now = chrono::Local::now();
+            let text = Self::status_text(&now.format("%H:%M").to_string(), self.cached_battery());
+            let palette = crate::design::palette(true);
+            let galley = ui.painter().layout_no_wrap(
+                text,
+                FontId::proportional(12.),
+                Color32::from_white_alpha(230),
+            );
+            let size = galley.size() + vec2(20., 12.);
+            let rect = Rect::from_min_size(
+                pos2(area.right() - 10. - size.x, area.bottom() - 10. - size.y),
+                size,
+            );
+            ui.painter()
+                .rect_filled(rect, size.y / 2., Color32::from_black_alpha(120));
+            ui.painter().galley(rect.center() - galley.size() / 2., galley, palette.muted);
+            let wait = 61 - chrono::Timelike::second(&now) as u64;
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_secs(wait));
         }
     }
     fn vertical_ui(
@@ -3954,6 +5458,35 @@ impl ReaderApp {
             }
             self.hitboxes
                 .insert(format!("vertical-page-{global}"), target);
+            // Chapter separator: a strip on the boundary between the
+            // previous chapter's last page and this segment's first page.
+            // Purely visual — `top`/`heights`/anchors are untouched.
+            if local == 0 && global > 0 {
+                let seam = target.top().clamp(content.top(), content.bottom());
+                painter.line_segment(
+                    [pos2(content.left(), seam), pos2(content.right(), seam)],
+                    Stroke::new(1., Color32::from_white_alpha(40)),
+                );
+                // Compact floating pill on the seam — ellipsized to at most
+                // 70% of the strip width. Purely visual; top/heights/anchors
+                // are untouched.
+                let mut job = egui::text::LayoutJob::simple(
+                    self.chapter_separator_label(&seg),
+                    FontId::proportional(12.),
+                    Color32::from_white_alpha(235),
+                    content.width() * 0.7 - 20.,
+                );
+                job.wrap.max_rows = 1;
+                let galley = painter.layout_job(job);
+                let band = Rect::from_center_size(
+                    pos2(content.center().x, seam),
+                    galley.size() + vec2(20., 10.),
+                );
+                painter.rect_filled(band, 10., Color32::from_black_alpha(150));
+                painter.galley(band.center() - galley.size() / 2., galley, Color32::WHITE);
+                self.hitboxes
+                    .insert(format!("vertical-separator-{global}"), band);
+            }
             if let Some(texture) = self.pages.get(&(seg.to_string(), local)) {
                 texture.paint(&painter, target, self.crop);
                 self.rendered_page_nodes += 1;
@@ -4102,7 +5635,7 @@ impl ReaderApp {
                             continue;
                         }
                         let cover_id = self.cover_id(&book.id);
-                        self.ask_cover(&cover_id);
+                        self.ask_cover(ui.ctx(), &cover_id);
                         ui.painter().rect_filled(rect, 18., palette.surface);
                         let cover = Rect::from_min_size(rect.min + vec2(14., 14.), vec2(58., 82.));
                         if let Some(texture) = self.covers.get(&cover_id) {
@@ -4180,6 +5713,11 @@ impl ReaderApp {
         });
     }
     fn settings_ui(&mut self, ui: &mut Ui, area: Rect) {
+        if !self.storage_opened {
+            self.storage_opened = true;
+            self.send(Command::StorageReport);
+            self.sources.request_storage();
+        }
         let palette = crate::design::palette(self.dark);
         let column = Self::page_column(area, 92., 88.);
         ui.scope_builder(UiBuilder::new().max_rect(column), |ui| {
@@ -4211,6 +5749,31 @@ impl ReaderApp {
                                     ) {
                                         self.theme = key.into();
                                         self.setting("theme", self.theme.clone());
+                                    }
+                                }
+                            });
+                            ui.add_space(18.);
+                            ui.label(
+                                RichText::new("配色").color(palette.muted).small(),
+                            );
+                            let scheme_width = if ui.available_width() < 330. {
+                                ((ui.available_width() - 10.) / 2.).floor() - 1.
+                            } else {
+                                ((ui.available_width() - 20.) / 3.).floor() - 1.
+                            };
+                            ui.horizontal_wrapped(|ui| {
+                                for scheme in crate::design::Scheme::ALL {
+                                    if crate::design::scheme_choice(
+                                        ui,
+                                        scheme,
+                                        self.color_scheme == scheme.key(),
+                                        scheme_width,
+                                    ) {
+                                        self.color_scheme = scheme.key().into();
+                                        self.setting(
+                                            "palette",
+                                            self.color_scheme.clone(),
+                                        );
                                     }
                                 }
                             });
@@ -4304,6 +5867,70 @@ impl ReaderApp {
                                 "不保存新的阅读进度和历史",
                             ) {
                                 self.setting("private", self.private.to_string());
+                                self.sources.set_private(self.private);
+                            }
+                            ui.separator();
+                            ui.add_space(6.);
+                            if crate::design::toggle(
+                                ui,
+                                &mut self.keep_awake_setting,
+                                "阅读时屏幕常亮",
+                                "打开书籍时不让屏幕自动熄灭",
+                            ) {
+                                self.setting(
+                                    "keep-awake",
+                                    self.keep_awake_setting.to_string(),
+                                );
+                                if !self.keep_awake_setting {
+                                    self.keep_awake(false);
+                                } else if matches!(self.screen, Screen::Reader(_)) {
+                                    self.keep_awake(true);
+                                }
+                            }
+                            ui.separator();
+                            ui.add_space(6.);
+                            if crate::design::toggle(
+                                ui,
+                                &mut self.reader_status,
+                                "显示时间和电量",
+                                "阅读时右下角显示时间与电量",
+                            ) {
+                                self.setting(
+                                    "reader-status",
+                                    self.reader_status.to_string(),
+                                );
+                            }
+                            ui.separator();
+                            ui.add_space(6.);
+                            crate::design::section(ui, "点击翻页");
+                            let zone_width = if ui.available_width() < 370. {
+                                ((ui.available_width() - 10.) / 2.).floor() - 1.
+                            } else {
+                                ((ui.available_width() - 20.) / 3.).floor() - 1.
+                            };
+                            let mut zones = self.tap_zones.clone();
+                            ui.horizontal_wrapped(|ui| {
+                                for (key, name) in [
+                                    ("lr", "左右翻页"),
+                                    ("next", "两侧都是下一页"),
+                                    ("off", "关闭点击翻页"),
+                                ] {
+                                    if ui
+                                        .add(
+                                            Button::new(name)
+                                                .selected(zones == key)
+                                                .min_size(vec2(zone_width, 48.))
+                                                .wrap(),
+                                        )
+                                        .clicked()
+                                    {
+                                        zones = key.into();
+                                    }
+                                }
+                            });
+                            if zones != self.tap_zones {
+                                self.tap_zones = zones.clone();
+                                self.setting("tap-zones", zones);
                             }
                         });
                     ui.add_space(10.);
@@ -4342,6 +5969,45 @@ impl ReaderApp {
                                 self.sources.set_follow_interval(chosen);
                                 self.setting("follow-interval", chosen.to_string());
                             }
+                            ui.add_space(10.);
+                            ui.label(
+                                RichText::new("自动下载新章节（会使用移动网络）")
+                                    .color(palette.muted)
+                                    .small(),
+                            );
+                            let current = self.sources.auto_download().to_string();
+                            let mut mode = current.clone();
+                            let width = if ui.available_width() < 340. {
+                                ((ui.available_width() - 10.) / 2.).floor() - 1.
+                            } else {
+                                ((ui.available_width() - 30.) / 4.).floor() - 1.
+                            };
+                            ui.horizontal_wrapped(|ui| {
+                                for (value, name) in [
+                                    ("off", "关闭"),
+                                    ("all", "新章节全部"),
+                                    ("latest1", "只下最新 1 章"),
+                                    ("latest3", "只下最新 3 章"),
+                                ] {
+                                    let button = ui.add(
+                                        Button::new(name)
+                                            .selected(mode == value)
+                                            .min_size(vec2(width, 44.))
+                                            .wrap(),
+                                    );
+                                    self.hitboxes.insert(
+                                        format!("auto-download-{value}"),
+                                        button.rect,
+                                    );
+                                    if button.clicked() {
+                                        mode = value.to_string();
+                                    }
+                                }
+                            });
+                            if mode != current {
+                                self.sources.set_auto_download(&mode);
+                                self.setting("auto-download", mode);
+                            }
                         });
                     ui.add_space(10.);
                     ui.separator();
@@ -4349,7 +6015,7 @@ impl ReaderApp {
                         .inner_margin(Margin::symmetric(2, 16))
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
-                            crate::design::section(ui, "进度跟踪（AniList / Kitsu）");
+                            crate::design::section(ui, "进度跟踪（AniList / Kitsu / Bangumi）");
                             let mut sync = self.trackers.auto_sync();
                             if crate::design::toggle(
                                 ui,
@@ -4367,6 +6033,7 @@ impl ReaderApp {
                             for tracker in [
                                 crate::trackers::TrackerKind::Anilist,
                                 crate::trackers::TrackerKind::Kitsu,
+                                crate::trackers::TrackerKind::Bangumi,
                             ] {
                                 ui.add_space(10.);
                                 let name = tracker.label();
@@ -4395,6 +6062,76 @@ impl ReaderApp {
                                     self.tracker_login_row(ui, tracker);
                                 }
                             }
+                        });
+                    if yejian_platform::supports_app_lock() {
+                        ui.add_space(10.);
+                        ui.separator();
+                        Frame::new()
+                            .inner_margin(Margin::symmetric(2, 16))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                crate::design::section(ui, "隐私");
+                                let mut on = self.applock.enabled();
+                                if crate::design::toggle(
+                                    ui,
+                                    &mut on,
+                                    "应用锁（面容 ID / 触控 ID / 设备密码）",
+                                    "回到应用时验证身份后再显示内容",
+                                ) && self.applock.request_toggle(on)
+                                {
+                                    self.start_auth("验证以更改应用锁");
+                                }
+                                if self.applock.enabled() {
+                                    ui.separator();
+                                    ui.add_space(6.);
+                                    ui.label(
+                                        RichText::new("离开多久后重新锁定")
+                                            .color(palette.muted)
+                                            .small(),
+                                    );
+                                    let width = ((ui.available_width() - 20.) / 3.).floor() - 1.;
+                                    let mut delay = self.applock.delay_secs();
+                                    ui.horizontal_wrapped(|ui| {
+                                        for (secs, name) in
+                                            crate::applock::DELAY_CHOICES
+                                        {
+                                            if ui
+                                                .add(
+                                                    Button::new(*name)
+                                                        .selected(delay == *secs)
+                                                        .min_size(vec2(width, 44.))
+                                                        .wrap(),
+                                                )
+                                                .clicked()
+                                            {
+                                                delay = *secs;
+                                            }
+                                        }
+                                    });
+                                    if delay != self.applock.delay_secs() {
+                                        self.applock.set_delay(delay);
+                                        self.setting(
+                                            "app-lock-delay",
+                                            delay.to_string(),
+                                        );
+                                    }
+                                }
+                                #[cfg(target_os = "android")]
+                                ui.label(
+                                    RichText::new("Android 的最近任务预览不会被遮挡")
+                                        .color(palette.muted)
+                                        .small(),
+                                );
+                            });
+                    }
+                    ui.add_space(10.);
+                    ui.separator();
+                    Frame::new()
+                        .inner_margin(Margin::symmetric(2, 16))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            crate::design::section(ui, "存储");
+                            self.storage_group_ui(ui, palette);
                         });
                     ui.add_space(10.);
                     ui.separator();
@@ -4485,6 +6222,446 @@ impl ReaderApp {
                 });
         });
     }
+    /// The 存储 settings group: per-bucket sizes plus confirmed cleanups.
+    fn storage_group_ui(&mut self, ui: &mut Ui, palette: crate::design::Palette) {
+        let library = self.storage.clone();
+        let sources = self.sources.storage().cloned();
+        let total = library.as_ref().map(|r| r.total_bytes()).unwrap_or(0)
+            + sources.as_ref().map(|r| r.total_bytes()).unwrap_or(0);
+        ui.label(
+            RichText::new(format!("共 {}", Self::format_bytes(total))).strong(),
+        );
+        ui.add_space(8.);
+        let size = |bytes: Option<u64>| match bytes {
+            Some(bytes) => Self::format_bytes(bytes),
+            None => "统计中…".into(),
+        };
+        let mut row = |ui: &mut Ui, label: &str, bytes: Option<u64>, hitbox: Option<&str>| {
+            ui.horizontal(|ui| {
+                ui.label(label);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(RichText::new(size(bytes)).color(palette.muted));
+                    if let Some(key) = hitbox {
+                        let button = ui.add(Button::new("清理").min_size(vec2(64., 36.)));
+                        self.hitboxes.insert(key.into(), button.rect);
+                        if button.clicked() {
+                            self.storage_confirm = Some(match key {
+                                "storage-removed-clean" => StorageConfirm::RemovedBooks,
+                                "storage-staging-clean" => StorageConfirm::Staging,
+                                _ => StorageConfirm::Covers,
+                            });
+                        }
+                    }
+                });
+            });
+        };
+        row(ui, "书架漫画", library.as_ref().map(|r| r.shelf_bytes), None);
+        row(
+            ui,
+            "已移出的书",
+            library.as_ref().map(|r| r.removed_bytes),
+            Some("storage-removed-clean"),
+        );
+        let staging = sources
+            .as_ref()
+            .map(|r| r.staging_active + r.staging_done);
+        row(ui, "下载暂存", staging, Some("storage-staging-clean"));
+        row(
+            ui,
+            "封面缓存",
+            sources.as_ref().map(|r| r.covers),
+            Some("storage-covers-clean"),
+        );
+        ui.add_space(4.);
+        ui.label(
+            RichText::new("清理只删除文件，阅读进度与书架记录都会保留。")
+                .small()
+                .color(palette.muted),
+        );
+    }
+    /// Both storage workers have answered at least once.
+    #[cfg(debug_assertions)]
+    pub fn storage_ready(&self) -> bool {
+        self.storage.is_some() && self.sources.storage().is_some()
+    }
+    /// Human size like `1.2 GB`.
+    fn format_bytes(bytes: u64) -> String {
+        const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+        let mut value = bytes as f64;
+        let mut unit = 0;
+        while value >= 1024. && unit + 1 < UNITS.len() {
+            value /= 1024.;
+            unit += 1;
+        }
+        if unit == 0 {
+            format!("{bytes} B")
+        } else {
+            format!("{value:.1} {}", UNITS[unit])
+        }
+    }
+    /// Confirmation dialog for every destructive 存储 / chapter delete.
+    fn storage_confirm_ui(&mut self, ctx: &Context) {
+        let Some(action) = self.storage_confirm.clone() else {
+            return;
+        };
+        let (title, copy) = match &action {
+            StorageConfirm::RemovedBooks => (
+                "清理已移出的书",
+                "删除所有已移出书籍的漫画和封面文件。阅读进度保留，重新导入同一文件即可恢复。"
+                    .to_string(),
+            ),
+            StorageConfirm::Staging => (
+                "清理下载暂存",
+                "删除已完成或失败任务的暂存文件，进行中的下载不受影响。".to_string(),
+            ),
+            StorageConfirm::Covers => (
+                "清理封面缓存",
+                "删除书源封面缓存文件，封面会在需要时重新下载。".to_string(),
+            ),
+            StorageConfirm::Chapters(ids) => (
+                "删除已下载章节",
+                format!(
+                    "删除 {} 个已下载章节的文件。章节的阅读进度保留，重新下载可恢复。",
+                    ids.len()
+                ),
+            ),
+            StorageConfirm::Category(name) => (
+                "删除分类",
+                format!("分类“{name}”会删除，分类里的漫画会回到未分类。阅读进度保留。"),
+            ),
+        };
+        let screen = ctx.content_rect();
+        // Dim everything under the card and swallow the tap so it can only
+        // close the dialog — nothing beneath is clickable.
+        let scrim = Area::new(Id::unique("storage-confirm-scrim"))
+            .order(Order::Foreground)
+            .fade_in(false)
+            .interactable(true)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                ui.painter()
+                    .rect_filled(screen, 0., Color32::from_black_alpha(96));
+                ui.allocate_rect(screen, Sense::click())
+            });
+        if scrim.inner.clicked() {
+            self.storage_confirm = None;
+            return;
+        }
+        // fade_in(false) + surface fill: the card is opaque from the first
+        // frame, nothing behind it can bleed through.
+        let mut card_rect = Rect::NOTHING;
+        Area::new(Id::unique("storage-confirm"))
+            .order(Order::Foreground)
+            .fade_in(false)
+            .interactable(true)
+            .movable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                let frame = crate::design::surface(ui).show(ui, |ui| {
+                    ui.set_width(
+                        (screen.width() - 56.).clamp(220., 420.),
+                    );
+                    ui.heading(title);
+                    ui.label(copy);
+                    ui.add_space(6.);
+                    ui.horizontal(|ui| {
+                        if ui.button("取消").clicked() {
+                            self.storage_confirm = None;
+                        }
+                        let confirm =
+                            ui.add(crate::design::danger("删除", self.dark));
+                        self.hitboxes
+                            .insert("storage-confirm-go".into(), confirm.rect);
+                        if confirm.clicked() {
+                            match action {
+                                StorageConfirm::RemovedBooks => {
+                                    self.send(Command::PurgeRemoved)
+                                }
+                                StorageConfirm::Staging => {
+                                    self.sources.clean_staging()
+                                }
+                                StorageConfirm::Covers => {
+                                    self.sources.clear_cover_cache()
+                                }
+                                StorageConfirm::Chapters(ids) => {
+                                    self.send(Command::PurgeBooks(ids));
+                                    self.chapter_selected.clear();
+                                    self.chapter_manage = false;
+                                }
+                                StorageConfirm::Category(name) => {
+                                    self.send(Command::ClearCategory(name.clone()));
+                                    self.user_categories.retain(|item| item != &name);
+                                    self.save_categories();
+                                    if self.category == name {
+                                        self.category = String::new();
+                                    }
+                                }
+                            }
+                            self.storage_confirm = None;
+                        }
+                    });
+                });
+                card_rect = frame.response.rect;
+            });
+        self.hitboxes
+            .insert("storage-confirm-card".into(), card_rect);
+    }
+    /// Categories shown in the manage panel / pick list: stored user order
+    /// plus categories found on books that are not stored yet. Fixed entries
+    /// (全部/未分类/在线追更) never appear here.
+    fn managed_categories(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::from(["未分类", "在线追更"]);
+        let mut list = Vec::new();
+        for name in &self.user_categories {
+            if seen.insert(name.as_str()) {
+                list.push(name.clone());
+            }
+        }
+        let mut derived: Vec<String> = self
+            .books
+            .iter()
+            .map(|book| book.category.clone())
+            .filter(|name| !name.is_empty() && !seen.contains(name.as_str()))
+            .collect();
+        derived.sort();
+        derived.dedup();
+        list.extend(derived);
+        list
+    }
+    /// Adds a user category (deduped, trimmed) and persists the list.
+    fn add_category(&mut self, name: &str) -> Option<String> {
+        let name = name.trim();
+        if name.is_empty()
+            || matches!(name, "全部" | "未分类" | "在线追更")
+            || self.managed_categories().iter().any(|item| item == name)
+        {
+            return None;
+        }
+        let name = name.to_string();
+        self.user_categories.push(name.clone());
+        self.save_categories();
+        Some(name)
+    }
+    /// Opaque scrim + card shared by the manage and pick panels — same
+    /// pattern as the storage delete confirmations.
+    fn opaque_card<R>(
+        &mut self,
+        ctx: &Context,
+        id: &str,
+        open: &mut bool,
+        body: impl FnOnce(&mut Self, &mut Ui) -> R,
+    ) -> Option<R> {
+        let screen = ctx.content_rect();
+        let scrim = Area::new(Id::unique(format!("{id}-scrim")))
+            .order(Order::Foreground)
+            .fade_in(false)
+            .interactable(true)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                ui.painter()
+                    .rect_filled(screen, 0., Color32::from_black_alpha(96));
+                ui.allocate_rect(screen, Sense::click())
+            });
+        if scrim.inner.clicked() {
+            *open = false;
+            return None;
+        }
+        let mut card_rect = Rect::NOTHING;
+        let mut out: Option<R> = None;
+        Area::new(Id::unique(id))
+            .order(Order::Foreground)
+            .fade_in(false)
+            .interactable(true)
+            .movable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                let frame = crate::design::surface(ui).show(ui, |ui| {
+                    ui.set_width((screen.width() - 56.).clamp(240., 440.));
+                    out = Some(body(self, ui));
+                });
+                card_rect = frame.response.rect;
+            });
+        self.hitboxes.insert(format!("{id}-card"), card_rect);
+        out
+    }
+    /// 分类管理 panel and the multi-select 分类 picker.
+    fn category_panels_ui(&mut self, ctx: &Context) {
+        if self.category_manage {
+            let mut open = true;
+            let categories = self.managed_categories();
+            self.opaque_card::<()>(ctx, "category-manage", &mut open, |app, ui| {
+                ui.heading("分类管理");
+                ScrollArea::vertical().max_height(300.).show(ui, |ui| {
+                    for (index, name) in categories.iter().enumerate() {
+                        if app.category_renaming.as_deref() == Some(name.as_str()) {
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    TextEdit::singleline(&mut app.category_rename_edit)
+                                        .desired_width(ui.available_width() - 60.),
+                                );
+                                if ui.button("确定").clicked() {
+                                    let new = app.category_rename_edit.trim().to_string();
+                                    if !new.is_empty() && new != *name {
+                                        app.send(Command::RenameCategory(
+                                            name.clone(),
+                                            new.clone(),
+                                        ));
+                                        if let Some(pos) =
+                                            app.user_categories.iter().position(|x| x == name)
+                                        {
+                                            app.user_categories[pos] = new.clone();
+                                        } else {
+                                            app.user_categories.push(new.clone());
+                                        }
+                                        app.save_categories();
+                                        if app.category == *name {
+                                            app.category = new;
+                                        }
+                                    }
+                                    app.category_renaming = None;
+                                }
+                            });
+                            continue;
+                        }
+                        ui.horizontal(|ui| {
+                            ui.add(Label::new(name).wrap());
+                            let pos = app
+                                .user_categories
+                                .iter()
+                                .position(|item| item == name);
+                            let up_enabled = pos.is_some_and(|pos| pos > 0);
+                            let down_enabled = pos
+                                .is_some_and(|pos| pos + 1 < app.user_categories.len());
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .add(Button::new("删除").min_size(vec2(52., 0.)))
+                                        .clicked()
+                                    {
+                                        app.storage_confirm =
+                                            Some(StorageConfirm::Category(name.clone()));
+                                    }
+                                    if ui
+                                        .add(Button::new("重命名").min_size(vec2(52., 0.)))
+                                        .clicked()
+                                    {
+                                        app.category_renaming = Some(name.clone());
+                                        app.category_rename_edit = name.clone();
+                                    }
+                                    let down = ui.add_enabled(
+                                        down_enabled,
+                                        Button::new("下移").min_size(vec2(52., 0.)),
+                                    );
+                                    if down_enabled {
+                                        app.hitboxes
+                                            .insert(format!("category-down-{index}"), down.rect);
+                                    }
+                                    if down.clicked()
+                                        && let Some(pos) = pos
+                                    {
+                                        app.user_categories.swap(pos, pos + 1);
+                                        app.save_categories();
+                                    }
+                                    let up = ui.add_enabled(
+                                        up_enabled,
+                                        Button::new("上移").min_size(vec2(52., 0.)),
+                                    );
+                                    if up_enabled {
+                                        app.hitboxes
+                                            .insert(format!("category-up-{index}"), up.rect);
+                                    }
+                                    if up.clicked()
+                                        && let Some(pos) = pos
+                                    {
+                                        app.user_categories.swap(pos, pos - 1);
+                                        app.save_categories();
+                                    }
+                                },
+                            );
+                        });
+                        ui.add_space(4.);
+                    }
+                    if categories.is_empty() {
+                        ui.label(RichText::new("还没有自建分类").small());
+                    }
+                });
+                ui.add_space(6.);
+                ui.horizontal(|ui| {
+                    let edit = ui.add(
+                        TextEdit::singleline(&mut app.category_new)
+                            .hint_text("新分类名")
+                            .desired_width(ui.available_width() - 60.),
+                    );
+                    app.hitboxes.insert("category-new".into(), edit.rect);
+                    let add = ui.button("新建");
+                    app.hitboxes.insert("category-add".into(), add.rect);
+                    if (add.clicked()
+                        || edit.lost_focus()
+                            && ui.input(|input| input.key_pressed(Key::Enter)))
+                        && app.add_category(&app.category_new.clone()).is_some()
+                    {
+                        app.category_new.clear();
+                    }
+                });
+                ui.add_space(6.);
+                if ui.button("关闭").clicked() {
+                    app.category_manage = false;
+                }
+            });
+            self.category_manage = open && self.category_manage;
+        }
+        if self.category_pick {
+            let mut open = true;
+            let mut choices = vec!["未分类".to_string()];
+            choices.extend(self.managed_categories());
+            let books = self.selected_books();
+            self.opaque_card::<()>(ctx, "category-pick", &mut open, |app, ui| {
+                ui.heading("选择分类");
+                ScrollArea::vertical().max_height(300.).show(ui, |ui| {
+                    for (index, name) in choices.iter().enumerate() {
+                        let row = ui.add_sized(
+                            [ui.available_width(), 40.],
+                            Button::new(name.clone()),
+                        );
+                        app.hitboxes
+                            .insert(format!("category-pick-{index}-{name}"), row.rect);
+                        if row.clicked() {
+                            app.send(Command::Category(books.clone(), name.clone()));
+                            app.selected.clear();
+                            app.category_pick = false;
+                        }
+                    }
+                });
+                ui.add_space(6.);
+                ui.horizontal(|ui| {
+                    let edit = ui.add(
+                        TextEdit::singleline(&mut app.category_new)
+                            .hint_text("新分类名")
+                            .desired_width(ui.available_width() - 90.),
+                    );
+                    let add = ui.add_enabled(
+                        !app.category_new.trim().is_empty(),
+                        Button::new("新建并加入"),
+                    );
+                    if add.clicked()
+                        && let Some(name) = app.add_category(&app.category_new.clone())
+                    {
+                        app.send(Command::Category(books.clone(), name));
+                        app.selected.clear();
+                        app.category_new.clear();
+                        app.category_pick = false;
+                    }
+                    let _ = edit;
+                });
+                ui.add_space(6.);
+                if ui.button("取消").clicked() {
+                    app.category_pick = false;
+                }
+            });
+            self.category_pick = open && self.category_pick;
+        }
+    }
     fn tracker_login_row(&mut self, ui: &mut Ui, tracker: crate::trackers::TrackerKind) {
         let idle = self.trackers.idle();
         match tracker {
@@ -4558,6 +6735,30 @@ impl ReaderApp {
                     self.tracker_kitsu_pass.clear();
                 }
             }
+            crate::trackers::TrackerKind::Bangumi => {
+                ui.label(
+                    RichText::new("在 next.bgm.tv/demo/access-token 生成令牌后粘贴到下面")
+                        .color(crate::design::palette(self.dark).muted)
+                        .small(),
+                );
+                ui.add(
+                    TextEdit::singleline(&mut self.tracker_bangumi_token)
+                        .desired_width(ui.available_width())
+                        .password(true)
+                        .hint_text("粘贴 Bangumi Access Token"),
+                );
+                let token = self.tracker_bangumi_token.trim().to_string();
+                let button = ui.add_enabled(
+                    idle && !token.is_empty(),
+                    Button::new("用粘贴的令牌登录").min_size(vec2(0., 44.)),
+                );
+                self.hitboxes.insert("tracker-bangumi-login".into(), button.rect);
+                if button.clicked() {
+                    self.trackers
+                        .submit(crate::trackers::TrackCommand::BangumiToken(token));
+                    self.tracker_bangumi_token.clear();
+                }
+            }
         }
     }
     fn track_panel_ui(&mut self, ui: &mut Ui, key: &str) {
@@ -4566,10 +6767,10 @@ impl ReaderApp {
         let palette = crate::design::palette(self.dark);
         let bound = self.trackers.binding(key).cloned();
         if let Some(binding) = &bound {
-            let tracker = if binding.tracker == "kitsu" {
-                TrackerKind::Kitsu
-            } else {
-                TrackerKind::Anilist
+            let tracker = match binding.tracker.as_str() {
+                "kitsu" => TrackerKind::Kitsu,
+                "bangumi" => TrackerKind::Bangumi,
+                _ => TrackerKind::Anilist,
             };
             ui.label(format!(
                 "已绑定 {} · {}",
@@ -4687,7 +6888,7 @@ impl ReaderApp {
             );
             let idle = self.trackers.idle();
             ui.horizontal(|ui| {
-                for tracker in [TrackerKind::Anilist, TrackerKind::Kitsu] {
+                for tracker in [TrackerKind::Anilist, TrackerKind::Kitsu, TrackerKind::Bangumi] {
                     let logged = self.trackers.account(tracker).is_some();
                     if ui
                         .add_enabled(
@@ -4707,9 +6908,10 @@ impl ReaderApp {
             });
             if self.trackers.account(TrackerKind::Anilist).is_none()
                 && self.trackers.account(TrackerKind::Kitsu).is_none()
+                && self.trackers.account(TrackerKind::Bangumi).is_none()
             {
                 ui.label(
-                    RichText::new("先到 设置 → 进度跟踪 登录 AniList 或 Kitsu")
+                    RichText::new("先到 设置 → 进度跟踪 登录 AniList、Kitsu 或 Bangumi")
                         .color(palette.muted)
                         .small(),
                 );
@@ -4778,6 +6980,9 @@ impl ReaderApp {
             ui.style_mut().wrap_mode = Some(TextWrapMode::Wrap);
             self.sources.ui(ui);
         });
+        if self.sources.take_shelf_return() {
+            self.tab = Tab::Library;
+        }
         self.hitboxes
             .extend(self.sources.hitboxes.iter().map(|(id, rect)| (id.clone(), *rect)));
     }
@@ -4811,6 +7016,72 @@ impl ReaderApp {
             }
         }
     }
+    /// Launch a device-owner authentication; failures to even show the
+    /// prompt land as a finished error so the state machine never waits.
+    fn start_auth(&mut self, reason: &str) {
+        if let Err(error) = yejian_platform::authenticate(reason) {
+            self.applock.auth_failed_to_start(error.to_string());
+        }
+    }
+
+    /// Topmost opaque lock screen: paper surface, app name and 解锁. The
+    /// full-rect interaction swallows every touch so nothing beneath can be
+    /// tapped while locked.
+    fn lock_ui(&mut self, ui: &mut Ui, full: Rect) {
+        if self.applock.take_auto_attempt() {
+            self.start_auth("解锁页间");
+        }
+        let palette = crate::design::palette(self.dark);
+        egui::Area::new(Id::unique("app-lock"))
+            .order(Order::Foreground)
+            .fade_in(false)
+            .interactable(true)
+            .show(ui.ctx(), |ui| {
+                ui.set_clip_rect(full);
+                ui.allocate_rect(full, Sense::click());
+                ui.painter().rect_filled(full, 0., palette.surface);
+                let column = Rect::from_center_size(
+                    pos2(full.center().x, full.center().y - 20.),
+                    vec2((full.width() - 48.).min(360.), 240.),
+                );
+                ui.painter().text(
+                    pos2(column.center().x, column.top() + 30.),
+                    Align2::CENTER_CENTER,
+                    "页间",
+                    crate::typography::display(34. * self.font_scale.min(1.3)),
+                    palette.ink,
+                );
+                ui.painter().text(
+                    pos2(column.center().x, column.top() + 78.),
+                    Align2::CENTER_CENTER,
+                    "已锁定",
+                    FontId::proportional(14. * self.font_scale),
+                    palette.muted,
+                );
+                let row = Rect::from_center_size(
+                    pos2(column.center().x, column.top() + 140.),
+                    vec2(column.width().min(200.), 48.),
+                );
+                let button = ui.put(
+                    row,
+                    crate::design::primary("解锁", self.dark).min_size(row.size()),
+                );
+                self.hitboxes.insert("app-lock-unlock".into(), button.rect);
+                if button.clicked() && self.applock.begin_unlock() {
+                    self.start_auth("解锁页间");
+                }
+                if let Some(failure) = self.applock.failure() {
+                    ui.painter().text(
+                        pos2(column.center().x, column.top() + 190.),
+                        Align2::CENTER_CENTER,
+                        failure,
+                        FontId::proportional(12. * self.font_scale),
+                        palette.muted,
+                    );
+                }
+            });
+    }
+
     fn dialogs(&mut self, ctx: &Context) {
         if self.reader_options {
             let response = Modal::new(Id::unique("reader-options"))
@@ -4818,7 +7089,7 @@ impl ReaderApp {
                     Frame::popup(&ctx.style_of(Theme::Dark))
                         .fill(crate::design::palette(true).surface)
                         .inner_margin(18)
-                        .corner_radius(16),
+                        .corner_radius(20),
                 )
                 .show(ctx, |ui| {
                     ui.set_width((ctx.content_rect().width() - 56.).clamp(200., 440.));
@@ -4983,43 +7254,202 @@ impl ReaderApp {
                 .map(|m| m.manga_title.clone())
                 .unwrap_or_else(|| "已下载章节".into());
             let chapters = self.chapters_for(&id);
+            // Keep only selections that still resolve to downloaded chapters.
+            let ids: std::collections::HashSet<String> =
+                chapters.iter().map(|book| book.id.clone()).collect();
+            self.chapter_selected.retain(|id| ids.contains(id));
+            if chapters.is_empty() {
+                self.chapter_manage = false;
+            }
             let response = Modal::new(Id::unique("chapter-picker")).show(ctx, |ui| {
                 ui.set_width((ctx.content_rect().width() - 56.).clamp(200., 460.));
-                ui.heading(title);
+                ui.horizontal(|ui| {
+                    ui.heading(title);
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            let manage =
+                                ui.button(if self.chapter_manage { "完成" } else { "管理" });
+                            self.hitboxes
+                                .insert("chapter-manage".into(), manage.rect);
+                            if manage.clicked() {
+                                self.chapter_manage = !self.chapter_manage;
+                                if !self.chapter_manage {
+                                    self.chapter_selected.clear();
+                                }
+                            }
+                        },
+                    );
+                });
+                let palette = crate::design::palette(self.dark);
+                ui.horizontal(|ui| {
+                    for (label, flag) in [("章节", false), ("书签", true)] {
+                        let selected = self.dialog_bookmarks == flag;
+                        let tab = Button::new(
+                            RichText::new(label).color(if selected {
+                                palette.ink
+                            } else {
+                                palette.muted
+                            }),
+                        )
+                        .fill(if selected {
+                            palette.soft
+                        } else {
+                            palette.surface
+                        });
+                        let tab = ui.add(tab);
+                        self.hitboxes
+                            .insert(format!("dialog-tab-{}", label), tab.rect);
+                        if tab.clicked() {
+                            self.dialog_bookmarks = flag;
+                        }
+                    }
+                });
+                if self.dialog_bookmarks {
+                    let meta = self.reading_metadata(&id);
+                    let work = crate::bookmarks::work_key(&id, meta.as_ref());
+                    let marks: Vec<crate::bookmarks::Bookmark> = self
+                        .bookmarks
+                        .for_work(&work)
+                        .into_iter()
+                        .cloned()
+                        .collect();
+                    if self.private {
+                        ui.label("私密阅读时书签不可用。");
+                    } else if marks.is_empty() {
+                        ui.label(RichText::new("还没有书签。顶栏的书签按钮收藏当前页。").small());
+                    }
+                    ScrollArea::vertical().max_height(300.).show(ui, |ui| {
+                        for (index, mark) in marks.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    Label::new(format!(
+                                        "{} · 第 {} 页",
+                                        mark.title,
+                                        mark.page + 1
+                                    ))
+                                    .wrap(),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui.button("删除").clicked() {
+                                            self.bookmarks.remove(&work, index);
+                                            if let Err(error) =
+                                                self.bookmarks.save(&self.root)
+                                            {
+                                                self.error =
+                                                    Some(format!("书签保存失败：{error}"));
+                                            }
+                                        }
+                                        let jump = ui.button("跳转");
+                                        self.hitboxes.insert(
+                                            format!("bookmark-jump-{index}"),
+                                            jump.rect,
+                                        );
+                                        if jump.clicked() {
+                                            self.bookmark_jump(mark.clone(), &id);
+                                        }
+                                    },
+                                );
+                            });
+                            ui.add_space(4.);
+                        }
+                    });
+                }
+                if !self.dialog_bookmarks {
                 ScrollArea::vertical().max_height(380.).show(ui, |ui| {
-                    for book in chapters {
+                    for book in &chapters {
                         let name = self
                             .chapter(&book.id)
                             .map(|m| m.chapter_title.clone())
                             .unwrap_or_else(|| book.title.clone());
-                        let label = format!(
-                            "{}{}\n第 {} / {} 页",
-                            if book.id == id {
-                                "正在阅读 · "
-                            } else {
-                                ""
-                            },
-                            name,
-                            book.current_page + 1,
-                            book.page_count
-                        );
-                        let response = ui.add_sized(
-                            [ui.available_width(), 58. * self.font_scale.sqrt()],
-                            Button::new(label).wrap(),
-                        );
-                        self.hitboxes
-                            .insert(format!("chapter-{}", book.id), response.rect);
-                        if response.clicked() {
-                            self.open_reader(&book);
+                        let done = book.last_read_at.is_some()
+                            && book.current_page + 1 >= book.page_count;
+                        if self.chapter_manage {
+                            let mut checked = self.chapter_selected.contains(&book.id);
+                            let label = format!("{}{}", name, if done { " · 已读完" } else { "" });
+                            let response = ui.checkbox(&mut checked, label);
+                            self.hitboxes
+                                .insert(format!("chapter-check-{}", book.id), response.rect);
+                            if response.changed() {
+                                if checked {
+                                    self.chapter_selected.insert(book.id.clone());
+                                } else {
+                                    self.chapter_selected.remove(&book.id);
+                                }
+                            }
+                        } else {
+                            let label = format!(
+                                "{}{}\n第 {} / {} 页",
+                                if book.id == id {
+                                    "正在阅读 · "
+                                } else {
+                                    ""
+                                },
+                                name,
+                                book.current_page + 1,
+                                book.page_count
+                            );
+                            let response = ui.add_sized(
+                                [ui.available_width(), 58. * self.font_scale.sqrt()],
+                                Button::new(label).wrap(),
+                            );
+                            self.hitboxes
+                                .insert(format!("chapter-{}", book.id), response.rect);
+                            if response.clicked() {
+                                self.open_reader(book);
+                            }
                         }
                     }
                 });
+                if self.chapter_manage {
+                    let finished: Vec<String> = chapters
+                        .iter()
+                        .filter(|book| {
+                            book.last_read_at.is_some()
+                                && book.current_page + 1 >= book.page_count
+                        })
+                        .map(|book| book.id.clone())
+                        .collect();
+                    ui.horizontal(|ui| {
+                        let delete_selected = ui.add_enabled(
+                            !self.chapter_selected.is_empty(),
+                            Button::new("删除所选"),
+                        );
+                        self.hitboxes
+                            .insert("chapter-delete".into(), delete_selected.rect);
+                        if delete_selected.clicked() {
+                            self.storage_confirm = Some(StorageConfirm::Chapters(
+                                self.chapter_selected.iter().cloned().collect(),
+                            ));
+                        }
+                        let delete_done = ui.add_enabled(
+                            !finished.is_empty(),
+                            Button::new("删除已读完的章节"),
+                        );
+                        self.hitboxes
+                            .insert("chapter-delete-done".into(), delete_done.rect);
+                        if delete_done.clicked() {
+                            self.storage_confirm =
+                                Some(StorageConfirm::Chapters(finished));
+                        }
+                    });
+                    ui.add_space(6.);
+                }
+                }
                 if ui.button("关闭").clicked() {
                     self.chapter_dialog = None;
+                    self.chapter_manage = false;
+                    self.chapter_selected.clear();
+                    self.dialog_bookmarks = false;
                 }
             });
             if response.should_close() {
                 self.chapter_dialog = None;
+                self.chapter_manage = false;
+                self.chapter_selected.clear();
+                self.dialog_bookmarks = false;
             }
         }
         if let Some(text) = self.error.clone() {
@@ -5058,22 +7488,57 @@ impl ReaderApp {
                 .resizable(false)
                 .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
                 .show(ctx, |ui| {
-                    ui.label(format!(
-                        "将 {} 本书移出书架。原漫画文件保留。",
-                        self.selected.len()
-                    ));
+                    let online: Vec<String> = self
+                        .selected
+                        .iter()
+                        .filter(|id| Self::online_parts(id).is_some())
+                        .cloned()
+                        .collect();
+                    let local = self.selected.len() - online.len();
+                    ui.label(if online.is_empty() {
+                        if self.remove_files {
+                            format!("将 {} 本书移出书架并删除文件。阅读进度保留。", self.selected.len())
+                        } else {
+                            format!("将 {} 本书移出书架。原漫画文件保留。", self.selected.len())
+                        }
+                    } else if local == 0 {
+                        format!(
+                            "将 {} 部作品移出书架。会取消追更，已下载的章节不受影响。",
+                            online.len()
+                        )
+                    } else {
+                        "在线作品会取消追更；本地章节的文件处理见下方选项。".into()
+                    });
+                    if local > 0 {
+                        let checkbox = ui.checkbox(&mut self.remove_files, "同时删除文件");
+                        self.hitboxes
+                            .insert("remove-files".into(), checkbox.rect);
+                    }
                     ui.horizontal(|ui| {
                         if ui.button("取消").clicked() {
                             self.confirm_remove = false;
                         }
                         if ui.button("移出").clicked() {
-                            self.send(Command::Remove(self.selected_books()));
+                            let local_ids = self.selected_books();
+                            if self.remove_files {
+                                self.send(Command::PurgeBooks(local_ids));
+                            } else {
+                                self.send(Command::Remove(local_ids));
+                            }
+                            for id in online {
+                                if let Some((source, manga)) = Self::online_parts(&id) {
+                                    self.sources.unfollow(source, manga);
+                                }
+                            }
                             self.selected.clear();
                             self.confirm_remove = false;
+                            self.remove_files = true;
                         }
                     });
                 });
         }
+        self.storage_confirm_ui(ctx);
+        self.category_panels_ui(ctx);
         if let Some(key) = self.track_panel.clone() {
             let response = Modal::new(Id::unique("track-panel")).show(ctx, |ui| {
                 ui.set_width((ctx.content_rect().width() - 48.).clamp(220., 460.));
@@ -5091,8 +7556,37 @@ impl ReaderApp {
     pub fn book_count(&self) -> usize {
         self.books.len()
     }
+    /// Shelf entries including synthesised online follows.
+    pub fn visible_count(&self) -> usize {
+        self.visible_books().len()
+    }
     pub fn current_page(&self) -> usize {
         self.page
+    }
+    /// The 本章完 card is showing past the last page.
+    pub fn chapter_end(&self) -> bool {
+        self.chapter_end
+    }
+    /// Strip segments joined so far, for vertical-flow acceptance checks.
+    pub fn strip_segments_len(&self) -> usize {
+        self.strip_segments().len()
+    }
+    pub fn is_vertical(&self) -> bool {
+        self.vertical
+    }
+    /// Which input blocker is active, for acceptance diagnostics.
+    pub fn block_reason(&self) -> &'static str {
+        if self.reader_options {
+            "options"
+        } else if self.chapter_dialog.is_some() {
+            "chapters"
+        } else if self.track_panel.is_some() {
+            "track"
+        } else if self.error.is_some() {
+            "error"
+        } else {
+            "none"
+        }
     }
     pub fn current_fraction(&self) -> f32 {
         if self.vertical {
@@ -5135,6 +7629,32 @@ impl ReaderApp {
     pub fn covers_loaded(&self) -> bool {
         self.cover_pending.is_empty()
     }
+    /// Height of the painted 3D shelf stage, for layout verification.
+    pub fn shelf_stage_height(&self) -> f32 {
+        self.shelf_stage.height()
+    }
+    /// Fraction of the stage width given to the 3D books, for layout
+    /// verification.
+    pub fn shelf_books_fraction(&self) -> f32 {
+        self.shelf_books.width() / self.shelf_stage.width()
+    }
+    /// Index of the centred book in the current visible order.
+    pub fn focus_index(&self) -> usize {
+        (self.motion.focus.round() as i32).rem_euclid(self.visible_books().len().max(1) as i32)
+            as usize
+    }
+    /// Persisted key of the active shelf sort, for menu verification.
+    pub fn shelf_sort_key(&self) -> &'static str {
+        self.shelf_sort.key()
+    }
+    /// Title of the centred book, for sort-order verification.
+    pub fn focused_book_title(&self) -> String {
+        let books = self.visible_books();
+        books
+            .get(self.focus_index())
+            .map(|book| book.title.clone())
+            .unwrap_or_default()
+    }
 }
 
 impl eframe::App for ReaderApp {
@@ -5144,6 +7664,7 @@ impl eframe::App for ReaderApp {
         self.report_snapshot_ready(ui.ctx());
     }
     fn on_exit(&mut self) {
+        self.keep_awake(false);
         self.flush_position();
         self.page_generation += 1;
         self.worker
@@ -5170,6 +7691,7 @@ mod tests {
             current_page: 0,
             page_fraction: 0.,
             updated_at: 1,
+            added_at: 1,
             last_read_at: None,
             category: String::new(),
         }
@@ -5688,5 +8210,562 @@ mod tests {
         );
         assert_eq!(app.page, 1);
         assert_eq!(app.books[0].current_page, 1, "chapter one left at its end");
+    }
+
+    fn link(book_id: &str, chapter_id: &str, number: f64) -> ChapterLink {
+        ChapterLink {
+            book_id: book_id.into(),
+            metadata: ChapterMetadata {
+                source_id: "source.a".into(),
+                manga_id: "story".into(),
+                manga_title: "Story".into(),
+                chapter_id: chapter_id.into(),
+                chapter_title: chapter_id.into(),
+                chapter_number: Some(number),
+                volume_number: None,
+            },
+        }
+    }
+
+    #[test]
+    fn shelf_sorts_keep_recent_order_and_rank_progress_and_added() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = ReaderApp::new(root.path().into(), Context::default());
+        let mut done = book("done");
+        done.current_page = 19;
+        done.last_read_at = Some(10);
+        let mut half = book("half");
+        half.current_page = 9;
+        half.last_read_at = Some(20);
+        let mut most = book("most");
+        most.current_page = 15;
+        most.last_read_at = Some(5);
+        let fresh = book("fresh");
+        app.books = vec![done, half, most, fresh];
+        let order = |app: &ReaderApp| {
+            app.visible_books()
+                .iter()
+                .map(|book| book.id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            order(&app),
+            ["done", "half", "most", "fresh"],
+            "the default order must be the stored order exactly"
+        );
+        app.shelf_sort = ShelfSort::Progress;
+        assert_eq!(
+            order(&app),
+            ["most", "half", "done", "fresh"],
+            "in-progress by fraction, then finished, then unread"
+        );
+        for (index, book) in app.books.iter_mut().enumerate() {
+            book.added_at = (index as i64 + 1) * 100;
+        }
+        app.shelf_sort = ShelfSort::Added;
+        assert_eq!(order(&app), ["fresh", "most", "half", "done"]);
+    }
+
+    #[test]
+    fn shelf_sort_reads_series_progress_and_earliest_added() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = ReaderApp::new(root.path().into(), Context::default());
+        let mut chapter1 = book("s1");
+        chapter1.current_page = 19;
+        chapter1.last_read_at = Some(3);
+        chapter1.added_at = 300;
+        let mut chapter2 = book("s2");
+        chapter2.current_page = 9;
+        chapter2.last_read_at = Some(40);
+        chapter2.added_at = 100;
+        let mut chapter3 = book("s3");
+        chapter3.added_at = 400;
+        app.books = vec![chapter1, chapter2, chapter3];
+        app.chapters = vec![link("s1", "c1", 1.), link("s2", "c2", 2.), link("s3", "c3", 3.)];
+        app.chapter_indices = app
+            .chapters
+            .iter()
+            .enumerate()
+            .map(|(i, link)| (link.book_id.clone(), i))
+            .collect();
+        // Representative = latest read chapter (s2): progress (1 + 0.5)/3.
+        app.shelf_sort = ShelfSort::Progress;
+        let visible = app.visible_books();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].id, "s2");
+        let ordinals = app.series_ordinals();
+        let (group, fraction) = app.work_progress(&visible[0], &ordinals);
+        assert_eq!(group, 0, "a half-read middle chapter is in progress");
+        assert!((fraction - 0.5).abs() < 0.001);
+        // Finish the last chapter: the work counts as finished.
+        app.books[2].current_page = 19;
+        app.books[2].last_read_at = Some(50);
+        let visible = app.visible_books();
+        let ordinals = app.series_ordinals();
+        let (group, _) = app.work_progress(&visible[0], &ordinals);
+        assert_eq!(group, 1);
+        // Added sort takes the earliest chapter's join date.
+        app.shelf_sort = ShelfSort::Added;
+        let mut solo = book("solo");
+        solo.added_at = 200;
+        app.books.push(solo);
+        let order: Vec<String> = app.visible_books().iter().map(|b| b.id.clone()).collect();
+        assert_eq!(
+            order,
+            ["solo", "s3"],
+            "series added_at is the earliest chapter's (100 < solo's 200)"
+        );
+    }
+
+    #[test]
+    fn sorting_jumps_to_first_book_and_animates_unless_reduced() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = ReaderApp::new(root.path().into(), Context::default());
+        app.books = vec![book("a"), book("b"), book("c")];
+        app.motion.focus = 2.;
+        app.set_shelf_sort(ShelfSort::Added, 10.);
+        assert_eq!(app.motion.focus, 0.);
+        let reorder = app.shelf_reorder.expect("a sort change must animate");
+        assert_eq!(reorder.from_ids, ["a", "b", "c"]);
+        // No animation when reduce-motion is on.
+        app.reduced = true;
+        app.shelf_reorder = None;
+        app.set_shelf_sort(ShelfSort::Progress, 11.);
+        assert!(app.shelf_reorder.is_none());
+        // A same-set reorder from a library refresh also animates.
+        app.reduced = false;
+        app.shelf_sort = ShelfSort::Recent;
+        app.motion.focus = 1.;
+        let mut swapped = app.books.clone();
+        swapped.swap(0, 2);
+        app.replace_books(swapped, 12.);
+        let reorder = app
+            .shelf_reorder
+            .expect("same books in a new order must animate");
+        assert_eq!(reorder.from_ids, ["a", "b", "c"]);
+        assert_eq!(reorder.from_focus, 1.);
+        // A real change does not animate.
+        app.shelf_reorder = None;
+        let mut grown = app.books.clone();
+        grown.push(book("d"));
+        app.replace_books(grown, 13.);
+        assert!(app.shelf_reorder.is_none());
+    }
+
+    fn online_app(root: &tempfile::TempDir) -> ReaderApp {
+        crate::follows::save(
+            root.path(),
+            &[
+                follows::Follow {
+                    source_id: "source.a".into(),
+                    manga_id: "story".into(),
+                    title: "Story".into(),
+                    snapshot: String::new(),
+                    known: vec!["c1".into()],
+                    total: 1,
+                    followed_at: Some(7),
+                    ..Default::default()
+                },
+                follows::Follow {
+                    source_id: "source.b".into(),
+                    manga_id: "web".into(),
+                    title: "网络连载".into(),
+                    snapshot: String::new(),
+                    known: vec!["a".into(), "b".into()],
+                    fresh: vec!["c".into()],
+                    total: 3,
+                    checked_at: Some(20),
+                    ..Default::default()
+                },
+            ],
+        )
+        .unwrap();
+        ReaderApp::new(root.path().into(), Context::default())
+    }
+
+    #[test]
+    fn online_follows_join_the_shelf_without_duplicating_local_works() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = online_app(&root);
+        app.books = vec![book("local"), book("linked")];
+        app.replace_links(vec![linked("linked", "c1")]);
+        let books = app.visible_books();
+        let ids: Vec<String> = books.iter().map(|b| b.id.clone()).collect();
+        // The local-linked work is not duplicated as an online entry.
+        assert!(!ids.iter().any(|id| id.starts_with("online:source.a")));
+        let online = books
+            .iter()
+            .find(|book| book.id == "online:source.b\u{1f}web")
+            .expect("the followed work joins the shelf");
+        assert_eq!(online.title, "网络连载");
+        assert_eq!(online.category, "在线追更");
+        assert_eq!(online.page_count, 3);
+        assert_eq!(online.added_at, 20, "followed_at falls back to checked_at");
+        assert_eq!(online.last_read_at, None);
+        assert_eq!(app.online_badge(online), Some(1));
+        // The badge rides the local representative of a followed work instead.
+        let linked_book = books.iter().find(|book| book.id == "linked").unwrap();
+        assert_eq!(app.online_badge(linked_book), None);
+        // The category filter can isolate online works.
+        app.category = "在线追更".into();
+        let ids: Vec<String> = app
+            .visible_books()
+            .iter()
+            .map(|book| book.id.clone())
+            .collect();
+        assert_eq!(ids, ["online:source.b\u{1f}web"]);
+    }
+
+    #[test]
+    fn online_entries_participate_in_all_three_sorts() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = online_app(&root);
+        let mut local = book("local");
+        local.last_read_at = Some(5);
+        app.books = vec![local];
+        let first = |app: &ReaderApp| app.visible_books()[0].id.clone();
+        // Recent keeps library order, online entries appended by follow order.
+        assert_eq!(first(&app), "local");
+        app.shelf_sort = ShelfSort::Added;
+        // added_at 20 beats the fixture's 1.
+        assert_eq!(first(&app), "online:source.b\u{1f}web");
+        app.shelf_sort = ShelfSort::Progress;
+        // Unread online entries sort into the not-started group, i.e. last.
+        assert_eq!(first(&app), "local");
+    }
+
+    #[test]
+    fn removing_an_online_entry_unfollows_it() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = online_app(&root);
+        assert!(app.sources.unfollow("source.b", "web"));
+        assert!(!app.sources.unfollow("source.b", "missing"));
+        assert_eq!(crate::follows::load(root.path()).unwrap().len(), 1);
+        let ids: Vec<String> = app
+            .visible_books()
+            .iter()
+            .map(|book| book.id.clone())
+            .collect();
+        // The removed work leaves; unrelated follows stay on the shelf.
+        assert_eq!(ids, ["online:source.a\u{1f}story"]);
+    }
+
+    #[test]
+    fn online_progress_uses_the_reading_order_and_chapter_name() {
+        let root = tempfile::tempdir().unwrap();
+        crate::follows::save(
+            root.path(),
+            &[follows::Follow {
+                source_id: "source.a".into(),
+                manga_id: "story".into(),
+                title: "Story".into(),
+                snapshot: String::new(),
+                // The source lists newest first; the stored order does not.
+                known: vec!["c3".into(), "c2".into(), "c1".into()],
+                reading_order: vec!["c1".into(), "c2".into(), "c3".into()],
+                total: 3,
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        let mut app = ReaderApp::new(root.path().into(), Context::default());
+        app.sources
+            .seed_read_at("source.a", "story", "c2", "第 2 话", 10);
+        let book = app.visible_books()[0].clone();
+        assert_eq!(
+            book.current_page, 1,
+            "progress is the index in reading order, not in source order"
+        );
+        assert_eq!(book.page_fraction, 0.);
+        assert_eq!(book.last_read_at, Some(10));
+        assert_eq!(
+            app.online_progress_label(app.online_follow(&book.id).unwrap()),
+            "在线 · 读到 第 2 话"
+        );
+    }
+
+    #[test]
+    fn online_progress_falls_back_when_the_reading_order_is_unknown() {
+        let root = tempfile::tempdir().unwrap();
+        crate::follows::save(
+            root.path(),
+            &[
+                // An older record without the order kept, but already read.
+                follows::Follow {
+                    source_id: "source.a".into(),
+                    manga_id: "old".into(),
+                    title: "Old".into(),
+                    snapshot: String::new(),
+                    known: vec!["c2".into(), "c1".into()],
+                    total: 2,
+                    ..Default::default()
+                },
+                // A new record read halfway in its stored order.
+                follows::Follow {
+                    source_id: "source.a".into(),
+                    manga_id: "new".into(),
+                    title: "New".into(),
+                    snapshot: String::new(),
+                    known: vec!["c2".into(), "c1".into()],
+                    reading_order: vec!["c1".into(), "c2".into()],
+                    total: 2,
+                    ..Default::default()
+                },
+            ],
+        )
+        .unwrap();
+        let mut app = ReaderApp::new(root.path().into(), Context::default());
+        app.sources.seed_read_at("source.a", "old", "c1", "第 1 话", 5);
+        app.sources.seed_read_at("source.a", "new", "c1", "第 1 话", 5);
+        let books = app.visible_books();
+        assert_eq!(
+            books
+                .iter()
+                .find(|book| book.id == "online:source.a\u{1f}old")
+                .unwrap()
+                .page_fraction,
+            -1.,
+            "an unresolvable order marks progress as unknown"
+        );
+        assert_eq!(
+            books
+                .iter()
+                .find(|book| book.id == "online:source.a\u{1f}new")
+                .unwrap()
+                .page_fraction,
+            0.
+        );
+        app.shelf_sort = ShelfSort::Progress;
+        let ids: Vec<String> = app
+            .visible_books()
+            .iter()
+            .map(|book| book.id.clone())
+            .collect();
+        assert_eq!(
+            ids,
+            ["online:source.a\u{1f}new", "online:source.a\u{1f}old"],
+            "unknown progress sorts behind known progress, not ahead"
+        );
+        // The label still names the chapter even when the order is unknown.
+        assert_eq!(
+            app.online_progress_label(
+                app.online_follow("online:source.a\u{1f}old").unwrap()
+            ),
+            "在线 · 读到 第 1 话"
+        );
+    }
+
+    #[test]
+    fn tap_zones_respect_mode_and_rtl() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = ReaderApp::new(root.path().into(), Context::default());
+        let mut target = book("one");
+        target.current_page = 5;
+        app.books = vec![target.clone()];
+        app.open_reader(&target);
+        // lr follows the reading direction.
+        app.tap_zones = "lr".into();
+        app.reader_tap("one", 0.9, 1);
+        assert_eq!(app.page, 6);
+        app.reader_tap("one", 0.1, 1);
+        assert_eq!(app.page, 5);
+        app.rtl = true;
+        app.reader_tap("one", 0.1, 1);
+        assert_eq!(app.page, 6, "rtl left edge advances");
+        app.reader_tap("one", 0.9, 1);
+        assert_eq!(app.page, 5, "rtl right edge retreats");
+        app.rtl = false;
+        // next: both outer zones advance.
+        app.tap_zones = "next".into();
+        app.reader_tap("one", 0.1, 1);
+        assert_eq!(app.page, 6);
+        app.reader_tap("one", 0.9, 1);
+        assert_eq!(app.page, 7);
+        // off: outer taps do nothing, the center still toggles controls.
+        app.tap_zones = "off".into();
+        app.reader_tap("one", 0.1, 1);
+        app.reader_tap("one", 0.9, 1);
+        assert_eq!(app.page, 7);
+        let controls = app.controls;
+        app.reader_tap("one", 0.5, 1);
+        assert_eq!(app.controls, !controls);
+        app.reader_tap("one", 0.5, 1);
+        assert_eq!(app.controls, controls);
+    }
+
+    #[test]
+    fn chapter_end_card_enters_leaves_and_never_saves_past_the_last_page() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = ReaderApp::new(root.path().into(), Context::default());
+        let mut one = book("one");
+        one.current_page = 19;
+        let two = book("two");
+        app.books = vec![one.clone(), two];
+        app.chapters = vec![link("one", "c1", 1.), link("two", "c2", 2.)];
+        app.chapter_indices = app
+            .chapters
+            .iter()
+            .enumerate()
+            .map(|(i, link)| (link.book_id.clone(), i))
+            .collect();
+        app.open_reader(&one);
+        assert_eq!(app.page, 19);
+        // The first advance past the last page shows the card instead of
+        // moving — progress stays on the real last page.
+        app.next_page("one", 1);
+        assert!(app.chapter_end);
+        assert_eq!(app.page, 19);
+        assert_eq!(app.current_book_id(), Some("one"));
+        // Back returns to the last page without a card.
+        app.next_page("one", -1);
+        assert!(!app.chapter_end);
+        assert_eq!(app.page, 19);
+        // Forward again, then continue into the next linked chapter.
+        app.next_page("one", 1);
+        assert!(app.chapter_end);
+        app.next_page("one", 1);
+        assert_eq!(app.current_book_id(), Some("two"));
+        assert_eq!(app.page, 0);
+        assert!(!app.chapter_end);
+        // The last chapter's card stays when there is no next chapter.
+        let mut tail = book("two");
+        tail.current_page = 19;
+        app.open_reader(&tail);
+        app.next_page("two", 1);
+        assert!(app.chapter_end);
+        app.next_page("two", 1);
+        assert!(app.chapter_end && app.page == 19);
+        assert_eq!(app.current_book_id(), Some("two"));
+    }
+
+    #[test]
+    fn keep_awake_only_fires_on_state_transitions() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = ReaderApp::new(root.path().into(), Context::default());
+        let target = book("one");
+        app.books = vec![target.clone()];
+        app.open_reader(&target);
+        assert_eq!(app.awake_log, [true]);
+        // Re-entering the reader while already awake does not repeat.
+        app.open_reader(&target);
+        assert_eq!(app.awake_log, [true]);
+        app.back(1.0, Rect::from_min_size(Pos2::ZERO, vec2(390., 844.)));
+        assert_eq!(app.awake_log, [true, false]);
+        app.open_reader(&target);
+        assert_eq!(app.awake_log, [true, false, true]);
+        eframe::App::on_exit(&mut app);
+        assert_eq!(app.awake_log, [true, false, true, false]);
+    }
+
+    #[test]
+    fn reader_status_formats_time_and_battery() {
+        assert_eq!(ReaderApp::status_text("21:34", Some(0.85)), "21:34 · 85%");
+        assert_eq!(ReaderApp::status_text("21:34", Some(0.05)), "21:34 · 5%");
+        assert_eq!(ReaderApp::status_text("21:34", None), "21:34");
+        assert_eq!(ReaderApp::status_text("21:34", Some(1.4)), "21:34 · 100%");
+    }
+
+    #[test]
+    fn category_tabs_merge_user_and_derived_and_fixed_stay_first() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = ReaderApp::new(root.path().into(), Context::default());
+        app.user_categories = vec!["热血".into(), "悬疑".into()];
+        let mut old = book("old");
+        old.category = "旧分类".into();
+        let mut member = book("member");
+        member.category = "热血".into();
+        app.books = vec![old, member];
+        let tabs: Vec<String> = app
+            .category_tabs()
+            .iter()
+            .map(|(label, _)| label.clone())
+            .collect();
+        assert_eq!(
+            tabs,
+            ["全部", "未分类", "在线追更", "热血", "悬疑", "旧分类", "管理"]
+        );
+        // 管理 is the only tab without a filter value; fixed names are not
+        // manageable entries either.
+        assert_eq!(
+            app.managed_categories(),
+            vec!["热血".to_string(), "悬疑".to_string(), "旧分类".to_string()]
+        );
+        assert!(app.add_category("全部").is_none());
+        assert!(app.add_category("未分类").is_none());
+        assert!(app.add_category("在线追更").is_none());
+        assert!(app.add_category("热血").is_none());
+        assert_eq!(app.add_category(" 日常 ").as_deref(), Some("日常"));
+        assert_eq!(app.user_categories.last().unwrap(), "日常");
+    }
+
+    #[test]
+    fn bookmark_toggle_and_cross_chapter_jump() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = Context::default();
+        let mut app = ReaderApp::new(root.path().into(), ctx);
+        app.books = vec![book("one"), book("two")];
+        app.chapters = vec![linked("one", "c1"), linked("two", "c2")];
+        app.chapter_indices = app
+            .chapters
+            .iter()
+            .enumerate()
+            .map(|(index, link)| (link.book_id.clone(), index))
+            .collect();
+        app.screen = Screen::Reader("one".into());
+        app.page = 3;
+        app.bookmark_toggle("one");
+        assert!(app.bookmarked("one"));
+        app.bookmark_toggle("one");
+        assert!(!app.bookmarked("one"));
+        app.bookmark_toggle("one");
+        // Cross-chapter bookmark: resolves the linked local book.
+        app.bookmarks.toggle(crate::bookmarks::Bookmark {
+            work: "source.a\u{1f}story".into(),
+            chapter: "c2".into(),
+            page: 5,
+            title: "c2".into(),
+            created_at: 1,
+        });
+        let mark = app
+            .bookmarks
+            .for_work("source.a\u{1f}story")
+            .into_iter()
+            .find(|mark| mark.chapter == "c2")
+            .unwrap()
+            .clone();
+        assert_eq!(app.bookmark_book(&mark).unwrap().id, "two");
+        app.bookmark_jump(mark, "one");
+        assert!(matches!(&app.screen, Screen::Reader(id) if id == "two"));
+        assert_eq!(app.page, 5);
+        // Private mode disables bookmarks entirely.
+        app.private = true;
+        app.screen = Screen::Reader("one".into());
+        app.page = 0;
+        app.bookmark_toggle("one");
+        assert!(!app.bookmarked("one"));
+        assert!(app.pending_notice.is_some());
+        // An online key without a task reports a friendly error.
+        app.error = None;
+        app.bookmark_jump(
+            crate::bookmarks::Bookmark {
+                work: "source.b\u{1f}m2".into(),
+                chapter: "c9".into(),
+                page: 0,
+                title: "c9".into(),
+                created_at: 1,
+            },
+            "one",
+        );
+        assert!(app.error.is_some());
+    }
+
+    #[test]
+    fn startup_clears_staged_share_files() {
+        let root = tempfile::tempdir().unwrap();
+        let share = root.path().join("share");
+        std::fs::create_dir_all(&share).unwrap();
+        std::fs::write(share.join("old.png"), b"x").unwrap();
+        let _app = ReaderApp::new(root.path().into(), Context::default());
+        assert!(!share.exists());
     }
 }

@@ -27,6 +27,13 @@ extern "C" {
     fn yejian_ios_open_web(url: *const c_char, user_agent: *const c_char) -> i64;
     fn yejian_ios_poll_web() -> *mut c_char;
     fn yejian_ios_open_external_url(url: *const c_char) -> i64;
+    fn yejian_ios_set_keep_awake(awake: bool);
+    fn yejian_ios_battery_level() -> f32;
+    fn yejian_ios_supports_app_lock() -> i64;
+    fn yejian_ios_authenticate(reason: *const c_char) -> i64;
+    fn yejian_ios_poll_auth() -> *mut c_char;
+    fn yejian_ios_poll_foreground() -> *mut c_char;
+    fn yejian_ios_set_privacy_shield(on: bool);
 }
 
 static WAKER: Mutex<Option<Box<dyn Fn() + Send + Sync>>> = Mutex::new(None);
@@ -152,4 +159,66 @@ pub(crate) fn open_external_url(url: &str) -> Result<()> {
         0 => Ok(()),
         _ => Err(PlatformError::Io("系统无法打开该链接".into())),
     }
+}
+
+/// Toggles `UIApplication.isIdleTimerDisabled` (main thread on the Swift side).
+pub(crate) fn set_keep_awake(awake: bool) {
+    unsafe { yejian_ios_set_keep_awake(awake) };
+}
+
+/// `UIDevice.batteryLevel` mapped to 0.0–1.0; `None` when unavailable.
+pub(crate) fn battery_level() -> Option<f32> {
+    let level = unsafe { yejian_ios_battery_level() };
+    (level >= 0.).then_some(level / 100.)
+}
+
+/// `LAContext.canEvaluatePolicy(.deviceOwnerAuthentication)`.
+pub(crate) fn supports_app_lock() -> bool {
+    (unsafe { yejian_ios_supports_app_lock() }) == 1
+}
+
+/// Starts `LAContext.evaluatePolicy`; the outcome arrives through
+/// [`crate::poll_auth`].
+pub(crate) fn authenticate(reason: &str) -> Result<()> {
+    let reason = CString::new(reason)
+        .map_err(|_| PlatformError::Io("reason contains a NUL byte".into()))?;
+    match unsafe { yejian_ios_authenticate(reason.as_ptr()) } {
+        0 => Ok(()),
+        -2 => Err(PlatformError::Unsupported("device-owner authentication")),
+        _ => Err(PlatformError::NotReady("LocalAuthentication prompt")),
+    }
+}
+
+/// Drains the Swift auth queue into the shared result slot. Called by
+/// [`crate::poll_auth`] on iOS via this hook.
+pub(crate) fn poll_auth() {
+    while let Some(text) = take_string(unsafe { yejian_ios_poll_auth() }) {
+        if text.is_empty() {
+            continue;
+        }
+        crate::push_auth_result(if text == "ok" {
+            Ok(())
+        } else {
+            Err(text)
+        });
+    }
+}
+
+/// Drains the Swift foreground queue into the shared event slot.
+pub(crate) fn poll_foreground() {
+    while let Some(text) = take_string(unsafe { yejian_ios_poll_foreground() }) {
+        let event = match text.as_str() {
+            "b" => Some(crate::ForegroundEvent::Background),
+            "f" => Some(crate::ForegroundEvent::Foreground),
+            _ => None,
+        };
+        if let Some(event) = event {
+            crate::push_foreground_event(event);
+        }
+    }
+}
+
+/// Shows/removes the opaque recent-tasks shield on the key window.
+pub(crate) fn set_privacy_shield(on: bool) {
+    unsafe { yejian_ios_set_privacy_shield(on) };
 }

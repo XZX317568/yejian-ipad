@@ -249,7 +249,7 @@ impl Library {
             if stored.removed {
                 connection
                     .execute(
-                        "UPDATE books SET removed = 0, updated_at = ?1 WHERE id = ?2",
+                        "UPDATE books SET removed = 0, updated_at = ?1, added_at = ?1 WHERE id = ?2",
                         params![now_millis(), &stored.book.id],
                     )
                     .context("restore removed book")?;
@@ -380,8 +380,8 @@ impl Library {
                 "INSERT INTO books(
                      id, title, author, archive_path, cover_path, page_count,
                      current_page, updated_at, last_read_at, category,
-                     content_hash, kind, removed
-                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, NULL, ?8, ?9, ?10, 0)",
+                     content_hash, kind, removed, added_at
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, NULL, ?8, ?9, ?10, 0, ?7)",
                 params![
                     &prepared.content_hash,
                     &prepared.title,
@@ -413,6 +413,7 @@ fn prepared_book(prepared: &PreparedImport) -> Book {
         current_page: 0,
         page_fraction: 0.0,
         updated_at: prepared.updated_at,
+        added_at: prepared.updated_at,
         last_read_at: None,
         category: DEFAULT_CATEGORY.to_string(),
     }

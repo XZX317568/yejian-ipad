@@ -456,6 +456,41 @@ pub fn has_in_app_web() -> bool {
     cfg!(any(target_os = "ios", target_os = "android"))
 }
 
+/// Keeps the screen on while `awake` is true. Called only on transitions;
+/// a no-op on desktop.
+#[cfg(target_os = "ios")]
+pub fn set_keep_awake(awake: bool) {
+    ios::set_keep_awake(awake);
+}
+
+/// Keeps the screen on while `awake` is true (`FLAG_KEEP_SCREEN_ON`).
+#[cfg(target_os = "android")]
+pub fn set_keep_awake(awake: bool) {
+    let _ = android::set_keep_awake(awake);
+}
+
+/// Desktop builds never keep the screen on.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn set_keep_awake(_awake: bool) {}
+
+/// Battery charge 0.0–1.0, or `None` when the platform cannot report it.
+#[cfg(target_os = "ios")]
+pub fn battery_level() -> Option<f32> {
+    ios::battery_level()
+}
+
+/// Battery charge 0.0–1.0, or `None` when the platform cannot report it.
+#[cfg(target_os = "android")]
+pub fn battery_level() -> Option<f32> {
+    android::battery_level().ok().flatten()
+}
+
+/// Desktops do not report a battery level.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn battery_level() -> Option<f32> {
+    None
+}
+
 /// Opens `url` with the system browser/handler using an argument array —
 /// never a shell string.
 #[cfg(target_os = "android")]
@@ -699,6 +734,163 @@ pub(crate) fn parse_insets_csv(csv: &str) -> Result<Insets> {
         ));
     }
     Ok(insets)
+}
+
+// -- 应用锁 / device-owner authentication ---------------------------------
+
+/// Direction the shell reports when the app leaves or re-enters the
+/// foreground. The app-lock state machine maps `Foreground` after
+/// `Background` to a re-lock after its configured delay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForegroundEvent {
+    Background,
+    Foreground,
+}
+
+static AUTH_RESULTS: std::sync::Mutex<std::collections::VecDeque<std::result::Result<(), String>>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+static FOREGROUND_EVENTS: std::sync::Mutex<std::collections::VecDeque<ForegroundEvent>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+pub(crate) fn push_auth_result(result: std::result::Result<(), String>) {
+    if let Ok(mut queue) = AUTH_RESULTS.lock() {
+        queue.push_back(result);
+    }
+}
+
+#[cfg(any(target_os = "android", target_os = "ios"))]
+pub(crate) fn push_foreground_event(event: ForegroundEvent) {
+    if let Ok(mut queue) = FOREGROUND_EVENTS.lock() {
+        queue.push_back(event);
+    }
+}
+
+/// Next finished device-owner authentication, if any.
+pub fn poll_auth() -> Option<std::result::Result<(), String>> {
+    #[cfg(target_os = "ios")]
+    ios::poll_auth();
+    #[cfg(target_os = "android")]
+    android::poll_auth();
+    AUTH_RESULTS
+        .lock()
+        .ok()
+        .and_then(|mut queue| queue.pop_front())
+}
+
+/// Next background/foreground transition reported by the shell, if any.
+pub fn take_foreground_event() -> Option<ForegroundEvent> {
+    #[cfg(target_os = "ios")]
+    ios::poll_foreground();
+    #[cfg(target_os = "android")]
+    android::poll_foreground();
+    FOREGROUND_EVENTS
+        .lock()
+        .ok()
+        .and_then(|mut queue| queue.pop_front())
+}
+
+#[cfg(target_os = "ios")]
+pub fn supports_app_lock() -> bool {
+    ios::supports_app_lock()
+}
+
+#[cfg(target_os = "android")]
+pub fn supports_app_lock() -> bool {
+    #[cfg(debug_assertions)]
+    if let Some(fake) = app_lock_fake() {
+        return fake.supported;
+    }
+    android::supports_app_lock().unwrap_or(false)
+}
+
+/// Desktops have no device-owner authentication.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn supports_app_lock() -> bool {
+    #[cfg(debug_assertions)]
+    if let Some(fake) = app_lock_fake() {
+        return fake.supported;
+    }
+    false
+}
+
+/// Starts one async authentication; the outcome arrives through
+/// [`poll_auth`]. `reason` is the user-visible prompt line.
+#[cfg(target_os = "ios")]
+pub fn authenticate(reason: &str) -> Result<()> {
+    ios::authenticate(reason)
+}
+
+/// Starts one async authentication; the outcome arrives through
+/// [`poll_auth`].
+#[cfg(target_os = "android")]
+pub fn authenticate(reason: &str) -> Result<()> {
+    if let Some(result) = fake_auth_result() {
+        push_auth_result(result);
+        return Ok(());
+    }
+    android::authenticate(reason)
+}
+
+/// Desktops cannot authenticate; the debug fake still lets acceptance runs
+/// exercise the whole flow.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn authenticate(_reason: &str) -> Result<()> {
+    if let Some(result) = fake_auth_result() {
+        push_auth_result(result);
+        return Ok(());
+    }
+    Err(PlatformError::Unsupported("device-owner authentication"))
+}
+
+/// iOS: cover/uncover the app during transitions (recent-apps preview).
+/// Android and desktop builds have no system hook for it.
+#[cfg(target_os = "ios")]
+pub fn set_privacy_shield(on: bool) {
+    ios::set_privacy_shield(on);
+}
+
+/// Android cannot hide the recent-apps preview from a regular activity.
+#[cfg(not(target_os = "ios"))]
+pub fn set_privacy_shield(_on: bool) {}
+
+/// Fake support/auth answers for desktop acceptance runs (debug only).
+#[cfg(debug_assertions)]
+#[derive(Clone, Default)]
+struct AppLockFake {
+    supported: bool,
+    auth: Option<std::result::Result<(), String>>,
+}
+
+#[cfg(debug_assertions)]
+static APP_LOCK_FAKE: std::sync::Mutex<AppLockFake> =
+    std::sync::Mutex::new(AppLockFake {
+        supported: false,
+        auth: None,
+    });
+
+#[cfg(debug_assertions)]
+fn app_lock_fake() -> Option<AppLockFake> {
+    let fake = APP_LOCK_FAKE.lock().ok()?.clone();
+    (fake.supported || fake.auth.is_some()).then_some(fake)
+}
+
+#[cfg(debug_assertions)]
+fn fake_auth_result() -> Option<std::result::Result<(), String>> {
+    app_lock_fake().and_then(|fake| fake.auth)
+}
+
+#[cfg(not(debug_assertions))]
+fn fake_auth_result() -> Option<std::result::Result<(), String>> {
+    None
+}
+
+/// Debug-only seam: pretend the platform supports app lock and answer every
+/// `authenticate` call with `auth`.
+#[cfg(debug_assertions)]
+pub fn set_app_lock_fake(supported: bool, auth: Option<std::result::Result<(), String>>) {
+    if let Ok(mut slot) = APP_LOCK_FAKE.lock() {
+        *slot = AppLockFake { supported, auth };
+    }
 }
 
 #[cfg(target_os = "android")]

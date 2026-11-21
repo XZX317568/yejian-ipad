@@ -5527,6 +5527,7 @@ version = "0.1.1"
 dependencies = [
  "android_logger",
  "anyhow",
+ "chrono",
  "eframe",
  "egui",
  "egui-wgpu",

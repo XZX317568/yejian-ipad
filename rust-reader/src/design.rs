@@ -12,34 +12,332 @@ pub(crate) struct Palette {
     pub accent: Color32,
     pub accent_soft: Color32,
     pub on_accent: Color32,
+    pub primary: Color32,
+    pub on_primary: Color32,
+    pub danger: Color32,
+    pub page: Color32,
+    pub spine: Color32,
+    pub edge: Color32,
+    pub floor: Color32,
+}
+
+/// The selectable colour schemes; 纸墨 stays the default.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Scheme {
+    Ink,
+    Mist,
+    Sepia,
+    Mono,
+    Sakura,
+    Dusk,
+}
+
+impl Scheme {
+    pub(crate) const ALL: [Scheme; 6] = [
+        Scheme::Ink,
+        Scheme::Mist,
+        Scheme::Sepia,
+        Scheme::Mono,
+        Scheme::Sakura,
+        Scheme::Dusk,
+    ];
+
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Scheme::Ink => "ink",
+            Scheme::Mist => "mist",
+            Scheme::Sepia => "sepia",
+            Scheme::Mono => "mono",
+            Scheme::Sakura => "sakura",
+            Scheme::Dusk => "dusk",
+        }
+    }
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Scheme::Ink => "纸墨",
+            Scheme::Mist => "雾蓝",
+            Scheme::Sepia => "茶韵",
+            Scheme::Mono => "素白",
+            Scheme::Sakura => "樱粉",
+            Scheme::Dusk => "黛紫",
+        }
+    }
+
+    pub(crate) fn from_key(key: &str) -> Scheme {
+        Scheme::ALL
+            .into_iter()
+            .find(|scheme| scheme.key() == key)
+            .unwrap_or(Scheme::Ink)
+    }
+}
+
+thread_local! {
+    static CURRENT: std::cell::Cell<Scheme> = const { std::cell::Cell::new(Scheme::Ink) };
+}
+
+pub(crate) fn set_scheme(scheme: Scheme) {
+    CURRENT.with(|current| current.set(scheme));
+}
+
+pub(crate) fn scheme() -> Scheme {
+    CURRENT.with(|current| current.get())
+}
+
+fn rgb(r: u8, g: u8, b: u8) -> Color32 {
+    Color32::from_rgb(r, g, b)
+}
+
+/// The sixteen roles, in order: paper, surface, soft, ink, muted, line,
+/// accent, accent_soft, on_accent, primary, on_primary, danger, page, spine,
+/// edge, floor.
+fn roles(values: [[u8; 3]; 16]) -> Palette {
+    let [paper, surface, soft, ink, muted, line, accent, accent_soft, on_accent, primary, on_primary, danger, page, spine, edge, floor] =
+        values;
+    Palette {
+        paper: rgb(paper[0], paper[1], paper[2]),
+        surface: rgb(surface[0], surface[1], surface[2]),
+        soft: rgb(soft[0], soft[1], soft[2]),
+        ink: rgb(ink[0], ink[1], ink[2]),
+        muted: rgb(muted[0], muted[1], muted[2]),
+        line: rgb(line[0], line[1], line[2]),
+        accent: rgb(accent[0], accent[1], accent[2]),
+        accent_soft: rgb(accent_soft[0], accent_soft[1], accent_soft[2]),
+        on_accent: rgb(on_accent[0], on_accent[1], on_accent[2]),
+        primary: rgb(primary[0], primary[1], primary[2]),
+        on_primary: rgb(on_primary[0], on_primary[1], on_primary[2]),
+        danger: rgb(danger[0], danger[1], danger[2]),
+        page: rgb(page[0], page[1], page[2]),
+        spine: rgb(spine[0], spine[1], spine[2]),
+        edge: rgb(edge[0], edge[1], edge[2]),
+        floor: rgb(floor[0], floor[1], floor[2]),
+    }
+}
+
+pub(crate) fn palette_of(scheme: Scheme, dark: bool) -> Palette {
+    let values = match (scheme, dark) {
+        (Scheme::Ink, false) => roles([
+            [247, 244, 238],
+            [255, 253, 249],
+            [239, 235, 227],
+            [31, 27, 23],
+            [115, 108, 101],
+            [229, 223, 213],
+            [184, 69, 47],
+            [246, 231, 224],
+            [255, 253, 249],
+            [31, 27, 23],
+            [255, 253, 249],
+            [179, 38, 30],
+            [255, 253, 249],
+            [244, 240, 231],
+            [227, 223, 211],
+            [138, 128, 107],
+        ]),
+        (Scheme::Ink, true) => roles([
+            [20, 18, 16],
+            [28, 25, 22],
+            [37, 33, 29],
+            [237, 231, 222],
+            [161, 152, 142],
+            [52, 48, 42],
+            [224, 123, 96],
+            [58, 38, 32],
+            [28, 25, 22],
+            [237, 231, 222],
+            [28, 25, 22],
+            [242, 184, 181],
+            [40, 37, 33],
+            [48, 43, 38],
+            [62, 56, 50],
+            [254, 253, 248],
+        ]),
+        (Scheme::Mist, false) => roles([
+            [244, 246, 249],
+            [255, 255, 255],
+            [233, 237, 242],
+            [26, 31, 43],
+            [100, 110, 129],
+            [221, 226, 234],
+            [61, 90, 152],
+            [227, 233, 245],
+            [255, 255, 255],
+            [26, 31, 43],
+            [255, 255, 255],
+            [179, 38, 30],
+            [255, 255, 255],
+            [238, 241, 245],
+            [217, 222, 230],
+            [122, 132, 150],
+        ]),
+        (Scheme::Mist, true) => roles([
+            [17, 20, 25],
+            [24, 28, 35],
+            [33, 38, 47],
+            [230, 234, 240],
+            [149, 157, 171],
+            [44, 50, 60],
+            [142, 168, 224],
+            [38, 48, 74],
+            [24, 28, 35],
+            [230, 234, 240],
+            [24, 28, 35],
+            [242, 184, 181],
+            [35, 40, 50],
+            [42, 48, 59],
+            [57, 64, 77],
+            [230, 234, 240],
+        ]),
+        (Scheme::Sepia, false) => roles([
+            [242, 232, 213],
+            [250, 243, 230],
+            [232, 220, 196],
+            [59, 47, 34],
+            [117, 100, 77],
+            [221, 207, 180],
+            [154, 91, 42],
+            [238, 220, 196],
+            [250, 243, 230],
+            [59, 47, 34],
+            [250, 243, 230],
+            [168, 50, 31],
+            [251, 245, 234],
+            [239, 228, 207],
+            [220, 203, 172],
+            [142, 122, 94],
+        ]),
+        (Scheme::Sepia, true) => roles([
+            [28, 23, 18],
+            [36, 30, 23],
+            [47, 39, 30],
+            [233, 220, 198],
+            [168, 151, 127],
+            [58, 49, 38],
+            [217, 160, 102],
+            [63, 47, 31],
+            [36, 30, 23],
+            [233, 220, 198],
+            [36, 30, 23],
+            [242, 184, 181],
+            [46, 38, 29],
+            [54, 45, 34],
+            [74, 62, 48],
+            [233, 220, 198],
+        ]),
+        (Scheme::Mono, false) => roles([
+            [245, 245, 244],
+            [255, 255, 255],
+            [235, 235, 234],
+            [22, 22, 22],
+            [110, 110, 108],
+            [224, 224, 222],
+            [43, 43, 43],
+            [230, 230, 228],
+            [255, 255, 255],
+            [22, 22, 22],
+            [255, 255, 255],
+            [179, 38, 30],
+            [255, 255, 255],
+            [240, 240, 239],
+            [218, 218, 216],
+            [124, 124, 122],
+        ]),
+        (Scheme::Mono, true) => roles([
+            [0, 0, 0],
+            [17, 17, 17],
+            [28, 28, 28],
+            [237, 237, 237],
+            [154, 154, 154],
+            [42, 42, 42],
+            [237, 237, 237],
+            [38, 38, 38],
+            [17, 17, 17],
+            [237, 237, 237],
+            [17, 17, 17],
+            [242, 184, 181],
+            [30, 30, 30],
+            [38, 38, 38],
+            [54, 54, 54],
+            [237, 237, 237],
+        ]),
+        (Scheme::Sakura, false) => roles([
+            [250, 244, 244],
+            [255, 252, 252],
+            [242, 232, 233],
+            [42, 31, 34],
+            [125, 105, 114],
+            [235, 220, 223],
+            [192, 71, 110],
+            [248, 227, 234],
+            [255, 252, 252],
+            [42, 31, 34],
+            [255, 252, 252],
+            [179, 38, 30],
+            [255, 252, 252],
+            [246, 236, 238],
+            [230, 212, 216],
+            [147, 124, 133],
+        ]),
+        (Scheme::Sakura, true) => roles([
+            [23, 18, 20],
+            [32, 26, 28],
+            [43, 35, 38],
+            [240, 228, 231],
+            [174, 154, 161],
+            [58, 48, 52],
+            [238, 143, 174],
+            [68, 38, 47],
+            [32, 26, 28],
+            [240, 228, 231],
+            [32, 26, 28],
+            [242, 184, 181],
+            [42, 34, 37],
+            [50, 41, 44],
+            [69, 57, 61],
+            [240, 228, 231],
+        ]),
+        (Scheme::Dusk, false) => roles([
+            [245, 244, 248],
+            [255, 255, 255],
+            [235, 233, 241],
+            [31, 28, 42],
+            [110, 105, 129],
+            [223, 220, 232],
+            [102, 80, 164],
+            [233, 228, 246],
+            [255, 255, 255],
+            [31, 28, 42],
+            [255, 255, 255],
+            [179, 38, 30],
+            [255, 255, 255],
+            [240, 238, 245],
+            [218, 214, 228],
+            [130, 124, 150],
+        ]),
+        (Scheme::Dusk, true) => roles([
+            [19, 18, 25],
+            [27, 26, 35],
+            [37, 35, 47],
+            [232, 229, 240],
+            [160, 155, 179],
+            [50, 47, 62],
+            [185, 166, 240],
+            [49, 42, 74],
+            [27, 26, 35],
+            [232, 229, 240],
+            [27, 26, 35],
+            [242, 184, 181],
+            [38, 36, 47],
+            [45, 43, 56],
+            [60, 57, 73],
+            [232, 229, 240],
+        ]),
+    };
+    values
 }
 
 pub(crate) fn palette(dark: bool) -> Palette {
-    if dark {
-        Palette {
-            paper: Color32::from_rgb(24, 29, 28),
-            surface: Color32::from_rgb(32, 39, 37),
-            soft: Color32::from_rgb(39, 47, 44),
-            ink: Color32::from_rgb(233, 235, 226),
-            muted: Color32::from_rgb(161, 174, 165),
-            line: Color32::from_rgb(54, 65, 59),
-            accent: Color32::from_rgb(155, 201, 177),
-            accent_soft: Color32::from_rgb(43, 65, 54),
-            on_accent: Color32::from_rgb(23, 47, 37),
-        }
-    } else {
-        Palette {
-            paper: Color32::from_rgb(250, 249, 246),
-            surface: Color32::from_rgb(255, 255, 252),
-            soft: Color32::from_rgb(240, 239, 234),
-            ink: Color32::from_rgb(35, 43, 38),
-            muted: Color32::from_rgb(105, 117, 108),
-            line: Color32::from_rgb(222, 225, 214),
-            accent: Color32::from_rgb(45, 91, 71),
-            accent_soft: Color32::from_rgb(228, 236, 224),
-            on_accent: Color32::from_rgb(255, 254, 246),
-        }
-    }
+    palette_of(scheme(), dark)
 }
 
 pub(crate) fn visuals(dark: bool) -> Visuals {
@@ -55,11 +353,14 @@ pub(crate) fn visuals(dark: bool) -> Visuals {
     v.window_fill = p.surface;
     v.extreme_bg_color = p.surface;
     v.faint_bg_color = p.soft;
-    v.window_stroke = Stroke::new(1., p.line);
+    v.window_stroke = Stroke::new(if dark { 1. } else { 0. }, p.line);
     v.window_corner_radius = CornerRadius::same(20);
+    v.window_shadow = card_shadow(dark);
     v.menu_corner_radius = CornerRadius::same(12);
-    v.selection.bg_fill = p.accent_soft;
-    v.selection.stroke = Stroke::new(1., p.accent);
+    // egui shares `selection` between selected text and selected widgets; the
+    // warm `soft` fill keeps selected chips/tabs ink-on-grey instead of pink.
+    v.selection.bg_fill = p.soft;
+    v.selection.stroke = Stroke::new(1., p.ink);
     v.hyperlink_color = p.accent;
     v.widgets.noninteractive.bg_stroke = Stroke::new(1., p.line);
     v.widgets.noninteractive.fg_stroke = Stroke::new(1., p.ink);
@@ -76,21 +377,45 @@ pub(crate) fn visuals(dark: bool) -> Visuals {
         widget.corner_radius = CornerRadius::same(10);
         widget.expansion = 0.;
     }
-    v.widgets.hovered.bg_fill = p.accent_soft;
-    v.widgets.hovered.weak_bg_fill = p.accent_soft;
-    v.widgets.active.bg_fill = p.accent_soft;
-    v.widgets.active.weak_bg_fill = p.accent_soft;
-    v.widgets.active.fg_stroke.color = p.accent;
+    v.widgets.hovered.bg_fill = p.soft;
+    v.widgets.hovered.weak_bg_fill = p.soft;
+    v.widgets.active.bg_fill = p.soft;
+    v.widgets.active.weak_bg_fill = p.soft;
     v
 }
 
+/// Cards and modals float on a soft shadow in light mode and keep a 1px
+/// outline in dark mode where a shadow would be invisible.
+pub(crate) fn card_shadow(dark: bool) -> Shadow {
+    if dark {
+        Shadow::NONE
+    } else {
+        Shadow {
+            offset: [0, 2],
+            blur: 12,
+            spread: 0,
+            color: Color32::from_black_alpha(20),
+        }
+    }
+}
+
+pub(crate) fn card_stroke(dark: bool) -> Stroke {
+    if dark {
+        Stroke::new(1., palette(dark).line)
+    } else {
+        Stroke::NONE
+    }
+}
+
 pub(crate) fn surface(ui: &Ui) -> Frame {
-    let p = palette(ui.visuals().dark_mode);
+    let dark = ui.visuals().dark_mode;
+    let p = palette(dark);
     Frame::new()
         .fill(p.surface)
-        .corner_radius(14)
+        .corner_radius(16)
         .inner_margin(20)
-        .stroke(Stroke::new(1., p.line.gamma_multiply(0.55)))
+        .stroke(card_stroke(dark))
+        .shadow(card_shadow(dark))
 }
 
 /// A theme choice shows what the page will look like before it is selected.
@@ -107,8 +432,7 @@ pub(crate) fn theme_choice(
     let height = 78. + text.size().y;
     let (rect, response) = ui.allocate_exact_size(vec2(width, height), Sense::click());
     response.widget_info(|| WidgetInfo::selected(Role::RadioButton, true, selected, name));
-    ui.painter()
-        .rect_filled(rect, 12., if selected { p.accent_soft } else { p.surface });
+    ui.painter().rect_filled(rect, 12., p.surface);
     ui.painter().rect_stroke(
         rect,
         12.,
@@ -123,22 +447,17 @@ pub(crate) fn theme_choice(
         pos2(rect.right() - 12., rect.top() + 59.),
     );
     let preview_dark = kind == "dark";
-    let bg = if preview_dark {
-        Color32::from_rgb(32, 38, 34)
-    } else {
-        Color32::from_rgb(244, 242, 234)
-    };
-    ui.painter().rect_filled(preview, 5., bg);
+    let pv = palette(preview_dark);
+    ui.painter().rect_filled(preview, 5., pv.paper);
     if kind == "system" {
         ui.painter().rect_filled(
             Rect::from_min_max(pos2(preview.center().x, preview.top()), preview.max),
             5.,
-            Color32::from_rgb(32, 38, 34),
+            palette(true).paper,
         );
     }
     let book = Rect::from_min_size(preview.min + vec2(8., 7.), vec2(22., 34.));
-    ui.painter()
-        .rect_filled(book, 2., Color32::from_rgb(135, 151, 123));
+    ui.painter().rect_filled(book, 2., pv.accent);
     for (offset, fraction) in [(12., 0.60), (21., 0.42), (31., 0.50)] {
         ui.painter().line_segment(
             [
@@ -148,15 +467,64 @@ pub(crate) fn theme_choice(
                     preview.top() + offset,
                 ),
             ],
-            Stroke::new(
-                2.,
-                if preview_dark {
-                    Color32::from_gray(140)
-                } else {
-                    Color32::from_gray(158)
-                },
-            ),
+            Stroke::new(2., pv.muted),
         );
+    }
+    ui.painter().galley(
+        pos2(rect.center().x - text.size().x / 2., rect.top() + 68.),
+        text,
+        p.ink,
+    );
+    response.clicked()
+}
+
+/// A colour-scheme card: three book spines and three swatches preview the
+/// scheme's paper, ink and accent in the current light/dark mode.
+pub(crate) fn scheme_choice(ui: &mut Ui, scheme: Scheme, selected: bool, width: f32) -> bool {
+    let p = palette(ui.visuals().dark_mode);
+    let pv = palette_of(scheme, ui.visuals().dark_mode);
+    let font = TextStyle::Button.resolve(ui.style());
+    let name = scheme.name();
+    let text = ui.painter().layout(name.into(), font, p.ink, width - 16.);
+    let height = 78. + text.size().y;
+    let (rect, response) = ui.allocate_exact_size(vec2(width, height), Sense::click());
+    response.widget_info(|| WidgetInfo::selected(Role::RadioButton, true, selected, name));
+    ui.painter().rect_filled(rect, 12., p.surface);
+    ui.painter().rect_stroke(
+        rect,
+        12.,
+        Stroke::new(
+            if selected { 1.5 } else { 1. },
+            if selected { p.accent } else { p.line },
+        ),
+        StrokeKind::Inside,
+    );
+    let preview = Rect::from_min_max(
+        rect.min + vec2(12., 11.),
+        pos2(rect.right() - 12., rect.top() + 59.),
+    );
+    ui.painter().rect_filled(preview, 5., pv.paper);
+    let spine_w = 10.;
+    for (i, fill) in [pv.spine, pv.accent, pv.page].iter().enumerate() {
+        let spine = Rect::from_min_size(
+            preview.min + vec2(8. + i as f32 * (spine_w + 3.), 7.),
+            vec2(spine_w, 34.),
+        );
+        ui.painter().rect_filled(spine, 2., *fill);
+        ui.painter().rect_stroke(
+            spine,
+            2.,
+            Stroke::new(1., pv.line),
+            StrokeKind::Inside,
+        );
+    }
+    for (i, fill) in [pv.paper, pv.ink, pv.accent].iter().enumerate() {
+        let center = pos2(
+            preview.left() + 8. + 3. * (spine_w + 3.) + 14. + i as f32 * 20.,
+            preview.top() + 24.,
+        );
+        ui.painter().circle_filled(center, 7., *fill);
+        ui.painter().circle_stroke(center, 7., Stroke::new(1., pv.line));
     }
     ui.painter().galley(
         pos2(rect.center().x - text.size().x / 2., rect.top() + 68.),
@@ -168,10 +536,11 @@ pub(crate) fn theme_choice(
 
 pub(crate) fn section(ui: &mut Ui, title: &str) {
     let p = palette(ui.visuals().dark_mode);
+    ui.add_space(4.);
     ui.add(
         Label::new(
             RichText::new(title)
-                .size(ui.text_style_height(&TextStyle::Body))
+                .size(ui.text_style_height(&TextStyle::Body) * 17. / 15.)
                 .strong()
                 .color(p.ink),
         )
@@ -182,10 +551,21 @@ pub(crate) fn section(ui: &mut Ui, title: &str) {
 
 pub(crate) fn primary(label: &str, dark: bool) -> Button<'_> {
     let p = palette(dark);
-    Button::new(RichText::new(label).color(p.on_accent))
-        .fill(p.accent)
+    Button::new(RichText::new(label).color(p.on_primary))
+        .fill(p.primary)
         .corner_radius(12)
-        .min_size(vec2(44., 48.))
+        .min_size(vec2(88., 48.))
+        .wrap()
+}
+
+/// Destructive confirm action — danger fill, on_primary stays light on
+/// the dark red in light mode and dark on the pale red in dark mode.
+pub(crate) fn danger(label: &str, dark: bool) -> Button<'_> {
+    let p = palette(dark);
+    Button::new(RichText::new(label).color(p.on_primary))
+        .fill(p.danger)
+        .corner_radius(12)
+        .min_size(vec2(88., 48.))
         .wrap()
 }
 
@@ -225,10 +605,67 @@ pub(crate) fn toggle(ui: &mut Ui, value: &mut bool, title: &str, description: &s
     } else {
         track.left() + 14.
     };
-    ui.painter().circle_filled(
-        pos2(x, track.center().y),
-        10.,
-        if *value { p.on_accent } else { p.surface },
-    );
+    ui.painter()
+        .circle_filled(pos2(x, track.center().y), 10., p.surface);
     response.clicked()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn luminance(color: Color32) -> f32 {
+        fn channel(c: u8) -> f32 {
+            let c = c as f32 / 255.;
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        0.2126 * channel(color.r()) + 0.7152 * channel(color.g()) + 0.0722 * channel(color.b())
+    }
+
+    fn contrast(a: Color32, b: Color32) -> f32 {
+        let (hi, lo) = {
+            let (la, lb) = (luminance(a), luminance(b));
+            (la.max(lb), la.min(lb))
+        };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    #[test]
+    fn every_scheme_keeps_text_and_controls_legible() {
+        for scheme in Scheme::ALL {
+            for dark in [false, true] {
+                let p = palette_of(scheme, dark);
+                let mode = if dark { "dark" } else { "light" };
+                for (a, b, min, label) in [
+                    (p.ink, p.paper, 7., "ink on paper"),
+                    (p.ink, p.surface, 7., "ink on surface"),
+                    (p.muted, p.surface, 4.5, "muted on surface"),
+                    (p.muted, p.paper, 4.5, "muted on paper"),
+                    (p.on_primary, p.primary, 4.5, "on_primary on primary"),
+                    (p.on_primary, p.danger, 4.5, "on_primary on danger"),
+                    (p.accent, p.surface, 3., "accent on surface"),
+                    (p.accent, p.paper, 3., "accent on paper"),
+                ] {
+                    let ratio = contrast(a, b);
+                    assert!(
+                        ratio >= min,
+                        "{} {mode}: {label} contrast {ratio:.2} below {min}",
+                        scheme.key()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scheme_keys_round_trip_and_unknown_falls_back_to_ink() {
+        for scheme in Scheme::ALL {
+            assert_eq!(Scheme::from_key(scheme.key()), scheme);
+        }
+        assert_eq!(Scheme::from_key("does-not-exist"), Scheme::Ink);
+    }
 }

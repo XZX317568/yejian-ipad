@@ -23,6 +23,11 @@ pub struct Book {
     #[serde(default)]
     pub page_fraction: f32,
     pub updated_at: i64,
+    /// Unix milliseconds of when the book joined the library. Rows written
+    /// before this column existed read as `updated_at` via the `COALESCE` in
+    /// `BOOK_COLUMNS`.
+    #[serde(default)]
+    pub added_at: i64,
     pub last_read_at: Option<i64>,
     pub category: String,
 }
