@@ -41,6 +41,7 @@ private final class YejianDocumentBridge: NSObject, UIApplicationDelegate, UIDoc
     private var bgRefreshHandler: (@convention(c) () -> UnsafeMutablePointer<CChar>?)?
     private var bgRefreshFree: (@convention(c) (UnsafeMutablePointer<CChar>?) -> Void)?
     private static let refreshTaskId = "app.yejian.reader.rust.refresh"
+    private var refreshRegistered = false
 
     private var shieldWanted = false
     private weak var shieldView: UIView?
@@ -83,15 +84,15 @@ private final class YejianDocumentBridge: NSObject, UIApplicationDelegate, UIDoc
                 object: nil,
                 queue: .main
             ) { [weak self] _ in
-                self?.prepareNow()
+                self?.prepareNow(launching: true)
             }
         }
         DispatchQueue.main.async { [weak self] in
-            self?.prepareNow()
+            self?.prepareNow(launching: false)
         }
     }
 
-    private func prepareNow() {
+    private func prepareNow(launching: Bool) {
         guard !prepared else { return }
         prepared = true
         do {
@@ -152,12 +153,18 @@ private final class YejianDocumentBridge: NSObject, UIApplicationDelegate, UIDoc
         // 新章节通知: the delegate routes taps to Rust, and the refresh task
         // is registered while didFinishLaunching is still on the stack.
         UNUserNotificationCenter.current().delegate = self
-        BGTaskScheduler.shared.register(
-            forTaskWithIdentifier: Self.refreshTaskId,
-            using: nil
-        ) { [weak self] task in
-            if let task = task as? BGAppRefreshTask {
-                self?.handleRefresh(task)
+        // Registering after launch has finished raises an exception, so the
+        // late fallback path skips background refresh entirely.
+        if launching {
+            refreshRegistered = BGTaskScheduler.shared.register(
+                forTaskWithIdentifier: Self.refreshTaskId,
+                using: nil
+            ) { [weak self] task in
+                if let task = task as? BGAppRefreshTask {
+                    self?.handleRefresh(task)
+                } else {
+                    task.setTaskCompleted(success: false)
+                }
             }
         }
     }
@@ -873,6 +880,7 @@ extension YejianDocumentBridge {
 
     /// Schedules the next BGAppRefreshTask on entering background.
     private func scheduleBackgroundRefresh() {
+        guard refreshRegistered else { return }
         lock.lock()
         let interval = refreshIntervalSeconds
         lock.unlock()
@@ -884,11 +892,21 @@ extension YejianDocumentBridge {
     /// Runs Rust's check off the main queue, posts each notification it
     /// returns, then schedules the next refresh.
     private func handleRefresh(_ task: BGAppRefreshTask) {
+        scheduleBackgroundRefresh()
+        let finished = NSLock()
+        var completed = false
+        let complete: (Bool) -> Void = { success in
+            finished.lock()
+            defer { finished.unlock() }
+            guard !completed else { return }
+            completed = true
+            task.setTaskCompleted(success: success)
+        }
         task.expirationHandler = {
-            task.setTaskCompleted(success: false)
+            complete(false)
         }
         DispatchQueue.global().async { [weak self] in
-            defer { task.setTaskCompleted(success: true) }
+            defer { complete(true) }
             guard let self = self else { return }
             self.lock.lock()
             let handler = self.bgRefreshHandler
