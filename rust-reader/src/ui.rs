@@ -425,6 +425,25 @@ impl ReaderApp {
         self.sources.browser_ready("browse")
     }
     #[cfg(debug_assertions)]
+    pub fn prepare_global_search_acceptance(&mut self) -> anyhow::Result<()> {
+        self.tab = Tab::Sources;
+        self.screen = Screen::Library;
+        self.sources.preview_global_search()
+    }
+    #[cfg(debug_assertions)]
+    pub fn global_search_done(&self) -> bool {
+        let groups = &self.source_browser_report()["groups"];
+        groups
+            .as_array()
+            .map(|list| {
+                !list.is_empty()
+                    && list
+                        .iter()
+                        .all(|group| group["state"] != "searching")
+            })
+            .unwrap_or(false)
+    }
+    #[cfg(debug_assertions)]
     pub fn prepare_installed_source_acceptance(&mut self, id: &str) -> anyhow::Result<()> {
         self.tab = Tab::Sources;
         self.screen = Screen::Library;
@@ -1512,6 +1531,7 @@ impl ReaderApp {
                             "palette" => self.color_scheme = value,
                             "shelf-grid" => self.library_grid = value == "open",
                             "shelf-sort" => self.shelf_sort = ShelfSort::from_key(&value),
+                            "search-scope" => self.sources.set_search_scope(&value),
                             "reduce-motion" => self.reduced = value == "true",
                             "reading-direction" => {
                                 self.reader_globals.rtl = value == "rtl";
@@ -2478,6 +2498,9 @@ impl ReaderApp {
             }
         }
         self.sources.poll();
+        if let Some(scope) = self.sources.take_scope_change() {
+            self.setting("search-scope", scope);
+        }
         if let Some(notice) = self.sources.follow_notice.take() {
             self.pending_notice = Some(notice);
         }

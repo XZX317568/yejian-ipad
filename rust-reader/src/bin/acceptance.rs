@@ -929,6 +929,37 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
     h.frames(5)?;
     design_capture(h, "design-filtered-results", &mut captures)?;
 
+    // Round 2: one working fixture source and one corrupt fixture source
+    // produce a success group and a failure group in installed order.
+    h.app.prepare_global_search_acceptance()?;
+    h.wait(ReaderApp::global_search_done)?;
+    h.frames(5)?;
+    {
+        let groups = h.app.source_browser_report()["groups"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        anyhow::ensure!(
+            groups.iter().any(|group| {
+                group["source"] == "local.filter-acceptance"
+                    && group["state"]
+                        .as_str()
+                        .is_some_and(|state| state.starts_with("done:"))
+            }),
+            "global: the filter fixture group did not finish with results"
+        );
+        anyhow::ensure!(
+            groups.iter().any(|group| {
+                group["source"] == "local.broken-acceptance"
+                    && group["state"]
+                        .as_str()
+                        .is_some_and(|state| state.starts_with("failed:"))
+            }),
+            "global: the broken fixture group did not report its failure"
+        );
+    }
+    design_capture(h, "design-global-search", &mut captures)?;
+
     // Reopen the real saved settings, preserving the source and reading
     // history. Only the temporary acceptance library is changed.
     eframe::App::on_exit(&mut h.app);
@@ -1039,6 +1070,10 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
         h.app.source_browser_report()["filter_editor"] == false,
         "design: large-text filter cancel did not leave the form"
     );
+    h.app.prepare_global_search_acceptance()?;
+    h.wait(ReaderApp::global_search_done)?;
+    h.frames(5)?;
+    design_capture(h, "design-large-text-global-search", &mut captures)?;
     library.set_setting("font-scale", "1")?;
     online_shelf_pass(h, library_root, &mut captures)?;
     let report = serde_json::json!({

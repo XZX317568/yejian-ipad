@@ -1483,6 +1483,15 @@ pub struct Sources {
     selected_manga: Option<Manga>,
     url: String,
     query: String,
+    /// "current" or "global": whether the search field covers one or all sources.
+    search_scope: String,
+    global_gen: u64,
+    global_query: String,
+    global_groups: Vec<GlobalGroup>,
+    /// New scope choice for `ReaderApp` to persist under `search-scope`.
+    scope_dirty: Option<String>,
+    global_tx: mpsc::Sender<GlobalCmd>,
+    global_rx: mpsc::Receiver<GlobalEvent>,
     request_id: u64,
     current_request: Arc<AtomicU64>,
     pending: Option<Task>,
@@ -1958,6 +1967,171 @@ struct UpdateEvent {
     /// `source-covers` key + decoded image delivered with `chapters: None`.
     cover: Option<(String, ColorImage)>,
 }
+
+// -- global (all-sources) search ------------------------------------------
+
+/// How many sources may search at once in the global scope.
+const GLOBAL_SEARCH_LIMIT: usize = 4;
+/// One source's slice of a global search; longer means "超时".
+const GLOBAL_SEARCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// A global search request; retries reuse the generation of their run.
+struct GlobalCmd {
+    generation: u64,
+    query: String,
+    sources: Vec<String>,
+}
+/// One source's answer to a global search, streamed as soon as it lands.
+struct GlobalEvent {
+    generation: u64,
+    source: String,
+    result: Result<Vec<Manga>, String>,
+}
+/// Test seam: the search call the worker makes for one source.
+trait GlobalEngine: Send + Sync {
+    fn search(&self, query: &str) -> Result<Vec<Manga>, String>;
+}
+struct RealGlobalEngine(Arc<SourceEngine>);
+impl GlobalEngine for RealGlobalEngine {
+    fn search(&self, query: &str) -> Result<Vec<Manga>, String> {
+        pollster::block_on(self.0.search_page(query, 1, vec![]))
+            .map(|result| result.entries)
+            .map_err(|error| format!("{error}"))
+    }
+}
+
+/// `yejian-global-search` loop. Per-source workers are detached threads that
+/// send completions over a channel: a hung `search_page` can keep its thread
+/// forever, but the loop never joins it — after `timeout` the slot is freed,
+/// marked "超时", and any late answer is dropped by the generation/inflight
+/// check. That keeps a wedged source from stalling the next generation the
+/// way `std::thread::scope` (which joins) would.
+fn global_search_run(
+    rx: mpsc::Receiver<GlobalCmd>,
+    event_tx: mpsc::Sender<GlobalEvent>,
+    load: impl Fn(&str) -> Result<Arc<dyn GlobalEngine>, String>,
+    timeout: std::time::Duration,
+    stale: Arc<std::sync::Mutex<HashSet<String>>>,
+    ctx: Context,
+) {
+    let mut engines: std::collections::HashMap<String, Arc<dyn GlobalEngine>> =
+        std::collections::HashMap::new();
+    let (done_tx, done_rx) = mpsc::channel::<(u64, String, Result<Vec<Manga>, String>)>();
+    let mut generation = 0u64;
+    let mut query = String::new();
+    let mut pending: VecDeque<String> = VecDeque::new();
+    let mut inflight: std::collections::HashMap<String, std::time::Instant> =
+        std::collections::HashMap::new();
+    // When the UI drops its sender, keep draining already-started jobs so
+    // their completions/timeouts are still delivered before the loop exits.
+    let mut closed = false;
+    loop {
+        for id in stale.lock().unwrap().drain() {
+            engines.remove(&id);
+        }
+        while inflight.len() < GLOBAL_SEARCH_LIMIT && let Some(source) = pending.pop_front() {
+            let engine = match engines.entry(source.clone()) {
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    Ok(entry.get().clone())
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => match load(&source) {
+                    Ok(engine) => Ok(entry.insert(engine).clone()),
+                    Err(error) => Err(error),
+                },
+            };
+            match engine {
+                Ok(engine) => {
+                    inflight.insert(source.clone(), std::time::Instant::now());
+                    let (tx, query, generation, source) =
+                        (done_tx.clone(), query.clone(), generation, source);
+                    thread::spawn(move || {
+                        let result = engine.search(&query);
+                        let _ = tx.send((generation, source, result));
+                    });
+                }
+                Err(error) => {
+                    let _ = event_tx.send(GlobalEvent {
+                        generation,
+                        source,
+                        result: Err(error),
+                    });
+                    ctx.request_repaint();
+                }
+            }
+        }
+        for (done_gen, source, result) in done_rx.try_iter() {
+            if done_gen == generation && inflight.remove(&source).is_some() {
+                let _ = event_tx.send(GlobalEvent {
+                    generation: done_gen,
+                    source,
+                    result,
+                });
+                ctx.request_repaint();
+            }
+        }
+        let now = std::time::Instant::now();
+        let expired: Vec<String> = inflight
+            .iter()
+            .filter(|(_, started)| now.duration_since(**started) > timeout)
+            .map(|(source, _)| source.clone())
+            .collect();
+        for source in expired {
+            inflight.remove(&source);
+            let _ = event_tx.send(GlobalEvent {
+                generation,
+                source,
+                result: Err("超时".into()),
+            });
+            ctx.request_repaint();
+        }
+        match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok(cmd) => {
+                if cmd.generation < generation {
+                    continue;
+                }
+                if cmd.generation > generation {
+                    generation = cmd.generation;
+                    query = cmd.query.clone();
+                    pending.clear();
+                    // The slots clear conceptually; the detached workers may
+                    // still run, but their results no longer match.
+                    inflight.clear();
+                }
+                for source in cmd.sources {
+                    if !inflight.contains_key(&source) && !pending.contains(&source) {
+                        pending.push_back(source);
+                    }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => closed = true,
+        }
+        if closed && pending.is_empty() && inflight.is_empty() {
+            return;
+        }
+    }
+}
+
+/// One source's slice of the grouped global results.
+struct GlobalGroup {
+    source: String,
+    state: GlobalState,
+}
+#[derive(Clone)]
+enum GlobalState {
+    Searching,
+    Done(Vec<Manga>),
+    Failed(String),
+}
+impl Clone for GlobalGroup {
+    fn clone(&self) -> Self {
+        Self {
+            source: self.source.clone(),
+            state: self.state.clone(),
+        }
+    }
+}
+
 impl Sources {
     #[cfg(debug_assertions)]
     pub(crate) fn preview_community(&mut self) {
@@ -2006,6 +2180,25 @@ impl Sources {
         Ok(())
     }
 
+    /// Second acceptance source: valid manifest, corrupt WASM, so a global
+    /// search reports one success group and one failure group.
+    #[cfg(debug_assertions)]
+    pub(crate) fn preview_global_search(&mut self) -> anyhow::Result<()> {
+        self.preview_browser("browse")?;
+        let broken = self.root.join("sources/local.broken-acceptance");
+        std::fs::create_dir_all(&broken)?;
+        std::fs::write(
+            broken.join("source.json"),
+            r#"{"info":{"id":"local.broken-acceptance","name":"故障验收源","version":1,"languages":["zh"],"urls":["https://fixture.invalid"]}}"#,
+        )?;
+        std::fs::write(broken.join("main.wasm"), b"not a wasm module")?;
+        self.installed = SourceCatalog::new(self.root.join("sources")).list()?;
+        self.set_search_scope("global");
+        self.query = "冒险".into();
+        self.start_search();
+        Ok(())
+    }
+
     #[cfg(debug_assertions)]
     pub(crate) fn browser_report(&self) -> serde_json::Value {
         serde_json::json!({
@@ -2014,6 +2207,14 @@ impl Sources {
             "filter_editor":self.filter_editor.is_some(),"busy":self.busy,
             "results":self.results.entries.iter().map(|manga|manga.title.as_str()).collect::<Vec<_>>(),
             "applied":self.applied_filters,
+            "scope":self.search_scope,
+            "groups":self.global_groups.iter().map(|group|serde_json::json!({
+                "source":group.source,
+                "state":match &group.state{
+                    GlobalState::Searching=>"searching".into(),
+                    GlobalState::Done(entries)=>format!("done:{}",entries.len()),
+                    GlobalState::Failed(reason)=>format!("failed:{reason}"),
+                }})).collect::<Vec<_>>(),
         })
     }
 
@@ -2512,6 +2713,35 @@ impl Sources {
                 })
                 .expect("Unable to start download worker");
         }
+        // Cross-source searches keep their own engine map so a source update
+        // invalidates them like every other worker.
+        let (global_tx, global_rx) = mpsc::channel::<GlobalEvent>();
+        let (global_cmd_tx, global_cmd_rx) = mpsc::channel::<GlobalCmd>();
+        {
+            let (catalog_root, stale, ctx) =
+                (root.clone(), stale_engines.clone(), ctx.clone());
+            thread::Builder::new()
+                .name("yejian-global-search".into())
+                .spawn(move || {
+                    let catalog = SourceCatalog::new(catalog_root.join("sources"));
+                    global_search_run(
+                        global_cmd_rx,
+                        global_tx,
+                        move |source| {
+                            SourceEngine::load(&catalog, source)
+                                .map(|engine| {
+                                    Arc::new(RealGlobalEngine(Arc::new(engine)))
+                                        as Arc<dyn GlobalEngine>
+                                })
+                                .map_err(|error| format!("{error:#}"))
+                        },
+                        GLOBAL_SEARCH_TIMEOUT,
+                        stale,
+                        ctx,
+                    );
+                })
+                .expect("Unable to start global search worker");
+        }
 
         let (tasks, load_warning) = load_queue(&root);
         let ready: VecDeque<String> = pending_imports(&tasks).into();
@@ -2531,6 +2761,13 @@ impl Sources {
             selected_manga: None,
             url: String::new(),
             query: String::new(),
+            search_scope: "current".into(),
+            global_gen: 0,
+            global_query: String::new(),
+            global_groups: Vec::new(),
+            scope_dirty: None,
+            global_tx: global_cmd_tx,
+            global_rx,
             request_id: 0,
             current_request,
             pending: None,
@@ -3706,9 +3943,101 @@ impl Sources {
             self.submit(Task::Metadata(id.into()));
         }
     }
+    /// True while the search field targets every installed source.
+    fn global_mode(&self) -> bool {
+        self.search_scope == "global"
+    }
+    /// Restored from the `search-scope` setting at startup.
+    pub(crate) fn set_search_scope(&mut self, scope: &str) {
+        self.search_scope = if scope == "global" {
+            "global"
+        } else {
+            "current"
+        }
+        .into();
+    }
+    /// UI toggle; the change is queued for the app to persist.
+    fn choose_scope(&mut self, scope: &str) {
+        if self.search_scope == scope {
+            return;
+        }
+        self.set_search_scope(scope);
+        self.scope_dirty = Some(self.search_scope.clone());
+        if !self.query.trim().is_empty() {
+            self.start_search();
+        }
+    }
+    /// `ReaderApp` persists the pending scope under `search-scope`.
+    pub(crate) fn take_scope_change(&mut self) -> Option<String> {
+        self.scope_dirty.take()
+    }
+    /// Fires one search per installed source; results stream back by group.
+    fn global_search(&mut self) {
+        self.listing = None;
+        self.selected_manga = None;
+        self.chapters.clear();
+        let query = self.query.trim().to_string();
+        self.query = query.clone();
+        self.global_query = query.clone();
+        self.global_gen += 1;
+        self.global_groups = self
+            .installed
+            .iter()
+            .map(|source| GlobalGroup {
+                source: source.manifest.id.clone(),
+                state: GlobalState::Searching,
+            })
+            .collect();
+        let sources: Vec<String> = self
+            .global_groups
+            .iter()
+            .map(|group| group.source.clone())
+            .collect();
+        let _ = self.global_tx.send(GlobalCmd {
+            generation: self.global_gen,
+            query,
+            sources,
+        });
+    }
+    /// Re-runs one source inside the current generation.
+    fn retry_global(&mut self, source: &str) {
+        if let Some(group) = self
+            .global_groups
+            .iter_mut()
+            .find(|group| group.source == source)
+        {
+            group.state = GlobalState::Searching;
+        }
+        let _ = self.global_tx.send(GlobalCmd {
+            generation: self.global_gen,
+            query: self.global_query.clone(),
+            sources: vec![source.into()],
+        });
+    }
+    /// Group header: jump into that source and run the normal search.
+    fn dive_into(&mut self, source: &str) {
+        self.select_source(source);
+        self.search_scope = "current".into();
+        self.scope_dirty = Some("current".into());
+        self.start_search();
+    }
+    /// A cover from another source opens under that source, like 我的追更.
+    fn open_global_manga(&mut self, manga: Manga) {
+        if manga.source_key == self.selected_source {
+            self.open_manga(manga);
+        } else {
+            self.select_source(&manga.source_key.clone());
+            self.pending_open = Some(manga);
+        }
+    }
+
     /// New search from the text field: page one of this source and query.
 
     fn start_search(&mut self) {
+        if self.global_mode() {
+            self.global_search();
+            return;
+        }
         let source = self.selected_source.clone();
         if source.is_empty() {
             return;
@@ -4376,6 +4705,26 @@ impl Sources {
         while let Ok(event) = self.up_rx.try_recv() {
             self.handle_update(event);
         }
+        while let Ok(event) = self.global_rx.try_recv() {
+            if event.generation != self.global_gen {
+                continue;
+            }
+            if let Some(group) = self
+                .global_groups
+                .iter_mut()
+                .find(|group| group.source == event.source)
+            {
+                group.state = match event.result {
+                    Ok(mut entries) => {
+                        for manga in &mut entries {
+                            manga.source_key = event.source.clone();
+                        }
+                        GlobalState::Done(entries)
+                    }
+                    Err(reason) => GlobalState::Failed(reason),
+                };
+            }
+        }
         if !self.auto_checked && !self.installed.is_empty() {
             self.auto_checked = true;
             self.check_updates(false);
@@ -4648,6 +4997,15 @@ impl Sources {
                     .desired_width(ui.available_width()),
             );
             let enter = input.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
+            self.hitboxes.insert("source-search".into(), input.rect);
+            ui.horizontal_wrapped(|ui| {
+                for (scope, label) in [("current", "当前书源"), ("global", "全部书源")] {
+                    let selected = self.search_scope == scope;
+                    if ui.selectable_label(selected, label).clicked() {
+                        self.choose_scope(scope);
+                    }
+                }
+            });
             ui.horizontal_wrapped(|ui| {
                 if ui
                     .add_enabled(
@@ -4659,31 +5017,34 @@ impl Sources {
                 {
                     self.start_search();
                 }
-                let hidden = self.filters_hidden();
-                let label = if self.applied_filters.is_empty() {
-                    "筛选与排序".into()
-                } else {
-                    format!("筛选（{}）", self.applied_filters.len())
-                };
-                if ui
-                    .add_enabled(
-                        self.metadata_loaded && !hidden && !self.filters.is_empty(),
-                        quiet_action(&label),
-                    )
-                    .clicked()
-                {
-                    self.filter_editor =
-                        Some(FilterEditor::new(&self.filters, &self.applied_filters));
-                }
-                if !self.applied_filters.is_empty()
-                    && !hidden
-                    && ui.add(quiet_action("清除筛选")).clicked()
-                {
-                    self.applied_filters.clear();
-                    self.start_search();
+                if !self.global_mode() {
+                    let hidden = self.filters_hidden();
+                    let label = if self.applied_filters.is_empty() {
+                        "筛选与排序".into()
+                    } else {
+                        format!("筛选（{}）", self.applied_filters.len())
+                    };
+                    if ui
+                        .add_enabled(
+                            self.metadata_loaded && !hidden && !self.filters.is_empty(),
+                            quiet_action(&label),
+                        )
+                        .clicked()
+                    {
+                        self.filter_editor =
+                            Some(FilterEditor::new(&self.filters, &self.applied_filters));
+                    }
+                    if !self.applied_filters.is_empty()
+                        && !hidden
+                        && ui.add(quiet_action("清除筛选")).clicked()
+                    {
+                        self.applied_filters.clear();
+                        self.start_search();
+                    }
                 }
             });
-            if self.filters_hidden() {
+            if self.global_mode() {
+            } else if self.filters_hidden() {
                 ui.label("此书源的关键词搜索不使用筛选；清空关键词后可筛选。");
             } else if self.metadata_loaded && self.filters.is_empty() && self.filter_error.is_none()
             {
@@ -6009,6 +6370,201 @@ impl Sources {
         }
     }
 
+    /// One global-search cover cell, sharing the result-grid card styling.
+    fn global_cell(
+        &mut self,
+        ui: &mut Ui,
+        group: usize,
+        index: usize,
+        manga: &Manga,
+        cell: Rect,
+        cover_rect: Rect,
+        want: &mut Vec<CoverReq>,
+        open: &mut Option<Manga>,
+    ) {
+        let palette = design::palette(ui.visuals().dark_mode);
+        let response = ui.interact(
+            cell,
+            ui.scope_id().with(("global-result", group, index)),
+            if self.busy {
+                Sense::hover()
+            } else {
+                Sense::click()
+            },
+        );
+        response.widget_info(|| WidgetInfo::labeled(Role::Button, !self.busy, &manga.title));
+        self.hitboxes
+            .insert(format!("global-result-{group}-{index}"), cell);
+        if response.clicked() {
+            *open = Some(manga.clone());
+        }
+        let url = manga.cover.clone().unwrap_or_default();
+        let texture = if ui.clip_rect().expand(cell.height() + 16.).intersects(cell) {
+            let texture = self.cover_image(ui.ctx(), &manga.source_key, &url);
+            if texture.is_none() && !url.is_empty() {
+                want.push(CoverReq {
+                    key: cover_key(&manga.source_key, &url),
+                    source: manga.source_key.clone(),
+                    url,
+                });
+            }
+            texture
+        } else {
+            None
+        };
+        if response.hovered() && !self.busy {
+            ui.painter().rect_filled(cell, 8., palette.soft);
+        }
+        let painter = ui.painter().with_clip_rect(ui.clip_rect().intersect(cell));
+        paint_cover(
+            &painter,
+            cover_rect,
+            texture.as_ref(),
+            &manga.title,
+            TextStyle::Heading.resolve(ui.style()),
+            &palette,
+        );
+        let mut title_job = egui::text::LayoutJob::simple(
+            manga.title.clone(),
+            TextStyle::Body.resolve(ui.style()),
+            palette.ink,
+            cell.width(),
+        );
+        title_job.wrap.max_rows = 2;
+        let title_galley = painter.layout_job(title_job);
+        painter.galley(
+            pos2(cell.left(), cover_rect.bottom() + 6.),
+            title_galley,
+            palette.ink,
+        );
+    }
+
+    /// 全部书源 results: one group per installed source, covers in a row.
+    fn global_results_ui(&mut self, ui: &mut Ui) {
+        let palette = design::palette(ui.visuals().dark_mode);
+        let mut want = Vec::new();
+        let mut open = None;
+        let mut dive = None;
+        let mut retry = None;
+        for (g, group) in self.global_groups.clone().iter().enumerate() {
+            let name = self
+                .installed
+                .iter()
+                .find(|source| source.manifest.id == group.source)
+                .map(|source| source.manifest.name.clone())
+                .unwrap_or_else(|| group.source.clone());
+            match &group.state {
+                GlobalState::Done(entries) => {
+                    if entries.is_empty() {
+                        ui.add_space(6.);
+                        ui.label(
+                            RichText::new(format!("{name} · 无结果")).color(palette.muted),
+                        );
+                        continue;
+                    }
+                    let (rect, _) = ui.allocate_exact_size(
+                        vec2(ui.available_width(), 44.),
+                        Sense::hover(),
+                    );
+                    let hit = ui.interact(
+                        rect,
+                        ui.scope_id().with(("global-group", g)),
+                        Sense::click(),
+                    );
+                    hit.widget_info(|| {
+                        WidgetInfo::labeled(
+                            Role::Button,
+                            true,
+                            format!("{name} · {} 条", entries.len()),
+                        )
+                    });
+                    self.hitboxes.insert(format!("global-group-{g}"), rect);
+                    if hit.hovered() {
+                        ui.painter().rect_filled(rect, 8., palette.soft);
+                    }
+                    if hit.clicked() {
+                        dive = Some(group.source.clone());
+                    }
+                    ui.painter().text(
+                        rect.left_center(),
+                        Align2::LEFT_CENTER,
+                        format!("{name} · {} 条 ›", entries.len()),
+                        TextStyle::Heading.resolve(ui.style()),
+                        palette.ink,
+                    );
+                    let gap = 12.;
+                    let cell_w = 120_f32.min(ui.available_width());
+                    let cover_h = cell_w * 1.5;
+                    let cell_h = cover_h
+                        + 6.
+                        + ui.text_style_height(&TextStyle::Body) * 2.
+                        + 4.;
+                    ScrollArea::horizontal()
+                        .id_salt(("global-row", g))
+                        .max_height(cell_h + 16.)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                for (i, manga) in entries.iter().enumerate() {
+                                    let (cell, _) = ui.allocate_exact_size(
+                                        vec2(cell_w, cell_h),
+                                        Sense::hover(),
+                                    );
+                                    self.global_cell(
+                                        ui,
+                                        g,
+                                        i,
+                                        manga,
+                                        cell,
+                                        Rect::from_min_size(
+                                            cell.min,
+                                            vec2(cell_w, cover_h),
+                                        ),
+                                        &mut want,
+                                        &mut open,
+                                    );
+                                    ui.add_space(gap);
+                                }
+                            });
+                        });
+                    ui.add_space(6.);
+                }
+                GlobalState::Searching => {
+                    ui.add_space(6.);
+                    ui.label(format!("{name} · 搜索中…"));
+                }
+                GlobalState::Failed(reason) => {
+                    ui.add_space(6.);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(format!("{name} · {reason}")).color(palette.muted));
+                        if ui.add(quiet_action("重试")).clicked() {
+                            retry = Some(group.source.clone());
+                        }
+                        if reason.contains("cloudflare")
+                            || reason.contains("验证")
+                        {
+                            if ui
+                                .add(quiet_action("网页验证"))
+                                .clicked()
+                            {
+                                self.open_web(&group.source.clone(), None);
+                            }
+                        }
+                    });
+                }
+            }
+        }
+        self.plan_covers(want);
+        if let Some(manga) = open {
+            self.open_global_manga(manga);
+        }
+        if let Some(source) = dive {
+            self.dive_into(&source);
+        }
+        if let Some(source) = retry {
+            self.retry_global(&source);
+        }
+    }
+
     pub fn ui(&mut self, ui: &mut Ui) {
         self.hitboxes.clear();
         self.poll();
@@ -6078,6 +6634,9 @@ impl Sources {
                         self.follows_ui(ui);
                         self.repository_ui(ui);
                     }
+                    if self.global_mode() && !self.global_groups.is_empty() {
+                        self.global_results_ui(ui);
+                    } else {
                     if !self.results.entries.is_empty() {
                         let label = self
                             .listing
@@ -6103,6 +6662,7 @@ impl Sources {
                         {
                             self.load_next_page();
                         }
+                    }
                     }
                 } else {
                     self.detail_ui(ui);
@@ -6551,6 +7111,13 @@ mod tests {
             selected_manga: None,
             url: String::new(),
             query: String::new(),
+            search_scope: "current".into(),
+            global_gen: 0,
+            global_query: String::new(),
+            global_groups: Vec::new(),
+            scope_dirty: None,
+            global_tx: mpsc::channel().0,
+            global_rx: mpsc::channel().1,
             request_id: 0,
             current_request: Arc::new(AtomicU64::new(0)),
             pending: None,
@@ -8823,4 +9390,197 @@ mod tests {
             cover_key(&sources.follows[0].source_id, &url.unwrap()),
         );
     }
+
+    struct FakeEngine<F>(F);
+    impl<F: Fn(&str) -> Vec<Manga> + Send + Sync> GlobalEngine for FakeEngine<F> {
+        fn search(&self, query: &str) -> Result<Vec<Manga>, String> {
+            Ok((self.0)(query))
+        }
+    }
+
+    #[test]
+    fn global_worker_never_exceeds_the_concurrency_cap() {
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (run, pk) = (running.clone(), peak.clone());
+        let (cmd_tx, cmd_rx) = mpsc::channel::<GlobalCmd>();
+        let (event_tx, event_rx) = mpsc::channel::<GlobalEvent>();
+        let stale: Arc<std::sync::Mutex<HashSet<String>>> = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let ctx = Context::default();
+        let handle = thread::spawn(move || {
+            global_search_run(
+                cmd_rx,
+                event_tx,
+                move |source| {
+                    if source == "err" {
+                        return Err("boom".into());
+                    }
+                    let (run, pk) = (run.clone(), pk.clone());
+                    Ok(Arc::new(FakeEngine(move |_: &str| {
+                        let now = run.fetch_add(1, Ordering::SeqCst) + 1;
+                        pk.fetch_max(now, Ordering::SeqCst);
+                        thread::sleep(std::time::Duration::from_millis(30));
+                        run.fetch_sub(1, Ordering::SeqCst);
+                        vec![Manga::default()]
+                    })) as Arc<dyn GlobalEngine>)
+                },
+                std::time::Duration::from_secs(5),
+                stale,
+                ctx,
+            );
+        });
+        let sources: Vec<String> =
+            (0..9).map(|i| format!("s{i}")).chain(["err".into()]).collect();
+        let count = sources.len();
+        cmd_tx
+            .send(GlobalCmd {
+                generation: 1,
+                query: "q".into(),
+                sources,
+            })
+            .unwrap();
+        drop(cmd_tx);
+        handle.join().unwrap();
+        assert!(peak.load(Ordering::SeqCst) <= GLOBAL_SEARCH_LIMIT);
+        let events: Vec<GlobalEvent> = event_rx.iter().collect();
+        assert_eq!(events.len(), count);
+        let err = events
+            .iter()
+            .find(|event| event.source == "err")
+            .expect("load failures still produce an event");
+        assert_eq!(err.result.as_ref().err().unwrap(), "boom");
+    }
+
+    #[test]
+    fn global_worker_times_out_and_discards_the_late_result() {
+        let (cmd_tx, cmd_rx) = mpsc::channel::<GlobalCmd>();
+        let (event_tx, event_rx) = mpsc::channel::<GlobalEvent>();
+        let stale: Arc<std::sync::Mutex<HashSet<String>>> = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let ctx = Context::default();
+        let handle = thread::spawn(move || {
+            global_search_run(
+                cmd_rx,
+                event_tx,
+                |source| {
+                    if source == "hang" {
+                        Ok(Arc::new(FakeEngine(|_: &str| {
+                            thread::sleep(std::time::Duration::from_secs(2));
+                            vec![Manga::default()]
+                        })) as Arc<dyn GlobalEngine>)
+                    } else {
+                        Ok(Arc::new(FakeEngine(|_: &str| {
+                            vec![Manga::default()]
+                        })) as Arc<dyn GlobalEngine>)
+                    }
+                },
+                std::time::Duration::from_millis(80),
+                stale,
+                ctx,
+            );
+        });
+        cmd_tx
+            .send(GlobalCmd {
+                generation: 1,
+                query: "q".into(),
+                sources: vec!["hang".into(), "fast".into()],
+            })
+            .unwrap();
+        // Wait for the timeout + fast result while the hung thread still runs.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut events = Vec::new();
+        while events.len() < 2 && std::time::Instant::now() < deadline {
+            if let Ok(event) =
+                event_rx.recv_timeout(std::time::Duration::from_millis(200))
+            {
+                events.push(event);
+            }
+        }
+        let timeout = events
+            .iter()
+            .find(|event| event.source == "hang")
+            .expect("hung source reports a timeout");
+        assert_eq!(timeout.result.as_ref().err().unwrap(), "超时");
+        // A new generation starts while `hang` is still sleeping: the worker
+        // is not joining it, so the next search proceeds immediately.
+        cmd_tx
+            .send(GlobalCmd {
+                generation: 2,
+                query: "q".into(),
+                sources: vec!["fast".into()],
+            })
+            .unwrap();
+        drop(cmd_tx);
+        handle.join().unwrap();
+        let events: Vec<GlobalEvent> = event_rx.iter().collect();
+        assert!(events.iter().any(|event| {
+            event.generation == 2 && event.source == "fast" && event.result.is_ok()
+        }));
+    }
+
+    #[test]
+    fn global_worker_discards_stale_generation_events() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sources = test_sources(root.path());
+        sources.global_gen = 2;
+        sources.global_groups = vec![GlobalGroup {
+            source: "x".into(),
+            state: GlobalState::Searching,
+        }];
+        // Same generation check poll() applies.
+        let stale_event = GlobalEvent {
+            generation: 1,
+            source: "x".into(),
+            result: Ok(vec![Manga::default()]),
+        };
+        assert_ne!(stale_event.generation, sources.global_gen);
+        if stale_event.generation == sources.global_gen {
+            if let Some(group) = sources
+                .global_groups
+                .iter_mut()
+                .find(|group| group.source == stale_event.source)
+            {
+                group.state = GlobalState::Done(vec![]);
+            }
+        }
+        assert!(matches!(
+            sources.global_groups[0].state,
+            GlobalState::Searching
+        ));
+        // Same-source event at the current generation updates the group.
+        let fresh = GlobalEvent {
+            generation: 2,
+            source: "x".into(),
+            result: Err("超时".into()),
+        };
+        if fresh.generation == sources.global_gen {
+            if let Some(group) = sources
+                .global_groups
+                .iter_mut()
+                .find(|group| group.source == fresh.source)
+            {
+                group.state = GlobalState::Failed("超时".into());
+            }
+        }
+        assert!(matches!(
+            &sources.global_groups[0].state,
+            GlobalState::Failed(reason) if reason == "超时"
+        ));
+    }
+
+    #[test]
+    fn search_scope_persists_and_reverts_to_current() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sources = test_sources(root.path());
+        assert_eq!(sources.search_scope, "current");
+        sources.choose_scope("global");
+        assert_eq!(sources.take_scope_change().as_deref(), Some("global"));
+        assert!(sources.take_scope_change().is_none(), "change is consumed once");
+        sources.choose_scope("current");
+        assert_eq!(sources.take_scope_change().as_deref(), Some("current"));
+        sources.set_search_scope("global");
+        assert!(sources.global_mode());
+        sources.set_search_scope("junk");
+        assert!(!sources.global_mode(), "unknown values fall back to current");
+    }
 }
+
