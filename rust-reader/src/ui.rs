@@ -3061,15 +3061,15 @@ impl ReaderApp {
         let tip = pos2(area.right() - 6., area.top() + 4. + galley.size().y / 2.);
         let tri = if self.library_grid {
             [
-                tip + vec2(-4., -2.5),
-                tip + vec2(4., -2.5),
-                tip + vec2(0., 3.),
-            ]
-        } else {
-            [
                 tip + vec2(-4., 2.5),
                 tip + vec2(4., 2.5),
                 tip + vec2(0., -3.),
+            ]
+        } else {
+            [
+                tip + vec2(-4., -2.5),
+                tip + vec2(4., -2.5),
+                tip + vec2(0., 3.),
             ]
         };
         ui.painter().add(Shape::convex_polygon(
