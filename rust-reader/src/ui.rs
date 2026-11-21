@@ -1172,16 +1172,24 @@ impl ReaderApp {
             {
                 continue;
             }
-            let order = follow.known.iter().chain(follow.fresh.iter());
             let (mut current_page, mut last_read_at) = (0, None);
-            if let Some((chapter_key, at)) =
+            let mut progress_known = true;
+            if let Some((chapter_key, _name, at)) =
                 self.sources.work_last_read(&follow.source_id, &follow.manga_id)
             {
                 last_read_at = Some(at);
-                current_page = order
-                    .enumerate()
-                    .find_map(|(index, key)| (key == &chapter_key).then_some(index))
-                    .unwrap_or(0);
+                match follow
+                    .reading_order
+                    .iter()
+                    .position(|key| key == &chapter_key)
+                {
+                    Some(index) => current_page = index,
+                    // Records saved before the reading order was kept can't be
+                    // placed; marking progress unknown keeps them behind works
+                    // whose progress is real rather than showing a flipped
+                    // index for newest-first sources.
+                    None => progress_known = false,
+                }
             }
             let added_at = follow.followed() as i64;
             entries.push(Book {
@@ -1192,7 +1200,7 @@ impl ReaderApp {
                 cover_path: None,
                 page_count: follow.total.max(1),
                 current_page,
-                page_fraction: 0.,
+                page_fraction: if progress_known { 0. } else { -1. },
                 updated_at: last_read_at.unwrap_or(added_at),
                 added_at,
                 last_read_at,
@@ -1224,7 +1232,11 @@ impl ReaderApp {
     /// `(group, fraction)`: 0 in progress, 1 finished, 2 not started. The
     /// fraction blends the chapter ordinal with the page position inside it.
     fn work_progress(&self, book: &Book, ordinals: &HashMap<&str, (usize, usize)>) -> (u8, f32) {
-        let page_progress = if book.last_read_at.is_none() {
+        let page_progress = if book.page_fraction < 0. {
+            // Online entries whose reading order is unknown sort behind every
+            // work with a real in-progress fraction.
+            -1.
+        } else if book.last_read_at.is_none() {
             0.
         } else if book.current_page + 1 >= book.page_count {
             1.
@@ -1386,6 +1398,21 @@ impl ReaderApp {
                 .find(|f| f.source_id == meta.source_id && f.manga_id == meta.manga_id)
         }?;
         (follow.fresh.len() > 0).then(|| follow.fresh.len())
+    }
+    /// Info line under a followed work: fresh count, else the last-read
+    /// chapter's name, else just the source.
+    fn online_progress_label(&self, follow: &follows::Follow) -> String {
+        let name = self.sources.source_display_name(&follow.source_id);
+        if !follow.fresh.is_empty() {
+            return format!("在线 · {} · {} 话更新", name, follow.fresh.len());
+        }
+        match self
+            .sources
+            .work_last_read(&follow.source_id, &follow.manga_id)
+        {
+            Some((_, chapter, _)) => format!("在线 · 读到 {chapter}"),
+            None => format!("在线 · {name}"),
+        }
     }
     fn open_online(&mut self, id: &str, resume: bool) {
         let Some((source, manga)) = Self::online_parts(id).map(|(s, m)| (s.to_string(), m.to_string()))
@@ -3410,14 +3437,7 @@ impl ReaderApp {
         ui.painter().galley(info, title, ink);
         let has_progress = book.last_read_at.is_some();
         let progress = if let Some(follow) = self.online_follow(&book.id) {
-            let name = self.sources.source_display_name(&follow.source_id);
-            if !follow.fresh.is_empty() {
-                format!("在线 · {} · {} 话更新", name, follow.fresh.len())
-            } else if has_progress {
-                format!("在线 · 读到第 {} 话", book.current_page + 1)
-            } else {
-                format!("在线 · {name}")
-            }
+            self.online_progress_label(follow)
         } else {
             let pages = if has_progress {
                 format!("第 {} / {} 页", book.current_page + 1, book.page_count)
@@ -6690,5 +6710,110 @@ mod tests {
             .collect();
         // The removed work leaves; unrelated follows stay on the shelf.
         assert_eq!(ids, ["online:source.a\u{1f}story"]);
+    }
+
+    #[test]
+    fn online_progress_uses_the_reading_order_and_chapter_name() {
+        let root = tempfile::tempdir().unwrap();
+        crate::follows::save(
+            root.path(),
+            &[follows::Follow {
+                source_id: "source.a".into(),
+                manga_id: "story".into(),
+                title: "Story".into(),
+                snapshot: String::new(),
+                // The source lists newest first; the stored order does not.
+                known: vec!["c3".into(), "c2".into(), "c1".into()],
+                reading_order: vec!["c1".into(), "c2".into(), "c3".into()],
+                total: 3,
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        let mut app = ReaderApp::new(root.path().into(), Context::default());
+        app.sources
+            .seed_read_at("source.a", "story", "c2", "第 2 话", 10);
+        let book = app.visible_books()[0].clone();
+        assert_eq!(
+            book.current_page, 1,
+            "progress is the index in reading order, not in source order"
+        );
+        assert_eq!(book.page_fraction, 0.);
+        assert_eq!(book.last_read_at, Some(10));
+        assert_eq!(
+            app.online_progress_label(app.online_follow(&book.id).unwrap()),
+            "在线 · 读到 第 2 话"
+        );
+    }
+
+    #[test]
+    fn online_progress_falls_back_when_the_reading_order_is_unknown() {
+        let root = tempfile::tempdir().unwrap();
+        crate::follows::save(
+            root.path(),
+            &[
+                // An older record without the order kept, but already read.
+                follows::Follow {
+                    source_id: "source.a".into(),
+                    manga_id: "old".into(),
+                    title: "Old".into(),
+                    snapshot: String::new(),
+                    known: vec!["c2".into(), "c1".into()],
+                    total: 2,
+                    ..Default::default()
+                },
+                // A new record read halfway in its stored order.
+                follows::Follow {
+                    source_id: "source.a".into(),
+                    manga_id: "new".into(),
+                    title: "New".into(),
+                    snapshot: String::new(),
+                    known: vec!["c2".into(), "c1".into()],
+                    reading_order: vec!["c1".into(), "c2".into()],
+                    total: 2,
+                    ..Default::default()
+                },
+            ],
+        )
+        .unwrap();
+        let mut app = ReaderApp::new(root.path().into(), Context::default());
+        app.sources.seed_read_at("source.a", "old", "c1", "第 1 话", 5);
+        app.sources.seed_read_at("source.a", "new", "c1", "第 1 话", 5);
+        let books = app.visible_books();
+        assert_eq!(
+            books
+                .iter()
+                .find(|book| book.id == "online:source.a\u{1f}old")
+                .unwrap()
+                .page_fraction,
+            -1.,
+            "an unresolvable order marks progress as unknown"
+        );
+        assert_eq!(
+            books
+                .iter()
+                .find(|book| book.id == "online:source.a\u{1f}new")
+                .unwrap()
+                .page_fraction,
+            0.
+        );
+        app.shelf_sort = ShelfSort::Progress;
+        let ids: Vec<String> = app
+            .visible_books()
+            .iter()
+            .map(|book| book.id.clone())
+            .collect();
+        assert_eq!(
+            ids,
+            ["online:source.a\u{1f}new", "online:source.a\u{1f}old"],
+            "unknown progress sorts behind known progress, not ahead"
+        );
+        // The label still names the chapter even when the order is unknown.
+        assert_eq!(
+            app.online_progress_label(
+                app.online_follow("online:source.a\u{1f}old").unwrap()
+            ),
+            "在线 · 读到 第 1 话"
+        );
     }
 }

@@ -22,6 +22,11 @@ pub struct Follow {
     /// When the work was followed; older records fall back to `checked_at`.
     #[serde(default)]
     pub followed_at: Option<u64>,
+    /// Chapter keys in reading order (oldest first), from the same ordering
+    /// the detail page uses. Empty for records written before the order was
+    /// kept — their progress is unknown rather than reversed.
+    #[serde(default)]
+    pub reading_order: Vec<String>,
     #[serde(default)]
     pub error: Option<String>,
 }

@@ -1954,7 +1954,7 @@ struct UpdateEvent {
     source: String,
     manga: String,
     /// `None`: only the cover arrived, after the batch's chapter results.
-    chapters: Option<Result<Vec<String>, String>>,
+    chapters: Option<Result<Vec<Chapter>, String>>,
     /// `source-covers` key + decoded image delivered with `chapters: None`.
     cover: Option<(String, ColorImage)>,
 }
@@ -2269,14 +2269,14 @@ impl Sources {
 
                     let mut engines = std::collections::HashMap::<String, SourceEngine>::new();
                     for (source, manga) in batch.iter().cloned() {
-                        let chapters = (|| -> anyhow::Result<Vec<String>> {
+                        let chapters = (|| -> anyhow::Result<Vec<Chapter>> {
                             if !engines.contains_key(&source) {
                                 engines
                                     .insert(source.clone(), SourceEngine::load(&catalog, &source)?);
                             }
-                            let list =
-                                pollster::block_on(engines[&source].chapters_with(manga.clone()))?;
-                            Ok(list.into_iter().map(|chapter| chapter.key).collect())
+                            Ok(pollster::block_on(
+                                engines[&source].chapters_with(manga.clone()),
+                            )?)
                         })()
                         .map_err(|error| format!("{error:#}"));
                         let event = UpdateEvent {
@@ -2708,6 +2708,10 @@ impl Sources {
             .iter()
             .map(|chapter| chapter.key.clone())
             .collect();
+        follow.reading_order = chapter_list(&self.chapters, "", false)
+            .iter()
+            .map(|chapter| chapter.key.clone())
+            .collect();
         follow.mark_seen(&keys);
         follow.checked_at = Some(follows::now());
         follow.followed_at = Some(follows::now());
@@ -2790,13 +2794,45 @@ impl Sources {
             .find(|source| source.manifest.id == source_id)
             .map_or_else(|| source_id.to_string(), |source| source.manifest.name.clone())
     }
-    /// Latest chapter read state for a work: (chapter key, read_at).
-    pub(crate) fn work_last_read(&self, source: &str, manga: &str) -> Option<(String, i64)> {
+    /// Latest chapter read state for a work: (chapter key, display name, read_at).
+    pub(crate) fn work_last_read(
+        &self,
+        source: &str,
+        manga: &str,
+    ) -> Option<(String, String, i64)> {
         self.tasks
             .iter()
             .filter(|task| task.source_id == source && task.manga_id == manga)
-            .filter_map(|task| task.read_at.map(|at| (task.chapter_id.clone(), at)))
-            .max_by_key(|(_, at)| *at)
+            .filter_map(|task| {
+                task.read_at
+                    .map(|at| (task.chapter_id.clone(), task.chapter_title.clone(), at))
+            })
+            .max_by_key(|(_, _, at)| *at)
+    }
+    #[cfg(test)]
+    pub(crate) fn seed_read_at(
+        &mut self,
+        source: &str,
+        manga: &str,
+        chapter: &str,
+        title: &str,
+        at: i64,
+    ) {
+        let mut task = DownloadTask::from_chapter(
+            source,
+            &Manga {
+                key: manga.into(),
+                title: manga.into(),
+                ..Default::default()
+            },
+            &Chapter {
+                key: chapter.into(),
+                title: Some(title.into()),
+                ..Default::default()
+            },
+        );
+        task.read_at = Some(at);
+        self.tasks.push(task);
     }
     /// Drops a follow; used when an online shelf entry is 移出'd.
     pub(crate) fn unfollow(&mut self, source: &str, manga: &str) -> bool {
@@ -3072,7 +3108,13 @@ impl Sources {
         if let Some(index) = self.follow_index(&event.source, &event.manga) {
             let follow = &mut self.follows[index];
             match chapters {
-                Ok(keys) => {
+                Ok(list) => {
+                    follow.reading_order = chapter_list(&list, "", false)
+                        .iter()
+                        .map(|chapter| chapter.key.clone())
+                        .collect();
+                    let keys: Vec<String> =
+                        list.iter().map(|chapter| chapter.key.clone()).collect();
                     follow.apply_check(&keys, follows::now());
                 }
                 Err(error) => {
@@ -4305,6 +4347,11 @@ impl Sources {
                         if let Some(index) = self.follow_index(&source, &manga.key) {
                             let keys: Vec<String> =
                                 list.iter().map(|chapter| chapter.key.clone()).collect();
+                            self.follows[index].reading_order =
+                                chapter_list(&list, "", false)
+                                    .iter()
+                                    .map(|chapter| chapter.key.clone())
+                                    .collect();
                             self.follows[index].mark_seen(&keys);
                             self.follows[index].title = manga.title.clone();
                             self.save_follows();
@@ -6450,6 +6497,37 @@ mod tests {
             },
         )
     }
+    #[test]
+    fn update_checks_flip_newest_first_lists_into_reading_order() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sources = test_sources(root.path());
+        sources.selected_source = "source.a".into();
+        sources.toggle_follow(&manga("source.a", "m"));
+        sources.checking = 1;
+        // Many sources hand chapters back newest-first; the persisted order
+        // must match the detail page's reading order, oldest first.
+        sources.handle_update(UpdateEvent {
+            source: "source.a".into(),
+            manga: "m".into(),
+            chapters: Some(Ok(
+                [("c3", 3.), ("c1", 1.), ("c2", 2.)]
+                    .iter()
+                    .map(|(key, number)| Chapter {
+                        key: (*key).into(),
+                        chapter_number: Some((*number) as f32),
+                        ..Default::default()
+                    })
+                    .collect(),
+            )),
+            cover: None,
+        });
+        assert_eq!(
+            sources.follows[0].reading_order,
+            ["c1", "c2", "c3"],
+            "update checks store chapters in reading order"
+        );
+    }
+
     fn test_sources(root: &Path) -> Sources {
         let (dl_tx, dl_cmd_rx) = mpsc::channel();
         // Keep the command receiver alive so `pump()` can actually dispatch the
@@ -6683,7 +6761,15 @@ mod tests {
         sources.handle_update(UpdateEvent {
             source: "source.a".into(),
             manga: "m".into(),
-            chapters: Some(Ok(vec!["c1".into(), "c2".into(), "c3".into()])),
+            chapters: Some(Ok(
+                ["c1", "c2", "c3"]
+                    .iter()
+                    .map(|key| Chapter {
+                        key: (*key).into(),
+                        ..Default::default()
+                    })
+                    .collect(),
+            )),
             cover: None,
         });
         assert_eq!(sources.checking, 0);
@@ -6691,6 +6777,12 @@ mod tests {
         assert_eq!(
             follows::load(root.path()).unwrap()[0].fresh,
             vec!["c3".to_string()]
+        );
+        // The stored reading order is oldest-first even though the source
+        // listed chapters in its own order.
+        assert_eq!(
+            follows::load(root.path()).unwrap()[0].reading_order,
+            ["c1", "c2", "c3"]
         );
 
         sources.request_id = 7;
@@ -8650,7 +8742,15 @@ mod tests {
         sources.handle_update(UpdateEvent {
             source: "source.a".into(),
             manga: "m".into(),
-            chapters: Some(Ok(vec!["c1".into(), "c2".into()])),
+            chapters: Some(Ok(
+                ["c1", "c2"]
+                    .iter()
+                    .map(|key| Chapter {
+                        key: (*key).into(),
+                        ..Default::default()
+                    })
+                    .collect(),
+            )),
             cover: None,
         });
         assert_eq!(sources.checking, 0);
