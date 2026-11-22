@@ -97,6 +97,8 @@
 - 2026-11-22 ffmpeg 管线可用：`artifacts/rust/stage0/body.mp4`（160 帧 / 121KB）
 - 2026-11-22 kill test 先 FAILED（纸全平仍 PASS），补断言后 **PASSED**：broken EXIT=1 / good EXIT=0，日志 `.tools/loop-baseline/stage0-killtest5.log`
 - 2026-11-23 **iPad 模拟器真机链路打通**：macOS 盒跑通 CI 同款 build-rust-ios.sh --sim → xcodebuild → capture-ipad-simulator.sh → IPadRotationTests **4/4 PASS**；shelf.png 证实竖屏底部标签栏+全屏书架在真模拟器生效（截图拉回到 artifacts/rust/sim-pulled/，经 devin forward + python http.server）。verify-ipad-snapshots.py 崩在缺 relocated-library.json（覆盖率缺口，非 bug）
+- 2026-11-23 **模拟器第三轮全链 PASS**（含 flip+verify 修复）：ipad-sim3 capture 完整跑完 CAPTURE_EXIT=0、legacy-library.json 就位、verify-ipad-snapshots.py PASS（上一轮 pipe2 的"缺 JSON 崩"已修复+根因是 capture 中断非 verify 错）。IPadRotationTests 4/4
+- 2026-11-23 **阶段4合上规格**（.tools/stage4-close-spec.md）：参考无专属合上实现，coverReturn=840ms 只是 Cupertino pop 倒放；detail→shelf flight.returning 已完整；唯一缺口 reader→detail 的 reader_exit 镜像（spread_clip 收缩 bands 复用）
 - 2026-11-23 **阶段3翻页规格**（.tools/stage3-flip-spec.md）：参考里**无 page-curl**，转场是 Cupertino 平推；方案 = PageSlide 平移轴不动 + 页图 mesh 化加列向 depth 隆起（PaperFlightPose.depthAt 行向→列向）。flip 参数组待实现，R4 守卫 placeholder 平移
 - 2026-11-23 verify-ipad-snapshots.py 修复 f898b8d：缺 legacy/relocated JSON 降级 WARNING 跳过（真凶是 capture 中断被 tee 吞 exit code）
 - 2026-11-23 **模拟器第二轮全链 PASS**（含摊开）：ipad-sim2 出 8 画面（shelf/detail/detail-landscape/reader/history/browse/community/filters/filters-landscape），IPadRotationTests 4/4，TEST EXECUTE SUCCEEDED；detail 完成态布局全居中正确。截图路径 artifacts/rust/ipad-sim2（盒子）/ sim-pulled/detail-sim2.png（本地）
