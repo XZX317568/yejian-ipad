@@ -59,9 +59,13 @@ pub struct Volume {
     pub cap: [Pos2; 4],
     pub thickness: f32,
     pub height: f32,
+    /// 有效比例 = 全局 shelf 比例 × 按槽位缩放，文字与装饰都按它排版。
     scale: f32,
     ink: f32,
     opacity: f32,
+    /// 屏幕边缘柔边渐隐系数（0..=1），在 paint 层乘到 opacity 上。
+    /// 与 opacity 分开存：contains()/环绕交叉淡入淡出都只看 opacity。
+    fade: f32,
     lift: f32,
     distance: f32,
     floor: Pos2,
@@ -116,6 +120,30 @@ pub fn lane_pitch_for(area: Rect, count: usize) -> f32 {
     }
 }
 
+/// 按距焦点的槽位数缩小整本书：±1 槽 0.90x、±2 槽 0.82x，
+/// 之后每退一槽再乘 0.92（下限 0.55）。边缘书"退到背景"而不只是变暗。
+/// 用连续 distance 而不是取整槽号，拖动中途形变保持平滑。
+fn slot_shrink(distance: f32) -> f32 {
+    let d = distance.abs();
+    if d <= 1. {
+        1. - 0.10 * d
+    } else if d <= 2. {
+        0.90 - 0.08 * (d - 1.)
+    } else {
+        (0.82 * 0.92_f32.powf(d - 2.)).max(0.55)
+    }
+}
+
+/// 书靠近 shelf_area 左右边缘 0..band 时按 smoothstep 渐隐，
+/// 取代之前被 painter clip 硬裁的生硬边缘。band = min(48, 宽度 5%)。
+/// 以书"靠内"的边衡量：从左侧滑入的书在左缘离开左 band 后即全亮。
+fn edge_fade(bounds: Rect, area: Rect) -> f32 {
+    let band = 48.0_f32.min(area.width() * 0.05).max(1.);
+    let left = motion::smooth((bounds.max.x - area.left()) / band);
+    let right = motion::smooth((area.right() - bounds.min.x) / band);
+    left.min(right)
+}
+
 pub fn geometry(area: Rect, count: usize, focus: f32, entrance: f32) -> Vec<Volume> {
     if count == 0 {
         return Vec::new();
@@ -157,10 +185,17 @@ pub fn geometry(area: Rect, count: usize, focus: f32, entrance: f32) -> Vec<Volu
         for lane in first..=last {
             let shelf = crate::params::params().shelf.clone();
             let weight = motion::weight(lane as f32);
-            let x = start_x + lane as f32 * pitch
-                - cover * shelf.pull_base * weight * (shelf.pull_linear - shelf.pull_quad * weight) * 0.66;
-            left = left.min(x);
-            right = right.max(x + spine + cover * 0.66);
+            let shrink = slot_shrink(lane as f32);
+            let pull = cover
+                * shelf.pull_base
+                * weight
+                * (shelf.pull_linear - shelf.pull_quad * weight)
+                * shrink;
+            let footprint = (spine + cover * 0.66) * shrink;
+            let cx = start_x + lane as f32 * pitch + (spine + cover * 0.66) / 2.
+                - pull * 0.66;
+            left = left.min(cx - footprint / 2.);
+            right = right.max(cx + footprint / 2.);
         }
         start_x += area.center().x - (left + right) / 2.;
     }
@@ -191,8 +226,13 @@ pub fn geometry(area: Rect, count: usize, focus: f32, entrance: f32) -> Vec<Volu
                 return None;
             }
             let shelf = crate::params::params().shelf.clone();
+            let shrink = slot_shrink(distance);
             let weight = motion::weight(distance);
-            let pull = cover * shelf.pull_base * weight * (shelf.pull_linear - shelf.pull_quad * weight);
+            let pull = cover
+                * shelf.pull_base
+                * weight
+                * (shelf.pull_linear - shelf.pull_quad * weight)
+                * shrink;
             let lift = motion::smooth(weight);
             let rail = distance.clamp(-7., 7.);
             let start = ((distance + 8.) / 24.).clamp(0., 0.65);
@@ -205,28 +245,37 @@ pub fn geometry(area: Rect, count: usize, focus: f32, entrance: f32) -> Vec<Volu
             );
             let phase = entrance * motion::ENTRANCE as f32 / 1.7 - distance * 0.075;
             let crest = (1. + (phase * std::f32::consts::TAU).sin()) * 0.5;
-            let load = -9. * crest * crest * (1. - ink) * scale;
+            let load = -9. * crest * crest * (1. - ink) * scale * shrink;
             // 对称下沉：|rail| 项让两侧一起矮下去，避免整排"往右下坠"。
             let rail_y = (rail.abs() * shelf.rail_linear * 0.8 + rail * rail * shelf.rail_quad) * scale;
+            // 槽位缩放绕"未缩放占地中心"进行：底边对齐 rail、水平居中，
+            // 所以缩小只让槽内空隙对称变宽，不会让书错位或互穿。
+            let footprint = spine + cover * 0.66;
+            let spine_b = spine * shrink;
+            let cover_b = cover * shrink;
+            let height_b = height * shrink;
+            let center_x = start_x + distance * pitch + footprint / 2.;
+            let footprint_b = footprint * shrink;
+            // floor 沿用原语义：槽位锚点（不含 pull），阴影画在书"应停靠"的位置。
             let floor = pos2(
-                start_x + distance * pitch,
+                center_x - footprint_b / 2.,
                 area.top() + v_pad + base_y + height + rail_y,
             );
             let origin = pos2(
-                start_x + distance * pitch - pull * 0.66,
-                area.top() + v_pad + base_y + pull * 0.30 - height * 0.60 * lift + rail_y + load,
+                center_x - footprint_b / 2. - pull * 0.66,
+                area.top() + v_pad + base_y + pull * 0.30 - height_b * 0.60 * lift + rail_y + load,
             );
             let front = Plane {
                 origin,
-                horizontal: vec2(spine, spine * 0.10),
-                vertical: vec2(0., height),
+                horizontal: vec2(spine_b, spine_b * 0.10),
+                vertical: vec2(0., height_b),
             };
             let face = Plane {
                 origin: front.point(1., 0.),
-                horizontal: vec2(cover * 0.66, cover * -0.30),
-                vertical: vec2(0., height),
+                horizontal: vec2(cover_b * 0.66, cover_b * -0.30),
+                vertical: vec2(0., height_b),
             };
-            Some(Volume {
+            let volume = Volume {
                 lane,
                 index: lane.rem_euclid(count as i32) as usize,
                 front,
@@ -243,14 +292,19 @@ pub fn geometry(area: Rect, count: usize, focus: f32, entrance: f32) -> Vec<Volu
                     face.point(1., 0.),
                     origin + face.horizontal,
                 ],
-                thickness: spine,
-                height,
-                scale,
+                thickness: spine_b,
+                height: height_b,
+                scale: scale * shrink,
                 ink,
                 opacity,
+                fade: 1.,
                 lift,
                 distance,
                 floor,
+            };
+            Some(Volume {
+                fade: edge_fade(volume.bounds(), area),
+                ..volume
             })
         })
         .collect()
@@ -334,7 +388,7 @@ pub fn paint_floor(p: &Painter, volumes: &[Volume], dark: bool) {
                 origin + tail,
             ],
             vec2(-1., 1.),
-            ink.gamma_multiply((0.12 - 0.065 * lift) * volume.opacity),
+            ink.gamma_multiply((0.12 - 0.065 * lift) * volume.opacity * volume.fade),
             Color32::TRANSPARENT,
         );
         // 已排除：用 ellipse 画"接触阴影"在这套斜轴测几何上会变成一排圆形色块，
@@ -488,7 +542,7 @@ pub fn paint_volume(
     selected: bool,
 ) {
     let mut faded = p.clone();
-    faded.multiply_opacity(volume.opacity);
+    faded.multiply_opacity(volume.opacity * volume.fade);
     let p = &faded;
     let scale = volume.scale;
     let face_unit = Plane {
