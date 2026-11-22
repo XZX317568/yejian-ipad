@@ -318,6 +318,9 @@ pub fn paint_floor(p: &Painter, volumes: &[Volume], dark: bool) {
             ink.gamma_multiply((0.12 - 0.065 * lift) * volume.opacity),
             Color32::TRANSPARENT,
         );
+        // 已排除：用 ellipse 画"接触阴影"在这套斜轴测几何上会变成一排圆形色块，
+        // 看起来像石头而不是影子（2026-11-23 实测，见 STATE 已验证事实）。
+        // 正确做法是把接触阴影并进上面那张地面梯度多边形，而不是另画椭圆。
     }
 }
 
@@ -506,6 +509,12 @@ pub fn paint_volume(
     } else {
         Color32::from_rgb(198, 190, 172).gamma_multiply(0.9)
     };
+    // 景深压暗：每退一槽 13%，把注意力压回焦点书（Gemini 建议 12–15%）。
+    // 书放大后如果没有这层，两侧书会和焦点书抢视线。
+    let dim = 1. - 0.13 * volume.distance.abs().min(3.);
+    let paper = paper.gamma_multiply(dim);
+    let spine = spine.gamma_multiply(dim);
+    let edge_line = edge_line.gamma_multiply(dim);
     flat_stroked(p, volume.face, paper, Stroke::new(0.8, edge_line));
     let mut print = p.clone();
     print.multiply_opacity(volume.ink);

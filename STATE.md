@@ -80,6 +80,8 @@
 - 2026-11-22 参数外置生效且无需重编译：`paper.base` 17→0 后 frame-045/060/075 哈希全变，日志 `.tools/loop-baseline/stage0-params-live.log`
 - 2026-11-22 ffmpeg 管线可用：`artifacts/rust/stage0/body.mp4`（160 帧 / 121KB）
 - 2026-11-22 kill test 先 FAILED（纸全平仍 PASS），补断言后 **PASSED**：broken EXIT=1 / good EXIT=0，日志 `.tools/loop-baseline/stage0-killtest5.log`
+- 2026-11-23 景深压暗已生效：每退一槽 13%（`shelf.rs` paint_volume），两侧书不再和焦点书抢视线
+- 2026-11-23 **负结果**：用 ellipse 另画"接触阴影"在这套斜轴测几何上会变成一排圆色块（像石头），已回退；正确做法是并进地面梯度多边形
 - 2026-11-23 全屏书架落地：`ui.rs` 舞台吃满视口、底部展签；`shelf.rs` scale 2.6 / cover 190。iPad 8 档矩阵 PASS（`artifacts/rust/fullshelf2/`），全量 acceptance PASS（`artifacts/rust/fullshelf-full2/`）
 - 2026-11-23 录制必须慢动作：`dt=1/240` 时飞行段才铺满 168 帧；固定 1/60 时整段只剩 1–2 帧飞行
 - 2026-11-22 全 workspace 测试 EXIT=0（含新增 2 条纸张曲线断言），日志 `.tools/loop-baseline/stage0-tests2.log`
