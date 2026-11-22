@@ -37,6 +37,9 @@
 
 ### iPad 版面体检结论（详见 `.tools/ui-audit-20261123.md`）
 
+> ✅ 已修完并推送：展签居中+横屏让位（2ca30f0）、竖屏底部标签栏+width>height 侧栏判定+横屏窄栏（f546d2e）。用户反馈的"没适配 iPad"核心根因是 `side_navigation()` 的 `width>=1000` 把 1024 竖屏误判成横屏桌面布局。
+> ⚠️ 目标曾因 6 轮上限 blocked，已放宽到 24 轮并 resume（2026-11-23 02:50）。
+
 两个独立 agent（ui-critic / nav-spec）给出的顺序：①展签内部左偏 ②竖屏该改底部标签栏（1024 竖屏仍走桌面侧栏，且 `side_navigation()` 用 width≥1000 判断会误判）③横屏 books rect 未扣展签带导致压字 ④边缘书柔边渐隐。本轮已修：书群垂直居中、舞台再让 104pt、pitch 下限、rail 对称下沉。
 
 ### Gemini 建议里尚未实现的（下一步）
