@@ -226,6 +226,30 @@ impl Harness {
         let to = (pa.len().min(pb.len()) / stride).min(to) * stride;
         Ok(from <= to && pa[from..to] == pb[from..to])
     }
+    /// 行 y 上在 [x0,x1) 里最右一个非纸底像素列（|luma-bg|>5），无则 x0。
+    fn right_edge(&self, name: &str, y: usize, x0: usize, x1: usize, bg: f32) -> Result<f32> {
+        let px = self.captured_pixels(name)?;
+        let w = self.size[0] as usize;
+        for x in (x0..x1).rev() {
+            let i = (y * w + x) * 4;
+            let luma = (px[i] as u32 + px[i + 1] as u32 + px[i + 2] as u32) as f32 / 3.;
+            if (luma - bg).abs() > 5. {
+                return Ok(x as f32);
+            }
+        }
+        Ok(x0 as f32)
+    }
+    /// 一行 [x0,x1) 像素的平均亮度（0..255），摊开像素断言用。
+    fn row_luma(&self, name: &str, y: usize, x0: usize, x1: usize) -> Result<f32> {
+        let px = self.captured_pixels(name)?;
+        let w = self.size[0] as usize;
+        let mut sum = 0u64;
+        for x in x0..x1 {
+            let i = (y * w + x) * 4;
+            sum += (px[i] as u64 + px[i + 1] as u64 + px[i + 2] as u64) / 3;
+        }
+        Ok(sum as f32 / (x1 - x0).max(1) as f32)
+    }
     /// 合上中点帧采样：页区下方边距行，bands 内阅读器黑（~19）、
     /// bands 外详情页纸白（~248）。
     fn close_mid_samples(&self, name: &str) -> Result<(u8, u8)> {
@@ -1184,6 +1208,91 @@ fn filters_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// spec §7 像素断言：spread-mid 帧上采样斜边两侧竖条，并量边界斜率。
+/// 斜扫期间 flight mesh 已隐藏，未揭示区 = 纸底色（~248）。
+/// dir=+1：揭示边界 x_edge(y) = edge - slant·frac(y)，conservative band
+/// 用 band 下缘——即边界是 staircase，逐 band 右跳 slant/bands。
+/// 两个采样行落在封面卡艺术区（y∈[335,775]），避开圆角顶/底与标题行；
+/// 标题行（y≈825）只断言未揭示侧=底色（R2：文字 alpha≈0 的穿帮锚点）。
+fn spread_mid_check(h: &Harness, p: f32) -> Result<()> {
+    let area_top = 24.;
+    let w = h.size[0] as f32;
+    let hgt = h.size[1] as f32 - 24. - 20.;
+    let slant = yejian::motion_spread_slant(w);
+    let edge = yejian::motion_spread_edge(w, slant, p);
+    let (dx, dy) = yejian::motion_spread_offset(p);
+    anyhow::ensure!(
+        dx < 0.,
+        "spread_mid_check assumes dir=+1 (dx={dx}) — generalize before flipping spread.dir"
+    );
+    // Detail cover card on iPad portrait (ui::detail_cover_rect): rows are
+    // derived from the card so the check follows layout retunes.
+    let card_w = (hgt * 0.25).clamp(250., 320.);
+    let card_h = card_w * 166. / 118.;
+    let block = card_h + 220.;
+    let card_top = area_top + 84. + (hgt - 84. - 24. - block).max(0.) * 0.40;
+    let card_left = w / 2. - card_w / 2.;
+    // The visible copy is the shifted incoming plane: art rect is the card
+    // translated by (dx, dy).
+    let art_left = card_left + dx;
+    let art_right = card_left + card_w + dx;
+    let art_top = card_top + dy;
+    let bands = 8f32.max((slant / 8.).ceil());
+    // Conservative per-band edge in screen x for an absolute y row.
+    let front = |y: f32| -> f32 {
+        let frac = ((y - area_top) / hgt).clamp(0., 1.);
+        edge - slant * (frac * bands).ceil() / bands
+    };
+    let bg = h.row_luma("spread-mid", 700, 930, 1000)?;
+    // Two rows inside the art, well clear of the rounded top/bottom corners.
+    let mut edges = Vec::new();
+    for y in [art_top + card_h * 0.18, art_top + card_h * 0.82] {
+        let f = front(y);
+        anyhow::ensure!(
+            f > art_left + 60. && f < art_right - 10.,
+            "spread-mid: predicted front {f:.0}@y{y} outside card art [{art_left:.0},{art_right:.0}] — p={p} not mid-sweep"
+        );
+        // Revealed strip: well inside the sweep and inside the art — must
+        // differ from paper (art + stroke + shadow).
+        let rev_x = ((f - 50.) as usize).max(art_left as usize + 5);
+        let rev = h.row_luma("spread-mid", y as usize, rev_x, rev_x + 24)?;
+        anyhow::ensure!(
+            (rev - bg).abs() > 12.,
+            "spread-mid: revealed strip x={rev_x}..{} luma {rev:.0} ≈ paper {bg:.0} — incoming copy missing under the front",
+            rev_x + 24
+        );
+        // Unrevealed strip: right of the staircase edge — must be clean paper.
+        let unrev_x = (f + 30.) as usize;
+        let unrev = h.row_luma("spread-mid", y as usize, unrev_x, unrev_x + 24)?;
+        anyhow::ensure!(
+            (unrev - bg).abs() <= 8.,
+            "spread-mid: unrevealed strip x={unrev_x}..{} luma {unrev:.0} ≠ paper {bg:.0} — leaked content or wrong boundary",
+            unrev_x + 24
+        );
+        // Pixel-measured edge: rightmost non-paper column in this row, inside art.
+        let measured = h.right_edge("spread-mid", y as usize, art_left as usize, (f + 30.) as usize, bg)?;
+        edges.push((y, measured));
+    }
+    // Slant check: measured boundary slope vs formula slant/h, ±15%.
+    let ((y1, x1), (y2, x2)) = (edges[0], edges[1]);
+    let slope = (x2 - x1).abs() / (y2 - y1);
+    let expected = slant / hgt;
+    anyhow::ensure!(
+        (slope - expected).abs() / expected <= 0.15,
+        "spread-mid: boundary slope {slope:.3} vs expected {expected:.3} (±15%) — slant angle wrong"
+    );
+    // R2 anchor: the text column is unclipped. Its right half sits in the
+    // unrevealed region at p≈0.5; alpha≈0 must keep it at paper luma.
+    let text_x = (front(825.) + 20.) as usize;
+    let text = h.row_luma("spread-mid", 825, text_x, text_x + 40)?;
+    anyhow::ensure!(
+        (text - bg).abs() <= 8.,
+        "spread-mid: text luma {text:.0} ≠ paper {bg:.0} at x={text_x} — unclipped text column ghosts into the unrevealed region"
+    );
+    println!("spread-mid: p={p:.3} edge={edge:.0} slope={slope:.3} bg={bg:.0} PASS");
+    Ok(())
+}
+
 fn ipad_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
     use yejian_platform::{Insets, set_insets_override};
     // iPad window sizes in points (one harness pixel per point), plus the
@@ -1289,7 +1398,28 @@ fn ipad_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
         h.size = size;
         h.frames(10)?;
         h.click("open-book")?;
-        h.frames(65)?;
+        if name == "portrait" {
+            // 摊开中点帧（spec §7 像素断言）：首个 eased p>=0.5 的帧。
+            // 斜扫期间 flight mesh 隐藏，未揭示区 = 纸底色。
+            let mut mid = false;
+            let mut mid_p = 0f32;
+            for i in 1..=45usize {
+                let p = yejian::motion_spread_progress(
+                    (i as f64 * h.dt / yejian::motion_open_seconds()).min(1.) as f32,
+                );
+                let capture = !mid && p >= 0.5;
+                if capture {
+                    mid = true;
+                    mid_p = p;
+                }
+                h.frame(vec![], capture.then_some("spread-mid"))?;
+            }
+            anyhow::ensure!(mid, "spread sweep never reached p=0.5");
+            h.frames(20)?;
+            spread_mid_check(h, mid_p)?;
+        } else {
+            h.frames(65)?;
+        }
         h.frame(vec![], Some(&format!("ipad-pro-129-{name}-detail")))?;
         h.click("read")?;
         h.wait(ReaderApp::page_loaded)?;

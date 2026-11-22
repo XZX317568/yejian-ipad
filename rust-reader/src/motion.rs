@@ -75,6 +75,17 @@ pub fn spread_offset(p: f32) -> (f32, f32) {
     (-s.shift_x * s.dir * (1. - p), s.shift_y * (1. - p))
 }
 
+/// Detail text-column reveal opacity along the flight t axis
+/// (`detail_alpha` in `ui::detail_ui`). R2: the column stays unclipped
+/// (ScrollArea cannot be re-emitted per band), so its fade is delayed to
+/// ride *behind* the diagonal front: smoothstep of `(t - 0.62) / 0.3`
+/// reaches 15% only once the front has swept ~3/4 of the plane — past the
+/// centred text column — and saturates just before the sweep closes.
+/// (`text_column_stays_invisible_until_sweep_mostly_done` pins this.)
+pub fn detail_text_alpha(t: f32) -> f32 {
+    smooth(((t - 0.62) / 0.3).clamp(0., 1.))
+}
+
 /// Eased spread progress along the flight t axis: clamps into
 /// `[start, start + span]` then applies the shared cubic. `t >= 1` after the
 /// flight ends keeps returning 1, so the resting detail frame equals `p=1`.
@@ -789,5 +800,37 @@ mod tests {
         // clip already saturates at w, so assert it merely settles to ~1.
         assert!(spread_progress(s.start + s.span - 1e-4) >= 0.999);
         assert_eq!(spread_progress(s.start + s.span), 1.);
+    }
+
+    /// R2 anchor (spec §7): the text column is painted with only
+    /// `detail_text_alpha` — never band-clipped like the cover card. That
+    /// asymmetry is a live risk only if text is legible inside the
+    /// unrevealed region. Pin the two timing facts that keep it invisible:
+    /// the column is ~transparent at the spread's mid-sweep frame, and it
+    /// does not reach legibility until the front has swept most of the
+    /// plane. If a retune breaks either bound, reconsider clipping or
+    /// delaying the text column instead of weakening this test.
+    #[test]
+    fn text_column_stays_invisible_until_sweep_mostly_done() {
+        // Mid-sweep: first t where the eased front hits p = 0.5.
+        let t_mid = (0..=10_000)
+            .map(|i| i as f32 / 10_000.)
+            .find(|&t| spread_progress(t) >= 0.5)
+            .expect("spread reaches p=0.5");
+        assert!(
+            detail_text_alpha(t_mid) < 0.02,
+            "text alpha {} at mid-sweep t {t_mid} — column would ghost through",
+            detail_text_alpha(t_mid)
+        );
+        // Legibility: first t where the fade passes 15%.
+        let t_legible = (0..=10_000)
+            .map(|i| i as f32 / 10_000.)
+            .find(|&t| detail_text_alpha(t) >= 0.15)
+            .expect("text reaches 15%");
+        assert!(
+            spread_progress(t_legible) >= 0.75,
+            "text fades in at t {t_legible} while front is only p={} — unrevealed sliver would still cover the text column",
+            spread_progress(t_legible)
+        );
     }
 }

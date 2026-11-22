@@ -32,6 +32,31 @@ pub fn motion_close_seconds() -> f64 {
     motion::close_seconds()
 }
 
+/// 打开（shelf→detail）飞行时长（秒），供 acceptance 按帧推进 reveal。
+pub fn motion_open_seconds() -> f64 {
+    motion::OPEN
+}
+
+/// 摊开斜扫进度（0..=1，沿飞行 t 轴），供 acceptance 定位 p≈0.5 中点帧。
+pub fn motion_spread_progress(t: f32) -> f32 {
+    motion::spread_progress(t)
+}
+
+/// incoming 平面位移 (−shift_x·dir·(1−p), +shift_y·(1−p))（archive_motion.dart:323）。
+pub fn motion_spread_offset(p: f32) -> (f32, f32) {
+    motion::spread_offset(p)
+}
+
+/// 斜边长 min(slant_px, w·slant_pct)（archive_motion.dart:338）。
+pub fn motion_spread_slant(w: f32) -> f32 {
+    motion::spread_slant(w)
+}
+
+/// 斜扫前缘横坐标 edge=(w+slant)·p（平面左缘起算）。
+pub fn motion_spread_edge(w: f32, slant: f32, p: f32) -> f32 {
+    motion::spread_edge(w, slant, p)
+}
+
 use std::path::PathBuf;
 
 pub fn configure_fonts(ctx: &egui::Context) {

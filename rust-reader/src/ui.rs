@@ -2578,7 +2578,18 @@ impl ReaderApp {
                 };
                 let t = ((now - flight.started) / duration).clamp(0., 1.) as f32;
                 let progress = if flight.returning { 1. - t } else { t };
-                if let Some(texture) = self
+                // 摊开分工：斜扫 banded copy 揭示封面期间，飞行 mesh 隐藏。
+                // 否则 mesh 会盖住整副 banded 副本，斜扫只能露出左侧一条
+                // 位移残影——spec §7 的"未揭示区=底色"断言也无处可采样。
+                // forward 时 spread>0 即隐藏（banded 副本在卡牌处补位）；
+                // returning 时 spread<1 即隐藏，反向扫完由 mesh 接管。
+                let spread_p = motion::spread_progress(progress);
+                let show_mesh = if flight.returning {
+                    spread_p >= 0.999
+                } else {
+                    spread_p <= 0.001
+                };
+                if show_mesh && let Some(texture) = self
                     .cover_mips
                     .get(&flight.id)
                     .map(shelf::CoverMips::base)
@@ -3682,9 +3693,14 @@ fn library_thumbnails(
             }
         });
         // The text column's reveal opacity; it also lifts 8pt into place.
-        let detail_alpha = reveal
-            .map(|reveal| motion::smooth(((reveal - 0.5) / 0.5).max(0.)))
-            .unwrap_or(1.);
+        // R2 (spec §7): text stays unclipped (ScrollArea cannot be
+        // re-emitted per clip band), so `motion::detail_text_alpha` ramps
+        // behind the diagonal front instead of the travel fade — otherwise
+        // the column is already opaque while the right half still sits in
+        // the unrevealed region (穿帮, visible in spread-mid before this).
+        // Anchors: unit test `text_column_stays_invisible_until_sweep_
+        // mostly_done` + the acceptance text-row strip in spread-mid.
+        let detail_alpha = reveal.map(motion::detail_text_alpha).unwrap_or(1.);
         // While the reader peels away over this page, the text column
         // waits under the bands and fades in past `under_alpha_start`.
         let exit_alpha = self.exit_under_alpha(now);
@@ -3754,12 +3770,13 @@ fn library_thumbnails(
                 details_start,
                 vec2(360., (area.bottom() - 24. - details_start.y).max(160.)),
             );
+            let column_alpha = detail_alpha * exit_alpha;
             ui.scope_builder(UiBuilder::new().max_rect(body), |ui| {
                 ScrollArea::vertical()
                     .id_salt(("detail-body", id))
                     .show(ui, |ui| {
-                        if exit_alpha < 0.999 {
-                            ui.set_opacity(exit_alpha);
+                        if column_alpha < 0.999 {
+                            ui.set_opacity(column_alpha);
                         }
                         ui.add(
                             Label::new(
@@ -3783,12 +3800,13 @@ fn library_thumbnails(
             return;
         }
         let body = Rect::from_min_max(details_start, area.max - vec2(24., 12.));
+        let column_alpha = detail_alpha * exit_alpha;
         ui.scope_builder(UiBuilder::new().max_rect(body), |ui| {
             ScrollArea::vertical()
                 .id_salt(("detail-body", id))
                 .show(ui, |ui| {
-                    if exit_alpha < 0.999 {
-                        ui.set_opacity(exit_alpha);
+                    if column_alpha < 0.999 {
+                        ui.set_opacity(column_alpha);
                     }
                     ui.vertical_centered(|ui| {
                         let title_size = if area.width() >= 700. { 30. } else { 24. };
