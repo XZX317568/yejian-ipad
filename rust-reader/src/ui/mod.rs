@@ -1,18 +1,24 @@
-use crate::{
-    follows,
-    motion::{self, ShelfMotion},
-    shelf::{self, Plane},
-    sources::{STREAM_PREFIX, StreamChapter},
-    worker::{Command, Event, PAGE_NOT_READY, Worker},
-};
-use chrono::Datelike;
+
+use crate::motion::self;
+use crate::motion::ShelfMotion;
+use crate::shelf::self;
+use crate::shelf::Plane;
+
+
+use crate::worker::Command;
+use crate::worker::Event;
+use crate::worker::PAGE_NOT_READY;
+use crate::worker::Worker;
+
 use egui::*;
-use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    path::PathBuf,
-    sync::atomic::Ordering,
-};
-use yejian_core::{Book, ChapterLink, ChapterMetadata};
+use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::atomic::Ordering;
+use yejian_core::Book;
+use yejian_core::ChapterLink;
+
 mod shelf_page;
 mod reader_page;
 mod settings_page;
@@ -20,13 +26,12 @@ mod history_page;
 mod categories;
 mod dialogs;
 mod test_support;
-use shelf_page::*;
-use reader_page::*;
-use settings_page::*;
-use history_page::*;
-use categories::*;
-use dialogs::*;
-use test_support::*;
+use shelf_page::Flight;
+use reader_page::PageTexture;
+use shelf_page::Reorder;
+use shelf_page::ShelfSort;
+use dialogs::StorageConfirm;
+use reader_page::StreamBook;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -42,178 +47,178 @@ enum Screen {
     Reader(String),
 }
 pub struct ReaderApp {
-    pub(super) root: PathBuf,
-    pub(super) worker: Worker,
-    pub(super) books: Vec<Book>,
-    pub(super) chapters: Vec<ChapterLink>,
-    pub(super) chapter_indices: HashMap<String, usize>,
-    pub(super) chapter_dialog: Option<String>,
-    pub(super) ready: bool,
-    pub(super) startup_error: Option<String>,
-    pub(super) query: String,
-    pub(super) search: bool,
-    pub(super) category: String,
+    root: PathBuf,
+    worker: Worker,
+    books: Vec<Book>,
+    chapters: Vec<ChapterLink>,
+    chapter_indices: HashMap<String, usize>,
+    chapter_dialog: Option<String>,
+    ready: bool,
+    startup_error: Option<String>,
+    query: String,
+    search: bool,
+    category: String,
     /// User-created categories in stored order (the `categories` setting).
-    pub(super) user_categories: Vec<String>,
+    user_categories: Vec<String>,
     /// The 分类管理 panel (opaque card) is open.
-    pub(super) category_manage: bool,
+    category_manage: bool,
     /// Multi-select 分类 picker is open.
-    pub(super) category_pick: bool,
+    category_pick: bool,
     /// 新建分类 input inside the manage/pick panels.
-    pub(super) category_new: String,
+    category_new: String,
     /// Category being renamed inside the manage panel.
-    pub(super) category_renaming: Option<String>,
+    category_renaming: Option<String>,
     /// Draft name for the row being renamed.
-    pub(super) category_rename_edit: String,
-    pub(super) bookmarks: crate::bookmarks::Bookmarks,
+    category_rename_edit: String,
+    bookmarks: crate::bookmarks::Bookmarks,
     /// Chapter dialog shows the 书签 tab instead of 章节.
-    pub(super) dialog_bookmarks: bool,
+    dialog_bookmarks: bool,
     /// Page to land on when a bookmarked online chapter's stream opens.
-    pub(super) pending_bookmark_page: Option<usize>,
+    pending_bookmark_page: Option<usize>,
     /// Last page bytes staged under `share/` (acceptance asserts on it).
-    pub(super) last_shared: Option<PathBuf>,
-    pub(super) selected: HashSet<String>,
-    pub(super) tab: Tab,
-    pub(super) screen: Screen,
-    pub(super) reader_return: Screen,
-    pub(super) reader_options: bool,
-    pub(super) pending_reader_tap: Option<(f64, Pos2)>,
-    pub(super) motion: ShelfMotion,
+    last_shared: Option<PathBuf>,
+    selected: HashSet<String>,
+    tab: Tab,
+    screen: Screen,
+    reader_return: Screen,
+    reader_options: bool,
+    pending_reader_tap: Option<(f64, Pos2)>,
+    motion: ShelfMotion,
     #[cfg(debug_assertions)]
-    pub(super) snapshot_request: Option<String>,
+    snapshot_request: Option<String>,
     #[cfg(debug_assertions)]
-    pub(super) snapshot_pending: Option<(String, f64)>,
-    pub(super) first_frame: Option<f64>,
-    pub(super) shelf_viewport: Rect,
-    pub(super) shelf_shift: f32,
-    pub(super) flight: Option<Flight>,
-    pub(super) covers: HashMap<String, TextureHandle>,
-    pub(super) cover_usage: HashMap<String, u64>,
-    pub(super) cover_clock: u64,
-    pub(super) visible_covers: HashSet<String>,
-    pub(super) cover_pending: HashSet<String>,
-    pub(super) cover_failed: HashSet<String>,
-    pub(super) pages: HashMap<(String, usize), PageTexture>,
-    pub(super) page_pending: HashSet<(String, usize)>,
-    pub(super) prefetch_blocked: HashSet<(String, usize)>,
-    pub(super) page_errors: HashMap<(String, usize), String>,
-    pub(super) page: usize,
-    pub(super) page_generation: u64,
-    pub(super) vertical_reader: crate::vertical::VerticalReader,
+    snapshot_pending: Option<(String, f64)>,
+    first_frame: Option<f64>,
+    shelf_viewport: Rect,
+    shelf_shift: f32,
+    flight: Option<Flight>,
+    covers: HashMap<String, TextureHandle>,
+    cover_usage: HashMap<String, u64>,
+    cover_clock: u64,
+    visible_covers: HashSet<String>,
+    cover_pending: HashSet<String>,
+    cover_failed: HashSet<String>,
+    pages: HashMap<(String, usize), PageTexture>,
+    page_pending: HashSet<(String, usize)>,
+    prefetch_blocked: HashSet<(String, usize)>,
+    page_errors: HashMap<(String, usize), String>,
+    page: usize,
+    page_generation: u64,
+    vertical_reader: crate::vertical::VerticalReader,
     /// Strip segment before/after the current chapter as `(book or
     /// `stream:` id, page count)`. `prev` exists only after the anchor
     /// crossed a seam; `next` only once its page count is known.
-    pub(super) vertical_prev: Option<(String, usize)>,
-    pub(super) vertical_next: Option<(String, usize)>,
-    pub(super) next_stream: Option<StreamBook>,
-    pub(super) saved_position: Option<(String, usize, f32)>,
-    pub(super) persisted_position: Option<(String, usize, f32)>,
-    pub(super) failed_position: Option<(String, usize, f32, bool)>,
-    pub(super) position_save_error: Option<String>,
-    pub(super) last_position_save: f64,
-    pub(super) zoom: f32,
-    pub(super) pan: Vec2,
-    pub(super) controls: bool,
+    vertical_prev: Option<(String, usize)>,
+    vertical_next: Option<(String, usize)>,
+    next_stream: Option<StreamBook>,
+    saved_position: Option<(String, usize, f32)>,
+    persisted_position: Option<(String, usize, f32)>,
+    failed_position: Option<(String, usize, f32, bool)>,
+    position_save_error: Option<String>,
+    last_position_save: f64,
+    zoom: f32,
+    pan: Vec2,
+    controls: bool,
     /// Showing the 本章完 end card past the last page.
-    pub(super) chapter_end: bool,
+    chapter_end: bool,
     /// "lr" | "next" | "off" — tap-zone behaviour (`tap-zones` setting).
-    pub(super) tap_zones: String,
+    tap_zones: String,
     /// 阅读时屏幕常亮 setting; `awake` mirrors the platform flag.
-    pub(super) keep_awake_setting: bool,
-    pub(super) awake: bool,
+    keep_awake_setting: bool,
+    awake: bool,
     /// Calls made to `set_keep_awake`, asserted by tests.
     #[cfg(test)]
-    pub(super) awake_log: Vec<bool>,
+    awake_log: Vec<bool>,
     /// 显示时间和电量 setting + cached battery (refreshed ≤1/min).
-    pub(super) reader_status: bool,
-    pub(super) battery: Option<f32>,
-    pub(super) battery_at: Option<std::time::Instant>,
-    pub(super) reader_drag: f32,
-    pub(super) reader_drag_y: f32,
-    pub(super) reader_fit_limit: f32,
-    pub(super) private: bool,
-    pub(super) rtl: bool,
-    pub(super) vertical: bool,
-    pub(super) spread: bool,
-    pub(super) crop: bool,
-    pub(super) fit_width: bool,
-    pub(super) brightness: f32,
-    pub(super) spread_offset: bool,
-    pub(super) reader_globals: crate::reader_prefs::ReaderPrefs,
-    pub(super) reader_prefs: HashMap<String, crate::reader_prefs::ReaderPrefs>,
-    pub(super) dark: bool,
-    pub(super) reduced: bool,
-    pub(super) theme: String,
-    pub(super) color_scheme: String,
-    pub(super) library_grid: bool,
-    pub(super) shelf_sort: ShelfSort,
-    pub(super) sort_menu: bool,
-    pub(super) shelf_reorder: Option<Reorder>,
-    pub(super) shelf_reserve: f32,
-    pub(super) shelf_stage: Rect,
-    pub(super) shelf_books: Rect,
-    pub(super) font_scale: f32,
-    pub(super) widget_font_scale: f32,
-    pub(super) error: Option<String>,
-    pub(super) notice: Option<(String, f64)>,
-    pub(super) pending_notice: Option<String>,
-    pub(super) confirm_remove: bool,
+    reader_status: bool,
+    battery: Option<f32>,
+    battery_at: Option<std::time::Instant>,
+    reader_drag: f32,
+    reader_drag_y: f32,
+    reader_fit_limit: f32,
+    private: bool,
+    rtl: bool,
+    vertical: bool,
+    spread: bool,
+    crop: bool,
+    fit_width: bool,
+    brightness: f32,
+    spread_offset: bool,
+    reader_globals: crate::reader_prefs::ReaderPrefs,
+    reader_prefs: HashMap<String, crate::reader_prefs::ReaderPrefs>,
+    dark: bool,
+    reduced: bool,
+    theme: String,
+    color_scheme: String,
+    library_grid: bool,
+    shelf_sort: ShelfSort,
+    sort_menu: bool,
+    shelf_reorder: Option<Reorder>,
+    shelf_reserve: f32,
+    shelf_stage: Rect,
+    shelf_books: Rect,
+    font_scale: f32,
+    widget_font_scale: f32,
+    error: Option<String>,
+    notice: Option<(String, f64)>,
+    pending_notice: Option<String>,
+    confirm_remove: bool,
     /// 移出书架 confirm: also delete archive/cover files (default on).
-    pub(super) remove_files: bool,
+    remove_files: bool,
     /// Library storage report for the 存储 settings group.
-    pub(super) storage: Option<yejian_core::StorageReport>,
+    storage: Option<yejian_core::StorageReport>,
     /// Re-requests storage numbers each time the settings tab opens.
-    pub(super) storage_opened: bool,
+    storage_opened: bool,
     /// Pending destructive storage action awaiting confirmation.
-    pub(super) storage_confirm: Option<StorageConfirm>,
+    storage_confirm: Option<StorageConfirm>,
     /// Chapter-picker manage mode: multi-select for deletion.
-    pub(super) chapter_manage: bool,
-    pub(super) chapter_selected: std::collections::HashSet<String>,
-    pub(super) import_text: String,
-    pub(super) backup_path: String,
-    pub(super) sources: crate::sources::Sources,
-    pub(super) stream: Option<StreamBook>,
-    pub(super) sync: crate::sync::ProgressSync,
-    pub(super) trackers: crate::trackers::Trackers,
-    pub(super) tracker_anilist_token: String,
-    pub(super) tracker_kitsu_user: String,
-    pub(super) tracker_kitsu_pass: String,
-    pub(super) tracker_bangumi_token: String,
-    pub(super) track_panel: Option<String>,
-    pub(super) track_query: String,
+    chapter_manage: bool,
+    chapter_selected: std::collections::HashSet<String>,
+    import_text: String,
+    backup_path: String,
+    sources: crate::sources::Sources,
+    stream: Option<StreamBook>,
+    sync: crate::sync::ProgressSync,
+    trackers: crate::trackers::Trackers,
+    tracker_anilist_token: String,
+    tracker_kitsu_user: String,
+    tracker_kitsu_pass: String,
+    tracker_bangumi_token: String,
+    track_panel: Option<String>,
+    track_query: String,
     /// Unsaved status/progress edits in the tracking panel, by binding key.
     /// Keyed by binding key and remote media id so a rebind starts fresh.
     /// Each field is `Some` only while the user has edited it.
-    pub(super) track_draft: Option<(String, String, Option<crate::trackers::TrackStatus>, Option<i64>)>,
+    track_draft: Option<(String, String, Option<crate::trackers::TrackStatus>, Option<i64>)>,
     /// 应用锁 state; the lock itself is in-memory, never persisted.
-    pub(super) applock: crate::applock::AppLock,
+    applock: crate::applock::AppLock,
     /// 阅读统计 per local day per device (`reading-stats.json`).
-    pub(super) stats: crate::stats::Stats,
+    stats: crate::stats::Stats,
     /// 新章节通知: enabled by the 追更 settings toggle after the system
     /// grants permission; `notify_sent` dedupes chapter keys forever.
-    pub(super) notify_enabled: bool,
-    pub(super) notify_permission_pending: bool,
-    pub(super) notify_sent: crate::notify::SentStore,
+    notify_enabled: bool,
+    notify_permission_pending: bool,
+    notify_sent: crate::notify::SentStore,
     /// 云同步（WebDAV）worker + the settings text buffers.
-    pub(super) cloud: crate::cloud::CloudSync,
-    pub(super) cloud_url: String,
-    pub(super) cloud_user: String,
-    pub(super) cloud_password: String,
-    pub(super) cloud_dir: String,
+    cloud: crate::cloud::CloudSync,
+    cloud_url: String,
+    cloud_user: String,
+    cloud_password: String,
+    cloud_dir: String,
     /// Source ids other devices installed, offered for 一键安装.
-    pub(super) cloud_missing: Vec<String>,
+    cloud_missing: Vec<String>,
     /// Last appearance change (theme/palette/font-scale/direction) — the
     /// `appearance` group's shared `updated_at`.
-    pub(super) appearance_ts: i64,
+    appearance_ts: i64,
     /// Whether the shell currently reports the app as foregrounded
     /// (desktop stays true; mobile reports via ForegroundEvent).
-    pub(super) app_foreground: bool,
+    app_foreground: bool,
     /// `history-hidden` setting: footprint row key -> hidden_at epoch secs.
-    pub(super) history_hidden: std::collections::BTreeMap<String, i64>,
+    history_hidden: std::collections::BTreeMap<String, i64>,
     /// 阅读足迹 search field.
-    pub(super) history_query: String,
+    history_query: String,
     /// Pending 清空足迹 confirmation.
-    pub(super) history_clear: bool,
+    history_clear: bool,
     pub hitboxes: BTreeMap<String, Rect>,
     pub rendered_book_nodes: usize,
     pub frame_is_animating: bool,
@@ -1528,6 +1533,11 @@ impl eframe::App for ReaderApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::reader_page::spread_pair;
+    use yejian_core::ChapterMetadata;
+    use crate::sources::STREAM_PREFIX;
+    use crate::sources::StreamChapter;
+    use crate::follows;
 
     fn book(id: &str) -> Book {
         Book {

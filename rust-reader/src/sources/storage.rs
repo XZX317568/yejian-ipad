@@ -1,40 +1,35 @@
-use crate::{
-    design,
-    follows::{self, Follow},
-    source_filters::FilterEditor,
-    source_repos::{Lang, SourceRepos},
-};
-use anyhow::Context as _;
+
+
+
+
+
+
+
 use egui::*;
-use serde::{Deserialize, Serialize};
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    io::{Read, Write},
-    path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
-        mpsc,
-    },
-    thread,
-};
-use yejian_core::{ChapterLink, ChapterMetadata};
-use yejian_sources::*;
+
+
+
+use std::collections::HashSet;
+
+
+
+use std::path::Path;
+use std::path::PathBuf;
+
+
+
+
+
+
+use std::sync::mpsc;
+
+
+
+
 use super::*;
-use super::engine::*;
-use super::downloads::*;
-use super::covers::*;
-use super::updates::*;
-use super::global_search::*;
-use super::migrate::*;
-use super::web::*;
-use super::repos::*;
-use super::ui_browse::*;
-use super::ui_detail::*;
-use super::ui_library::*;
-use super::ui_downloads::*;
-#[cfg(any(test, debug_assertions))]
-use super::test_support::*;
+use super::downloads::DownloadStatus;
+use super::downloads::remove_task_cache;
+use super::downloads::work_root;
 
 /// Bytes held under the sources root, split by where the space goes.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -245,6 +240,7 @@ impl Sources {
 mod tests {
     use super::*;
     use crate::sources::test_support::*;
+    use crate::sources::downloads::snapshot_root;
 
     #[test]
     fn storage_report_splits_active_and_finished_staging() {

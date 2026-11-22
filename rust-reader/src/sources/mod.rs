@@ -1,24 +1,29 @@
-use crate::{
-    design,
-    follows::{self, Follow},
-    source_filters::FilterEditor,
-    source_repos::{Lang, SourceRepos},
-};
-use anyhow::Context as _;
+
+use crate::follows::self;
+use crate::follows::Follow;
+use crate::source_filters::FilterEditor;
+use crate::source_repos::Lang;
+use crate::source_repos::SourceRepos;
 use egui::*;
-use serde::{Deserialize, Serialize};
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    io::{Read, Write},
-    path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
-        mpsc,
-    },
-    thread,
-};
-use yejian_core::{ChapterLink, ChapterMetadata};
+
+
+
+use std::collections::HashSet;
+use std::collections::VecDeque;
+
+
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::AtomicU64;
+
+use std::sync::atomic::Ordering;
+use std::sync::mpsc;
+use std::thread;
+
+use yejian_core::ChapterMetadata;
 use yejian_sources::*;
 
 mod engine;
@@ -37,230 +42,252 @@ mod ui_library;
 mod ui_downloads;
 #[cfg(any(test, debug_assertions))]
 mod test_support;
-
-use covers::*;
-use downloads::*;
-use engine::*;
-use global_search::*;
-use migrate::*;
-use repos::*;
-use storage::*;
-use tasks::*;
-#[cfg(any(test, debug_assertions))]
-use test_support::*;
-use ui_browse::*;
-use ui_detail::*;
-use ui_downloads::*;
-use ui_library::*;
-use updates::*;
-use web::*;
+use engine::BrowseSession;
+use covers::CoverDone;
+use covers::CoverHttpJob;
+use covers::CoverReq;
+use tasks::DownloadTask;
+use global_search::GLOBAL_SEARCH_TIMEOUT;
+use global_search::GlobalCmd;
+use global_search::GlobalEvent;
+use global_search::GlobalGroup;
+use engine::Outcome;
+use engine::Reply;
+use ui_browse::ResultsState;
+use web::SettingsStore;
+use storage::StorageCmd;
+use storage::StorageEvent;
+use engine::Task;
+use web::WebSession;
+use web::WebSiteCookies;
+use ui_detail::chapter_list;
+use engine::execute_task;
+use covers::fetch_follow_cover;
+use global_search::global_search_run;
+use tasks::load_queue;
+use web::load_source_settings;
+use web::load_web_cookies;
+use engine::page_bytes;
+use tasks::pending_imports;
+use tasks::recover_completed_archive;
+use engine::request;
+use covers::shrink_cover;
+use covers::source_cover_path;
+use storage::storage_worker_run;
+use covers::store_source_cover;
 
 // Re-exports: names other modules reach as `crate::sources::X`, at the same
 // visibility they had before the split.
-pub use downloads::{DownloadedChapter, STREAM_PREFIX, StreamChapter, StreamState};
+pub use downloads::{STREAM_PREFIX, StreamChapter};
 pub(crate) use downloads::{identity_id, manga_snapshot_path, save_manga_snapshot, stream_page};
 pub(crate) use global_search::GlobalState;
 pub(crate) use migrate::{MigratePost, MigrateState};
 pub use storage::SourceStorage;
 pub(crate) use updates::{DEFAULT_FOLLOW_INTERVAL_MIN, FOLLOW_INTERVAL_CHOICES};
 
+// Names used by this parent module itself (kept `pub(super)` in the children).
+use downloads::{DlCmd, DlEvent, STOP_NONE, STOP_PAUSE, acquire_download_lock};
+use global_search::{GlobalEngine, RealGlobalEngine};
+use migrate::MigrateOutcome;
+use updates::UpdateEvent;
+
 pub struct Sources {
-    pub(super) root: PathBuf,
-    pub(super) tx: mpsc::Sender<(u64, Task)>,
-    pub(super) rx: mpsc::Receiver<(u64, Result<Reply, String>)>,
-    pub(super) installed: Vec<InstalledSource>,
-    pub(super) repository: Option<RepositoryIndex>,
-    pub(super) results: ResultsState,
-    pub(super) chapters: Vec<Chapter>,
-    pub(super) chapter_query: String,
-    pub(super) chapters_newest_first: bool,
-    pub(super) open_chapter: Option<ChapterMetadata>,
-    pub(super) library_chapters: std::collections::HashMap<String, ChapterMetadata>,
-    pub(super) selected_source: String,
-    pub(super) selected_manga: Option<Manga>,
-    pub(super) url: String,
-    pub(super) query: String,
+    root: PathBuf,
+    tx: mpsc::Sender<(u64, Task)>,
+    rx: mpsc::Receiver<(u64, Result<Reply, String>)>,
+    installed: Vec<InstalledSource>,
+    repository: Option<RepositoryIndex>,
+    results: ResultsState,
+    chapters: Vec<Chapter>,
+    chapter_query: String,
+    chapters_newest_first: bool,
+    open_chapter: Option<ChapterMetadata>,
+    library_chapters: std::collections::HashMap<String, ChapterMetadata>,
+    selected_source: String,
+    selected_manga: Option<Manga>,
+    url: String,
+    query: String,
     /// "current" or "global": whether the search field covers one or all sources.
-    pub(super) search_scope: String,
-    pub(super) global_gen: u64,
-    pub(super) global_query: String,
-    pub(super) global_groups: Vec<GlobalGroup>,
+    search_scope: String,
+    global_gen: u64,
+    global_query: String,
+    global_groups: Vec<GlobalGroup>,
     /// New scope choice for `ReaderApp` to persist under `search-scope`.
-    pub(super) scope_dirty: Option<String>,
+    scope_dirty: Option<String>,
     /// Submitted keywords, newest first, capped at 20. Persisted by
     /// `ReaderApp` under `search-history`.
-    pub(super) search_history: Vec<String>,
+    search_history: Vec<String>,
     /// History changed and `ReaderApp` should persist it.
-    pub(super) history_dirty: bool,
+    history_dirty: bool,
     /// A tap on 清空 asks for confirmation before dropping the history.
-    pub(super) history_confirm: bool,
+    history_confirm: bool,
     /// Private reading suppresses history recording (mirrors the setting).
-    pub(super) private: bool,
-    pub(super) global_tx: mpsc::Sender<GlobalCmd>,
-    pub(super) global_rx: mpsc::Receiver<GlobalEvent>,
-    pub(super) storage_tx: mpsc::Sender<StorageCmd>,
-    pub(super) storage_rx: mpsc::Receiver<StorageEvent>,
+    private: bool,
+    global_tx: mpsc::Sender<GlobalCmd>,
+    global_rx: mpsc::Receiver<GlobalEvent>,
+    storage_tx: mpsc::Sender<StorageCmd>,
+    storage_rx: mpsc::Receiver<StorageEvent>,
     /// Latest sizes from `yejian-source-storage`; all scans run off-thread.
-    pub(super) storage: Option<SourceStorage>,
-    pub(super) request_id: u64,
-    pub(super) current_request: Arc<AtomicU64>,
-    pub(super) pending: Option<Task>,
-    pub(super) failed: Option<Task>,
-    pub(super) filters: Vec<Filter>,
-    pub(super) listings: Vec<Listing>,
-    pub(super) applied_filters: Vec<FilterValue>,
-    pub(super) listing: Option<String>,
-    pub(super) filter_editor: Option<FilterEditor>,
-    pub(super) metadata_loaded: bool,
-    pub(super) filter_error: Option<String>,
-    pub(super) listing_error: Option<String>,
-    pub(super) sessions: std::collections::HashMap<String, BrowseSession>,
-    pub(super) repository_search: String,
+    storage: Option<SourceStorage>,
+    request_id: u64,
+    current_request: Arc<AtomicU64>,
+    pending: Option<Task>,
+    failed: Option<Task>,
+    filters: Vec<Filter>,
+    listings: Vec<Listing>,
+    applied_filters: Vec<FilterValue>,
+    listing: Option<String>,
+    filter_editor: Option<FilterEditor>,
+    metadata_loaded: bool,
+    filter_error: Option<String>,
+    listing_error: Option<String>,
+    sessions: std::collections::HashMap<String, BrowseSession>,
+    repository_search: String,
     #[cfg(debug_assertions)]
-    pub(super) preview_mode: Option<String>,
-    pub(super) busy: bool,
-    pub(super) status: String,
+    preview_mode: Option<String>,
+    busy: bool,
+    status: String,
     /// When the current status string was first observed by the UI. Success
     /// notices fade out four seconds later; errors stay until the next
     /// action replaces them.
-    pub(super) status_seen: Option<(String, std::time::Instant)>,
-    pub(super) tasks: Vec<DownloadTask>,
-    pub(super) running: Option<String>,
-    pub(super) ready: VecDeque<String>,
+    status_seen: Option<(String, std::time::Instant)>,
+    tasks: Vec<DownloadTask>,
+    running: Option<String>,
+    ready: VecDeque<String>,
     /// Import attempts that are really in flight, kept only in memory.
 
     /// `ack_downloaded` or `import_failed` clears the entry; while it is
 
     /// present the UI never offers a duplicate retry for the same file.
-    pub(super) import_attempts: HashSet<String>,
-    pub(super) dl_tx: mpsc::Sender<DlCmd>,
-    pub(super) dl_rx: mpsc::Receiver<DlEvent>,
-    pub(super) dl_stop: Arc<AtomicU8>,
-    pub(super) stream_request: Option<StreamChapter>,
+    import_attempts: HashSet<String>,
+    dl_tx: mpsc::Sender<DlCmd>,
+    dl_rx: mpsc::Receiver<DlEvent>,
+    dl_stop: Arc<AtomicU8>,
+    stream_request: Option<StreamChapter>,
     /// A download paused only so that a chapter being read can run first.
 
     /// It goes back to the queue instead of waiting for a manual "继续".
-    pub(super) preempted: Option<String>,
-    pub(super) follows: Vec<Follow>,
+    preempted: Option<String>,
+    follows: Vec<Follow>,
     /// A followed manga to open once its source has finished loading.
-    pub(super) pending_open: Option<Manga>,
+    pending_open: Option<Manga>,
     /// Detail was opened from the shelf: 返回 pops back to 书架 instead of
     /// the source browser.
-    pub(super) shelf_origin: bool,
-    pub(super) shelf_return: bool,
+    shelf_origin: bool,
+    shelf_return: bool,
     /// A shelf 继续阅读 asked for the resume action once chapters arrive.
-    pub(super) pending_resume: bool,
-    pub(super) checking: usize,
+    pending_resume: bool,
+    checking: usize,
     /// Whether the in-flight batch came from the scheduler — its completion
 
     /// summary goes to the notice bar rather than the sources status line.
-    pub(super) checking_background: bool,
-    pub(super) auto_checked: bool,
+    checking_background: bool,
+    auto_checked: bool,
     /// egui context the scheduler uses for one-shot wake repaints.
-    pub(super) ctx: Context,
+    ctx: Context,
     /// Minutes between automatic follow checks; `0` disables them. Persisted
 
     /// as `follow-interval` through the library settings store.
-    pub(super) follow_interval_min: u64,
+    follow_interval_min: u64,
     /// egui-time deadline of the next scheduled check. Kept as wall-clock
 
     /// `Instant` so a suspended frame clock cannot skip a whole interval.
-    pub(super) follow_next_due: Option<std::time::Instant>,
+    follow_next_due: Option<std::time::Instant>,
     /// Fresh chapters collected by finished checks, waiting for the shell
     /// to turn into system notifications (deduped in notify.rs).
-    pub(super) notify_pending: Vec<crate::notify::FreshUpdate>,
+    notify_pending: Vec<crate::notify::FreshUpdate>,
     /// New-chapter summary surfaced to the app shell's notice bar once a
 
     /// background (scheduled) check finishes.
     pub(crate) follow_notice: Option<String>,
-    pub(super) up_tx: mpsc::Sender<Vec<(String, Manga)>>,
-    pub(super) up_rx: mpsc::Receiver<UpdateEvent>,
+    up_tx: mpsc::Sender<Vec<(String, Manga)>>,
+    up_rx: mpsc::Receiver<UpdateEvent>,
     /// Decoded follow covers by snapshot key; `None` means not on disk yet.
-    pub(super) covers: std::collections::HashMap<String, Option<TextureHandle>>,
+    covers: std::collections::HashMap<String, Option<TextureHandle>>,
     /// Each followed manga's cover URL resolved from its snapshot, once per
 
     /// session — the grid's `source-covers` cache keys are URL-based, so the
 
     /// follow rows reuse the same pipeline instead of `follow-covers/`.
-    pub(super) follow_cover_urls: std::collections::HashMap<String, Option<String>>,
+    follow_cover_urls: std::collections::HashMap<String, Option<String>>,
     /// Result-grid covers. `cover_queue` only holds cells near the viewport;
 
     /// `cover_inflight` dedupes sent-but-unfinished requests and
 
     /// `cover_outstanding` bounds how many are with the workers at once.
-    pub(super) cover_req_tx: mpsc::Sender<CoverReq>,
-    pub(super) cover_done_rx: mpsc::Receiver<CoverDone>,
-    pub(super) cover_queue: VecDeque<CoverReq>,
-    pub(super) cover_inflight: HashSet<String>,
-    pub(super) cover_outstanding: usize,
+    cover_req_tx: mpsc::Sender<CoverReq>,
+    cover_done_rx: mpsc::Receiver<CoverDone>,
+    cover_queue: VecDeque<CoverReq>,
+    cover_inflight: HashSet<String>,
+    cover_outstanding: usize,
     /// URLs that failed once this session; placeholders render instead of
 
     /// hammering a dead image host every frame.
-    pub(super) cover_failed: HashSet<String>,
-    pub(super) cover_ready: std::collections::HashMap<String, Option<ColorImage>>,
-    pub(super) cover_missing_disk: HashSet<String>,
-    pub(super) cover_textures: std::collections::HashMap<String, TextureHandle>,
-    pub(super) cover_lru: VecDeque<String>,
+    cover_failed: HashSet<String>,
+    cover_ready: std::collections::HashMap<String, Option<ColorImage>>,
+    cover_missing_disk: HashSet<String>,
+    cover_textures: std::collections::HashMap<String, TextureHandle>,
+    cover_lru: VecDeque<String>,
     /// Page already auto-loaded when its last grid row scrolled into view, so
 
     /// the marker cannot fire the same request again on the next frame.
-    pub(super) auto_next_page: Option<i32>,
+    auto_next_page: Option<i32>,
     /// Reading progress per `identity_id` chapter, fed by the host each frame
 
     /// so the detail page can offer 继续阅读 and row read states.
-    pub(super) chapter_progress: std::collections::HashMap<String, (usize, usize, Option<i64>)>,
-    pub(super) description_expanded: bool,
+    chapter_progress: std::collections::HashMap<String, (usize, usize, Option<i64>)>,
+    description_expanded: bool,
     /// Clickable rects registered this frame, merged into the app's hitboxes
 
     /// so acceptance and automation can find grid cells and detail actions.
     pub(crate) hitboxes: std::collections::BTreeMap<String, Rect>,
-    pub(super) settings_open: bool,
-    pub(super) settings_changed: bool,
+    settings_open: bool,
+    settings_changed: bool,
     /// User choices per source, persisted in `source-settings.json`.
-    pub(super) source_settings: SettingsStore,
+    source_settings: SettingsStore,
     /// Sources whose loaded engines must restart to read changed settings.
-    pub(super) stale_engines: Arc<std::sync::Mutex<HashSet<String>>>,
+    stale_engines: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Origin a Cloudflare challenge blocked, until the user verifies.
-    pub(super) challenge: Option<String>,
+    challenge: Option<String>,
     /// `auto-download` setting: "off" (default), "all", "latest1", "latest3".
-    pub(super) auto_download: String,
+    auto_download: String,
     /// 换源 panel state; while `Some` it owns the global-generation events.
-    pub(super) migrate: Option<MigrateState>,
+    migrate: Option<MigrateState>,
     /// Background migration completions (one-shot threads report here).
-    pub(super) migrate_tx: mpsc::Sender<anyhow::Result<MigrateOutcome>>,
-    pub(super) migrate_rx: mpsc::Receiver<anyhow::Result<MigrateOutcome>>,
+    migrate_tx: mpsc::Sender<anyhow::Result<MigrateOutcome>>,
+    migrate_rx: mpsc::Receiver<anyhow::Result<MigrateOutcome>>,
     /// Migration side-effects the host still owes the user once (tracker
     /// re-key + optional old-download purge + opening the new detail).
-    pub(super) migrate_post: Option<MigratePost>,
+    migrate_post: Option<MigratePost>,
     /// The in-flight verification/login page — an in-app WebView on mobile
 
     /// or the system-browser + paste dialog on desktop.
-    pub(super) web_session: Option<WebSession>,
-    pub(super) login_user: String,
-    pub(super) login_pass: String,
+    web_session: Option<WebSession>,
+    login_user: String,
+    login_pass: String,
     /// Cookies from verification/login pages by URL, in `web-cookies.json`.
-    pub(super) web_cookies: std::collections::BTreeMap<String, WebSiteCookies>,
+    web_cookies: std::collections::BTreeMap<String, WebSiteCookies>,
     /// Saved repo URLs + cached indexes backing update badges (source_repos.rs).
-    pub(super) repos: SourceRepos,
+    repos: SourceRepos,
     /// Language chip filter on the installable-sources list.
-    pub(super) repo_lang: Lang,
+    repo_lang: Lang,
     /// A repo-index refresh (manual or the once-a-day auto check) is in flight.
-    pub(super) repo_fetching: bool,
+    repo_fetching: bool,
     /// The daily auto check fires once per process, guarded by `checked_day`.
-    pub(super) repo_auto_done: bool,
+    repo_auto_done: bool,
     /// 测试 results per source id: "可用 · 820 ms" or a Chinese reason.
-    pub(super) repo_test_results: std::collections::HashMap<String, String>,
+    repo_test_results: std::collections::HashMap<String, String>,
     /// Tests currently running (≤4), keyed by source id for the 15 s timeout.
-    pub(super) repo_testing: std::collections::HashMap<String, std::time::Instant>,
+    repo_testing: std::collections::HashMap<String, std::time::Instant>,
     /// Tests waiting for a slot.
-    pub(super) repo_test_queue: VecDeque<String>,
-    pub(super) test_tx: mpsc::Sender<(String, Result<u64, String>)>,
-    pub(super) test_rx: mpsc::Receiver<(String, Result<u64, String>)>,
+    repo_test_queue: VecDeque<String>,
+    test_tx: mpsc::Sender<(String, Result<u64, String>)>,
+    test_rx: mpsc::Receiver<(String, Result<u64, String>)>,
     /// Pending 卸载 confirmation card.
-    pub(super) uninstall: Option<InstalledSource>,
+    uninstall: Option<InstalledSource>,
     /// Setting writes (source-repos, source-repos-checked-at) the host owes
     /// the settings store.
-    pub(super) setting_writes: VecDeque<(String, String)>,
+    setting_writes: VecDeque<(String, String)>,
 }
 
 /// One online work's latest read chapter — a 阅读足迹 row.

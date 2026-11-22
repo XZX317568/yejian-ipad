@@ -1,40 +1,37 @@
-use crate::{
-    design,
-    follows::{self, Follow},
-    source_filters::FilterEditor,
-    source_repos::{Lang, SourceRepos},
-};
-use anyhow::Context as _;
+
+use crate::follows::self;
+use crate::follows::Follow;
+
+
+
+
 use egui::*;
-use serde::{Deserialize, Serialize};
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    io::{Read, Write},
-    path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
-        mpsc,
-    },
-    thread,
-};
-use yejian_core::{ChapterLink, ChapterMetadata};
+
+
+
+use std::collections::HashSet;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 use yejian_sources::*;
 use super::*;
-use super::engine::*;
-use super::downloads::*;
-use super::covers::*;
-use super::global_search::*;
-use super::migrate::*;
-use super::storage::*;
-use super::web::*;
-use super::repos::*;
-use super::ui_browse::*;
-use super::ui_detail::*;
-use super::ui_library::*;
-use super::ui_downloads::*;
-#[cfg(any(test, debug_assertions))]
-use super::test_support::*;
+use super::downloads::DownloadStatus;
+use super::tasks::DownloadTask;
+use super::tasks::EnqueueOutcome;
+use super::ui_detail::chapter_list;
+use super::tasks::enqueue_task;
 
 /// Default automatic follow-check cadence (minutes); `0` turns it off.
 pub(crate) const DEFAULT_FOLLOW_INTERVAL_MIN: u64 = 60;

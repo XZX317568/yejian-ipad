@@ -1,40 +1,40 @@
-use crate::{
-    design,
-    follows::{self, Follow},
-    source_filters::FilterEditor,
-    source_repos::{Lang, SourceRepos},
-};
+
+use crate::follows::self;
+
+
+
+
 use anyhow::Context as _;
-use egui::*;
-use serde::{Deserialize, Serialize};
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    io::{Read, Write},
-    path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
-        mpsc,
-    },
-    thread,
-};
-use yejian_core::{ChapterLink, ChapterMetadata};
+use serde::Deserialize;
+use serde::Serialize;
+
+use std::collections::HashSet;
+
+
+use std::io::Write;
+use std::path::Path;
+use std::path::PathBuf;
+
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU8;
+
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::sync::mpsc;
+
+use yejian_core::ChapterLink;
+use yejian_core::ChapterMetadata;
 use yejian_sources::*;
 use super::*;
-use super::engine::*;
-use super::covers::*;
-use super::updates::*;
-use super::global_search::*;
-use super::migrate::*;
-use super::storage::*;
-use super::web::*;
-use super::repos::*;
-use super::ui_browse::*;
-use super::ui_detail::*;
-use super::ui_library::*;
-use super::ui_downloads::*;
-#[cfg(any(test, debug_assertions))]
-use super::test_support::*;
+use super::tasks::DownloadTask;
+use super::tasks::EnqueueOutcome;
+use super::tasks::PartCleanup;
+use super::tasks::TaskStore;
+use super::ui_detail::chapter_list;
+use super::ui_detail::chapter_name;
+use super::ui_detail::chapter_number_value;
+use super::tasks::enqueue_task;
+use super::tasks::next_queued;
 
 pub struct DownloadedChapter {
     pub id: String,
@@ -1367,6 +1367,7 @@ impl Sources {
 mod tests {
     use super::*;
     use crate::sources::test_support::*;
+    use crate::sources::tasks::{load_tasks, normalize_loaded};
 
     #[test]
     fn online_reading_runs_first_requeues_the_preempted_download_and_queues_the_next_chapter() {

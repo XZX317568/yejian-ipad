@@ -1,40 +1,36 @@
-use crate::{
-    design,
-    follows::{self, Follow},
-    source_filters::FilterEditor,
-    source_repos::{Lang, SourceRepos},
-};
-use anyhow::Context as _;
+use crate::design;
+use crate::follows::self;
+use crate::follows::Follow;
+
+
+
+
 use egui::*;
-use serde::{Deserialize, Serialize};
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    io::{Read, Write},
-    path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
-        mpsc,
-    },
-    thread,
-};
-use yejian_core::{ChapterLink, ChapterMetadata};
+
+
+use std::collections::HashMap;
+
+
+
+
+
+
+
+
+
+
+
+
+
+use std::thread;
+
+
 use yejian_sources::*;
 use super::*;
-use super::engine::*;
-use super::downloads::*;
-use super::covers::*;
-use super::updates::*;
-use super::global_search::*;
-use super::storage::*;
-use super::web::*;
-use super::repos::*;
-use super::ui_browse::*;
-use super::ui_detail::*;
-use super::ui_library::*;
-use super::ui_downloads::*;
-#[cfg(any(test, debug_assertions))]
-use super::test_support::*;
+use super::global_search::GlobalCmd;
+use super::ui_detail::chapter_list;
+use super::ui_detail::chapter_name;
+use super::ui_browse::quiet_action;
 
 /// One source's candidate list inside the 换源 panel.
 pub(crate) struct MigrateGroup {

@@ -1,40 +1,66 @@
-use crate::{
-    design,
-    follows::{self, Follow},
-    source_filters::FilterEditor,
-    source_repos::{Lang, SourceRepos},
-};
-use anyhow::Context as _;
+
+use crate::follows::self;
+use crate::follows::Follow;
+
+#[cfg(test)]
+use crate::source_repos::Lang;
+#[cfg(test)]
+use crate::source_repos::SourceRepos;
+
+#[cfg(test)]
 use egui::*;
-use serde::{Deserialize, Serialize};
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    io::{Read, Write},
-    path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
-        mpsc,
-    },
-    thread,
-};
-use yejian_core::{ChapterLink, ChapterMetadata};
+
+
+use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::HashSet;
+#[cfg(test)]
+use std::collections::VecDeque;
+#[cfg(test)]
+use std::io::Read;
+#[cfg(test)]
+use std::io::Write;
+#[cfg(test)]
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::Arc;
+
+#[cfg(test)]
+use std::sync::atomic::AtomicU8;
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
+
+
+#[cfg(test)]
+use std::sync::mpsc;
+#[cfg(test)]
+use std::thread;
+
+
 use yejian_sources::*;
 use super::*;
-use super::engine::*;
-use super::downloads::*;
-use super::covers::*;
-use super::updates::*;
-use super::global_search::*;
-use super::migrate::*;
-use super::storage::*;
-use super::web::*;
-use super::repos::*;
-use super::ui_browse::*;
-use super::ui_detail::*;
-use super::ui_library::*;
-use super::ui_downloads::*;
+use super::repos::COMMUNITY_INDEX;
+#[cfg(test)]
+use super::downloads::ChapterQueueState;
+use super::downloads::DownloadStatus;
+use super::tasks::DownloadTask;
+use super::migrate::MigrateConfirm;
+use super::migrate::MigrateGroup;
+use super::migrate::MigrateOutcome;
+#[cfg(test)]
+use super::ui_browse::ResultsState;
+#[cfg(test)]
+use super::downloads::STOP_NONE;
+use super::engine::Task;
+#[cfg(test)]
+use super::updates::UpdateEvent;
+use super::ui_detail::chapter_list;
+#[cfg(test)]
+use super::downloads::work_root;
 
+#[cfg(test)]
 pub(super) fn manga(source: &str, key: &str) -> Manga {
     Manga {
         source_key: source.into(),
@@ -44,6 +70,7 @@ pub(super) fn manga(source: &str, key: &str) -> Manga {
     }
 }
 
+#[cfg(test)]
 pub(super) fn url_page(url: &str) -> Page {
     Page {
         content: PageContent::Url {
@@ -56,10 +83,12 @@ pub(super) fn url_page(url: &str) -> Page {
     }
 }
 
+#[cfg(test)]
 pub(super) fn png() -> Vec<u8> {
     colored_png([36, 82, 94, 255])
 }
 
+#[cfg(test)]
 pub(super) fn colored_png(pixel: [u8; 4]) -> Vec<u8> {
     let image = image::RgbaImage::from_pixel(4, 4, image::Rgba(pixel));
     let mut out = std::io::Cursor::new(Vec::new());
@@ -69,6 +98,7 @@ pub(super) fn colored_png(pixel: [u8; 4]) -> Vec<u8> {
     out.into_inner()
 }
 
+#[cfg(test)]
 pub(super) fn source_manifest() -> SourceManifest {
     SourceManifest {
         id: "test.source".into(),
@@ -84,6 +114,7 @@ pub(super) fn source_manifest() -> SourceManifest {
     }
 }
 
+#[cfg(test)]
 pub(super) fn leb_u32(mut value: u32, out: &mut Vec<u8>) {
     loop {
         let mut byte = (value & 0x7f) as u8;
@@ -98,12 +129,14 @@ pub(super) fn leb_u32(mut value: u32, out: &mut Vec<u8>) {
     }
 }
 
+#[cfg(test)]
 pub(super) fn wasm_section(id: u8, payload: &[u8], out: &mut Vec<u8>) {
     out.push(id);
     leb_u32(payload.len() as u32, out);
     out.extend_from_slice(payload);
 }
 
+#[cfg(test)]
 pub(super) fn pages_wasm(urls: &[String]) -> Vec<u8> {
     let mut payload = Vec::new();
     leb_u32(urls.len() as u32, &mut payload);
@@ -154,6 +187,7 @@ pub(super) fn pages_wasm(urls: &[String]) -> Vec<u8> {
     module
 }
 
+#[cfg(test)]
 pub(super) fn serve_png(count: usize) -> (String, thread::JoinHandle<()>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -176,6 +210,7 @@ pub(super) fn serve_png(count: usize) -> (String, thread::JoinHandle<()>) {
     (format!("http://{address}"), handle)
 }
 
+#[cfg(test)]
 pub(super) fn task(source: &str, manga_id: &str, chapter: &str) -> DownloadTask {
     DownloadTask::from_chapter(
         source,
@@ -188,6 +223,7 @@ pub(super) fn task(source: &str, manga_id: &str, chapter: &str) -> DownloadTask 
     )
 }
 
+#[cfg(test)]
 pub(super) fn test_sources(root: &Path) -> Sources {
     let (dl_tx, dl_cmd_rx) = mpsc::channel();
     // Keep the command receiver alive so `pump()` can actually dispatch the
@@ -320,6 +356,7 @@ pub(super) fn test_sources(root: &Path) -> Sources {
     }
 }
 
+#[cfg(test)]
 pub(super) fn detail_chapter(key: &str, number: f32) -> Chapter {
     Chapter {
         key: key.into(),
@@ -329,6 +366,7 @@ pub(super) fn detail_chapter(key: &str, number: f32) -> Chapter {
     }
 }
 
+#[cfg(test)]
 pub(super) fn queue_state(
     status: DownloadStatus,
     read_page: Option<usize>,
@@ -345,12 +383,14 @@ pub(super) fn queue_state(
 }
 
 /// One `task-*` staging dir with payload bytes.
+#[cfg(test)]
 pub(super) fn stage_task(root: &Path, id: &str, bytes: usize) {
     let dir = work_root(root).join(format!("task-{id}"));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("page-1.img"), vec![7u8; bytes]).unwrap();
 }
 
+#[cfg(test)]
 pub(super) fn numbered(key: &str, number: f32) -> Chapter {
     Chapter {
         key: key.into(),
@@ -360,6 +400,7 @@ pub(super) fn numbered(key: &str, number: f32) -> Chapter {
     }
 }
 
+#[cfg(test)]
 pub(super) fn update(source: &str, manga: &str, chapters: Vec<Chapter>) -> UpdateEvent {
     UpdateEvent {
         source: source.into(),
@@ -369,6 +410,7 @@ pub(super) fn update(source: &str, manga: &str, chapters: Vec<Chapter>) -> Updat
     }
 }
 
+#[cfg(test)]
 pub(super) fn installed(id: &str, version: i64) -> InstalledSource {
     InstalledSource {
         manifest: SourceManifest {

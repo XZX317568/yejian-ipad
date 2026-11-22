@@ -1,40 +1,42 @@
-use crate::{
-    design,
-    follows::{self, Follow},
-    source_filters::FilterEditor,
-    source_repos::{Lang, SourceRepos},
-};
-use anyhow::Context as _;
-use egui::*;
-use serde::{Deserialize, Serialize};
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    io::{Read, Write},
-    path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
-        mpsc,
-    },
-    thread,
-};
-use yejian_core::{ChapterLink, ChapterMetadata};
+
+
+
+
+
+
+
+
+
+
+
+
+use std::io::Read;
+use std::io::Write;
+use std::path::Path;
+use std::path::PathBuf;
+
+
+use std::sync::atomic::AtomicU8;
+
+
+use std::sync::atomic::Ordering;
+
+
+
+
 use yejian_sources::*;
 use super::*;
-use super::downloads::*;
-use super::covers::*;
-use super::updates::*;
-use super::global_search::*;
-use super::migrate::*;
-use super::storage::*;
-use super::web::*;
-use super::repos::*;
-use super::ui_browse::*;
-use super::ui_detail::*;
-use super::ui_library::*;
-use super::ui_downloads::*;
-#[cfg(any(test, debug_assertions))]
-use super::test_support::*;
+use super::tasks::DownloadTask;
+use super::downloads::STOP_NONE;
+use super::downloads::STOP_PAUSE;
+use super::downloads::build_cbz;
+use super::downloads::existing_pages;
+use super::downloads::fetch_missing_pages;
+use super::downloads::page_signature;
+use super::downloads::remove_task_cache;
+use super::downloads::reset_page_cache;
+use super::downloads::stored_page;
+use super::downloads::task_dir;
 
 #[derive(Clone)]
 pub(super) enum Task {

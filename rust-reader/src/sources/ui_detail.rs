@@ -1,40 +1,40 @@
-use crate::{
-    design,
-    follows::{self, Follow},
-    source_filters::FilterEditor,
-    source_repos::{Lang, SourceRepos},
-};
-use anyhow::Context as _;
+use crate::design;
+
+
+
+
+
+
 use egui::*;
-use serde::{Deserialize, Serialize};
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    io::{Read, Write},
-    path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
-        mpsc,
-    },
-    thread,
-};
-use yejian_core::{ChapterLink, ChapterMetadata};
+
+
+
+use std::collections::HashSet;
+
+
+
+
+
+use std::sync::Arc;
+
+
+
+
+
+
+
+
+
 use yejian_sources::*;
 use super::*;
-use super::engine::*;
-use super::downloads::*;
-use super::covers::*;
-use super::updates::*;
-use super::global_search::*;
-use super::migrate::*;
-use super::storage::*;
-use super::web::*;
-use super::repos::*;
-use super::ui_browse::*;
-use super::ui_library::*;
-use super::ui_downloads::*;
-#[cfg(any(test, debug_assertions))]
-use super::test_support::*;
+use super::downloads::ChapterQueueState;
+use super::covers::CoverReq;
+use super::downloads::DownloadStatus;
+use super::tasks::DownloadTask;
+use super::covers::cover_key;
+use super::ui_browse::disclosure;
+use super::ui_browse::paint_cover;
+use super::ui_browse::quiet_action;
 
 pub(super) fn chapter_name(chapter: &Chapter) -> String {
     chapter
