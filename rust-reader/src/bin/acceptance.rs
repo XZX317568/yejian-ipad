@@ -1891,17 +1891,19 @@ fn record_pass(h: &mut Harness) -> Result<()> {
     let motion_frames: usize = std::env::var("YEJIAN_MOTION_FRAMES")
         .ok()
         .and_then(|v| v.parse().ok())
-        .filter(|n: &usize| *n >= 100)
-        .unwrap_or(280);
-    // 帧分配：书架滚动 ≤60 帧（60fps 实速）→ 摊开飞行（慢动作）→ 合上段
-    //（阅读器稳定 + reader-back 触发 peel 收缩 + 详情稳定，2 倍慢动作）。
+        .filter(|n: &usize| *n >= 300)
+        .unwrap_or(310);
+    // 帧分配：书架滚动 ≤60 帧（60fps 实速）→ 摊开飞行（慢动作）→ 阅读器段
+    //（稳定 → 拖拽翻页 → 稳定 → reader-back 合上，全程 1/120 二倍慢动作）。
     // motion::OPEN ≈ 0.72s：1/180 推进 ×131 帧 ≈ 0.73s 恰好覆盖全程，且
     // spread-mid 落在与 1/240 录制相同的 t≈0.70s 中点斜扫帧。
-    // 合上段至少要 52+30 帧（最长 exit_ms=420ms≈50.4 帧 + 稳定 30），总帧数
-    // 低于 ~275 时 hold 会缩到 0、长 exit 的断言会失败。
+    // 阅读器段 = hold 14 + 拖拽翻页 9 + 翻页补间 24 + hold 14 + 合上 ≥57；
+    // 合上要覆盖最长 exit_ms=420ms（1/120 下 ≈50.4 帧），总帧数低于 ~300
+    // 时余量不足，所以 YEJIAN_MOTION_FRAMES <300 一律回退默认 310。
     let scroll_n = (motion_frames / 4).min(60);
-    let open_n = ((motion_frames - scroll_n) * 6 / 10).max(131);
-    let close_n = motion_frames - scroll_n - open_n;
+    // 阅读器段（翻页 + 合上）保底 118 帧；摊开段吃剩余帧数，下限 131。
+    let open_n = (motion_frames - scroll_n - 118).max(131);
+    let reader_n = motion_frames - scroll_n - open_n;
     std::fs::create_dir_all(h.output.join("motion"))?;
     let at = |i: usize| format!("motion/frame-{i:03}");
     h.click("shelf-next")?;
@@ -1940,11 +1942,82 @@ fn record_pass(h: &mut Harness) -> Result<()> {
         !h.app.frame_is_animating,
         "record: reader still animating before close"
     );
-    // ~30 帧稳定阅读器（2 倍慢放），让裁决能看清 entry 收尾后的静止页。
-    let hold_n = close_n.saturating_sub(52).min(30);
-    for i in 0..hold_n {
-        h.frame(vec![], Some(&at(scroll_n + open_n + i)))?;
+    // ~14 帧稳定阅读器（2 倍慢放），让裁决能看清 entry 收尾后的静止页。
+    let hold1_n = 14.min(reader_n / 8);
+    let mut next = scroll_n + open_n;
+    for i in 0..hold1_n {
+        h.frame(vec![], Some(&at(next + i)))?;
     }
+    next += hold1_n;
+    // 翻页段：手动拖拽右缘向左 ~9 帧（drag 跟手阶段 flip_depth 隆起带全程
+    // 可见），释放帧记为 turn 首帧 → 提交 next_page → 补间 0.18s。
+    // 触发方式沿用全量验收的 flip-mid 证据手法（grab 右缘逐帧 PointerMoved），
+    // 不用 tap：tap 无法让隆起带拖在手指下慢放。
+    let before_page = h.app.current_page();
+    let canvas = h
+        .app
+        .hitboxes
+        .get("reader-canvas")
+        .copied()
+        .with_context(|| "record: reader-canvas control missing")?;
+    let grab = pos2(canvas.right() - 24., canvas.center().y);
+    // 按下帧不录（与 close 释放帧同理，release 帧才是段首帧）。
+    h.frame(
+        vec![
+            Event::PointerMoved(grab),
+            Event::PointerButton {
+                pos: grab,
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+        ],
+        None,
+    )?;
+    let mut held = grab;
+    for i in 0..8 {
+        held.x -= 56.;
+        h.frame(vec![Event::PointerMoved(held)], Some(&at(next + i)))?;
+    }
+    next += 8;
+    h.frame(
+        vec![Event::PointerButton {
+            pos: held,
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }],
+        Some(&at(next)),
+    )?;
+    next += 1;
+    anyhow::ensure!(
+        h.app.current_page() > before_page,
+        "record: drag did not commit a page turn ({before_page} -> {})",
+        h.app.current_page()
+    );
+    // 翻页补间 turn_ms=180ms：1/120 推进约 21.6 帧，录 24 帧覆盖收束。
+    let turn_n = 24.min(reader_n / 4);
+    for i in 0..turn_n {
+        h.frame(vec![], Some(&at(next + i)))?;
+    }
+    next += turn_n;
+    // 等补间/翻页余波彻底收尽，再录 ~14 帧稳定页，然后进入合上段。
+    h.wait(ReaderApp::page_loaded)?;
+    for _ in 0..90 {
+        if !h.app.frame_is_animating {
+            break;
+        }
+        h.frames(1)?;
+    }
+    anyhow::ensure!(
+        !h.app.frame_is_animating,
+        "record: reader still animating after turn"
+    );
+    let hold2_n = 14.min(reader_n / 8);
+    for i in 0..hold2_n {
+        h.frame(vec![], Some(&at(next + i)))?;
+    }
+    next += hold2_n;
     // back() fires on pointer release: the release frame is the first
     // peel-exit frame (p=1), so press goes unrecorded and release opens
     // the close segment — same hand-off the full pass names close-p1.
@@ -1973,15 +2046,17 @@ fn record_pass(h: &mut Harness) -> Result<()> {
             pressed: false,
             modifiers: Modifiers::NONE,
         }],
-        Some(&at(scroll_n + open_n + hold_n)),
+        Some(&at(next)),
     )?;
+    next += 1;
     anyhow::ensure!(
         h.app.reader_exit_active(),
         "record: reader-back armed no close exit"
     );
     // 剩余 ~57 帧 ×1/120 ≈ 0.48s，覆盖最长的 exit_ms(420) 加少量详情稳定。
-    for i in (hold_n + 1)..close_n {
-        h.frame(vec![], Some(&at(scroll_n + open_n + i)))?;
+    let close_anim_n = motion_frames - next;
+    for i in 0..close_anim_n {
+        h.frame(vec![], Some(&at(next + i)))?;
     }
     anyhow::ensure!(
         !h.app.reader_exit_active(),
@@ -1993,7 +2068,7 @@ fn record_pass(h: &mut Harness) -> Result<()> {
     );
     h.dt = 1. / 60.;
     println!(
-        "RECORD: {motion_frames} frames at 1024x1366 (scroll {scroll_n} / open {open_n} / close {close_n}, hold {hold_n})"
+        "RECORD: {motion_frames} frames at 1024x1366 (scroll {scroll_n} / open {open_n} / reader {reader_n}, holds {hold1_n}+{hold2_n}, turn {turn_n}, close {close_anim_n})"
     );
     Ok(())
 }
