@@ -995,6 +995,38 @@ impl ReaderApp {
                                     self.perf_overlay.to_string(),
                                 );
                             }
+                            ui.add_space(8.);
+                            ui.horizontal(|ui| {
+                                let export = ui.add(
+                                    Button::new("导出诊断日志").min_size(vec2(132., 36.)),
+                                );
+                                self.hitboxes
+                                    .insert("diagnostics-export".into(), export.rect);
+                                if export.clicked() {
+                                    self.export_diagnostics();
+                                }
+                                let clear = ui.add(
+                                    Button::new("清除日志").min_size(vec2(96., 36.)),
+                                );
+                                self.hitboxes.insert("logs-clear".into(), clear.rect);
+                                if clear.clicked() {
+                                    match crate::diagnostics::clear_logs(&self.root) {
+                                        Ok(()) => {
+                                            self.pending_notice = Some("日志已清除".into())
+                                        }
+                                        Err(error) => {
+                                            self.pending_notice =
+                                                Some(format!("清除日志失败：{error}"));
+                                        }
+                                    }
+                                }
+                            });
+                            ui.add_space(4.);
+                            ui.label(
+                                RichText::new("诊断日志不包含账号、令牌与 Cookie。")
+                                    .small()
+                                    .color(palette.muted),
+                            );
                         });
                     ui.add_space(24.);
                     ui.vertical_centered(|ui| {
@@ -1677,5 +1709,25 @@ impl ReaderApp {
                     );
                 }
             });
+    }
+
+    /// 导出诊断日志: zip staged under share/ then handed to the system
+    /// share sheet (desktop keeps the staged file).
+    pub(super) fn export_diagnostics(&mut self) {
+        match crate::diagnostics::export_diagnostics(&self.root) {
+            Ok(path) => {
+                self.last_shared = Some(path.clone());
+                match yejian_platform::share_file(&path) {
+                    Ok(()) => self.pending_notice = Some("诊断日志已导出".into()),
+                    Err(_) => {
+                        self.pending_notice =
+                            Some(format!("诊断日志已保存：{}", path.display()));
+                    }
+                }
+            }
+            Err(error) => {
+                self.pending_notice = Some(format!("导出诊断日志失败：{error}"));
+            }
+        }
     }
 }

@@ -3,8 +3,7 @@ mod cloud;
 mod bookmarks;
 mod design;
 mod follows;
-#[cfg(target_os = "ios")]
-mod ios_diagnostics;
+mod diagnostics;
 mod motion;
 mod reader_prefs;
 mod shelf;
@@ -63,6 +62,7 @@ fn text_styles(scale: f32) -> std::collections::BTreeMap<egui::TextStyle, egui::
 }
 
 pub fn run() -> eframe::Result {
+    diagnostics::init();
     perf::init();
     yejian_platform::init();
     log::debug!("platform initialized");
@@ -73,6 +73,7 @@ pub fn run() -> eframe::Result {
         .and_then(|i| args.get(i + 1))
         .map(PathBuf::from)
         .unwrap_or_else(default_data_dir);
+    diagnostics::attach_root(&root);
     let imports: Vec<PathBuf> = args
         .iter()
         .position(|x| x == "--import")
@@ -123,6 +124,8 @@ pub fn run() -> eframe::Result {
             Ok(Box::new(app))
         }),
     )
+    .inspect(|_| diagnostics::clear_running())
+    .inspect_err(|_| diagnostics::clear_running())
 }
 
 #[cfg(target_os = "ios")]
@@ -263,7 +266,7 @@ fn android_main(app: winit::platform::android::activity::AndroidApp) {
 #[cfg(target_os = "ios")]
 #[unsafe(no_mangle)]
 pub extern "C" fn yejian_start_app() {
-    ios_diagnostics::init();
+    diagnostics::init();
     log::info!("yejian_start_app: enter");
     match run() {
         Ok(()) => log::info!("yejian_start_app: run returned"),

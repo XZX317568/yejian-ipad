@@ -281,7 +281,7 @@ impl Sources {
             .entry(source.clone())
             .or_default()
             .insert(key.to_string(), value);
-        self.stale_engines.lock().unwrap().insert(source);
+        self.stale_engines.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(source);
         self.settings_changed = true;
         if let Err(error) = save_source_settings(&self.root, &self.source_settings) {
             self.status = format!("书源设置保存失败：{error:#}");
@@ -401,7 +401,9 @@ impl Sources {
         let mut cancel = false;
         egui::Modal::new(egui::Id::unique("web-verify-dialog")).show(ctx, |ui| { ui.set_width(ui.available_width().min(460.).max(280.)); design::section(ui, "网页验证与登录"); ui.add( Label::new( RichText::new(&url) .color(design::palette(ui.visuals().dark_mode).muted) .small(), ) .wrap(), ); ui.add_space(8.); ui.horizontal_wrapped(|ui| { if ui.add(quiet_action("重新在浏览器打开")).clicked() && let Err(error) = yejian_platform::open_external_url(&url) { self.status = format!("无法打开浏览器：{error}"); } if ui.add(quiet_action("复制默认 UA")).clicked() { ui.ctx().copy_text(DEFAULT_USER_AGENT.into()); } }); ui.add_space(8.); ui.label("把浏览器里的 Cookie 粘贴到这里（支持 name=value 串、Cookie: 整行、cookies.txt 或 JSON）："); ui.add( TextEdit::multiline(&mut paste) .desired_width(ui.available_width()) .desired_rows(4), ); ui.add_space(6.); ui.label( RichText::new( "浏览器 User-Agent（Cloudflare 验证需与浏览器一致，留空保持默认）：", ) .small(), ); ui.add( TextEdit::singleline(&mut agent) .desired_width(ui.available_width()), ); ui.add_space(10.); ui.horizontal_wrapped(|ui| { let ready = !crate::trackers::parse_cookie_paste(&paste).is_empty(); if ui .add_enabled(ready, design::primary("完成导入", ui.visuals().dark_mode)) .clicked() { finish = true; } if ui.add(quiet_action("取消")).clicked() { cancel = true; } }); if finish { } });
         if finish {
-            let session = self.web_session.take().unwrap();
+            let Some(session) = self.web_session.take() else {
+                return;
+            };
             let cookies = crate::trackers::parse_cookie_paste(&paste);
             let agent = (!agent.trim().is_empty()).then_some(agent);
             self.commit_web_session(session.source, session.login, &session.url, cookies, agent);

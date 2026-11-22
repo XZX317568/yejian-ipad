@@ -1161,9 +1161,11 @@ impl Trackers {
         let request = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let worker_request = request.clone();
         let worker_root = root.clone();
-        std::thread::Builder::new()
-            .name("yejian-trackers".into())
-            .spawn(move || {
+        crate::diagnostics::spawn_supervised(
+            "yejian-trackers",
+            true,
+            || crate::diagnostics::report_recovery("跟踪服务"),
+            move || {
                 while let Ok((id, command)) = cmd_rx.recv() {
                     if id != worker_request.load(std::sync::atomic::Ordering::Relaxed)
                         && matches!(command, TrackCommand::Search { .. } | TrackCommand::Refresh(_))
@@ -1180,8 +1182,8 @@ impl Trackers {
                     let _ = event_tx.send(TrackEvent::Done);
                     ctx.request_repaint();
                 }
-            })
-            .expect("unable to start tracker worker");
+            },
+        );
         Self {
             root,
             store,

@@ -166,6 +166,10 @@ pub struct ReaderApp {
     error: Option<String>,
     notice: Option<(String, f64)>,
     pending_notice: Option<String>,
+    /// How the previous run ended (panic vs silent kill), announced as a
+    /// toast once the shelf is ready; crash offers a 导出日志 action.
+    exit_notice: Option<crate::diagnostics::ExitNotice>,
+    exit_announced: bool,
     confirm_remove: bool,
     /// 移出书架 confirm: also delete archive/cover files (default on).
     remove_files: bool,
@@ -230,6 +234,8 @@ pub struct ReaderApp {
 }
 impl ReaderApp {
     pub fn new(root: PathBuf, ctx: Context) -> Self {
+        crate::diagnostics::attach_root(&root);
+        let exit_notice = crate::diagnostics::take_exit_notice();
         crate::perf::init();
         crate::perf::mark(crate::perf::Stage::PlatformInit);
         let backup_path = root.join("backup.yejian.zip").to_string_lossy().to_string();
@@ -379,6 +385,8 @@ impl ReaderApp {
             error: None,
             notice: None,
             pending_notice: None,
+            exit_notice,
+            exit_announced: false,
             confirm_remove: false,
             remove_files: true,
             storage: None,
@@ -1176,6 +1184,9 @@ impl ReaderApp {
                 yejian_platform::ForegroundEvent::Background => {
                     self.applock.background(now_secs);
                     self.app_foreground = false;
+                    // iOS may kill the process while suspended: a marker left
+                    // behind would read as an abnormal exit next launch.
+                    crate::diagnostics::clear_running();
                     // Settle and persist the reading clock while the app is
                     // still allowed to run — the process may never see
                     // another frame once it is suspended.
@@ -1187,6 +1198,7 @@ impl ReaderApp {
                 yejian_platform::ForegroundEvent::Foreground => {
                     self.applock.foreground(now_secs);
                     self.app_foreground = true;
+                    crate::diagnostics::mark_running();
                     self.cloud.sync_now(self.cloud_snapshot());
                 }
             }
@@ -1230,6 +1242,28 @@ impl ReaderApp {
         // Fresh chapters collected by checks: dedupe keys are marked when
         // surfaced; the system note only goes out while backgrounded —
         // foregrounded frames already show the in-app notice.
+        // How the previous run ended, announced once the shelf is up.
+        if self.ready && !self.exit_announced {
+            self.exit_announced = true;
+            if let Some(kind) = &self.exit_notice {
+                self.pending_notice = Some(match kind {
+                    crate::diagnostics::ExitNotice::Crash => {
+                        "上次意外退出，已保存崩溃日志".into()
+                    }
+                    crate::diagnostics::ExitNotice::Oom => {
+                        "上次可能因内存不足被系统关闭".into()
+                    }
+                });
+            }
+        }
+        // Supervised workers report automatic restarts (or restart advice).
+        let recoveries = crate::diagnostics::take_recoveries();
+        if !recoveries.is_empty() {
+            if recoveries.iter().any(|n| n.contains("下载")) {
+                self.sources.reload_download_queue();
+            }
+            self.pending_notice = Some(recoveries.join("；"));
+        }
         let notify_updates = self.sources.take_notify_updates();
         if !notify_updates.is_empty() {
             for update in &notify_updates {
@@ -1504,18 +1538,40 @@ impl ReaderApp {
         }
         if let Some((text, at)) = &self.notice {
             if now - *at < 5. {
+                let crash = matches!(
+                    self.exit_notice,
+                    Some(crate::diagnostics::ExitNotice::Crash)
+                );
                 let rect = Rect::from_center_size(
                     pos2(full.center().x, full.bottom() - 100.),
                     vec2((full.width() - 32.).min(560.), 40.),
                 );
                 ui.painter().rect_filled(rect, 10., ink);
+                let text_rect = if crash {
+                    rect.shrink2(vec2(16., 0.)).with_max_x(rect.max.x - 96.)
+                } else {
+                    rect
+                };
                 ui.painter().text(
-                    rect.center(),
+                    text_rect.center(),
                     Align2::CENTER_CENTER,
                     text,
                     FontId::proportional(12.),
                     self.colors().0,
                 );
+                if crash {
+                    let button = ui.put(
+                        Rect::from_center_size(
+                            pos2(rect.max.x - 52., rect.center().y),
+                            vec2(84., 30.),
+                        ),
+                        Button::new("导出日志"),
+                    );
+                    self.hitboxes.insert("crash-export".into(), button.rect);
+                    if button.clicked() {
+                        self.export_diagnostics();
+                    }
+                }
             }
         }
         self.dialogs(&ctx);

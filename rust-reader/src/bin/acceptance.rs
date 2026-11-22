@@ -1680,6 +1680,66 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
     anyhow::ensure!(synced_row(h), "roundD4: the 上次同步 status did not render");
     design_capture(h, "webdav-synced", &mut captures)?;
 
+    // E3: 关于 → 导出诊断日志 produces a share-staged zip with no secrets.
+    scroll_until_row_visible(h, "diagnostics-export", "导出诊断日志")?;
+    design_capture(h, "diagnostics-export", &mut captures)?;
+    h.click("diagnostics-export")?;
+    h.frames(3)?;
+    h.wait(|app| {
+        app.last_shared()
+            .map(|p| p.extension().is_some_and(|e| e == "zip"))
+            .unwrap_or(false)
+    })?;
+    let staged = h.app.last_shared().unwrap().to_path_buf();
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(&staged)?)?;
+    let entries: Vec<String> = (0..zip.len())
+        .map(|i| zip.by_index(i).unwrap().name().to_string())
+        .collect();
+    anyhow::ensure!(
+        entries.iter().any(|n| n == "device.txt"),
+        "diagnostics zip lacks device.txt: {entries:?}"
+    );
+    for secret in ["trackers.json", "webdav.json", "web-cookies.json"] {
+        anyhow::ensure!(
+            !entries.iter().any(|n| n.contains(secret)),
+            "diagnostics zip leaks {secret}: {entries:?}"
+        );
+    }
+
+    // E2: the 性能信息 overlay paints decode/frame/texture counters.
+    scroll_until_row_visible(h, "diagnostics-export", "导出诊断日志")?;
+    h.click_text("性能信息")?;
+    h.frames(3)?;
+    anyhow::ensure!(
+        h.painted_text.iter().any(|t| t.text.contains("ms") || t.text.contains("纹理") || t.text.contains("帧")),
+        "perf-overlay: overlay counters not painted"
+    );
+    design_capture(h, "perf-overlay", &mut captures)?;
+    h.click_text("性能信息")?;
+    h.frames(2)?;
+
+    // E3 notices: crash / oom exit assessment and a supervised restart.
+    h.app.fake_exit_notice(true);
+    h.frames(4)?;
+    anyhow::ensure!(
+        h.app.hitboxes.contains_key("crash-export"),
+        "crash-notice: 导出日志 affordance missing"
+    );
+    design_capture(h, "crash-notice", &mut captures)?;
+    h.app.clear_notice();
+    h.app.fake_exit_notice(false);
+    h.frames(4)?;
+    design_capture(h, "oom-notice", &mut captures)?;
+    h.app.clear_notice();
+    h.app.fake_worker_recovery();
+    h.frames(4)?;
+    anyhow::ensure!(
+        h.painted_text.iter().any(|t| t.text.contains("已自动恢复")),
+        "worker-recovered: recovery toast not painted"
+    );
+    design_capture(h, "worker-recovered", &mut captures)?;
+    h.app.clear_notice();
+
     // Reopen the real saved settings, preserving the source and reading
     // history. Only the temporary acceptance library is changed. Preview
     // follows/tasks must not be persisted into the real library on exit.

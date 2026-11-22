@@ -7,7 +7,6 @@ use std::{
         atomic::{AtomicU64, Ordering},
         mpsc,
     },
-    thread,
 };
 use yejian_core::{Book, ChapterLink, ChapterMetadata, Library};
 
@@ -137,18 +136,22 @@ impl Worker {
         let (tx, command_rx) = mpsc::channel();
         let (event_tx, rx) = mpsc::channel();
         let (position_tx, position_rx) = mpsc::channel();
+        let position_rx = Arc::new(Mutex::new(position_rx));
         let position_queue = position_tx.clone();
         let page_queue = new_page_queue();
         let page_queue_for_commands = page_queue.clone();
         let page_queue_for_threads = page_queue.clone();
         let (cover_tx, cover_rx) = mpsc::channel();
+        let cover_rx = Arc::new(Mutex::new(cover_rx));
         let cover_queue = cover_tx.clone();
         let generation = Arc::new(AtomicU64::new(0));
         let latest = generation.clone();
         let archive_access = Arc::new(RwLock::new(()));
-        thread::Builder::new()
-            .name("yejian-library".into())
-            .spawn(move || {
+        crate::diagnostics::spawn_supervised(
+            "yejian-library",
+            false,
+            || crate::diagnostics::report_fatal("书库"),
+            move || {
                 let notify = |event| {
                     let _ = event_tx.send(event);
                     ctx.request_repaint();
@@ -173,68 +176,71 @@ impl Worker {
                     .saturating_sub(2)
                     .clamp(2, 4);
                 for worker_index in 0..decode_threads {
-                    let image_library = match Library::open(&root) {
-                        Ok(library) => library,
-                        Err(error) => {
-                            notify(Event::StartupError(format!(
-                                "无法打开漫画图片存储：{error:#}"
-                            )));
-                            return;
-                        }
-                    };
                     let events = event_tx.clone();
                     let worker_ctx = ctx.clone();
                     let latest = latest.clone();
                     let archives = archive_access.clone();
                     let worker_root = root.clone();
                     let shared = page_queue_for_threads.clone();
-                    thread::Builder::new()
-                        .name(format!("yejian-images-{worker_index}"))
-                        .spawn(move || {
+                    crate::diagnostics::spawn_supervised(
+                        &format!("yejian-images-{worker_index}"),
+                        true,
+                        || crate::diagnostics::report_recovery("图片解码"),
+                        move || {
+                            let image_library = match Library::open(&worker_root) {
+                                Ok(library) => library,
+                                Err(error) => {
+                                    log::error!("无法打开漫画图片存储：{error:#}");
+                                    return;
+                                }
+                            };
                             read_pages(
-                                worker_root,
+                                worker_root.clone(),
                                 image_library,
-                                shared,
-                                events,
-                                worker_ctx,
-                                latest,
-                                archives,
+                                shared.clone(),
+                                events.clone(),
+                                worker_ctx.clone(),
+                                latest.clone(),
+                                archives.clone(),
                             );
-                        })
-                        .expect("Unable to start image worker");
+                        },
+                    );
                 }
                 // Covers keep a separate lane so shelf thumbnails never
                 // delay reading pages.
                 {
-                    let cover_library = match Library::open(&root) {
-                        Ok(library) => library,
-                        Err(error) => {
-                            notify(Event::StartupError(format!(
-                                "无法打开封面图片存储：{error:#}"
-                            )));
-                            return;
-                        }
-                    };
                     let events = event_tx.clone();
                     let worker_ctx = ctx.clone();
                     let archives = archive_access.clone();
-                    thread::Builder::new()
-                        .name("yejian-covers".into())
-                        .spawn(move || {
+                    let cover_root = root.clone();
+                    let cover_rx = cover_rx.clone();
+                    crate::diagnostics::spawn_supervised(
+                        "yejian-covers",
+                        true,
+                        || crate::diagnostics::report_recovery("封面"),
+                        move || {
+                            let cover_library = match Library::open(&cover_root) {
+                                Ok(library) => library,
+                                Err(error) => {
+                                    log::error!("无法打开封面图片存储：{error:#}");
+                                    return;
+                                }
+                            };
                             read_covers(
                                 cover_library,
-                                cover_rx,
-                                events,
-                                worker_ctx,
-                                archives,
+                                &cover_rx,
+                                events.clone(),
+                                worker_ctx.clone(),
+                                archives.clone(),
                             );
-                        })
-                        .expect("Unable to start cover worker");
+                        },
+                    );
                 }
                 let position_events=event_tx.clone();let position_ctx=ctx.clone();
-                thread::Builder::new().name("yejian-progress".into()).spawn(move||{
+                let position_rx=position_rx.clone();
+                crate::diagnostics::spawn_supervised("yejian-progress",true,||crate::diagnostics::report_recovery("阅读进度"),move||{
                     let mut last_error:Option<String>=None;
-                    while let Ok(command)=position_rx.recv() {
+                    while let Ok(command)=position_rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).recv() {
                         match command {
                             PositionCommand::Save{id,page,fraction,private}=>{
                                 match position_library.save_position(&id,page,fraction,private) {
@@ -246,7 +252,7 @@ impl Worker {
                             PositionCommand::Flush(reply)=>{let _=reply.send(last_error.clone().map_or(Ok(()),Err));}
                         }
                     }
-                }).expect("Unable to start reading-position worker");
+                });
                 // A refresh or backup requested after a position change must
                 // see the committed row, even with two SQLite connections.
                 let wait_for_positions = || -> anyhow::Result<()> {
@@ -522,8 +528,8 @@ impl Worker {
                         notify(Event::Error(format!("{e:#}")));
                     }
                 }
-            })
-            .expect("Unable to start library worker");
+            },
+        );
         Self {
             tx,
             rx,
@@ -738,12 +744,16 @@ fn read_pages(
 /// reading pages; they are not generation-gated.
 fn read_covers(
     library: Library,
-    requests: mpsc::Receiver<ImageRequest>,
+    requests: &Mutex<mpsc::Receiver<ImageRequest>>,
     events: mpsc::Sender<Event>,
     ctx: Context,
     archive_access: Arc<RwLock<()>>,
 ) {
-    while let Ok(request) = requests.recv() {
+    while let Ok(request) = requests
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .recv()
+    {
         crate::perf::record_queue(request.queued.elapsed().as_secs_f64() * 1000.);
         let bytes = (|| -> anyhow::Result<Vec<u8>> {
             let _guard = archive_access

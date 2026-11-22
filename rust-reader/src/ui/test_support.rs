@@ -195,6 +195,30 @@ impl ReaderApp {
     pub fn notify_updates_enabled(&self) -> bool {
         self.notify_enabled
     }
+    /// Acceptance seam: pretend the previous run exited abnormally; the
+    /// next drawn frame surfaces the matching notice.
+    #[cfg(debug_assertions)]
+    pub fn fake_exit_notice(&mut self, crash: bool) {
+        crate::diagnostics::test_hooks::fake_exit_notice(&self.root, crash);
+        self.exit_notice = crate::diagnostics::take_exit_notice();
+        self.exit_announced = false;
+    }
+    /// Acceptance seam: a supervised worker just restarted itself.
+    #[cfg(debug_assertions)]
+    pub fn fake_worker_recovery(&mut self) {
+        crate::diagnostics::report_recovery("下载");
+    }
+    /// Acceptance seam: dismiss the current toast and exit notice.
+    #[cfg(debug_assertions)]
+    pub fn clear_notice(&mut self) {
+        self.notice = None;
+        self.exit_notice = None;
+    }
+    /// Acceptance seam: whether an exit notice is pending announcement.
+    #[cfg(debug_assertions)]
+    pub fn exit_notice_pending(&self) -> bool {
+        self.exit_notice.is_some() && !self.exit_announced
+    }
     /// Acceptance seam: point the WebDAV form at a local fake server.
     #[cfg(debug_assertions)]
     pub fn prepare_webdav_acceptance(&mut self, url: String) {

@@ -24,7 +24,8 @@ impl ProgressSync {
     }
     fn with_address(root:PathBuf,ctx:Context,address:IpAddr)->Self {
         let(tx,rx_task)=mpsc::channel();let(tx_reply,rx)=mpsc::channel();
-        std::thread::Builder::new().name("yejian-sync".into()).spawn(move||{
+        crate::diagnostics::spawn_supervised("yejian-sync",true,||crate::diagnostics::report_recovery("设备间同步"),move||{
+            let (tx_reply,ctx)=(tx_reply.clone(),ctx.clone());
             let notify=Arc::new(move|reply|{let _=tx_reply.send(reply);ctx.request_repaint();});
             let runtime=match tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build(){Ok(r)=>r,Err(e)=>{notify(Reply::Error(e.to_string()));return;}};
             let mut host:Option<Host>=None;
@@ -89,7 +90,7 @@ impl ProgressSync {
                 if let Err(e)=result{notify(Reply::Error(format!("{e:#}")));}
             }
             if let Some(host)=host{runtime.block_on(host.stop());}
-        }).expect("Unable to start sync worker");
+        });
         Self{tx,rx,hosting:false,busy:false,url:String::new(),fingerprint:String::new(),code:String::new(),invitation:None,status:String::new(),changed:false}
     }
     pub fn poll(&mut self){

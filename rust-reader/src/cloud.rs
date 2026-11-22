@@ -18,8 +18,9 @@ use std::io::{BufRead, BufReader, Read, Write};
 #[cfg(test)]
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+#[cfg(test)]
 use std::thread;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -658,9 +659,11 @@ impl CloudSync {
     pub fn new(root: PathBuf) -> Self {
         let (tx, cmd_rx) = mpsc::channel::<CloudCommand>();
         let (reply_tx, rx) = mpsc::channel::<CloudReply>();
-        thread::Builder::new()
-            .name("yejian-cloud".into())
-            .spawn(move || {
+        crate::diagnostics::spawn_supervised(
+            "yejian-cloud",
+            true,
+            || crate::diagnostics::report_recovery("云同步"),
+            move || {
                 while let Ok(command) = cmd_rx.recv() {
                     match command {
                         CloudCommand::Sync { snapshot, config } => {
@@ -674,8 +677,8 @@ impl CloudSync {
                         }
                     }
                 }
-            })
-            .expect("Unable to start cloud sync worker");
+            },
+        );
         Self {
             tx,
             rx,
