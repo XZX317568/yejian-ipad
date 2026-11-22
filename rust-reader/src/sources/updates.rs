@@ -379,6 +379,16 @@ impl Sources {
     pub(crate) fn take_notify_updates(&mut self) -> Vec<crate::notify::FreshUpdate> {
         std::mem::take(&mut self.notify_pending)
     }
+    /// The download worker restarted after a panic: reload the persisted
+    /// task file and re-queue whatever was mid-flight.
+    pub(crate) fn reload_download_queue(&mut self) {
+        let (tasks, warning) = load_queue(&self.root);
+        self.tasks = tasks;
+        self.ready = pending_imports(&self.tasks).into();
+        if let Some(warning) = warning {
+            self.status = warning;
+        }
+    }
 }
 
 #[cfg(test)]

@@ -216,7 +216,7 @@ impl Sources {
         };
         let id = source.manifest.id.clone();
         // Forget the engine everywhere so nothing re-loads the deleted dir.
-        self.stale_engines.lock().unwrap().insert(id.clone());
+        self.stale_engines.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(id.clone());
         self.repo_test_results.remove(&id);
         self.repo_testing.remove(&id);
         self.repo_test_queue.retain(|queued| queued != &id);

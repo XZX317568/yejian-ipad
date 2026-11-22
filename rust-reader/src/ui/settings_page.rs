@@ -977,6 +977,57 @@ impl ReaderApp {
                                 },
                             );
                         });
+                    ui.add_space(10.);
+                    ui.separator();
+                    Frame::new()
+                        .inner_margin(Margin::symmetric(2, 16))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            crate::design::section(ui, "关于");
+                            if crate::design::toggle(
+                                ui,
+                                &mut self.perf_overlay,
+                                "性能信息",
+                                "在右上角显示解码、帧时间和纹理内存",
+                            ) {
+                                self.setting(
+                                    "perf-overlay",
+                                    self.perf_overlay.to_string(),
+                                );
+                            }
+                            ui.add_space(8.);
+                            ui.horizontal(|ui| {
+                                let export = ui.add(
+                                    Button::new("导出诊断日志").min_size(vec2(132., 44.)),
+                                );
+                                self.hitboxes
+                                    .insert("diagnostics-export".into(), export.rect);
+                                if export.clicked() {
+                                    self.export_diagnostics();
+                                }
+                                let clear = ui.add(
+                                    Button::new("清除日志").min_size(vec2(96., 44.)),
+                                );
+                                self.hitboxes.insert("logs-clear".into(), clear.rect);
+                                if clear.clicked() {
+                                    match crate::diagnostics::clear_logs(&self.root) {
+                                        Ok(()) => {
+                                            self.pending_notice = Some("日志已清除".into())
+                                        }
+                                        Err(error) => {
+                                            self.pending_notice =
+                                                Some(format!("清除日志失败：{error}"));
+                                        }
+                                    }
+                                }
+                            });
+                            ui.add_space(4.);
+                            ui.label(
+                                RichText::new("诊断日志不包含账号、令牌与 Cookie。")
+                                    .small()
+                                    .color(palette.muted),
+                            );
+                        });
                     ui.add_space(24.);
                     ui.vertical_centered(|ui| {
                         ui.label(
@@ -1658,5 +1709,56 @@ impl ReaderApp {
                     );
                 }
             });
+    }
+
+    /// Counts, installed source ids+versions and whitelisted settings —
+    /// the only structured state the diagnostics zip carries. Keys that
+    /// look secret (`token`, `cookie`, …) are filtered anyway.
+    fn diagnostics_summary(&self) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        let _ = writeln!(out, "books: {}", self.books.len());
+        let _ = writeln!(out, "follows: {}", self.sources.follows().len());
+        let _ = writeln!(out, "download-tasks: {}", self.sources.task_count());
+        let _ = writeln!(out, "installed-sources:");
+        for (id, version) in self.sources.installed_source_meta() {
+            let _ = writeln!(out, "  {id} v{version}");
+        }
+        let _ = writeln!(out, "settings:");
+        if let Ok(library) = yejian_core::Library::open(&self.root)
+            && let Ok(settings) = crate::worker::read_settings(&library)
+        {
+            for (key, value) in settings {
+                if !crate::diagnostics::sensitive_key(&key) {
+                    let _ = writeln!(out, "  {key}={value}");
+                }
+            }
+        }
+        out
+    }
+
+    /// 导出诊断日志: zip staged under share/ then handed to the system
+    /// share sheet (desktop keeps the staged file).
+    pub(super) fn export_diagnostics(&mut self) {
+        let summary = self.diagnostics_summary();
+        match crate::diagnostics::export_diagnostics(&self.root, &summary) {
+            Ok(path) => {
+                let file_name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("diagnostics.zip")
+                    .to_string();
+                self.last_shared = Some(path.clone());
+                match yejian_platform::share_file(&path) {
+                    Ok(()) => self.pending_notice = Some("诊断日志已导出".into()),
+                    Err(_) => {
+                        self.pending_notice = Some(format!("已生成诊断日志（{file_name}）"));
+                    }
+                }
+            }
+            Err(error) => {
+                self.pending_notice = Some(format!("导出诊断日志失败：{error}"));
+            }
+        }
     }
 }

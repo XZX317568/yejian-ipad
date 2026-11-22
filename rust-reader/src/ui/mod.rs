@@ -125,6 +125,10 @@ pub struct ReaderApp {
     tap_zones: String,
     /// 阅读时屏幕常亮 setting; `awake` mirrors the platform flag.
     keep_awake_setting: bool,
+    perf_overlay: bool,
+    last_frame_at: Option<std::time::Instant>,
+    page_target_px: f32,
+    hires_requested: HashSet<(String, usize)>,
     awake: bool,
     /// Calls made to `set_keep_awake`, asserted by tests.
     #[cfg(test)]
@@ -162,6 +166,10 @@ pub struct ReaderApp {
     error: Option<String>,
     notice: Option<(String, f64)>,
     pending_notice: Option<String>,
+    /// How the previous run ended (panic vs silent kill), announced as a
+    /// toast once the shelf is ready; crash offers a 导出日志 action.
+    exit_notice: Option<crate::diagnostics::ExitNotice>,
+    exit_announced: bool,
     confirm_remove: bool,
     /// 移出书架 confirm: also delete archive/cover files (default on).
     remove_files: bool,
@@ -226,6 +234,10 @@ pub struct ReaderApp {
 }
 impl ReaderApp {
     pub fn new(root: PathBuf, ctx: Context) -> Self {
+        crate::diagnostics::attach_root(&root);
+        let exit_notice = crate::diagnostics::take_exit_notice();
+        crate::perf::init();
+        crate::perf::mark(crate::perf::Stage::PlatformInit);
         let backup_path = root.join("backup.yejian.zip").to_string_lossy().to_string();
         let reader_prefs = crate::reader_prefs::load(&root).unwrap_or_default();
         // Page files staged for the share sheet are one-shot temp files.
@@ -334,6 +346,10 @@ impl ReaderApp {
             chapter_end: false,
             tap_zones: "lr".into(),
             keep_awake_setting: true,
+            perf_overlay: false,
+            last_frame_at: None,
+            page_target_px: 2048.,
+            hires_requested: HashSet::new(),
             awake: false,
             #[cfg(test)]
             awake_log: Vec::new(),
@@ -369,6 +385,8 @@ impl ReaderApp {
             error: None,
             notice: None,
             pending_notice: None,
+            exit_notice,
+            exit_announced: false,
             confirm_remove: false,
             remove_files: true,
             storage: None,
@@ -532,6 +550,7 @@ impl ReaderApp {
         while let Ok(event) = self.worker.rx.try_recv() {
             match event {
                 Event::Ready(books, settings, links) => {
+                    crate::perf::mark(crate::perf::Stage::LibraryOpen);
                     self.replace_links(links);
                     self.replace_books(books, ctx.input(|i| i.time));
                     self.ready = true;
@@ -595,6 +614,9 @@ impl ReaderApp {
                             }
                             "reader-status" => {
                                 self.reader_status = value != "false";
+                            }
+                            "perf-overlay" => {
+                                self.perf_overlay = value == "true";
                             }
                             "follow-interval" => {
                                 let minutes: u64 = value
@@ -739,6 +761,7 @@ impl ReaderApp {
                             continue;
                         }
                         self.page_pending.remove(&(id.clone(), page));
+                        self.hires_requested.remove(&(id.clone(), page));
                         if result.as_ref().is_err_and(|error| error == PAGE_NOT_READY) {
                             if let Some(stream) = self.stream_for_mut(&id) {
                                 stream.waiting.insert(page);
@@ -1018,6 +1041,16 @@ impl ReaderApp {
     /// then any category found on books that is not stored yet.
     /// `None` marks the trailing 管理 tab.
     pub fn draw(&mut self, ui: &mut Ui) {
+        crate::perf::mark(crate::perf::Stage::RendererReady);
+        {
+            let now = std::time::Instant::now();
+            if matches!(self.screen, Screen::Reader(_))
+                && let Some(last) = self.last_frame_at
+            {
+                crate::perf::record_frame(now.duration_since(last).as_secs_f64() * 1000.);
+            }
+            self.last_frame_at = Some(now);
+        }
         let ctx = ui.ctx().clone();
         self.visible_covers.clear();
         self.receive(&ctx);
@@ -1151,6 +1184,9 @@ impl ReaderApp {
                 yejian_platform::ForegroundEvent::Background => {
                     self.applock.background(now_secs);
                     self.app_foreground = false;
+                    // iOS may kill the process while suspended: a marker left
+                    // behind would read as an abnormal exit next launch.
+                    crate::diagnostics::clear_running();
                     // Settle and persist the reading clock while the app is
                     // still allowed to run — the process may never see
                     // another frame once it is suspended.
@@ -1162,6 +1198,7 @@ impl ReaderApp {
                 yejian_platform::ForegroundEvent::Foreground => {
                     self.applock.foreground(now_secs);
                     self.app_foreground = true;
+                    crate::diagnostics::mark_running();
                     self.cloud.sync_now(self.cloud_snapshot());
                 }
             }
@@ -1205,6 +1242,28 @@ impl ReaderApp {
         // Fresh chapters collected by checks: dedupe keys are marked when
         // surfaced; the system note only goes out while backgrounded —
         // foregrounded frames already show the in-app notice.
+        // How the previous run ended, announced once the shelf is up.
+        if self.ready && !self.exit_announced {
+            self.exit_announced = true;
+            if let Some(kind) = &self.exit_notice {
+                self.pending_notice = Some(match kind {
+                    crate::diagnostics::ExitNotice::Crash => {
+                        "上次意外退出，已保存崩溃日志".into()
+                    }
+                    crate::diagnostics::ExitNotice::Oom => {
+                        "上次可能因内存不足被系统关闭".into()
+                    }
+                });
+            }
+        }
+        // Supervised workers report automatic restarts (or restart advice).
+        let recoveries = crate::diagnostics::take_recoveries();
+        if !recoveries.is_empty() {
+            if recoveries.iter().any(|n| n.contains("下载")) {
+                self.sources.reload_download_queue();
+            }
+            self.pending_notice = Some(recoveries.join("；"));
+        }
         let notify_updates = self.sources.take_notify_updates();
         if !notify_updates.is_empty() {
             for update in &notify_updates {
@@ -1302,6 +1361,7 @@ impl ReaderApp {
             }
             Err(_) => full,
         };
+        self.page_target_px = full.width() * ctx.pixels_per_point();
         let (background, ink, _) = self.colors();
         ui.painter().rect_filled(full, 0., background);
         let tablet = Self::side_navigation(full);
@@ -1416,7 +1476,8 @@ impl ReaderApp {
                         }
                         match self.tab {
                             Tab::Library => {
-                                self.library_viewport(ui, content, now, entrance)
+                                self.library_viewport(ui, content, now, entrance);
+                                crate::perf::mark(crate::perf::Stage::FirstShelfFrame);
                             }
                             Tab::History => self.history_ui(ui, content),
                             Tab::Settings => self.settings_ui(ui, content),
@@ -1475,25 +1536,90 @@ impl ReaderApp {
                 }
             }
         }
-        if let Some((text, at)) = &self.notice {
-            if now - *at < 5. {
+        if let Some((text, at)) = self.notice.clone() {
+            if now - at < 5. {
+                let crash = matches!(
+                    self.exit_notice,
+                    Some(crate::diagnostics::ExitNotice::Crash)
+                ) && text.contains("意外退出");
+                let fg = self.colors().0;
+                let height = if crash { 54. } else { 42. };
                 let rect = Rect::from_center_size(
                     pos2(full.center().x, full.bottom() - 100.),
-                    vec2((full.width() - 32.).min(560.), 40.),
+                    vec2((full.width() - 32.).min(560.), height),
                 );
                 ui.painter().rect_filled(rect, 10., ink);
-                ui.painter().text(
-                    rect.center(),
-                    Align2::CENTER_CENTER,
+                let text_rect = if crash {
+                    rect.shrink2(vec2(16., 0.)).with_max_x(rect.max.x - 108.)
+                } else {
+                    rect.shrink2(vec2(16., 0.))
+                };
+                let mut job = egui::text::LayoutJob::simple(
                     text,
-                    FontId::proportional(12.),
-                    self.colors().0,
+                    FontId::proportional(12.5),
+                    fg,
+                    text_rect.width().max(40.),
                 );
+                job.wrap.max_rows = 1;
+                job.wrap.break_anywhere = true;
+                let galley = ui.painter().layout_job(job);
+                let text_pos = if crash {
+                    pos2(text_rect.min.x, rect.center().y - galley.size().y * 0.5)
+                } else {
+                    pos2(
+                        text_rect.center().x - galley.size().x * 0.5,
+                        rect.center().y - galley.size().y * 0.5,
+                    )
+                };
+                ui.painter().galley(text_pos, galley, fg);
+                if crash {
+                    let btn_rect = Rect::from_center_size(
+                        pos2(rect.max.x - 54., rect.center().y),
+                        vec2(92., 44.),
+                    );
+                    let button = ui.put(
+                        btn_rect,
+                        Button::new(RichText::new("导出日志").size(12.5).color(fg))
+                            .fill(fg.gamma_multiply(0.16))
+                            .stroke(Stroke::new(1., fg))
+                            .corner_radius(8.),
+                    );
+                    self.hitboxes.insert("crash-export".into(), button.rect);
+                    if button.clicked() {
+                        self.exit_notice = None;
+                        self.export_diagnostics();
+                    }
+                }
             }
         }
         self.dialogs(&ctx);
         if self.applock.locked() {
             self.lock_ui(ui, full);
+        }
+        if self.perf_overlay {
+            let text = crate::perf::overlay_text();
+            let font = FontId::monospace(11.);
+            let fg = Color32::from_rgb(242, 239, 233);
+            let galley = ui.painter().layout_no_wrap(text, font, fg);
+            let size = galley.size() + vec2(16., 10.);
+            let rect = Rect::from_min_size(
+                pos2((full.max.x - 12. - size.x).max(full.min.x + 8.), full.min.y + 12.),
+                size,
+            );
+            ui.painter()
+                .rect_filled(rect, 8., Color32::from_rgb(28, 26, 24));
+            ui.painter().rect_stroke(
+                rect,
+                8.,
+                Stroke::new(1., Color32::from_rgb(68, 64, 60)),
+                StrokeKind::Inside,
+            );
+            ui.painter().galley(rect.min + vec2(8., 5.), galley, fg);
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        }
+        // Covers are "all here" once the shelf's pending requests drain.
+        if self.ready && self.cover_pending.is_empty() && !self.books.is_empty() {
+            crate::perf::mark(crate::perf::Stage::CoversReady);
         }
         self.trim_covers();
         self.frame_is_animating = self.motion.active()
@@ -1514,6 +1640,7 @@ impl eframe::App for ReaderApp {
         self.report_snapshot_ready(ui.ctx());
     }
     fn on_exit(&mut self) {
+        self.worker.shutdown();
         self.keep_awake(false);
         self.flush_position();
         let epoch = crate::follows::now() as f64;
@@ -1600,18 +1727,19 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let ctx = Context::default();
         let mut app = ReaderApp::new(root.path().into(), ctx.clone());
-        for index in 0..80 {
+        // Covers evict on a byte LRU (64 MB cap); each of these is 4 MB.
+        for index in 0..18 {
             let id = format!("book-{index}");
             app.covers.insert(id.clone(), ctx.load_texture(
-                id.clone(), ColorImage::filled([2, 2], Color32::WHITE), TextureOptions::LINEAR,
+                id.clone(), ColorImage::filled([1024, 1024], Color32::WHITE), TextureOptions::LINEAR,
             ));
             app.cover_usage.insert(id, index);
         }
         app.visible_covers.insert("book-0".into());
         app.trim_covers();
-        assert_eq!(app.covers.len(), 48);
+        assert_eq!(app.covers.len(), 16);
         assert!(app.covers.contains_key("book-0"));
-        assert!(app.covers.contains_key("book-79"));
+        assert!(app.covers.contains_key("book-17"));
         assert!(!app.covers.contains_key("book-1"));
     }
     #[test]

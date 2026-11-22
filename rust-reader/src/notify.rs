@@ -221,12 +221,12 @@ pub(crate) fn run_background_check(
         let job_rx = job_rx.clone();
         let done_tx = done_tx.clone();
         let root = root.to_path_buf();
-        thread::Builder::new()
+        let handle = thread::Builder::new()
             .name(format!("yejian-bg-check-{index}"))
             .spawn(move || {
                 let catalog = SourceCatalog::new(root.join("sources"));
                 let mut engines = HashMap::<String, SourceEngine>::new();
-                while let Ok(follow) = job_rx.lock().expect("bg check job queue").recv() {
+                while let Ok(follow) = job_rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).recv() {
                     let result = (|| -> anyhow::Result<Vec<Chapter>> {
                         let manga = follow_manga(&root, &follow)?;
                         if !engines.contains_key(&follow.source_id) {
@@ -243,8 +243,10 @@ pub(crate) fn run_background_check(
                         return;
                     }
                 }
-            })
-            .expect("Unable to start bg check worker");
+            });
+        if handle.is_err() {
+            log::error!("unable to start bg check worker");
+        }
     }
     drop(done_tx);
     for follow in jobs.iter().cloned() {

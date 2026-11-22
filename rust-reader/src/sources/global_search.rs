@@ -92,12 +92,12 @@ impl GlobalEngine for RealGlobalEngine {
 /// check. That keeps a wedged source from stalling the next generation the
 /// way `std::thread::scope` (which joins) would.
 pub(super) fn global_search_run(
-    rx: mpsc::Receiver<GlobalCmd>,
-    event_tx: mpsc::Sender<GlobalEvent>,
+    rx: &mpsc::Receiver<GlobalCmd>,
+    event_tx: &mpsc::Sender<GlobalEvent>,
     load: impl Fn(&str) -> Result<Arc<dyn GlobalEngine>, String>,
     timeout: std::time::Duration,
-    stale: Arc<std::sync::Mutex<HashSet<String>>>,
-    ctx: Context,
+    stale: &Arc<std::sync::Mutex<HashSet<String>>>,
+    ctx: &Context,
 ) {
     let mut engines: std::collections::HashMap<String, Arc<dyn GlobalEngine>> =
         std::collections::HashMap::new();
@@ -119,7 +119,7 @@ pub(super) fn global_search_run(
     // their completions/timeouts are still delivered before the loop exits.
     let mut closed = false;
     loop {
-        for id in stale.lock().unwrap().drain() {
+        for id in stale.lock().unwrap_or_else(std::sync::PoisonError::into_inner).drain() {
             engines.remove(&id);
         }
         let engine_for = |engines: &mut std::collections::HashMap<String, Arc<dyn GlobalEngine>>,
@@ -429,8 +429,8 @@ mod tests {
         let ctx = Context::default();
         let handle = thread::spawn(move || {
             global_search_run(
-                cmd_rx,
-                event_tx,
+                &cmd_rx,
+                &event_tx,
                 move |source| {
                     if source == "err" {
                         return Err("boom".into());
@@ -445,8 +445,8 @@ mod tests {
                     })) as Arc<dyn GlobalEngine>)
                 },
                 std::time::Duration::from_secs(5),
-                stale,
-                ctx,
+                &stale,
+                &ctx,
             );
         });
         let sources: Vec<String> =
@@ -481,8 +481,8 @@ mod tests {
         let ctx = Context::default();
         let handle = thread::spawn(move || {
             global_search_run(
-                cmd_rx,
-                event_tx,
+                &cmd_rx,
+                &event_tx,
                 |source| {
                     if source == "hang" {
                         Ok(Arc::new(FakeEngine(|_: &str| {
@@ -496,8 +496,8 @@ mod tests {
                     }
                 },
                 std::time::Duration::from_millis(80),
-                stale,
-                ctx,
+                &stale,
+                &ctx,
             );
         });
         cmd_tx

@@ -2241,7 +2241,7 @@ mod tests {
         assert_eq!(book.page_count, 2);
         for page in 0..book.page_count {
             let bytes = library.page_bytes(&book.id, page).unwrap();
-            assert_eq!(crate::worker::decode(&bytes, false).unwrap().size, [4, 4]);
+            assert_eq!(crate::worker::decode(&bytes, false, 0).unwrap().size, [4, 4]);
         }
         sources.ack_downloaded(&downloaded.id);
         assert!(sources.take_downloaded().is_none());

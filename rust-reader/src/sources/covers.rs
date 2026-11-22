@@ -96,7 +96,10 @@ pub(super) fn shrink_cover(image: image::DynamicImage) -> image::DynamicImage {
 }
 
 pub(super) fn store_source_cover(path: &Path, image: &image::DynamicImage) -> anyhow::Result<ColorImage> {
-    std::fs::create_dir_all(path.parent().unwrap())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("封面路径缺少父目录"))?;
+    std::fs::create_dir_all(parent)?;
     let mut encoded = std::io::Cursor::new(Vec::new());
     image.write_to(&mut encoded, image::ImageFormat::Png)?;
     let part = path.with_extension("part");

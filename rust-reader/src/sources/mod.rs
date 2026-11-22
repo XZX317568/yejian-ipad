@@ -21,7 +21,6 @@ use std::sync::atomic::AtomicU64;
 
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
-use std::thread;
 
 use yejian_core::ChapterMetadata;
 use yejian_sources::*;
@@ -347,13 +346,15 @@ impl Sources {
             }
         }
         let worker_stale = stale_engines.clone();
-        thread::Builder::new()
-            .name("yejian-sources".into())
-            .spawn(move || {
+        crate::diagnostics::spawn_supervised(
+                "yejian-sources",
+                "书源引擎",
+                true,
+                move || {
                 let catalog = SourceCatalog::new(meta_root.join("sources"));
                 let mut engines = std::collections::HashMap::<String, SourceEngine>::new();
                 while let Ok((request_id, task)) = rx_task.recv() {
-                    for id in worker_stale.lock().unwrap().drain() {
+                    for id in worker_stale.lock().unwrap_or_else(std::sync::PoisonError::into_inner).drain() {
                         engines.remove(&id);
                     }
                     // Skip queued reads already replaced by a newer user choice.
@@ -557,8 +558,8 @@ impl Sources {
                         tx_reply.send((request_id, result.map_err(|error| format!("{error:#}"))));
                     meta_ctx.request_repaint();
                 }
-            })
-            .expect("Unable to start source worker");
+            },
+            );
         // Update checks get their own thread so a slow source never blocks
 
         // browsing or downloads.
@@ -567,9 +568,11 @@ impl Sources {
         let (up_event_tx, up_rx) = mpsc::channel();
         let up_root = root.clone();
         let up_ctx = ctx.clone();
-        thread::Builder::new()
-            .name("yejian-updates".into())
-            .spawn(move || {
+        crate::diagnostics::spawn_supervised(
+                "yejian-updates",
+                "追更检查",
+                true,
+                move || {
                 let catalog = SourceCatalog::new(up_root.join("sources"));
                 while let Ok(batch) = up_cmd_rx.recv() {
                     // Reload each round so an updated source is picked up.
@@ -619,8 +622,8 @@ impl Sources {
                         }
                     }
                 }
-            })
-            .expect("Unable to start update worker");
+            },
+            );
         // Result covers resolve through each source's interpreter on a single
 
         // thread, then fetch bytes on a small HTTP pool so a slow image host
@@ -640,13 +643,15 @@ impl Sources {
             let queue = cover_jobs.clone();
             let done_tx = cover_done_tx.clone();
             let stale = stale_engines.clone();
-            thread::Builder::new()
-                .name("yejian-covers".into())
-                .spawn(move || {
+            crate::diagnostics::spawn_supervised(
+                "yejian-covers",
+                "封面",
+                true,
+                move || {
                     let catalog = SourceCatalog::new(cover_root.join("sources"));
                     let mut engines = std::collections::HashMap::<String, SourceEngine>::new();
                     while let Ok(req) = cover_req_rx.recv() {
-                        for id in stale.lock().unwrap().drain() {
+                        for id in stale.lock().unwrap_or_else(std::sync::PoisonError::into_inner).drain() {
                             engines.remove(&id);
                         }
                         let job = (|| -> anyhow::Result<CoverHttpJob> {
@@ -674,7 +679,7 @@ impl Sources {
                         match job {
                             Ok(job) => {
                                 let (lock, cvar) = &*queue;
-                                lock.lock().unwrap().push_back(job);
+                                lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push_back(job);
                                 cvar.notify_one();
                             }
                             Err(_) => {
@@ -691,20 +696,22 @@ impl Sources {
                             }
                         }
                     }
-                })
-                .expect("Unable to start cover worker");
+                },
+            );
         }
         for _ in 0..4 {
             let queue = cover_jobs.clone();
             let done_tx = cover_done_tx.clone();
             let ctx = ctx.clone();
-            thread::Builder::new()
-                .name("yejian-cover-http".into())
-                .spawn(move || {
+            crate::diagnostics::spawn_supervised(
+                "yejian-cover-http",
+                "封面",
+                true,
+                move || {
                     let (lock, cvar) = &*queue;
                     loop {
                         let job = {
-                            let mut guard = lock.lock().unwrap();
+                            let mut guard = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                             loop {
                                 if let Some(job) = guard.pop_front() {
                                     break job;
@@ -730,8 +737,8 @@ impl Sources {
                         }
                         ctx.request_repaint();
                     }
-                })
-                .expect("Unable to start cover http worker");
+                },
+            );
         }
         // Downloads live on their own thread and run one task at a time, so a
 
@@ -744,9 +751,11 @@ impl Sources {
             let root = root.clone();
             let ctx = ctx.clone();
             let stop = dl_stop.clone();
-            thread::Builder::new()
-                .name("yejian-downloads".into())
-                .spawn(move || {
+            crate::diagnostics::spawn_supervised(
+                "yejian-downloads",
+                "下载",
+                true,
+                move || {
                     let catalog = SourceCatalog::new(root.join("sources"));
                     let mut engines = std::collections::HashMap::<String, SourceEngine>::new();
                     let send = |event| {
@@ -816,8 +825,8 @@ impl Sources {
                             }
                         }
                     }
-                })
-                .expect("Unable to start download worker");
+                },
+            );
         }
         // Cross-source searches keep their own engine map so a source update
         // invalidates them like every other worker.
@@ -826,13 +835,15 @@ impl Sources {
         {
             let (catalog_root, stale, ctx) =
                 (root.clone(), stale_engines.clone(), ctx.clone());
-            thread::Builder::new()
-                .name("yejian-global-search".into())
-                .spawn(move || {
+            crate::diagnostics::spawn_supervised(
+                "yejian-global-search",
+                "跨书源搜索",
+                true,
+                move || {
                     let catalog = SourceCatalog::new(catalog_root.join("sources"));
                     global_search_run(
-                        global_cmd_rx,
-                        global_tx,
+                        &global_cmd_rx,
+                        &global_tx,
                         move |source| {
                             SourceEngine::load(&catalog, source)
                                 .map(|engine| {
@@ -842,11 +853,11 @@ impl Sources {
                                 .map_err(|error| format!("{error:#}"))
                         },
                         GLOBAL_SEARCH_TIMEOUT,
-                        stale,
-                        ctx,
+                        &stale,
+                        &ctx,
                     );
-                })
-                .expect("Unable to start global search worker");
+                },
+            );
         }
         // Storage scans and cleanup run on their own worker so large
         // download-work trees never stall a frame.
@@ -854,10 +865,14 @@ impl Sources {
         let (storage_event_tx, storage_rx) = mpsc::channel::<StorageEvent>();
         {
             let (root, ctx) = (root.clone(), ctx.clone());
-            thread::Builder::new()
-                .name("yejian-source-storage".into())
-                .spawn(move || storage_worker_run(storage_cmd_rx, storage_event_tx, root, ctx))
-                .expect("Unable to start storage worker");
+            crate::diagnostics::spawn_supervised(
+                "yejian-source-storage",
+                "存储统计",
+                true,
+                move || {
+                    storage_worker_run(&storage_cmd_rx, &storage_event_tx, &root, &ctx)
+                },
+            );
         }
 
         let (migrate_tx, migrate_rx) = mpsc::channel();
@@ -1024,6 +1039,10 @@ impl Sources {
     /// The followed works, in follow order (newest first).
     pub(crate) fn follows(&self) -> &[Follow] {
         &self.follows
+    }
+    /// Download/queue entries, for the diagnostics summary.
+    pub(crate) fn task_count(&self) -> usize {
+        self.tasks.len()
     }
     /// Setting writes the host persists (`source-repos`, `-checked-at`).
     pub(crate) fn take_setting_writes(&mut self) -> Vec<(String, String)> {

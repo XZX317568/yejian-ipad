@@ -14,7 +14,6 @@ use std::collections::HashSet;
 
 
 use std::path::Path;
-use std::path::PathBuf;
 
 
 
@@ -148,10 +147,10 @@ pub(super) fn clean_finished_tasks(
 /// never on the UI thread. Every action answers with a fresh report so the
 /// settings rows reflect the result immediately.
 pub(super) fn storage_worker_run(
-    rx: mpsc::Receiver<StorageCmd>,
-    tx: mpsc::Sender<StorageEvent>,
-    root: PathBuf,
-    ctx: Context,
+    rx: &mpsc::Receiver<StorageCmd>,
+    tx: &mpsc::Sender<StorageEvent>,
+    root: &std::path::Path,
+    ctx: &Context,
 ) {
     while let Ok(cmd) = rx.recv() {
         match cmd.action {

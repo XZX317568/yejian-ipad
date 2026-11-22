@@ -1,13 +1,12 @@
 use egui::{ColorImage, Context};
 use std::{
-    collections::VecDeque,
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::{
-        Arc, RwLock,
+        Arc, Condvar, Mutex, RwLock,
         atomic::{AtomicU64, Ordering},
         mpsc,
     },
-    thread,
 };
 use yejian_core::{Book, ChapterLink, ChapterMetadata, Library};
 
@@ -25,6 +24,8 @@ pub enum Command {
         page: usize,
         cover: bool,
         generation: u64,
+        /// Display-sized decode target width in physical pixels (0 = keep).
+        target: u32,
     },
     Progress {
         id: String,
@@ -119,28 +120,38 @@ struct ImageRequest {
     page: usize,
     cover: bool,
     generation: u64,
+    target: u32,
+    queued: std::time::Instant,
 }
 pub struct Worker {
     pub tx: mpsc::Sender<Command>,
     pub rx: mpsc::Receiver<Event>,
     pub generation: Arc<AtomicU64>,
     position_tx: mpsc::Sender<PositionCommand>,
-    image_tx: mpsc::Sender<ImageRequest>,
+    page_queue: PageQueue,
+    cover_tx: mpsc::Sender<ImageRequest>,
 }
 impl Worker {
     pub fn start(root: PathBuf, ctx: Context) -> Self {
         let (tx, command_rx) = mpsc::channel();
         let (event_tx, rx) = mpsc::channel();
         let (position_tx, position_rx) = mpsc::channel();
+        let position_rx = Arc::new(Mutex::new(position_rx));
         let position_queue = position_tx.clone();
-        let (image_tx, image_rx) = mpsc::channel();
-        let image_queue = image_tx.clone();
+        let page_queue = new_page_queue();
+        let page_queue_for_commands = page_queue.clone();
+        let page_queue_for_threads = page_queue.clone();
+        let (cover_tx, cover_rx) = mpsc::channel();
+        let cover_rx = Arc::new(Mutex::new(cover_rx));
+        let cover_queue = cover_tx.clone();
         let generation = Arc::new(AtomicU64::new(0));
         let latest = generation.clone();
         let archive_access = Arc::new(RwLock::new(()));
-        thread::Builder::new()
-            .name("yejian-library".into())
-            .spawn(move || {
+        crate::diagnostics::spawn_supervised(
+            "yejian-library",
+            "书库",
+            false,
+            move || {
                 let notify = |event| {
                     let _ = event_tx.send(event);
                     ctx.request_repaint();
@@ -158,35 +169,78 @@ impl Worker {
                     Ok(library)=>library,
                     Err(e)=>{notify(Event::StartupError(format!("无法打开阅读位置存储：{e:#}")));return;}
                 };
-                let image_library = match Library::open(&root) {
-                    Ok(library) => library,
-                    Err(error) => {
-                        notify(Event::StartupError(format!("无法打开漫画图片存储：{error:#}")));
-                        return;
-                    }
-                };
-                let image_events = event_tx.clone();
-                let image_ctx = ctx.clone();
-                let image_archives = archive_access.clone();
-                let image_root = root.clone();
-                thread::Builder::new()
-                    .name("yejian-images".into())
-                    .spawn(move || {
-                        read_images(
-                            image_root,
-                            image_library,
-                            image_rx,
-                            image_events,
-                            image_ctx,
-                            latest,
-                            image_archives,
-                        );
-                    })
-                    .expect("Unable to start image worker");
+                // Page decode pool: each thread owns its SQLite connection.
+                let decode_threads = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+                    .saturating_sub(2)
+                    .clamp(2, 4);
+                for worker_index in 0..decode_threads {
+                    let events = event_tx.clone();
+                    let worker_ctx = ctx.clone();
+                    let latest = latest.clone();
+                    let archives = archive_access.clone();
+                    let worker_root = root.clone();
+                    let shared = page_queue_for_threads.clone();
+                    crate::diagnostics::spawn_supervised(
+                        &format!("yejian-images-{worker_index}"),
+                        "图片解码",
+                        true,
+                        move || {
+                            let image_library = match Library::open(&worker_root) {
+                                Ok(library) => library,
+                                Err(error) => {
+                                    log::error!("无法打开漫画图片存储：{error:#}");
+                                    return;
+                                }
+                            };
+                            read_pages(
+                                worker_root.clone(),
+                                image_library,
+                                shared.clone(),
+                                events.clone(),
+                                worker_ctx.clone(),
+                                latest.clone(),
+                                archives.clone(),
+                            );
+                        },
+                    );
+                }
+                // Covers keep a separate lane so shelf thumbnails never
+                // delay reading pages.
+                {
+                    let events = event_tx.clone();
+                    let worker_ctx = ctx.clone();
+                    let archives = archive_access.clone();
+                    let cover_root = root.clone();
+                    let cover_rx = cover_rx.clone();
+                    crate::diagnostics::spawn_supervised(
+                        "yejian-covers",
+                        "封面",
+                        true,
+                        move || {
+                            let cover_library = match Library::open(&cover_root) {
+                                Ok(library) => library,
+                                Err(error) => {
+                                    log::error!("无法打开封面图片存储：{error:#}");
+                                    return;
+                                }
+                            };
+                            read_covers(
+                                cover_library,
+                                &cover_rx,
+                                events.clone(),
+                                worker_ctx.clone(),
+                                archives.clone(),
+                            );
+                        },
+                    );
+                }
                 let position_events=event_tx.clone();let position_ctx=ctx.clone();
-                thread::Builder::new().name("yejian-progress".into()).spawn(move||{
+                let position_rx=position_rx.clone();
+                crate::diagnostics::spawn_supervised("yejian-progress","阅读进度",true,move||{
                     let mut last_error:Option<String>=None;
-                    while let Ok(command)=position_rx.recv() {
+                    while let Ok(command)=position_rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).recv() {
                         match command {
                             PositionCommand::Save{id,page,fraction,private}=>{
                                 match position_library.save_position(&id,page,fraction,private) {
@@ -198,7 +252,7 @@ impl Worker {
                             PositionCommand::Flush(reply)=>{let _=reply.send(last_error.clone().map_or(Ok(()),Err));}
                         }
                     }
-                }).expect("Unable to start reading-position worker");
+                });
                 // A refresh or backup requested after a position change must
                 // see the committed row, even with two SQLite connections.
                 let wait_for_positions = || -> anyhow::Result<()> {
@@ -295,9 +349,21 @@ impl Worker {
                                 page,
                                 cover,
                                 generation,
+                                target,
                             } => {
-                                image_queue.send(ImageRequest { id, page, cover, generation })
-                                    .map_err(|_| anyhow::anyhow!("图片读取线程已停止"))?;
+                                route_image(
+                                    &page_queue_for_commands,
+                                    &cover_queue,
+                                    ImageRequest {
+                                        id,
+                                        page,
+                                        cover,
+                                        generation,
+                                        target,
+                                        queued: std::time::Instant::now(),
+                                    },
+                                )
+                                .map_err(|_| anyhow::anyhow!("图片读取线程已停止"))?;
                             }
                             Command::Progress {
                                 id,
@@ -462,15 +528,23 @@ impl Worker {
                         notify(Event::Error(format!("{e:#}")));
                     }
                 }
-            })
-            .expect("Unable to start library worker");
+            },
+        );
         Self {
             tx,
             rx,
             generation,
             position_tx,
-            image_tx,
+            page_queue,
+            cover_tx,
         }
+    }
+    /// Wakes the pool workers so they exit instead of waiting forever.
+    pub fn shutdown(&self) {
+        let (lock, signal) = &*self.page_queue;
+        let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+        state.closed = true;
+        signal.notify_all();
     }
     pub fn send(&self, command: Command) -> Result<(), String> {
         if let Command::Progress {
@@ -495,17 +569,22 @@ impl Worker {
             page,
             cover,
             generation,
+            target,
         } = command
         {
-            return self
-                .image_tx
-                .send(ImageRequest {
+            return route_image(
+                &self.page_queue,
+                &self.cover_tx,
+                ImageRequest {
                     id,
                     page,
                     cover,
                     generation,
-                })
-                .map_err(|_| "图片读取线程已停止，请重新打开应用".into());
+                    target,
+                    queued: std::time::Instant::now(),
+                },
+            )
+            .map_err(|_| "图片读取线程已停止，请重新打开应用".into());
         }
         self.tx
             .send(command)
@@ -519,41 +598,102 @@ impl Worker {
     }
 }
 
-fn next_image(pending: &mut VecDeque<ImageRequest>, generation: u64) -> Option<ImageRequest> {
-    pending.retain(|request| request.cover || request.generation == generation);
-    // The UI submits the visible page first and neighbours afterwards.
-    // Preserve that order, but never put reading behind shelf thumbnails.
-    let index = pending
-        .iter()
-        .position(|request| !request.cover)
-        .unwrap_or(0);
-    pending.remove(index)
+/// Pending page requests shared by the decode pool, plus the page the
+/// reader opened on for each generation — the first request the UI makes
+/// after a page turn is always the visible one.
+struct PageState {
+    pending: Vec<ImageRequest>,
+    anchors: HashMap<u64, (String, usize)>,
+    closed: bool,
 }
 
-fn read_images(
+/// (mutex state, condvar) pair every page worker waits on.
+type PageQueue = Arc<(Mutex<PageState>, Condvar)>;
+
+fn new_page_queue() -> PageQueue {
+    Arc::new((
+        Mutex::new(PageState {
+            pending: Vec::new(),
+            anchors: HashMap::new(),
+            closed: false,
+        }),
+        Condvar::new(),
+    ))
+}
+
+/// Pages go to the shared pool, covers to their own FIFO lane.
+fn route_image(
+    pages: &PageQueue,
+    covers: &mpsc::Sender<ImageRequest>,
+    request: ImageRequest,
+) -> Result<(), ()> {
+    if request.cover {
+        return covers.send(request).map_err(|_| ());
+    }
+    let (lock, signal) = &**pages;
+    let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+    state
+        .anchors
+        .entry(request.generation)
+        .or_insert_with(|| (request.id.clone(), request.page));
+    state.pending.push(request);
+    signal.notify_one();
+    Ok(())
+}
+
+/// Index of the pending request a worker should take next, or `None` when
+/// nothing for the live generation is queued. Priority: the anchor page
+/// itself, then pages after it (forward), then pages before it.
+fn pick_page(state: &PageState, generation: u64) -> Option<usize> {
+    let anchor = state.anchors.get(&generation);
+    let mut best: Option<(u64, usize)> = None;
+    for (index, request) in state.pending.iter().enumerate() {
+        if request.generation != generation {
+            continue;
+        }
+        let same_book = anchor.is_some_and(|(id, _)| id == &request.id);
+        let anchor_page = anchor.map(|(_, page)| *page).unwrap_or(request.page);
+        let distance = request.page.abs_diff(anchor_page) as u64;
+        // Forward pages win at equal distance; other books queue behind.
+        let score = distance * 2
+            + u64::from(request.page < anchor_page)
+            + u64::from(!same_book && request.page != anchor_page) * 2;
+        if best.is_none_or(|(best_score, _)| score < best_score) {
+            best = Some((score, index));
+        }
+    }
+    best.map(|(_, index)| index)
+}
+
+fn read_pages(
     root: PathBuf,
     library: Library,
-    requests: mpsc::Receiver<ImageRequest>,
+    shared: PageQueue,
     events: mpsc::Sender<Event>,
     ctx: Context,
     latest: Arc<AtomicU64>,
     archive_access: Arc<RwLock<()>>,
 ) {
-    let mut pending = VecDeque::new();
+    let (lock, signal) = &*shared;
     loop {
-        if pending.is_empty() {
-            match requests.recv() {
-                Ok(request) => pending.push_back(request),
-                Err(_) => return,
+        let request = {
+            let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                if state.closed {
+                    return;
+                }
+                let generation = latest.load(Ordering::Relaxed);
+                // Requests contain ids only. Stale image pixels are never
+                // decoded just to be discarded later by the UI.
+                state.pending.retain(|r| r.generation == generation);
+                if let Some(index) = pick_page(&state, generation) {
+                    break state.pending.remove(index);
+                }
+                state = signal.wait(state).unwrap_or_else(|e| e.into_inner());
             }
-        }
-        // Requests contain ids only. Stale image pixels are never decoded
-        // just to be discarded later by the UI.
-        pending.extend(requests.try_iter().take(1024));
-        let Some(request) = next_image(&mut pending, latest.load(Ordering::Relaxed)) else {
-            continue;
         };
-        let current = || request.cover || request.generation == latest.load(Ordering::Relaxed);
+        crate::perf::record_queue(request.queued.elapsed().as_secs_f64() * 1000.);
+        let current = || request.generation == latest.load(Ordering::Relaxed);
         let bytes = (|| -> anyhow::Result<Vec<u8>> {
             let _guard = archive_access
                 .read()
@@ -565,15 +705,7 @@ fn read_images(
                 return crate::sources::stream_page(&root, task, request.page)?
                     .ok_or_else(|| anyhow::anyhow!(PAGE_NOT_READY));
             }
-            if request.cover {
-                let book = library.get_book(&request.id)?;
-                match book.cover_path {
-                    Some(path) => Ok(std::fs::read(path)?),
-                    None => library.page_bytes(&request.id, 0),
-                }
-            } else {
-                library.page_bytes(&request.id, request.page)
-            }
+            library.page_bytes(&request.id, request.page)
         })();
         if !current() {
             continue;
@@ -581,7 +713,12 @@ fn read_images(
         let result = match bytes {
             Err(error) if error.to_string() == PAGE_NOT_READY => Err(PAGE_NOT_READY.to_string()),
             bytes => bytes
-                .and_then(|bytes| decode(&bytes, request.cover))
+                .and_then(|bytes| {
+                    let began = std::time::Instant::now();
+                    let decoded = decode(&bytes, request.cover, request.target);
+                    crate::perf::record_decode(began.elapsed().as_secs_f64() * 1000.);
+                    decoded
+                })
                 .map_err(|error| format!("{error:#}")),
         };
         if !current() {
@@ -603,7 +740,56 @@ fn read_images(
     }
 }
 
-fn read_settings(library: &Library) -> anyhow::Result<Vec<(String, String)>> {
+/// Covers arrive on a dedicated FIFO lane so shelf thumbnails never delay
+/// reading pages; they are not generation-gated.
+fn read_covers(
+    library: Library,
+    requests: &Mutex<mpsc::Receiver<ImageRequest>>,
+    events: mpsc::Sender<Event>,
+    ctx: Context,
+    archive_access: Arc<RwLock<()>>,
+) {
+    while let Ok(request) = requests
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .recv()
+    {
+        crate::perf::record_queue(request.queued.elapsed().as_secs_f64() * 1000.);
+        let bytes = (|| -> anyhow::Result<Vec<u8>> {
+            let _guard = archive_access
+                .read()
+                .map_err(|_| anyhow::anyhow!("漫画档案锁已失效"))?;
+            let book = library.get_book(&request.id)?;
+            match book.cover_path {
+                Some(path) => Ok(std::fs::read(path)?),
+                None => library.page_bytes(&request.id, 0),
+            }
+        })();
+        let result = bytes
+            .and_then(|bytes| {
+                let began = std::time::Instant::now();
+                let decoded = decode(&bytes, true, 0);
+                crate::perf::record_decode(began.elapsed().as_secs_f64() * 1000.);
+                decoded
+            })
+            .map_err(|error| format!("{error:#}"));
+        if events
+            .send(Event::Image {
+                id: request.id,
+                page: request.page,
+                cover: true,
+                generation: request.generation,
+                result,
+            })
+            .is_err()
+        {
+            return;
+        }
+        ctx.request_repaint();
+    }
+}
+
+pub(crate) fn read_settings(library: &Library) -> anyhow::Result<Vec<(String, String)>> {
     let mut settings = Vec::new();
     for key in [
         "theme",
@@ -637,6 +823,7 @@ fn read_settings(library: &Library) -> anyhow::Result<Vec<(String, String)>> {
         "search-scope",
         "search-history",
         "categories",
+        "perf-overlay",
     ] {
         if let Some(value) = library.get_setting(key)? {
             settings.push((key.to_string(), value));
@@ -689,17 +876,44 @@ pub(super) fn image_reader(
     Ok(reader)
 }
 
-pub fn decode(bytes: &[u8], cover: bool) -> anyhow::Result<DecodedPage> {
-    let mut image = image_reader(bytes)?.decode()?;
-    if cover {
-        image = image.thumbnail(512, 768);
-    } else if image.width() > 3072 {
-        let height = (image.height() as f64 * 3072. / image.width() as f64)
-            .round()
-            .max(1.) as u32;
-        image = image.resize_exact(3072, height, image::imageops::FilterType::Triangle);
+fn half_rgba8(src: &image::RgbaImage) -> image::RgbaImage {
+    let dst_w = (src.width() / 2).max(1);
+    let dst_h = (src.height() / 2).max(1);
+    let raw = src.as_raw();
+    let stride = src.width() as usize * 4;
+    let mut out = vec![0u8; dst_w as usize * dst_h as usize * 4];
+    for y in 0..dst_h as usize {
+        let y0 = (y * 2).min(src.height() as usize - 1) * stride;
+        let y1 = (y * 2 + 1).min(src.height() as usize - 1) * stride;
+        let row_out = y * dst_w as usize * 4;
+        for x in 0..dst_w as usize {
+            let x0 = (x * 2).min(src.width() as usize - 1) * 4;
+            let x1 = (x * 2 + 1).min(src.width() as usize - 1) * 4;
+            let dst = row_out + x * 4;
+            for c in 0..4 {
+                let sum = raw[y0 + x0 + c] as u16
+                    + raw[y0 + x1 + c] as u16
+                    + raw[y1 + x0 + c] as u16
+                    + raw[y1 + x1 + c] as u16;
+                out[dst + c] = ((sum + 2) >> 2) as u8;
+            }
+        }
     }
-    let image = image.into_rgba8();
+    image::RgbaImage::from_raw(dst_w, dst_h, out).expect("half_rgba8 buffer matches dimensions")
+}
+
+pub fn decode(bytes: &[u8], cover: bool, target: u32) -> anyhow::Result<DecodedPage> {
+    let image = image_reader(bytes)?.decode()?;
+    let image = if cover {
+        image.thumbnail(512, 768).into_rgba8()
+    } else {
+        let mut rgba = image.into_rgba8();
+        let floor = target.max(1024);
+        while rgba.width() > 3072 || (target > 0 && rgba.width() >= floor.saturating_mul(2)) {
+            rgba = half_rgba8(&rgba);
+        }
+        rgba
+    };
     let size = [image.width() as usize, image.height() as usize];
     let content = if cover {
         [0., 0., 1., 1.]
@@ -836,28 +1050,53 @@ mod tests {
     }
 
     #[test]
-    fn image_queue_discards_old_pages_and_prioritizes_reading_over_covers() {
-        let request = |id: &str, page, cover, generation| super::ImageRequest {
+    fn page_pool_orders_anchor_forward_then_backward() {
+        let request = |id: &str, page, generation| super::ImageRequest {
             id: id.into(),
             page,
-            cover,
+            cover: false,
             generation,
+            target: 0,
+            queued: std::time::Instant::now(),
         };
-        let mut pending = std::collections::VecDeque::from([
-            request("old", 0, false, 7),
-            request("cover-a", 0, true, 0),
-            request("old", 1, false, 7),
-            request("current", 3, false, 8),
-            request("current", 4, false, 8),
-            request("cover-b", 0, true, 0),
-        ]);
-        let first = super::next_image(&mut pending, 8).unwrap();
-        assert_eq!((first.id.as_str(), first.page), ("current", 3));
-        let second = super::next_image(&mut pending, 8).unwrap();
-        assert_eq!((second.id.as_str(), second.page), ("current", 4));
-        assert_eq!(super::next_image(&mut pending, 8).unwrap().id, "cover-a");
-        assert_eq!(super::next_image(&mut pending, 8).unwrap().id, "cover-b");
-        assert!(super::next_image(&mut pending, 8).is_none());
+        // The first request of a generation is the anchor (the visible page).
+        let mut state = super::PageState {
+            pending: vec![
+                request("book", 5, 7),
+                request("book", 3, 8),
+                request("book", 1, 8),
+                request("book", 4, 8),
+                request("book", 0, 8),
+            ],
+            anchors: std::collections::HashMap::from([
+                (7, ("book".into(), 5)),
+                (8, ("book".into(), 3)),
+            ]),
+            closed: false,
+        };
+        // Stale generations are discarded before picking.
+        state.pending.retain(|r| r.generation == 8);
+        let order: Vec<usize> = (0..4)
+            .map(|_| {
+                let index = super::pick_page(&state, 8).unwrap();
+                state.pending.remove(index).page
+            })
+            .collect();
+        assert_eq!(order, [3, 4, 1, 0], "anchor, forward, backward");
+        assert!(super::pick_page(&state, 8).is_none());
+        // Covers never enter the page queue.
+        let covers_queue = super::new_page_queue();
+        let (cover_tx, cover_rx) = std::sync::mpsc::channel();
+        let cover = super::ImageRequest {
+            id: "book".into(),
+            page: 0,
+            cover: true,
+            generation: 0,
+            target: 0,
+            queued: std::time::Instant::now(),
+        };
+        super::route_image(&covers_queue, &cover_tx, cover).unwrap();
+        assert_eq!(cover_rx.try_recv().unwrap().id, "book");
     }
 
     #[test]
@@ -895,6 +1134,7 @@ mod tests {
                 page: 0,
                 cover: false,
                 generation: 8,
+                target: 0,
             })
             .unwrap();
         worker
@@ -903,6 +1143,7 @@ mod tests {
                 page: 0,
                 cover: false,
                 generation: 9,
+                target: 0,
             })
             .unwrap();
         worker
@@ -971,6 +1212,7 @@ mod tests {
                 page: 0,
                 cover: false,
                 generation: 1,
+                target: 0,
             })
             .unwrap();
         loop {
@@ -1033,6 +1275,7 @@ mod tests {
                 page: 0,
                 cover: false,
                 generation: 2,
+                target: 0,
             })
             .unwrap();
         loop {
@@ -1306,7 +1549,7 @@ mod tests {
         image
             .write_to(&mut encoded, image::ImageFormat::Png)
             .unwrap();
-        let decoded = super::decode(encoded.get_ref(), false).unwrap();
+        let decoded = super::decode(encoded.get_ref(), false, 0).unwrap();
         assert_eq!(decoded.size, [320, 9000]);
         assert_eq!(decoded.tiles.len(), 5);
         assert!(decoded.tiles.iter().all(|t| t.size[1] <= 2048));
@@ -1323,6 +1566,26 @@ mod tests {
             }
             top += tile.size[1];
         }
+    }
+
+    #[test]
+    fn oversized_and_display_targeted_pages_halve_cleanly() {
+        let image = image::RgbImage::from_fn(2480, 1600, |x, _| {
+            if x % 2 == 0 {
+                image::Rgb([20, 60, 100])
+            } else {
+                image::Rgb([60, 100, 140])
+            }
+        });
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+        let untouched = super::decode(encoded.get_ref(), false, 1668).unwrap();
+        assert_eq!(untouched.size, [2480, 1600]);
+        let halved = super::decode(encoded.get_ref(), false, 1194).unwrap();
+        assert_eq!(halved.size, [1240, 800]);
+        assert_eq!(halved.tiles[0].pixels[0], egui::Color32::from_rgb(40, 80, 120));
     }
 
     fn bordered_image(border: u8, border_px: u32) -> image::RgbaImage {
