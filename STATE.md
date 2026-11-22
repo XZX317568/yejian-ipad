@@ -15,6 +15,8 @@
   - [done] **阶段 0 收口** → 可进阶段 1
 - [~] **阶段 1 · 抽出**：新增 `shelf` 参数段（`pull_base / pull_linear / pull_quad / rail_linear / rail_quad / lift_px / roll_rad / arc_base / arc_pct / arc_max / columns / shade_gain`），已接进 `shelf.rs` 的抽出与飞行绘制。
   - 三个变体：**A 基线**（pull 0.84 / lift 18 / roll 0.045 / arc 12）｜**B 更拔**（1.00 / 22 / 0.06 / 16）｜**C 更克制**（0.70 / 14 / 0.03 / 9）
+  - ⚠️ 第一版录制**看不见飞行段**：`h.frame()` 每帧固定推进 1/60s，而飞行只 0.72s ⇒ 只有 ~43 帧，剩下全是静止的详情页。已加 `Harness.dt`，录制时开放段按 1/240 推进（4 倍慢动作）。
+  - 裁决素材：`artifacts/rust/record/r1/compare.mp4`（三宫格 8s）与 `contact.png`（3 行 × 4 关键时刻拼图，`tools/contact-sheet.ps1` 生成）
   - 待用户裁决（A/B/C）→ 写回裁决表后本段才算完成
 - [ ] 阶段 2 · 摊开　- [ ] 阶段 3 · 翻页　- [ ] 阶段 4 · 合上　- [ ] 阶段 5 · 常量对齐 + 边缘
 
@@ -63,6 +65,7 @@
 - 2026-11-22 参数外置生效且无需重编译：`paper.base` 17→0 后 frame-045/060/075 哈希全变，日志 `.tools/loop-baseline/stage0-params-live.log`
 - 2026-11-22 ffmpeg 管线可用：`artifacts/rust/stage0/body.mp4`（160 帧 / 121KB）
 - 2026-11-22 kill test 先 FAILED（纸全平仍 PASS），补断言后 **PASSED**：broken EXIT=1 / good EXIT=0，日志 `.tools/loop-baseline/stage0-killtest5.log`
+- 2026-11-23 录制必须慢动作：`dt=1/240` 时飞行段才铺满 168 帧；固定 1/60 时整段只剩 1–2 帧飞行
 - 2026-11-22 全 workspace 测试 EXIT=0（含新增 2 条纸张曲线断言），日志 `.tools/loop-baseline/stage0-tests2.log`
 
 - 2026-11-22 本地 `cargo test -j1`：**220 passed / 0 failed / 3 ignored**，10.8 分钟，日志 `.tools/loop-baseline/cargo-test-20261122-retry3.log`

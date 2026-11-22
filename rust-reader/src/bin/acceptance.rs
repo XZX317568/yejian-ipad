@@ -16,6 +16,8 @@ struct Harness {
     queue: wgpu::Queue,
     renderer: Renderer,
     now: f64,
+    /// 每帧推进的秒数；录制慢动作时调小，让飞行段在视频里占足够帧数。
+    dt: f64,
     size: [u32; 2],
     output: PathBuf,
     repaint_delay: Duration,
@@ -55,6 +57,7 @@ impl Harness {
             queue,
             renderer,
             now: 0.,
+            dt: 1. / 60.,
             size: [390, 844],
             output,
             repaint_delay: Duration::ZERO,
@@ -64,7 +67,7 @@ impl Harness {
         })
     }
     fn frame(&mut self, events: Vec<Event>, name: Option<&str>) -> Result<()> {
-        self.now += 1. / 60.;
+        self.now += self.dt;
         let input = RawInput {
             screen_rect: Some(Rect::from_min_size(
                 Pos2::ZERO,
@@ -1806,9 +1809,12 @@ fn record_pass(h: &mut Harness) -> Result<()> {
     }
     h.wait(ReaderApp::covers_loaded)?;
     h.click("shelf-center")?;
+    // 飞行只有 0.72s；按 1/240 推进，168 帧 ≈ 4 倍慢动作，裁决视频里才看得清。
+    h.dt = 1. / 240.;
     for i in 0..open_n {
         h.frame(vec![], Some(&format!("motion/frame-{:03}", i + scroll_n)))?;
     }
+    h.dt = 1. / 60.;
     println!("RECORD: {motion_frames} frames at 1024x1366 (scroll {scroll_n} / open {open_n})");
     Ok(())
 }
