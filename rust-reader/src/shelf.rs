@@ -62,6 +62,8 @@ pub struct Volume {
     scale: f32,
     ink: f32,
     opacity: f32,
+    lift: f32,
+    distance: f32,
     floor: Pos2,
 }
 impl Volume {
@@ -223,6 +225,8 @@ pub fn geometry(area: Rect, count: usize, focus: f32, entrance: f32) -> Vec<Volu
                 scale,
                 ink,
                 opacity,
+                lift,
+                distance,
                 floor,
             })
         })
@@ -259,6 +263,16 @@ fn flat_stroked(p: &Painter, plane: Plane, color: Color32, stroke: Stroke) {
     );
 }
 
+fn ellipse(p: &Painter, center: Pos2, radius: Vec2, fill: Color32) {
+    let points: Vec<Pos2> = (0..24)
+        .map(|i| {
+            let angle = i as f32 / 24. * std::f32::consts::TAU;
+            center + vec2(radius.x * angle.cos(), radius.y * angle.sin())
+        })
+        .collect();
+    polygon(p, points, fill, Stroke::NONE);
+}
+
 fn gradient(p: &Painter, points: &[Pos2], direction: Vec2, first: Color32, last: Color32) {
     let bounds = Rect::from_points(points);
     let half = bounds.size() * direction * 0.5;
@@ -281,10 +295,11 @@ pub fn paint_floor(p: &Painter, volumes: &[Volume], dark: bool) {
         Color32::from_rgb(138, 128, 107)
     };
     for volume in volumes {
-        let origin = volume.floor;
+        let lift = volume.lift;
+        let origin = volume.floor + vec2(-4., 5.) * lift * volume.scale;
         let front = volume.front.horizontal;
         let depth = volume.face.horizontal;
-        let tail = vec2(-10., 10.) * volume.scale;
+        let tail = vec2(-10., 10.) * volume.scale * (1. + 0.55 * lift);
         gradient(
             p,
             &[
@@ -296,7 +311,7 @@ pub fn paint_floor(p: &Painter, volumes: &[Volume], dark: bool) {
                 origin + tail,
             ],
             vec2(-1., 1.),
-            ink.gamma_multiply(0.10 * volume.opacity),
+            ink.gamma_multiply((0.12 - 0.065 * lift) * volume.opacity),
             Color32::TRANSPARENT,
         );
     }
@@ -320,7 +335,10 @@ fn cover_rows(face: Vec2) -> Vec<f32> {
 }
 
 fn corner_inset(face: Vec2, v: f32) -> f32 {
-    let corner = (v.min(1. - v) * face.y / 8.).min(1.);
+    // Fold to the nearer edge on a dyadic grid: mirrored `v` snap to the same
+    // representable value, so the cover mesh stays exactly symmetric.
+    let edge = ((v.min(1. - v)) * 4096.).round() / 4096.;
+    let corner = (edge * face.y / 8.).min(1.);
     (8. / face.x) * (1. - (1. - (1. - corner).powi(2)).max(0.).sqrt())
 }
 
@@ -360,6 +378,19 @@ fn shelf_face(plane: Plane) -> Vec2 {
 }
 
 pub fn paint_art(p: &Painter, plane: Plane, face: Vec2, texture: &TextureHandle, paper: Color32) {
+    paint_art_alpha(p, plane, face, texture, paper, 1.);
+}
+
+/// Same rounded center crop as `paint_art`, with the artwork tinted by
+/// `alpha` so covers can fade in over the paper backing placeholder.
+pub fn paint_art_alpha(
+    p: &Painter,
+    plane: Plane,
+    face: Vec2,
+    texture: &TextureHandle,
+    paper: Color32,
+    alpha: f32,
+) {
     // A flat panel needs only corner rows and two columns.
     let mut rows = vec![0., 1.];
     for i in 1..=8 {
@@ -367,7 +398,16 @@ pub fn paint_art(p: &Painter, plane: Plane, face: Vec2, texture: &TextureHandle,
         rows.extend([y, 1. - y]);
     }
     rows.sort_by(f32::total_cmp);
-    let mesh = cover_mesh(texture, face, &rows, 2, |u, v| plane.point(u, v));
+    let mut mesh = cover_mesh(texture, face, &rows, 2, |u, v| plane.point(u, v));
+    let tint = Color32::from_rgba_unmultiplied(
+        255,
+        255,
+        255,
+        (alpha.clamp(0., 1.) * 255.).round() as u8,
+    );
+    for vertex in &mut mesh.vertices {
+        vertex.color = tint;
+    }
     paint_paper_mesh(p, mesh, paper);
 }
 
@@ -539,6 +579,16 @@ pub fn paint_volume(
         volume.cap.to_vec(),
         Stroke::new(0.4, muted.gamma_multiply(0.24)),
     ));
+    if !tiny {
+        // Ultra-fine page-edge striations inside the top cap suggest the
+        // stacked paper leaves instead of a blank extruded box.
+        let striation = muted.gamma_multiply(if dark { 0.16 } else { 0.18 });
+        let depth = volume.cap[3] - volume.cap[0];
+        for f in [0.28, 0.52, 0.76] {
+            let a = volume.cap[0] + (volume.cap[1] - volume.cap[0]) * f;
+            p.line_segment([a + depth * 0.07, a + depth * 0.93], Stroke::new(0.4, striation));
+        }
+    }
     flat_stroked(p, volume.front, spine, Stroke::new(0.8, edge_line));
     // A whisper of a gutter line where the cover board meets the spine gives
     // each volume its own silhouette against the neighbour's white edge.
@@ -570,6 +620,29 @@ pub fn paint_volume(
             ink,
             false,
         );
+    }
+    // Neighbor contact AO: a narrow dark-to-transparent strip along the
+    // gutter edge of the cover face gives the board joint natural depth.
+    let gutter = volume.face.sub(0., 0., 0.08, 1.);
+    gradient(
+        p,
+        &[
+            gutter.point(0., 0.),
+            gutter.point(1., 0.),
+            gutter.point(1., 1.),
+            gutter.point(0., 1.),
+        ],
+        Vec2::X,
+        Color32::from_black_alpha(if dark { 56 } else { 26 }),
+        Color32::TRANSPARENT,
+    );
+    // Gentle focus dimming keeps the centered book crisp while neighbors
+    // recede, scaled by how far the lane sits from the focus.
+    let dim = (volume.distance.abs().min(1.5) / 1.5) * if dark { 0.08 } else { 0.055 };
+    if dim > 0.005 {
+        let shade = Color32::from_black_alpha((dim * 255.).round() as u8);
+        flat(p, volume.face, shade);
+        flat(p, volume.front, shade);
     }
     p.circle_stroke(volume.front.point(0.5, 0.94), 2.2, Stroke::new(0.6, muted));
     if selected {
@@ -607,7 +680,29 @@ pub fn paint_flight(
     let center = start.center().lerp(end.center(), travel) - vec2(0., arc + lift);
     let bounds = start.size() + (end.size() - start.size()) * travel;
     let face = shelf_face(from) + (end.size() - shelf_face(from)) * travel;
-    let mesh = cover_mesh(texture, face, &cover_rows(face), 17, |u, v| {
+    // A two-layer soft drop shadow tracks the page: it fades in on takeoff
+    // and dissolves as the paper lands into its resting shadow.
+    let elevation = ((lift + arc) / 48.).clamp(0., 1.) * (1. - contact * 0.7);
+    if elevation > 0.001 {
+        let ground = center + vec2(5., 7.) * elevation + vec2(0., (arc + lift) * 0.85);
+        let radius = vec2(bounds.x * 0.55, bounds.y * 0.30) * (0.8 + 0.5 * elevation);
+        let gain = if dark { 1.35 } else { 1. };
+        ellipse(
+            p,
+            ground,
+            radius * 1.4,
+            Color32::from_black_alpha((elevation * 24. * gain).round() as u8),
+        );
+        ellipse(
+            p,
+            ground,
+            radius,
+            Color32::from_black_alpha((elevation * 42. * gain).round() as u8),
+        );
+    }
+    let columns = 17;
+    let rows = cover_rows(face);
+    let mut mesh = cover_mesh(texture, face, &rows, columns, |u, v| {
         let scale = 300. / (300. - motion::paper_depth(t, u, v));
         let (u, v) = (0.5 + (u - 0.5) * scale, 0.5 + (v - 0.5) * scale);
         let begin_uv = (from.point(u, v) - start.min) / start.size();
@@ -617,6 +712,18 @@ pub fn paint_flight(
         let local = (free + (end_uv - free) * contact - Vec2::splat(0.5)) * bounds;
         center + vec2(local.x * cos - local.y * sin, local.x * sin + local.y * cos)
     });
+    // Directional lighting from finite differences of the paper depth map:
+    // ripple highlights and crease shading at zero shader cost.
+    for (i, vertex) in mesh.vertices.iter_mut().enumerate() {
+        let v = rows[i / columns as usize];
+        let inset = corner_inset(face, v);
+        let u = inset + (1. - 2. * inset) * (i % columns as usize) as f32 / (columns - 1) as f32;
+        let depth = motion::paper_depth(t, u, v);
+        let shade = motion::paper_depth(t, u + 0.03, v + 0.03) - depth + depth / 28.;
+        let brightness = (1. - shade * 0.012).clamp(0.91, 1.04);
+        let channel = (brightness * 255.).round().clamp(0., 255.) as u8;
+        vertex.color = Color32::from_rgb(channel, channel, channel);
+    }
     paint_paper_mesh(
         p,
         mesh,
@@ -709,5 +816,23 @@ mod tests {
                 }
             }
         }
+    }
+    #[test]
+    fn volumes_expose_lift_distance_and_cover_corners_stay_inside_the_crop() {
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(740., 560.));
+        let volumes = geometry(rect, 9, 2., 1.);
+        for volume in &volumes {
+            assert!((0. ..=1.).contains(&volume.lift));
+            assert!((volume.distance - (volume.lane as f32 - 2.)).abs() < 0.0001);
+            if volume.distance.abs() >= 1.48 {
+                assert_eq!(volume.lift, 0.);
+            }
+        }
+        let peak = volumes.iter().map(|v| v.lift).fold(0.0_f32, f32::max);
+        assert!((peak - 1.).abs() < 0.001);
+        let face = vec2(118., 166.);
+        assert_eq!(corner_inset(face, 0.5), 0.);
+        assert_eq!(corner_inset(face, 0.03), corner_inset(face, 0.97));
+        assert!((0. ..0.5).contains(&corner_inset(face, 0.)));
     }
 }

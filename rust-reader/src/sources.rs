@@ -40,14 +40,24 @@ fn quiet_action(label: &str) -> Button<'_> {
         .min_size(vec2(44., 44.))
         .wrap()
 }
+/// Secondary actions share the warm surface + hairline border of the rest
+/// of the design system instead of floating as bare text.
+fn bordered_action(label: &str, dark: bool) -> Button<'_> {
+    design::secondary(label, dark).wrap()
+}
 fn disclosure(ui: &mut Ui, label: &str, default_open: bool, body: impl FnOnce(&mut Ui)) {
     let mut state = collapsing_header::CollapsingState::load_with_default_open(
         ui.ctx(),
         ui.make_persistent_id(label),
         default_open,
     );
-    let mut response =
-        ui.add(quiet_action(label).right_text(if state.is_open() { "−" } else { "+" }));
+    let mut response = ui.add(
+        bordered_action(label, ui.visuals().dark_mode).right_text(if state.is_open() {
+            "−"
+        } else {
+            "+"
+        }),
+    );
     if response.clicked() {
         state.toggle(ui);
         response.mark_changed();
@@ -385,14 +395,17 @@ fn paint_cover(
     title: &str,
     font: FontId,
     palette: &crate::design::Palette,
+    alpha: f32,
 ) {
     match texture {
         Some(texture) => {
-            painter.image(
-                texture.id(),
-                rect,
-                Rect::from_min_max(pos2(0., 0.), pos2(1., 1.)),
-                Color32::WHITE,
+            crate::shelf::paint_art_alpha(
+                painter,
+                crate::shelf::Plane::rect(rect),
+                rect.size(),
+                texture,
+                palette.accent_soft,
+                alpha,
             );
         }
         None => {
@@ -1570,6 +1583,12 @@ pub struct Sources {
     cover_missing_disk: HashSet<String>,
     cover_textures: std::collections::HashMap<String, TextureHandle>,
     cover_lru: VecDeque<String>,
+    /// egui-time stamps for freshly materialized cover textures, feeding
+    /// the 180 ms fade-in and the shell's keep-animating signal.
+    cover_loaded_at: std::collections::HashMap<String, f64>,
+    /// Reduced-motion flag mirrored from the shell; fades jump straight
+    /// to their final frame when set.
+    reduced: bool,
     /// Page already auto-loaded when its last grid row scrolled into view, so
 
     /// the marker cannot fire the same request again on the next frame.
@@ -2576,6 +2595,8 @@ impl Sources {
             cover_missing_disk: HashSet::new(),
             cover_textures: Default::default(),
             cover_lru: VecDeque::new(),
+            cover_loaded_at: Default::default(),
+            reduced: false,
             auto_next_page: None,
             chapter_progress: Default::default(),
             description_expanded: false,
@@ -2787,6 +2808,10 @@ impl Sources {
                 )
             });
         self.covers.insert(snapshot.to_string(), texture.clone());
+        if texture.is_some() {
+            self.cover_loaded_at
+                .insert(snapshot.to_string(), ctx.input(|i| i.time));
+        }
         texture
     }
     /// Returns the texture for a result-grid cover, or `None` while it is
@@ -2832,11 +2857,14 @@ impl Sources {
         let texture =
             ctx.load_texture(format!("source-cover-{key}"), image, TextureOptions::LINEAR);
         self.cover_textures.insert(key.clone(), texture.clone());
+        self.cover_loaded_at
+            .insert(key.clone(), ctx.input(|i| i.time));
         self.cover_lru.push_back(key);
         while self.cover_textures.len() > COVER_TEXTURE_CAP {
             match self.cover_lru.pop_front() {
                 Some(evicted) => {
                     self.cover_textures.remove(&evicted);
+                    self.cover_loaded_at.remove(&evicted);
                 }
                 None => break,
             }
@@ -2877,6 +2905,26 @@ impl Sources {
         map: std::collections::HashMap<String, (usize, usize, Option<i64>)>,
     ) {
         self.chapter_progress = map;
+    }
+    /// Mirrors the shell's reduced-motion setting; cover fades complete
+    /// instantly so nothing keeps animating.
+    pub fn set_reduced(&mut self, reduced: bool) {
+        self.reduced = reduced;
+    }
+    /// True only while a freshly decoded cover is still inside its 180 ms
+    /// fade-in window, so the host repaints until every tile settles.
+    pub fn is_animating(&self, now: f64) -> bool {
+        !self.reduced && self.cover_loaded_at.values().any(|&t0| now - t0 < 0.18)
+    }
+    /// Fade-in progress for the cover stored under `key`; textures that
+    /// predate the timestamp map (or finished fading) render fully opaque.
+    fn cover_alpha(&self, key: &str, now: f64) -> f32 {
+        if self.reduced {
+            return 1.;
+        }
+        self.cover_loaded_at.get(key).map_or(1., |&t0| {
+            crate::motion::smooth(((now - t0) / 0.18).clamp(0., 1.) as f32)
+        })
     }
     /// The chapter 继续阅读 should open: the one touched most recently across
 
@@ -3025,6 +3073,8 @@ impl Sources {
         if self.follows.is_empty() {
             return;
         }
+        let palette = design::palette(ui.visuals().dark_mode);
+        let now = ui.ctx().input(|i| i.time);
         design::section(ui, &format!("我的追更 · {}", self.follows.len()));
         let checking = self.checking > 0;
         if ui
@@ -3081,7 +3131,20 @@ impl Sources {
             };
             // Only covers without a texture are fetched; asking for loaded
             // ones re-downloads them after every completed request.
-            if texture.is_none()
+            let missing = texture.is_none();
+            let (texture, alpha) = match texture {
+                Some(texture) => {
+                    let alpha = cover_url
+                        .as_ref()
+                        .map_or(1., |url| self.cover_alpha(&cover_key(&source_id, url), now));
+                    (Some(texture), alpha)
+                }
+                None => (
+                    self.cover_texture(ui.ctx(), &snapshot),
+                    self.cover_alpha(&snapshot, now),
+                ),
+            };
+            if missing
                 && let Some(url) = cover_url
             {
                 want_covers.push(CoverReq {
@@ -3090,18 +3153,22 @@ impl Sources {
                     url,
                 });
             }
-            let texture = match texture {
-                Some(texture) => Some(texture),
-                None => self.cover_texture(ui.ctx(), &snapshot),
-            };
             if let Some(texture) = texture {
                 let cover =
                     Rect::from_center_size(pos2(left + 18., (top + bottom) / 2.), vec2(40., 54.));
-                ui.painter().image(
-                    texture.id(),
+                crate::shelf::paint_art_alpha(
+                    ui.painter(),
+                    crate::shelf::Plane::rect(cover),
+                    cover.size(),
+                    &texture,
+                    palette.accent_soft,
+                    alpha,
+                );
+                ui.painter().rect_stroke(
                     cover,
-                    Rect::from_min_max(pos2(0., 0.), pos2(1., 1.)),
-                    Color32::WHITE,
+                    8.,
+                    Stroke::new(1., palette.line),
+                    StrokeKind::Inside,
                 );
             }
         }
@@ -4375,7 +4442,10 @@ impl Sources {
                     }
                 }
                 DownloadStatus::Failed => {
-                    if ui.add(quiet_action("重试")).clicked() {
+                    if ui
+                        .add(bordered_action("重试", ui.visuals().dark_mode))
+                        .clicked()
+                    {
                         self.retry_task(task);
                     }
                     if ui.add(quiet_action("取消")).clicked() {
@@ -4426,10 +4496,10 @@ impl Sources {
                 leave = true;
                 self.start_search();
             }
-            if ui.add(quiet_action("重置")).clicked() {
+            if ui.add(design::secondary("重置", dark)).clicked() {
                 editor = FilterEditor::new(&self.filters, &[]);
             }
-            if ui.add(quiet_action("取消")).clicked() {
+            if ui.add(design::secondary("取消", dark)).clicked() {
                 leave = true;
             }
         });
@@ -4439,11 +4509,20 @@ impl Sources {
         ui.add_space(14.);
         ui.separator();
         ui.add_space(14.);
-        ScrollArea::vertical()
+        let output = ScrollArea::vertical()
             .id_salt("source-filter-editor")
             .show(ui, |ui| {
                 editor.ui(ui, &self.filters);
             });
+        // Long option lists clip mid-row at the viewport edge; a warm fade
+        // lets them dissolve into the paper instead of slicing hard.
+        design::paint_scroll_fade(
+            ui.painter(),
+            output.inner_rect,
+            design::palette(dark).paper,
+            false,
+            true,
+        );
         if !leave {
             self.filter_editor = Some(editor);
         }
@@ -4469,7 +4548,8 @@ impl Sources {
     }
 
     fn browser_header(&mut self, ui: &mut Ui) {
-        let palette = design::palette(ui.visuals().dark_mode);
+        let dark = ui.visuals().dark_mode;
+        let palette = design::palette(dark);
         ui.vertical(|ui| {
             ui.set_min_width(ui.available_width());
             ui.horizontal_wrapped(|ui| {
@@ -4530,7 +4610,7 @@ impl Sources {
                 if ui
                     .add_enabled(
                         self.metadata_loaded && !hidden && !self.filters.is_empty(),
-                        quiet_action(&label),
+                        bordered_action(&label, dark),
                     )
                     .clicked()
                 {
@@ -4539,7 +4619,7 @@ impl Sources {
                 }
                 if !self.applied_filters.is_empty()
                     && !hidden
-                    && ui.add(quiet_action("清除筛选")).clicked()
+                    && ui.add(bordered_action("清除筛选", dark)).clicked()
                 {
                     self.applied_filters.clear();
                     self.start_search();
@@ -5063,7 +5143,10 @@ impl Sources {
                         .hint_text("粘贴书源仓库地址")
                         .desired_width(ui.available_width()),
                 );
-                if ui.add_enabled(!self.busy, quiet_action("读取")).clicked() {
+                if ui
+                    .add_enabled(!self.busy, bordered_action("读取", ui.visuals().dark_mode))
+                    .clicked()
+                {
                     self.submit(Task::Fetch(self.url.trim().into()));
                 }
             });
@@ -5228,8 +5311,9 @@ impl Sources {
         };
         let source = self.source_for(&manga);
         let width = ui.available_width();
+        let now = ui.ctx().input(|i| i.time);
 
-        let back = ui.add(quiet_action("返回搜索结果").min_size(vec2(88., 44.)));
+        let back = ui.add(bordered_action("返回搜索结果", dark).min_size(vec2(88., 44.)));
         self.hitboxes.insert("source-detail-back".into(), back.rect);
         if back.clicked() {
             self.selected_manga = None;
@@ -5281,6 +5365,7 @@ impl Sources {
 
         let cover_url = manga.cover.clone().unwrap_or_default();
         let texture = self.cover_image(ui.ctx(), &source, &cover_url);
+        let cover_alpha = self.cover_alpha(&cover_key(&source, &cover_url), now);
         let mut want = Vec::new();
         if texture.is_none() && !cover_url.is_empty() {
             want.push(CoverReq {
@@ -5351,9 +5436,9 @@ impl Sources {
                     read = true;
                 }
                 let button = if followed {
-                    ui.add(quiet_action("已追更 · 取消追更").min_size(vec2(0., 48.)))
+                    ui.add(bordered_action("已追更 · 取消追更", dark).min_size(vec2(0., 48.)))
                 } else {
-                    ui.add(quiet_action("追更").min_size(vec2(0., 48.)))
+                    ui.add(bordered_action("追更", dark).min_size(vec2(0., 48.)))
                 };
                 this.hitboxes
                     .insert("source-detail-follow".into(), button.rect);
@@ -5362,7 +5447,8 @@ impl Sources {
                 }
                 let button = ui.add_enabled(
                     missing > 0 && !this.busy,
-                    quiet_action(&format!("下载全部未下载（{missing}）")).min_size(vec2(0., 48.)),
+                    bordered_action(&format!("下载全部未下载（{missing}）"), dark)
+                        .min_size(vec2(0., 48.)),
                 );
                 this.hitboxes
                     .insert("source-detail-missing".into(), button.rect);
@@ -5374,6 +5460,7 @@ impl Sources {
         if wide {
             ui.horizontal(|ui| {
                 let (cover_rect, _) = ui.allocate_exact_size(cover_size, Sense::hover());
+                design::soft_shadow(ui.painter(), cover_rect, 8., 1.2, dark);
                 paint_cover(
                     ui.painter(),
                     cover_rect,
@@ -5381,6 +5468,7 @@ impl Sources {
                     &manga.title,
                     heading.clone(),
                     &palette,
+                    cover_alpha,
                 );
                 ui.add_space(16.);
                 ui.vertical(|ui| {
@@ -5391,6 +5479,7 @@ impl Sources {
         } else {
             ui.vertical_centered(|ui| {
                 let (cover_rect, _) = ui.allocate_exact_size(cover_size, Sense::hover());
+                design::soft_shadow(ui.painter(), cover_rect, 8., 1.2, dark);
                 paint_cover(
                     ui.painter(),
                     cover_rect,
@@ -5398,6 +5487,7 @@ impl Sources {
                     &manga.title,
                     heading.clone(),
                     &palette,
+                    cover_alpha,
                 );
             });
             ui.add_space(8.);
@@ -5498,7 +5588,8 @@ impl Sources {
         ui.horizontal_wrapped(|ui| {
             ui.selectable_value(&mut self.chapters_newest_first, false, "从头开始");
             ui.selectable_value(&mut self.chapters_newest_first, true, "最新在前");
-            if !self.chapter_query.is_empty() && ui.add(quiet_action("清除查找")).clicked() {
+            if !self.chapter_query.is_empty() && ui.add(bordered_action("清除查找", dark)).clicked()
+            {
                 self.chapter_query.clear();
             }
         });
@@ -5538,6 +5629,11 @@ impl Sources {
                 .chapter_progress
                 .get(&id)
                 .map(|&(page, count, _)| (page, count));
+            // Finished chapters drop to muted ink so unread ones stand out.
+            let read = progress.is_some_and(|(page, count)| count > 0 && page + 1 >= count)
+                || state.is_some_and(|state| {
+                    state.total > 0 && state.read_page.is_some_and(|page| page + 1 >= state.total)
+                });
             let lines = chapter_state_lines(
                 chapter.locked,
                 downloaded.is_some(),
@@ -5562,7 +5658,7 @@ impl Sources {
             let mut name_job = egui::text::LayoutJob::simple(
                 name.clone(),
                 body.clone(),
-                if chapter.locked {
+                if chapter.locked || read {
                     palette.muted
                 } else {
                     palette.ink
@@ -5621,8 +5717,21 @@ impl Sources {
             if response.clicked() {
                 open = Some(chapter.clone());
             }
-            if response.hovered() || resume_key.as_deref() == Some(chapter.key.as_str()) {
+            let is_resume = resume_key.as_deref() == Some(chapter.key.as_str());
+            if is_resume {
+                painter.rect_filled(row_rect, 6., palette.accent_soft.gamma_multiply(0.55));
+            } else if response.hovered() {
                 painter.rect_filled(row_rect, 6., palette.accent_soft);
+            }
+            if response.is_pointer_button_down_on() {
+                painter.rect_filled(row_rect, 6., palette.accent_soft);
+            }
+            if is_resume {
+                let bar = Rect::from_min_size(
+                    pos2(row_rect.left() + 1., row_rect.top() + 8.),
+                    vec2(3., (row_rect.height() - 16.).max(0.)),
+                );
+                painter.rect_filled(bar, 1.5, palette.accent);
             }
             let text_top = row_rect.top() + (row_h - text_h) / 2.;
             painter.galley(
@@ -5642,16 +5751,24 @@ impl Sources {
             }
             let lines_h = state_galleys.len() as f32 * (small_h + 2.) - 2.;
             for (row, galley) in state_galleys.iter().enumerate() {
-                painter.galley(
-                    pos2(
-                        row_rect.right() - button_w - 8. - galley.size().x,
-                        row_rect.top()
-                            + (row_h - lines_h.max(0.)) / 2.
-                            + row as f32 * (small_h + 2.),
-                    ),
-                    galley.clone(),
-                    palette.muted,
+                let galley_pos = pos2(
+                    row_rect.right() - button_w - 8. - galley.size().x,
+                    row_rect.top() + (row_h - lines_h.max(0.)) / 2. + row as f32 * (small_h + 2.),
                 );
+                painter.galley(galley_pos, galley.clone(), palette.muted);
+                // A crisp accent check makes linked chapters read as done at
+                // a glance without changing the state text itself.
+                if downloaded.is_some() && lines[row] == "已下载" {
+                    let c = pos2(galley_pos.x - 10., galley_pos.y + small_h / 2.);
+                    painter.line_segment(
+                        [c + vec2(-3.4, 0.2), c + vec2(-0.9, 2.6)],
+                        Stroke::new(1.6, palette.accent),
+                    );
+                    painter.line_segment(
+                        [c + vec2(-0.9, 2.6), c + vec2(3.6, -2.8)],
+                        Stroke::new(1.6, palette.accent),
+                    );
+                }
             }
             if show_download {
                 let button_rect = Rect::from_center_size(
@@ -5661,7 +5778,7 @@ impl Sources {
                 let label = if failed { "重试下载" } else { "仅下载" };
                 let button = ui.put(
                     button_rect,
-                    quiet_action(label).min_size(button_rect.size()),
+                    design::secondary(label, dark).min_size(button_rect.size()),
                 );
                 self.hitboxes
                     .insert(format!("source-chapter-dl-{index}"), button.rect);
@@ -5724,6 +5841,7 @@ impl Sources {
         let small_h = ui.text_style_height(&TextStyle::Small);
         let cell_h = cover_h + 6. + body_h * 2. + 2. + small_h + 6.;
         let expanded = ui.clip_rect().expand(cell_h + gap);
+        let now = ui.ctx().input(|i| i.time);
         let entries = self.results.entries.clone();
         let mut want = Vec::new();
         let mut last_row = None;
@@ -5754,11 +5872,12 @@ impl Sources {
                 }
                 let source = self.source_for(manga);
                 let url = manga.cover.clone().unwrap_or_default();
+                let key = cover_key(&source, &url);
                 let texture = if expanded.intersects(cell) {
                     let texture = self.cover_image(ui.ctx(), &source, &url);
                     if texture.is_none() && !url.is_empty() {
                         want.push(CoverReq {
-                            key: cover_key(&source, &url),
+                            key: key.clone(),
                             source,
                             url,
                         });
@@ -5768,9 +5887,12 @@ impl Sources {
                     None
                 };
                 if response.hovered() && !self.busy {
-                    ui.painter().rect_filled(cell, 8., palette.accent_soft);
+                    ui.painter().rect_filled(cell, 8., palette.soft);
                 }
-                let cover_rect = Rect::from_min_size(cell.min, vec2(cell_w, cover_h));
+                let cover_rect = design::press_rect(
+                    Rect::from_min_size(cell.min, vec2(cell_w, cover_h)),
+                    response.is_pointer_button_down_on(),
+                );
                 let painter = ui.painter().with_clip_rect(ui.clip_rect().intersect(cell));
                 paint_cover(
                     &painter,
@@ -5779,6 +5901,7 @@ impl Sources {
                     &manga.title,
                     TextStyle::Heading.resolve(ui.style()),
                     &palette,
+                    self.cover_alpha(&key, now),
                 );
                 let mut title_job = egui::text::LayoutJob::simple(
                     manga.title.clone(),
@@ -5846,7 +5969,10 @@ impl Sources {
                 {
                     self.open_web(&origin, None);
                 }
-                if ui.add(quiet_action("忽略")).clicked() {
+                if ui
+                    .add(bordered_action("忽略", ui.visuals().dark_mode))
+                    .clicked()
+                {
                     self.challenge = None;
                 }
             });
@@ -5972,7 +6098,10 @@ impl Sources {
                     ui.spinner();
                 }
                 if let Some(task) = self.failed.clone() {
-                    if ui.add(quiet_action("重试")).clicked() {
+                    if ui
+                        .add(bordered_action("重试", ui.visuals().dark_mode))
+                        .clicked()
+                    {
                         self.submit(task);
                     }
                 }
@@ -6402,6 +6531,8 @@ mod tests {
             cover_missing_disk: HashSet::new(),
             cover_textures: Default::default(),
             cover_lru: VecDeque::new(),
+            cover_loaded_at: Default::default(),
+            reduced: false,
             auto_next_page: None,
             chapter_progress: Default::default(),
             description_expanded: false,

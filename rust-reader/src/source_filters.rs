@@ -433,6 +433,21 @@ impl FilterEditor {
                         };
                         if config.uses_tag_style {
                             ui.horizontal_wrapped(draw);
+                        } else if config.options.len() >= 15 {
+                            // Long option lists get a bounded scroll of their
+                            // own; the bottom fade dissolves clipped rows into
+                            // the paper instead of slicing them in half.
+                            let output = ScrollArea::vertical()
+                                .id_salt("filter-options")
+                                .max_height(ui.text_style_height(&TextStyle::Body) * 13.2)
+                                .show(ui, draw);
+                            design::paint_scroll_fade(
+                                ui.painter(),
+                                output.inner_rect,
+                                palette.paper,
+                                false,
+                                true,
+                            );
                         } else {
                             draw(ui);
                         }
@@ -511,6 +526,18 @@ impl FilterEditor {
                         };
                         if config.uses_tag_style {
                             ui.horizontal_wrapped(draw);
+                        } else if config.options.len() >= 15 {
+                            let output = ScrollArea::vertical()
+                                .id_salt("filter-options")
+                                .max_height(ui.text_style_height(&TextStyle::Body) * 13.2)
+                                .show(ui, draw);
+                            design::paint_scroll_fade(
+                                ui.painter(),
+                                output.inner_rect,
+                                palette.paper,
+                                false,
+                                true,
+                            );
                         } else {
                             draw(ui);
                         }

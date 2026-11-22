@@ -573,6 +573,7 @@ pub(crate) fn parse_web_json(json: &str) -> Result<WebResult> {
 /// Parse the JSON contract produced by `RustActivity.pollImport()` and
 /// `yejian_ios_poll_import()`.
 #[cfg(any(target_os = "android", target_os = "ios", test))]
+#[cfg_attr(test, allow(dead_code))]
 pub(crate) fn parse_import_json(json: &str) -> Result<ImportBatch> {
     let value: serde_json::Value = serde_json::from_str(json)
         .map_err(|error| PlatformError::Protocol(format!("invalid import JSON: {error}")))?;
@@ -677,6 +678,7 @@ pub(crate) fn parse_import_json(json: &str) -> Result<ImportBatch> {
 
 /// Parse `"left,top,right,bottom"` as physical pixels.
 #[cfg(any(target_os = "android", target_os = "ios", test))]
+#[cfg_attr(test, allow(dead_code))]
 pub(crate) fn parse_insets_csv(csv: &str) -> Result<Insets> {
     let mut parts = csv.split(',');
     let mut next = || -> Result<i32> {
