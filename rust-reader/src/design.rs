@@ -418,6 +418,45 @@ pub(crate) fn surface(ui: &Ui) -> Frame {
         .shadow(card_shadow(dark))
 }
 
+/// Result of [`modal`]: whether the dimmed backdrop was clicked (dismiss)
+/// and where the card landed so callers can record a hitbox.
+pub(crate) struct Modal {
+    pub(crate) scrim_clicked: bool,
+    pub(crate) card_rect: Rect,
+}
+
+/// Opaque scrim + centered opaque card shared by every modal. The scrim
+/// swallows the tap so nothing beneath is clickable; `fade_in(false)` plus
+/// the surface fill keep the card opaque from the first frame.
+pub(crate) fn modal(ctx: &Context, key: &str, body: impl FnOnce(&mut Ui)) -> Modal {
+    let screen = ctx.content_rect();
+    let scrim = Area::new(Id::unique(format!("{key}-scrim")))
+        .order(Order::Foreground)
+        .fade_in(false)
+        .interactable(true)
+        .fixed_pos(screen.min)
+        .show(ctx, |ui| {
+            ui.painter()
+                .rect_filled(screen, 0., Color32::from_black_alpha(96));
+            ui.allocate_rect(screen, Sense::click())
+        });
+    let mut card_rect = Rect::NOTHING;
+    Area::new(Id::unique(key))
+        .order(Order::Foreground)
+        .fade_in(false)
+        .interactable(true)
+        .movable(false)
+        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+        .show(ctx, |ui| {
+            let frame = surface(ui).show(ui, |ui| body(ui));
+            card_rect = frame.response.rect;
+        });
+    Modal {
+        scrim_clicked: scrim.inner.clicked(),
+        card_rect,
+    }
+}
+
 /// A theme choice shows what the page will look like before it is selected.
 pub(crate) fn theme_choice(
     ui: &mut Ui,
