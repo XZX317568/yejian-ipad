@@ -19,6 +19,7 @@
   - 裁决素材：`artifacts/rust/record/r1/compare.mp4`（三宫格 8s）与 `contact.png`（3 行 × 4 关键时刻拼图，`tools/contact-sheet.ps1` 生成）
   - ✅ **裁决：A**（2026-11-23，用户在 `preview/` 里用 A/B/C 三个启动器亲手试过后选定）→ 阶段 1 完成
 - [~] **阶段 2 · 摊开**：核心链路已入库（`0f43700`，斜扫 clip 揭示 + spread 参数组）；三变体已录 `artifacts/rust/record/r2/compare.mp4`；preview 已加 试-r2-A/B/C 启动器 → **待用户裁决编号**
+- [~] **阶段 3 · 翻页**：核心链路已入库（`64381e0`，页图 mesh 化 + 列向 depth 隆起 + 详情→阅读器 entry）；三变体已录 `artifacts/rust/record/r3/compare.mp4` + 中点帧 `record/r3-flip/{A,B,C}/flip-*.png`；preview 已加 试-r3-A/B/C 启动器 → **待用户裁决编号**
   - 用户同时给出产品决定：**下线「藏书一览」网格，立体书架即主体**（已实现：`ui.rs` 不再绘制网格，网格高度并入 stage；`shelf_focus_book_id()` 补位验收链路）
 - [ ] 阶段 2 · 摊开　- [ ] 阶段 3 · 翻页　- [ ] 阶段 4 · 合上　- [ ] 阶段 5 · 常量对齐 + 边缘
 
