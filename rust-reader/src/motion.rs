@@ -2,6 +2,8 @@
 //! Copyrights and GPL-3.0 notices are retained in ../licenses.
 use std::f32::consts::PI;
 
+use crate::params::params;
+
 pub const ENTRANCE: f64 = 0.520;
 pub const SELECT: f64 = 0.420;
 pub const OPEN: f64 = 0.720;
@@ -9,7 +11,8 @@ pub const CLOSE: f64 = 0.580;
 
 /// Standard ease-out deceleration for UI transitions.
 pub fn ease_out(t: f32) -> f32 {
-    cubic(t, 0.22, 1., 0.36, 1.)
+    let e = params().ease.clone();
+    cubic(t, e.out_x1, e.out_y1, e.out_x2, e.out_y2)
 }
 
 /// Asymptotic edge damping: `sign * limit * (1 - 1 / (1 + |d|/limit))`.
@@ -27,7 +30,8 @@ pub fn smooth(x: f32) -> f32 {
 }
 
 pub fn weight(distance: f32) -> f32 {
-    if distance.abs() >= 1.48 { 0. } else { (distance / 1.48 * PI / 2.).cos().powi(2) }
+    let radius = params().weight.radius;
+    if distance.abs() >= radius { 0. } else { (distance / radius * PI / 2.).cos().powi(2) }
 }
 
 pub fn cubic(t: f32, x1: f32, y1: f32, x2: f32, y2: f32) -> f32 {
@@ -45,17 +49,19 @@ pub fn cubic(t: f32, x1: f32, y1: f32, x2: f32, y2: f32) -> f32 {
 }
 
 pub fn travel(t: f32) -> f32 {
-    cubic(((t - 0.12) / 0.46).clamp(0., 1.), 0.645, 0.045, 0.355, 1.)
+    let e = params().ease.clone();
+    cubic(((t - e.travel_start) / e.travel_span).clamp(0., 1.), 0.645, 0.045, 0.355, 1.)
 }
 
 pub fn paper_depth(t: f32, u: f32, v: f32) -> f32 {
     if t <= 0. || t >= 1. { return 0.; }
-    let peel = smooth((t - 0.025 - v * 0.11) / 0.11);
-    let landing = ((t - 0.58) / 0.42).clamp(0., 1.);
-    let contact = (1. - v) * 0.66 + u * 0.34;
-    let floating = 1. - smooth((landing - contact * 0.70) / 0.30);
-    let breeze = ((v * 1.3 - t * 1.6) * PI * 2.).sin();
-    peel * floating * (17. + 7. * (v * PI).sin() + 3. * breeze * (t * PI).sin())
+    let p = params().paper.clone();
+    let peel = smooth((t - p.peel_start - v * p.peel_row_delay) / p.peel_span);
+    let landing = ((t - p.landing_start) / p.landing_span).clamp(0., 1.);
+    let contact = (1. - v) * p.contact_spine + u * p.contact_face;
+    let floating = 1. - smooth((landing - contact * p.float_scale) / p.float_span);
+    let breeze = ((v * p.breeze_v - t * p.breeze_t) * PI * 2.).sin();
+    peel * floating * (p.base + p.arch * (v * PI).sin() + p.breeze_gain * breeze * (t * PI).sin())
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -71,32 +77,35 @@ pub struct Snap {
 impl Snap {
     /// Positions and velocities are in lanes, making resize continuous.
     pub fn new(start: f32, velocity: f32, pitch: f32) -> Self {
-        let directional = velocity.abs() * pitch >= 50.;
+        let s = params().snap.clone();
+        let directional = velocity.abs() * pitch >= s.directional_px;
         let release = if directional { velocity } else { 0. };
-        let mut target = (start + release / 4.4).round();
-        if directional && (target - start) * release.signum() < release.abs() / 12. {
-            let runway = start + release / 12.;
+        let mut target = (start + release / s.friction).round();
+        if directional && (target - start) * release.signum() < release.abs() / s.runway_lanes {
+            let runway = start + release / s.runway_lanes;
             target = if release > 0. { runway.ceil() } else { runway.floor() };
         }
-        let coast = if directional && release.abs() > 4. {
-            (release.abs() / 4.).ln() / 4.4
+        let coast = if directional && release.abs() > s.coast_min_velocity {
+            (release.abs() / s.coast_min_velocity).ln() / s.friction
         } else { 0. };
-        let handoff = start + release / 4.4 * (1. - (-4.4 * coast).exp());
-        let handoff_velocity = release * (-4.4 * coast).exp();
+        let handoff = start + release / s.friction * (1. - (-s.friction * coast).exp());
+        let handoff_velocity = release * (-s.friction * coast).exp();
         let landing = if directional { 3. * (target - handoff) / handoff_velocity } else { 0. };
         Self { start, velocity: release, target, coast, handoff, landing }
     }
     pub fn sample(&self, seconds: f32) -> (f32, bool) {
         if self.landing <= 0. {
+            let s = params().snap.clone();
             let delta = self.start - self.target;
-            let e = (-12. * seconds).exp();
-            let x = self.target + delta * (1. + 12. * seconds) * e;
-            let v = -144. * delta * seconds * e;
+            let e = (-s.spring_c * seconds).exp();
+            let x = self.target + delta * (1. + s.spring_c * seconds) * e;
+            let v = -s.spring_k * delta * seconds * e;
             let done = (x - self.target).abs() < 0.0001 && v.abs() < 0.003;
             return (if done { self.target } else { x }, done);
         }
         if seconds < self.coast {
-            return (self.start + self.velocity / 4.4 * (1. - (-4.4 * seconds).exp()), false);
+            let friction = params().snap.friction;
+            return (self.start + self.velocity / friction * (1. - (-friction * seconds).exp()), false);
         }
         let remaining = (1. - (seconds - self.coast) / self.landing).clamp(0., 1.);
         (self.target - (self.target - self.handoff) * remaining.powi(3), remaining == 0.)
@@ -129,7 +138,8 @@ impl ShelfMotion {
     pub fn tick(&mut self, now: f64) -> bool {
         if let Some((start, from, to)) = self.tween {
             let t = ((now - start) / SELECT).clamp(0., 1.) as f32;
-            self.focus = from + (to - from) * cubic(t, 0.2, 1.06, 0.35, 1.);
+            let e = params().ease.clone();
+            self.focus = from + (to - from) * cubic(t, e.select_x1, e.select_y1, e.select_x2, e.select_y2);
             if t >= 1. { self.tween = None; }
         }
         if let Some((start, snap)) = self.snap {

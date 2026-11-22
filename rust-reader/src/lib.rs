@@ -3,6 +3,7 @@ mod follows;
 #[cfg(target_os = "ios")]
 mod ios_diagnostics;
 mod motion;
+mod params;
 mod reader_prefs;
 mod shelf;
 mod source_filters;

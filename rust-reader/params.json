@@ -1,0 +1,41 @@
+{
+  "paper": {
+    "peel_start": 0.025,
+    "peel_span": 0.11,
+    "peel_row_delay": 0.11,
+    "landing_start": 0.58,
+    "landing_span": 0.42,
+    "contact_spine": 0.66,
+    "contact_face": 0.34,
+    "float_scale": 0.7,
+    "float_span": 0.3,
+    "breeze_v": 1.3,
+    "breeze_t": 1.6,
+    "base": 17,
+    "arch": 7,
+    "breeze_gain": 3
+  },
+  "snap": {
+    "directional_px": 50,
+    "friction": 4.4,
+    "runway_lanes": 12,
+    "coast_min_velocity": 4,
+    "spring_k": 144,
+    "spring_c": 12
+  },
+  "weight": {
+    "radius": 1.48
+  },
+  "ease": {
+    "out_x1": 0.22,
+    "out_y1": 1,
+    "out_x2": 0.36,
+    "out_y2": 1,
+    "select_x1": 0.2,
+    "select_y1": 1.06,
+    "select_x2": 0.35,
+    "select_y2": 1,
+    "travel_start": 0.12,
+    "travel_span": 0.46
+  }
+}
