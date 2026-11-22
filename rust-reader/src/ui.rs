@@ -1952,17 +1952,26 @@ impl ReaderApp {
         self.shelf_layout(area).books
     }
     fn shelf_layout(&self, area: Rect) -> ShelfLayout {
-        let margin = if area.width() >= 700. { 32. } else { 16. };
-        let width = (area.width() - margin * 2.).min(1200.);
-        let side_by_side = width >= 660.;
+        // iPad 是整屏应用：宽屏时不再留桌面式两侧边距，也不套 1200pt 上限。
+        let side_by_side = area.width() >= 660.;
+        let width = if side_by_side {
+            area.width()
+        } else {
+            (area.width() - 32.).min(1200.)
+        };
         let short_landscape = side_by_side && self.shelf_viewport.height() < 600.;
         let stacked_header = self.font_scale > 1.4 && area.width() < 520.;
-        let top = 144.
-            + if stacked_header {
-                84.
-            } else {
-                14. * (self.font_scale - 1.)
-            };
+        // 宽屏头部压缩：书架是主体，不该让桌面式大标题区占掉一大块。
+        let top = if side_by_side {
+            132. + 6. * (self.font_scale - 1.)
+        } else {
+            144.
+                + if stacked_header {
+                    84.
+                } else {
+                    14. * (self.font_scale - 1.)
+                }
+        };
         let tall_extra = if side_by_side {
             ((self.shelf_viewport.height() - 900.) * 0.30).clamp(0., 100.)
         } else {
@@ -1984,10 +1993,19 @@ impl ReaderApp {
         } else {
             384. + (self.font_scale - 1.) * 112. + browse_extra + 28.
         };
-        let stage = Rect::from_min_size(
-            pos2(area.center().x - width / 2., area.top() + top),
-            vec2(width, height),
-        );
+        // 宽屏：舞台严格贴住内容视口，避免出现可滚动的溢出（iPad 上不该滚动）。
+        let stage = if side_by_side {
+            let viewport = self.shelf_viewport;
+            Rect::from_min_size(
+                pos2(viewport.left(), viewport.top() + top),
+                vec2(viewport.width(), (viewport.height() - top - 8.).max(220.)),
+            )
+        } else {
+            Rect::from_min_size(
+                pos2(area.center().x - width / 2., area.top() + top),
+                vec2(width, height),
+            )
+        };
         let books = if side_by_side {
             // 右侧信息栏曾经占掉近一半宽度；书架是主体，把它压到 22%。
             Rect::from_min_size(
@@ -2845,7 +2863,10 @@ impl ReaderApp {
         } else {
             Color32::from_rgb(235, 233, 223)
         };
-        ui.painter().rect_filled(layout.stage, 22., stage_color);
+        // 宽屏（iPad）用满屏底色，不套圆角卡片——否则像桌面小部件而不是一个 app。
+        if !layout.side_by_side {
+            ui.painter().rect_filled(layout.stage, 22., stage_color);
+        }
         // 右侧栏与竖分隔线已下线：书架占满，信息改到底部展签。
         let volumes = shelf::geometry(shelf_area, books.len(), self.motion.focus, entrance);
         self.rendered_book_nodes = volumes.len();
