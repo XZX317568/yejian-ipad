@@ -125,6 +125,8 @@ pub struct ReaderApp {
     tap_zones: String,
     /// 阅读时屏幕常亮 setting; `awake` mirrors the platform flag.
     keep_awake_setting: bool,
+    perf_overlay: bool,
+    last_frame_at: Option<std::time::Instant>,
     awake: bool,
     /// Calls made to `set_keep_awake`, asserted by tests.
     #[cfg(test)]
@@ -226,6 +228,8 @@ pub struct ReaderApp {
 }
 impl ReaderApp {
     pub fn new(root: PathBuf, ctx: Context) -> Self {
+        crate::perf::init();
+        crate::perf::mark(crate::perf::Stage::PlatformInit);
         let backup_path = root.join("backup.yejian.zip").to_string_lossy().to_string();
         let reader_prefs = crate::reader_prefs::load(&root).unwrap_or_default();
         // Page files staged for the share sheet are one-shot temp files.
@@ -334,6 +338,8 @@ impl ReaderApp {
             chapter_end: false,
             tap_zones: "lr".into(),
             keep_awake_setting: true,
+            perf_overlay: false,
+            last_frame_at: None,
             awake: false,
             #[cfg(test)]
             awake_log: Vec::new(),
@@ -532,6 +538,7 @@ impl ReaderApp {
         while let Ok(event) = self.worker.rx.try_recv() {
             match event {
                 Event::Ready(books, settings, links) => {
+                    crate::perf::mark(crate::perf::Stage::LibraryOpen);
                     self.replace_links(links);
                     self.replace_books(books, ctx.input(|i| i.time));
                     self.ready = true;
@@ -595,6 +602,9 @@ impl ReaderApp {
                             }
                             "reader-status" => {
                                 self.reader_status = value != "false";
+                            }
+                            "perf-overlay" => {
+                                self.perf_overlay = value == "true";
                             }
                             "follow-interval" => {
                                 let minutes: u64 = value
@@ -1018,6 +1028,16 @@ impl ReaderApp {
     /// then any category found on books that is not stored yet.
     /// `None` marks the trailing 管理 tab.
     pub fn draw(&mut self, ui: &mut Ui) {
+        crate::perf::mark(crate::perf::Stage::RendererReady);
+        {
+            let now = std::time::Instant::now();
+            if matches!(self.screen, Screen::Reader(_))
+                && let Some(last) = self.last_frame_at
+            {
+                crate::perf::record_frame(now.duration_since(last).as_secs_f64() * 1000.);
+            }
+            self.last_frame_at = Some(now);
+        }
         let ctx = ui.ctx().clone();
         self.visible_covers.clear();
         self.receive(&ctx);
@@ -1416,7 +1436,8 @@ impl ReaderApp {
                         }
                         match self.tab {
                             Tab::Library => {
-                                self.library_viewport(ui, content, now, entrance)
+                                self.library_viewport(ui, content, now, entrance);
+                                crate::perf::mark(crate::perf::Stage::FirstShelfFrame);
                             }
                             Tab::History => self.history_ui(ui, content),
                             Tab::Settings => self.settings_ui(ui, content),
@@ -1494,6 +1515,26 @@ impl ReaderApp {
         self.dialogs(&ctx);
         if self.applock.locked() {
             self.lock_ui(ui, full);
+        }
+        if self.perf_overlay {
+            let text = crate::perf::overlay_text();
+            let font = FontId::monospace(11.);
+            let galley = ui.painter().layout_no_wrap(
+                text,
+                font,
+                Color32::from_rgb(230, 235, 240),
+            );
+            let rect = Rect::from_min_size(
+                full.min + vec2(8., 8.),
+                galley.size() + vec2(12., 8.),
+            );
+            ui.painter().rect_filled(rect, 6., Color32::from_black_alpha(170));
+            ui.painter().galley(rect.min + vec2(6., 4.), galley, Color32::WHITE);
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        }
+        // Covers are "all here" once the shelf's pending requests drain.
+        if self.ready && self.cover_pending.is_empty() && !self.books.is_empty() {
+            crate::perf::mark(crate::perf::Stage::CoversReady);
         }
         self.trim_covers();
         self.frame_is_animating = self.motion.active()

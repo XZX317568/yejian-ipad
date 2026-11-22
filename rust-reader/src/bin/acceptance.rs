@@ -3008,6 +3008,9 @@ fn main() -> Result<()> {
         println!("REAL SOURCE: {}", h.app.source_browser_report());
         return Ok(());
     }
+    if std::env::var_os("YEJIAN_BENCH").is_some() {
+        return bench_pass(&output);
+    }
     if std::env::var_os("YEJIAN_FILTERS_ONLY").is_some() {
         return filters_pass(&mut h, &data.join("library"));
     }
@@ -3742,5 +3745,245 @@ fn main() -> Result<()> {
             idle_delay
         ),
     )?;
+    Ok(())
+}
+
+/// Deterministic xorshift64 used only for bench fixture generation.
+struct BenchRng(u64);
+impl BenchRng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+}
+
+/// Renders one synthetic manga page: a light base, horizontal "screen tone"
+/// lines and per-pixel noise, so JPEG decode cost is realistic rather than a
+/// flat-color image that encodes to nothing.
+fn bench_page(width: u32, height: u32, seed: u64) -> Result<Vec<u8>> {
+    let mut rng = BenchRng(seed);
+    let mut image = image::RgbImage::new(width, height);
+    for (x, y, pixel) in image.enumerate_pixels_mut() {
+        let line = y % 6 < 2 || x % 7 == 0;
+        let noise = (rng.next() % 40) as u8;
+        let base = if line { 96u8 } else { 236u8 };
+        let v = base.saturating_sub(noise / 3);
+        *pixel = image::Rgb([v, v.saturating_sub(noise / 5), v.saturating_sub(noise / 4)]);
+    }
+    let mut out = std::io::Cursor::new(Vec::new());
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85)
+        .encode_image(&image)?;
+    Ok(out.into_inner())
+}
+
+/// Builds `name.cbz` with `count` JPEG pages of `width` x `height` each.
+fn bench_cbz(root: &Path, name: &str, width: u32, height: u32, count: usize) -> Result<PathBuf> {
+    use std::io::Write;
+    let path = root.join(format!("{name}.cbz"));
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(&path)?);
+    for page in 0..count {
+        let bytes = bench_page(width, height, 0x9e3779b97f4a7c15 + page as u64)?;
+        zip.start_file(
+            format!("{:03}.jpg", page + 1),
+            zip::write::SimpleFileOptions::default(),
+        )?;
+        zip.write_all(&bytes)?;
+    }
+    zip.finish()?;
+    Ok(path)
+}
+
+fn percentile_of(values: &mut Vec<f64>, p: f64) -> f64 {
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    if values.is_empty() {
+        return 0.;
+    }
+    values[((values.len() - 1) as f64 * p).round() as usize]
+}
+
+fn median(values: &[f64]) -> f64 {
+    let mut v = values.to_vec();
+    percentile_of(&mut v, 0.5)
+}
+
+/// One bench iteration: fresh app+library so caches do not leak across runs.
+/// `fixtures` holds pre-generated CBZ files; `size` is the simulated viewport
+/// in points at 2x (iPad-class density).
+fn bench_iteration(
+    fixtures: &Path,
+    library: &Path,
+    output: &Path,
+    size: [u32; 2],
+) -> Result<serde_json::Value> {
+    std::fs::create_dir_all(library)?;
+    let process_start = Instant::now();
+    let mut h = Harness::new(library.to_path_buf(), output.to_path_buf())?;
+    h.ctx.set_pixels_per_point(2.);
+    h.size = size;
+    yejian::perf::reset();
+    // cold_start_to_shelf_ms: from app/worker spawn to the first frame where
+    // the shelf shows its books with covers fully decoded.
+    h.app.import_files(vec![fixtures.join("bench-paged.cbz")]);
+    eprintln!("bench: waiting for shelf");
+    h.wait(|a| a.shelf_book_count() >= 1 && a.covers_loaded())?;
+    h.frame(vec![], None)?;
+    let cold_start_to_shelf_ms = process_start.elapsed().as_secs_f64() * 1000.;
+
+    let paged = h.app.shelf_book_id(0).context("paged book missing")?;
+    // open_to_first_page_ms: reader-open to the first frame painting the
+    // current page's texture.
+    let open_began = Instant::now();
+    eprintln!("bench: open_book {paged}");
+    h.app.open_book(&paged);
+    h.wait(ReaderApp::page_loaded)?;
+    h.frame(vec![], None)?;
+    let open_to_first_page_ms = open_began.elapsed().as_secs_f64() * 1000.;
+
+    // page_turn_wait_ms: 20 sequential turns issued every 400 ms wall clock;
+    // each wait ends when the new page's texture is painted.
+    let mut waits = Vec::new();
+    for turn in 1..=20usize {
+        let slot = Instant::now();
+        let before = h.app.current_page();
+        h.click("reader-next")?;
+        let deadline = Instant::now() + Duration::from_secs(25);
+        while !(h.app.current_page() > before && h.app.page_loaded()) {
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "bench turn {before} timed out at page {} (screen {})",
+                h.app.current_page(),
+                h.app.screen_name()
+            );
+            h.frame(vec![], None)?;
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        waits.push(slot.elapsed().as_secs_f64() * 1000.);
+        if turn < 20 {
+            let elapsed = slot.elapsed();
+            if elapsed < Duration::from_millis(400) {
+                std::thread::sleep(Duration::from_millis(400) - elapsed);
+            }
+        }
+    }
+    let page_turn_wait_ms_mean = waits.iter().sum::<f64>() / waits.len() as f64;
+    let page_turn_wait_ms_p95 = percentile_of(&mut waits.clone(), 0.95);
+
+    // strip_blank_frames: frames during a scripted fast scroll (fixed
+    // pt/frame over the whole strip) where any visible page region has no
+    // texture.
+    h.app.leave_reader();
+    h.frames(3)?;
+    h.app.set_mode("vertical");
+    h.app.import_files(vec![fixtures.join("bench-strip.cbz")]);
+    h.wait(|a| a.shelf_book_count() >= 2)?;
+    let strip = (0..h.app.shelf_book_count())
+        .filter_map(|i| h.app.shelf_book_id(i))
+        .find(|id| *id != paged)
+        .context("strip book missing")?;
+    h.app.open_book(&strip);
+    {
+        let deadline = Instant::now() + Duration::from_secs(180);
+        while !(h.app.is_vertical() && h.app.page_loaded()) {
+            anyhow::ensure!(Instant::now() < deadline, "bench strip open timed out");
+            h.frame(vec![], None)?;
+            std::thread::sleep(Duration::from_millis(15));
+        }
+    }
+    h.frames(3)?;
+    let mut strip_blank_frames = 0usize;
+    let scroll = -(h.size[1] as f32) * 0.8;
+    let center = pos2(h.size[0] as f32 / 2., h.size[1] as f32 / 2.);
+    for _ in 0..200 {
+        h.frame(
+            vec![
+                Event::PointerMoved(center),
+                Event::MouseWheel {
+                    unit: MouseWheelUnit::Point,
+                    delta: vec2(0., scroll),
+                    source: MouseWheelSource::Wheel,
+                    modifiers: Modifiers::NONE,
+                    phase: TouchPhase::Move,
+                },
+            ],
+            None,
+        )?;
+        if yejian::perf::take_blank_frame() {
+            strip_blank_frames += 1;
+        }
+        if h.app.current_fraction() >= 0.999 {
+            break;
+        }
+    }
+    // peak_texture_bytes: max resident page+cover texture bytes seen during
+    // the run (sum of live tile w*h*4).
+    let snapshot = yejian::perf::snapshot();
+    Ok(serde_json::json!({
+        "viewport": format!("{}x{}", size[0], size[1]),
+        "open_to_first_page_ms": open_to_first_page_ms,
+        "page_turn_wait_ms_mean": page_turn_wait_ms_mean,
+        "page_turn_wait_ms_p95": page_turn_wait_ms_p95,
+        "strip_blank_frames": strip_blank_frames,
+        "peak_texture_bytes": snapshot.peak_bytes,
+        "cold_start_to_shelf_ms": cold_start_to_shelf_ms,
+        "decode_p50_ms": snapshot.decode_p50_ms,
+        "decode_p95_ms": snapshot.decode_p95_ms,
+        "queue_p95_ms": snapshot.queue_p95_ms,
+        "frame_p95_ms": snapshot.frame_p95_ms,
+    }))
+}
+
+/// `YEJIAN_BENCH=1`: runs the perf bench 3x per viewport and writes
+/// `bench.json` (median per metric) into the output dir.
+fn bench_pass(output: &Path) -> Result<()> {
+    let fixtures = output.join("bench-fixtures");
+    std::fs::create_dir_all(&fixtures)?;
+    // (a) 40-page 1500x2200 JPEG manga; (b) 20-page 800x12000 vertical strip.
+    if !fixtures.join("bench-paged.cbz").exists() {
+        println!("bench: generating paged fixture (this takes a moment)");
+        bench_cbz(&fixtures, "bench-paged", 1500, 2200, 40)?;
+        println!("bench: generating strip fixture");
+        bench_cbz(&fixtures, "bench-strip", 800, 12000, 20)?;
+    }
+    let mut report = serde_json::Map::new();
+    for (label, size) in [("ipad-11", [834, 1194]), ("ipad-pro-129", [1024, 1366])] {
+        let mut runs = Vec::new();
+        for iteration in 0..3 {
+            let library = output.join(format!("bench-lib-{label}-{iteration}"));
+            let _ = std::fs::remove_dir_all(&library);
+            let run = bench_iteration(&fixtures, &library, output, size)?;
+            println!("bench {label} run {iteration}: {run}");
+            runs.push(run);
+        }
+        // Median per metric across the 3 runs.
+        let keys = [
+            "open_to_first_page_ms",
+   
+            "page_turn_wait_ms_mean",
+            "page_turn_wait_ms_p95",
+            "strip_blank_frames",
+            "peak_texture_bytes",
+            "cold_start_to_shelf_ms",
+            "decode_p50_ms",
+            "decode_p95_ms",
+            "queue_p95_ms",
+            "frame_p95_ms",
+        ];
+        let mut med = serde_json::Map::new();
+        for key in keys {
+            let values: Vec<f64> = runs
+                .iter()
+                .map(|run| run[key].as_f64().unwrap_or(0.))
+                .collect();
+            med.insert(key.into(), serde_json::json!(median(&values)));
+        }
+        report.insert(label.into(), serde_json::Value::Object(med));
+    }
+    std::fs::write(
+        output.join("bench.json"),
+        serde_json::to_string_pretty(&serde_json::Value::Object(report))?,
+    )?;
+    println!("BENCH: {}", output.join("bench.json").display());
     Ok(())
 }

@@ -787,6 +787,7 @@ impl ReaderApp {
     }
     pub(super) fn trim_covers(&mut self) {
         let mut bytes: usize = self.covers.values().map(|texture| texture.size()[0] * texture.size()[1] * 4).sum();
+        crate::perf::set_cover_bytes(bytes as u64);
         while self.covers.len() > 48 || bytes > 64 * 1024 * 1024 {
             let candidate = self.covers.keys()
                 .filter(|id| !self.visible_covers.contains(*id)
@@ -846,6 +847,12 @@ impl ReaderApp {
             self.pages.remove(&key);
             self.prefetch_blocked.insert(key);
         }
+        crate::perf::set_page_bytes(
+            self.pages
+                .values()
+                .map(|page| page.size.x as u64 * page.size.y as u64 * 4)
+                .sum::<u64>(),
+        );
     }
     /// The effective reader settings of one book: a saved per-work entry
     /// wins, then the source's viewer hint, then the global defaults.
@@ -1905,6 +1912,7 @@ impl ReaderApp {
                 let text = self
                     .stream_waiting_text(seg, local)
                     .unwrap_or_else(|| "正在打开这一页…".into());
+                crate::perf::note_blank_frame();
                 painter.text(
                     target.intersect(content).center(),
                     Align2::CENTER_CENTER,

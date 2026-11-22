@@ -119,6 +119,7 @@ struct ImageRequest {
     page: usize,
     cover: bool,
     generation: u64,
+    queued: std::time::Instant,
 }
 pub struct Worker {
     pub tx: mpsc::Sender<Command>,
@@ -296,7 +297,7 @@ impl Worker {
                                 cover,
                                 generation,
                             } => {
-                                image_queue.send(ImageRequest { id, page, cover, generation })
+                                image_queue.send(ImageRequest { id, page, cover, generation, queued: std::time::Instant::now() })
                                     .map_err(|_| anyhow::anyhow!("图片读取线程已停止"))?;
                             }
                             Command::Progress {
@@ -504,6 +505,7 @@ impl Worker {
                     page,
                     cover,
                     generation,
+                    queued: std::time::Instant::now(),
                 })
                 .map_err(|_| "图片读取线程已停止，请重新打开应用".into());
         }
@@ -553,6 +555,7 @@ fn read_images(
         let Some(request) = next_image(&mut pending, latest.load(Ordering::Relaxed)) else {
             continue;
         };
+        crate::perf::record_queue(request.queued.elapsed().as_secs_f64() * 1000.);
         let current = || request.cover || request.generation == latest.load(Ordering::Relaxed);
         let bytes = (|| -> anyhow::Result<Vec<u8>> {
             let _guard = archive_access
@@ -581,7 +584,12 @@ fn read_images(
         let result = match bytes {
             Err(error) if error.to_string() == PAGE_NOT_READY => Err(PAGE_NOT_READY.to_string()),
             bytes => bytes
-                .and_then(|bytes| decode(&bytes, request.cover))
+                .and_then(|bytes| {
+                    let began = std::time::Instant::now();
+                    let decoded = decode(&bytes, request.cover);
+                    crate::perf::record_decode(began.elapsed().as_secs_f64() * 1000.);
+                    decoded
+                })
                 .map_err(|error| format!("{error:#}")),
         };
         if !current() {
@@ -637,6 +645,7 @@ fn read_settings(library: &Library) -> anyhow::Result<Vec<(String, String)>> {
         "search-scope",
         "search-history",
         "categories",
+        "perf-overlay",
     ] {
         if let Some(value) = library.get_setting(key)? {
             settings.push((key.to_string(), value));
@@ -842,6 +851,7 @@ mod tests {
             page,
             cover,
             generation,
+            queued: std::time::Instant::now(),
         };
         let mut pending = std::collections::VecDeque::from([
             request("old", 0, false, 7),

@@ -977,6 +977,25 @@ impl ReaderApp {
                                 },
                             );
                         });
+                    ui.add_space(10.);
+                    ui.separator();
+                    Frame::new()
+                        .inner_margin(Margin::symmetric(2, 16))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            crate::design::section(ui, "关于");
+                            if crate::design::toggle(
+                                ui,
+                                &mut self.perf_overlay,
+                                "性能信息",
+                                "在左上角显示解码、帧时间和纹理内存",
+                            ) {
+                                self.setting(
+                                    "perf-overlay",
+                                    self.perf_overlay.to_string(),
+                                );
+                            }
+                        });
                     ui.add_space(24.);
                     ui.vertical_centered(|ui| {
                         ui.label(

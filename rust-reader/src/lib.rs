@@ -10,6 +10,7 @@ mod reader_prefs;
 mod shelf;
 mod source_filters;
 mod notify;
+pub mod perf;
 mod source_repos;
 mod sources;
 mod stats;
@@ -62,6 +63,7 @@ fn text_styles(scale: f32) -> std::collections::BTreeMap<egui::TextStyle, egui::
 }
 
 pub fn run() -> eframe::Result {
+    perf::init();
     yejian_platform::init();
     log::debug!("platform initialized");
     let args: Vec<String> = std::env::args().collect();
