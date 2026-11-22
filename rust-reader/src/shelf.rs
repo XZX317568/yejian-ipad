@@ -822,6 +822,70 @@ pub fn paint_flight(
     );
 }
 
+/// R1 fallback: egui clips with axis-aligned `Rect`s only — the renderer
+/// turns every clip into a scissor rect (egui-wgpu `ScissorRect`), so a
+/// `Shape::Path` clip cannot express the reference's slanted trapezoid
+/// (archive_motion.dart:338). We slice the reveal quad into horizontal
+/// bands and clip each band by a `Rect`; every band's trailing edge uses
+/// the conservative (unrevealed-side) boundary so the painted region is
+/// always a subset of the true quad — content is never cut short.
+/// With `dir = -1` the bands mirror around `rect.center().x`.
+const SPREAD_BANDS: u32 = 8;
+
+/// Clip rects approximating `(0,0) -> (edge,0) -> (edge-slant,h) -> (0,h)`
+/// at eased progress `p`. `dir < 0` mirrors the sweep. Union of the
+/// returned rects approximates the reveal quad; empty when `p == 0`.
+pub fn spread_clip(rect: Rect, p: f32, dir: f32) -> Vec<Rect> {
+    let w = rect.width();
+    let slant = motion::spread_slant(w);
+    let edge = motion::spread_edge(w, slant, p);
+    let h = rect.height().max(1.);
+    let mirror = dir < 0.;
+    let mut bands = Vec::with_capacity(SPREAD_BANDS as usize);
+    for band in 0..SPREAD_BANDS {
+        let (top, bottom) = (
+            rect.top() + h * band as f32 / SPREAD_BANDS as f32,
+            rect.top() + h * (band + 1) as f32 / SPREAD_BANDS as f32,
+        );
+        // Conservative edge: the true boundary is `edge - slant * y/h`;
+        // the smallest value inside a band sits at its lower end.
+        let x_edge = edge - slant * (band + 1) as f32 / SPREAD_BANDS as f32;
+        if x_edge <= 0. {
+            continue;
+        }
+        let band_rect = if mirror {
+            Rect::from_min_max(
+                pos2(rect.left() + (w - x_edge.min(w)).max(0.), top),
+                pos2(rect.right(), bottom),
+            )
+        } else {
+            Rect::from_min_max(pos2(rect.left(), top), pos2(rect.left() + x_edge.min(w), bottom))
+        };
+        bands.push(band_rect.intersect(rect));
+    }
+    bands.retain(|b| b.width() > 0.01 && b.height() > 0.01);
+    bands
+}
+
+/// Draws `draw` once per staircase clip band, shifted by the incoming-plane
+/// offset. `p` is the eased spread progress (`motion::spread_progress`).
+/// The caller's `painter` keeps its own clip/opacity; each band intersects
+/// on top of it, so the sweep never draws outside the widget's clip.
+pub fn paint_spread(
+    painter: &Painter,
+    rect: Rect,
+    p: f32,
+    dir: f32,
+    draw: impl Fn(&Painter, Vec2),
+) {
+    let (dx, dy) = motion::spread_offset(p);
+    let offset = vec2(dx, dy);
+    for band in spread_clip(rect, p, dir) {
+        let clipped = painter.with_clip_rect(band);
+        draw(&clipped, offset);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -921,5 +985,72 @@ mod tests {
         assert_eq!(corner_inset(face, 0.5), 0.);
         assert_eq!(corner_inset(face, 0.03), corner_inset(face, 0.97));
         assert!((0. ..0.5).contains(&corner_inset(face, 0.)));
+    }
+
+    #[test]
+    fn spread_clip_bands_cover_exactly_the_reveal_quad() {
+        let rect = Rect::from_min_size(pos2(50., 20.), vec2(400., 600.));
+        assert!(spread_clip(rect, 0., 1.).is_empty(), "p=0 must hide all");
+        let full = spread_clip(rect, 1., 1.);
+        let area: f32 = full.iter().map(|b| b.width() * b.height()).sum();
+        assert!(
+            (area - rect.width() * rect.height()).abs() < 1.,
+            "p=1 must cover the whole plane, got {area}"
+        );
+        // Monotonic sweep: union area grows with p and never exceeds the
+        // true trapezoid area by more than one band step of slant.
+        let mut prev = -1.;
+        for i in 0..=20 {
+            let p = i as f32 / 20.;
+            let bands = spread_clip(rect, p, 1.);
+            let covered: f32 = bands.iter().map(|b| b.width() * b.height()).sum();
+            assert!(covered >= prev - 0.01, "area shrunk at p={p}");
+            prev = covered;
+            // Bands tile the rect vertically; touching edges report
+            // intersects()=true in epaint, so assert near-zero overlap
+            // area instead.
+            for pair in bands.windows(2) {
+                let overlap = pair[0].intersect(pair[1]);
+                assert!(
+                    overlap.width() * overlap.height() < 0.01,
+                    "bands overlap at p={p}: {:?} vs {:?}",
+                    pair[0],
+                    pair[1]
+                );
+            }
+            for band in &bands {
+                assert!(rect.contains_rect(*band));
+            }
+        }
+    }
+
+    #[test]
+    fn spread_clip_dir_minus_one_mirrors_around_center() {
+        let rect = Rect::from_min_size(pos2(50., 20.), vec2(400., 600.));
+        for i in 1..=10 {
+            let p = i as f32 / 10.;
+            let left = spread_clip(rect, p, 1.);
+            let right = spread_clip(rect, p, -1.);
+            // dir=-1 produces the mirror image of dir=+1 around x=w/2:
+            // each mirrored band b satisfies b.right = rect.right - a.left
+            // and b.left = rect.right - a.right for the matching band a.
+            let l_area: f32 = left.iter().map(|b| b.width() * b.height()).sum();
+            let r_area: f32 = right.iter().map(|b| b.width() * b.height()).sum();
+            assert!((l_area - r_area).abs() < 0.01, "areas differ at p={p}");
+            let left_from_right: Vec<Rect> = right
+                .iter()
+                .map(|b| {
+                    Rect::from_min_max(
+                        pos2(rect.right() - b.right() + rect.left(), b.top()),
+                        pos2(rect.right() - b.left() + rect.left(), b.bottom()),
+                    )
+                })
+                .collect();
+            assert_eq!(left.len(), left_from_right.len());
+            for (a, m) in left.iter().zip(left_from_right.iter()) {
+                assert!((a.left() - m.left()).abs() < 0.01, "left edge at p={p}");
+                assert!((a.right() - m.right()).abs() < 0.01, "right edge at p={p}");
+            }
+        }
     }
 }

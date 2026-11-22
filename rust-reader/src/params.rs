@@ -19,6 +19,7 @@ pub struct Params {
     pub weight: Weight,
     pub ease: Ease,
     pub shelf: Shelf,
+    pub spread: Spread,
 }
 
 impl Default for Params {
@@ -29,6 +30,7 @@ impl Default for Params {
             weight: Weight::default(),
             ease: Ease::default(),
             shelf: Shelf::default(),
+            spread: Spread::default(),
         }
     }
 }
@@ -200,6 +202,52 @@ impl Default for Shelf {
             arc_max: 32.,
             columns: 17,
             shade_gain: 0.012,
+        }
+    }
+}
+
+/// Page spread (摊开): the slanted-edge reveal that wipes the detail page
+/// in over the landed cover — ArchivePlaneTransition `incoming`, ported.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Spread {
+    /// Slanted clip edge cap in points.
+    pub slant_px: f32,
+    /// Slanted clip edge as a fraction of the plane width; the effective
+    /// slant is `min(slant_px, w * slant_pct)`.
+    pub slant_pct: f32,
+    /// Horizontal component of the incoming-plane offset (times dir, times
+    /// `1 - p`).
+    pub shift_x: f32,
+    /// Vertical component of the incoming-plane offset (times `1 - p`).
+    pub shift_y: f32,
+    /// Point on the flight t axis where the spread begins.
+    pub start: f32,
+    /// Length of the t axis the spread occupies.
+    pub span: f32,
+    /// Wipe direction: +1 sweeps left to right, -1 mirrors it.
+    pub dir: f32,
+    /// Cubic bezier control points of the spread easing.
+    pub ease_x1: f32,
+    pub ease_y1: f32,
+    pub ease_x2: f32,
+    pub ease_y2: f32,
+}
+
+impl Default for Spread {
+    fn default() -> Self {
+        Self {
+            slant_px: 180.,
+            slant_pct: 0.46,
+            shift_x: 24.,
+            shift_y: 12.,
+            start: 0.45,
+            span: 0.55,
+            dir: 1.,
+            ease_x1: 0.18,
+            ease_y1: 0.72,
+            ease_x2: 0.18,
+            ease_y2: 1.,
         }
     }
 }

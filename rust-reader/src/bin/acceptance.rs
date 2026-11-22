@@ -1817,7 +1817,14 @@ fn record_pass(h: &mut Harness) -> Result<()> {
     // 飞行只有 0.72s；按 1/240 推进，168 帧 ≈ 4 倍慢动作，裁决视频里才看得清。
     h.dt = 1. / 240.;
     for i in 0..open_n {
-        h.frame(vec![], Some(&format!("motion/frame-{:03}", i + scroll_n)))?;
+        // t = i·(1/240)/0.72: i=121 lands at t≈0.70, mid-slant-sweep — kept
+        // as a named proof frame next to the motion strip.
+        let name = if i == 121 {
+            "spread-mid".to_string()
+        } else {
+            format!("motion/frame-{:03}", i + scroll_n)
+        };
+        h.frame(vec![], Some(&name))?;
     }
     h.dt = 1. / 60.;
     println!("RECORD: {motion_frames} frames at 1024x1366 (scroll {scroll_n} / open {open_n})");

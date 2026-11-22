@@ -53,6 +53,36 @@ pub fn travel(t: f32) -> f32 {
     cubic(((t - e.travel_start) / e.travel_span).clamp(0., 1.), 0.645, 0.045, 0.355, 1.)
 }
 
+/// Slanted clip edge length: `min(slant_px, w * slant_pct)`.
+/// (archive_motion.dart:338 — a clip path edge, not a cover shear.)
+pub fn spread_slant(w: f32) -> f32 {
+    let s = params().spread.clone();
+    s.slant_px.min(w * s.slant_pct).max(0.)
+}
+
+/// Horizontal position of the reveal edge at eased progress `p`, in plane
+/// coordinates measured from the leading (dir=+1: left) side. Pure so tests
+/// can pin the reference formula: `edge = (w + slant) * p`.
+pub fn spread_edge(w: f32, slant: f32, p: f32) -> f32 {
+    (w + slant) * p
+}
+
+/// Incoming-plane translation `(-shift_x * dir * (1-p), shift_y * (1-p))`.
+/// (archive_motion.dart:323.)
+pub fn spread_offset(p: f32) -> (f32, f32) {
+    let s = params().spread.clone();
+    (-s.shift_x * s.dir * (1. - p), s.shift_y * (1. - p))
+}
+
+/// Eased spread progress along the flight t axis: clamps into
+/// `[start, start + span]` then applies the shared cubic. `t >= 1` after the
+/// flight ends keeps returning 1, so the resting detail frame equals `p=1`.
+pub fn spread_progress(t: f32) -> f32 {
+    let s = params().spread.clone();
+    let raw = ((t - s.start) / s.span.max(0.001)).clamp(0., 1.);
+    cubic(raw, s.ease_x1, s.ease_y1, s.ease_x2, s.ease_y2)
+}
+
 pub fn paper_depth(t: f32, u: f32, v: f32) -> f32 {
     if t <= 0. || t >= 1. { return 0.; }
     let p = params().paper.clone();
@@ -544,5 +574,54 @@ mod tests {
         assert_eq!(z.sample(5.), Some((2.5, [9., 9.])));
         assert!(z.sample(5.).is_none());
         z.cancel();
+    }
+
+    #[test]
+    fn spread_clip_edge_is_monotonic_and_exact_at_endpoints() {
+        let (w, slant) = (1000., 180.);
+        assert_eq!(spread_edge(w, slant, 0.), 0.);
+        assert_eq!(spread_edge(w, slant, 1.), w + slant);
+        let mut prev = -1.;
+        for i in 0..=100 {
+            let e = spread_edge(w, slant, i as f32 / 100.);
+            assert!(e > prev, "edge not strictly increasing at {i}");
+            prev = e;
+        }
+        // Slant never exceeds the cap or the width fraction, whichever wins.
+        assert_eq!(spread_slant(391.30435), 180.);
+        assert!(spread_slant(391.30435 - 0.01) < 180.);
+        assert_eq!(spread_slant(1000.), 180.);
+        assert!(spread_slant(200.) - 92. < 0.001);
+    }
+
+    #[test]
+    fn spread_offset_and_easing_match_reference() {
+        // archive_motion.dart:323 — incoming translate (-24*dir, +12) * (1-p).
+        let (x0, y0) = spread_offset(0.);
+        assert!((x0 + 24.).abs() < 1e-4 && (y0 - 12.).abs() < 1e-4);
+        let (x1, y1) = spread_offset(1.);
+        assert_eq!((x1, y1), (0., 0.));
+        // Cubic(.18,.72,.18,1) at t=0.5 measures ~0.9372 on the 18-step
+        // bisect (note: spec's "~0.71" was the curve's y at s=0.5, not the
+        // eased midpoint).
+        let mid = cubic(0.5, 0.18, 0.72, 0.18, 1.);
+        assert!((mid - 0.9372).abs() < 0.01, "easing midpoint {mid}");
+    }
+
+    #[test]
+    fn spread_progress_clamps_outside_window() {
+        assert_eq!(spread_progress(0.), 0.);
+        assert_eq!(spread_progress(0.3), 0.);
+        assert_eq!(spread_progress(1.), 1.);
+        // t >= 1 after flight=None must equal the p=1 resting frame.
+        assert_eq!(spread_progress(1.4), 1.);
+        // The window edges are continuous: returning (t falling back through
+        // start/1) walks the same eased curve, so there is no pop.
+        let s = params().spread.clone();
+        assert!(spread_progress(s.start + 1e-4) > 0.);
+        // The reference cubic can overshoot 1 just inside the window's end;
+        // clip already saturates at w, so assert it merely settles to ~1.
+        assert!(spread_progress(s.start + s.span - 1e-4) >= 0.999);
+        assert_eq!(spread_progress(s.start + s.span), 1.);
     }
 }

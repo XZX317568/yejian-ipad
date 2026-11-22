@@ -3511,31 +3511,35 @@ fn library_thumbnails(
         let detail_alpha = reveal
             .map(|reveal| motion::smooth(((reveal - 0.5) / 0.5).max(0.)))
             .unwrap_or(1.);
-        // Soft paper shadow + a hairline border land only once the flying
-        // cover has nearly arrived — nothing may peek out from behind it.
-        if reveal.is_none_or(|reveal| reveal > 0.72) {
-            let mut cover_painter = ui.painter().clone();
-            if let Some(reveal) = reveal {
-                cover_painter.multiply_opacity(((reveal - 0.72) / 0.28).clamp(0., 1.));
-            }
-            crate::design::soft_shadow(&cover_painter, cover, 8., 2.2, self.dark);
-            cover_painter.rect_stroke(
-                cover,
-                9.,
-                Stroke::new(1., palette.line),
-                StrokeKind::Inside,
-            );
-        }
-        if self.flight.is_none()
-            && let Some(texture) = self.covers.get(&cover_id)
-        {
-            shelf::paint_art(
-                ui.painter(),
-                Plane::rect(cover),
-                cover.size(),
-                texture,
-                self.colors().0,
-            );
+        // 摊开 (R2 分工): the slanted staircase clip owns the cover
+        // geometry — soft shadow, hairline border, and the cover art itself
+        // are the `incoming` plane (archive_motion.dart incoming: slant clip
+        // + whole-plane offset). R1: egui has no arbitrary-path clip, so
+        // `shelf::spread_clip` stair-steps the trapezoid. The text column
+        // keeps `detail_alpha` because ScrollArea widgets cannot be
+        // re-emitted per band; the alpha fade also keeps text crisp per the
+        // reference's "opaque text stays crisp" design note.
+        // Once `flight` is None, `spread` is 1. and the bands cover `area`
+        // wholesale — the resting detail frame is exactly the p=1 frame.
+        let spread = reveal.map_or(1., motion::spread_progress);
+        if spread > 0.0005 {
+            let dir = crate::params::params().spread.dir;
+            let texture = self.covers.get(&cover_id);
+            let dark = self.dark;
+            let line = palette.line;
+            shelf::paint_spread(ui.painter(), area, spread, dir, |p, shift| {
+                let card = cover.translate(shift);
+                crate::design::soft_shadow(p, card, 8., 2.2, dark);
+                p.rect_stroke(
+                    card,
+                    9.,
+                    Stroke::new(1., line),
+                    StrokeKind::Inside,
+                );
+                if let Some(texture) = texture {
+                    shelf::paint_art(p, Plane::rect(card), card.size(), texture, self.colors().0);
+                }
+            });
         }
         let (_, ink, muted) = self.colors();
         let title = self

@@ -51,5 +51,18 @@
     "arc_max": 32,
     "columns": 17,
     "shade_gain": 0.012
+  },
+  "spread": {
+    "slant_px": 180,
+    "slant_pct": 0.46,
+    "shift_x": 24,
+    "shift_y": 12,
+    "start": 0.45,
+    "span": 0.55,
+    "dir": 1,
+    "ease_x1": 0.18,
+    "ease_y1": 0.72,
+    "ease_x2": 0.18,
+    "ease_y2": 1
   }
 }
