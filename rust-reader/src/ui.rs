@@ -2860,10 +2860,11 @@ impl ReaderApp {
         // 宽屏：把底部展签让出来，让扇形在"上方可用区域"里垂直居中，
         // 避免书全都压在屏幕底部（2026-11-23 用 analyze-layout.ps1 量出来的问题）。
         let shelf_area = if layout.side_by_side {
-            let band = (layout.stage.height() * 0.30).clamp(110., 200.);
+            // 书群可绘制区底部必须在展签顶再让 24pt，否则横屏书脚压字。
+            // 展签顶 = stage.bottom - band - 16 ⇒ 等价于扣 band + 40。
             Rect::from_min_max(
                 pos2(layout.books.left(), layout.books.top() + 12.),
-                pos2(layout.books.right(), layout.stage.bottom() - band - 28.),
+                pos2(layout.books.right(), layout.info.top() - 24.),
             )
         } else {
             layout.books
@@ -3027,9 +3028,15 @@ impl ReaderApp {
         );
         title.wrap.max_rows = 1;
         let title = ui.painter().layout_job(title);
-        info_painter.galley(info, title.clone(), ink);
+        // 展签内部全部水平居中：标题、分类胶囊、进度、按钮行都锚到展签中线。
+        let info_cx = layout.info.center().x;
+        info_painter.galley(
+            pos2(info_cx - title.size().x / 2., info.y),
+            title.clone(),
+            ink,
+        );
         let palette = crate::design::palette(self.dark);
-        let mut progress_pos = info + vec2(0., title.size().y + 10.);
+        let mut progress_y = info.y + title.size().y + 10.;
         // A quiet metadata pill rides under the title on wide layouts.
         if layout.side_by_side && !layout.short_landscape && self.font_scale <= 1.3 {
             let meta = if !book.category.is_empty() {
@@ -3046,12 +3053,12 @@ impl ReaderApp {
                     title_width,
                 );
                 let pill = Rect::from_min_size(
-                    progress_pos - vec2(4., 1.),
+                    pos2(info_cx - (galley.size().x + 18.) / 2., progress_y - 1.),
                     vec2(galley.size().x + 18., galley.size().y + 8.),
                 );
                 info_painter.rect_filled(pill, pill.height() / 2., palette.soft);
-                info_painter.galley(progress_pos + vec2(5., 3.), galley, palette.muted);
-                progress_pos.y += pill.height() + 6.;
+                info_painter.galley(pill.min + vec2(9., 4.), galley, palette.muted);
+                progress_y += pill.height() + 6.;
             }
         }
         let has_progress = book.last_read_at.is_some();
@@ -3075,7 +3082,7 @@ impl ReaderApp {
         let progress = ui.painter().layout_job(progress);
         // Keep the action with the title and progress when the column scrolls.
         // 展签式布局：按钮必须留在舞台内，不允许被挤到屏幕外。
-        let action_y = (progress_pos.y + progress.size().y + 18.)
+        let action_y = (progress_y + progress.size().y + 18.)
             .min(layout.info.bottom() - 56.)
             .max(layout.info.top() + 40.);
         let target_fraction = if has_progress {
@@ -3103,7 +3110,10 @@ impl ReaderApp {
             self.progress_tween = None;
         }
         let track = Rect::from_min_size(
-            pos2(info.x, progress_pos.y + progress.size().y + 12.),
+            pos2(
+                info_cx - (info_right - info.x).min(360.) / 2.,
+                progress_y + progress.size().y + 12.,
+            ),
             vec2((info_right - info.x).min(360.), 3.),
         );
         info_painter.rect_filled(track, 2., palette.line);
@@ -3114,13 +3124,18 @@ impl ReaderApp {
                 palette.accent,
             );
         }
-        info_painter.galley(progress_pos, progress, muted);
+        info_painter.galley(
+            pos2(info_cx - progress.size().x / 2., progress_y),
+            progress,
+            muted,
+        );
         let detail_width = 30. * self.font_scale + 24.;
         // 触控热区不得小于 44pt；右侧信息栏收窄后按钮也要保底 88pt 才不会压线。
         let action_width =
             (84. * self.font_scale + 68.).min(layout.info.width() - detail_width - 12.).max(88.);
+        // 两个按钮作为一组居中于展签，间距 12pt，热区仍 ≥44pt。
         let open_rect = Rect::from_min_size(
-            pos2(info.x + action_width + 12., action_y),
+            pos2(info_cx + 6., action_y),
             vec2(detail_width, 50.),
         );
         if self.selected.is_empty() && self.button(ui, "open-book", open_rect, "详情", false) {
@@ -3131,7 +3146,10 @@ impl ReaderApp {
                 self.open_detail(book, volume, &volumes, area, now);
             }
         }
-        let action = Rect::from_min_size(pos2(info.x, action_y), vec2(action_width, 50.));
+        let action = Rect::from_min_size(
+            pos2(info_cx - 6. - action_width, action_y),
+            vec2(action_width, 50.),
+        );
         if self.selected.is_empty()
             && self.button(
                 ui,
