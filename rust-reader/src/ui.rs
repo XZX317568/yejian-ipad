@@ -1968,14 +1968,21 @@ impl ReaderApp {
         } else {
             0.
         };
+        // 藏书一览网格已下线（2026-11-23 用户决定）：立体书架是主体，
+        // 原本留给网格的高度全部并入 stage。
+        let browse_extra = if side_by_side {
+            236. + tall_extra * 0.5
+        } else {
+            170.
+        } + 28. * (self.font_scale - 1.);
         let height = if short_landscape {
-            224. + (self.font_scale - 1.) * 16.
+            224. + (self.font_scale - 1.) * 16. + browse_extra + 28.
         } else if side_by_side {
-            374. + tall_extra + (self.font_scale - 1.) * 40.
+            374. + tall_extra + (self.font_scale - 1.) * 40. + browse_extra + 28.
         } else {
             // A little extra headroom keeps the pager clear of the lifted
             // cover corner on phone portrait.
-            384. + (self.font_scale - 1.) * 112.
+            384. + (self.font_scale - 1.) * 112. + browse_extra + 28.
         };
         let stage = Rect::from_min_size(
             pos2(area.center().x - width / 2., area.top() + top),
@@ -3135,7 +3142,7 @@ impl ReaderApp {
         };
         let pager_left = pager_right - 88. - tally.size().x - tally_gap * 2.;
         let y = if phone_portrait {
-            layout.browse.top() - 12.
+            layout.stage.bottom() - 56.
         } else {
             layout.stage.top() + 12.
         };
@@ -3170,7 +3177,7 @@ impl ReaderApp {
             self.motion
                 .select(self.motion.focus.round() + 1., now, self.reduced);
         }
-        self.library_thumbnails(ui, layout.browse, &books, index, now);
+        // 藏书一览网格已下线：书架即主体，不再在下方重复同一批书。
         if !self.selected.is_empty() {
             let rect = Rect::from_min_size(
                 pos2(area.left() + 24., area.bottom() - 122.),
@@ -3220,7 +3227,8 @@ impl ReaderApp {
             }
         }
     }
-    fn library_thumbnails(
+    #[allow(dead_code)] // 藏书一览已下线，保留实现备回滚
+fn library_thumbnails(
         &mut self,
         ui: &mut Ui,
         area: Rect,
@@ -6105,6 +6113,16 @@ impl ReaderApp {
             _ => false,
         }
     }
+    /// 书架焦点书的 id。藏书一览网格下线后，验收用它在「书架 → 详情 → 阅读」链路里核对身份。
+    pub fn shelf_focus_book_id(&self) -> Option<String> {
+        let books = self.visible_books();
+        if books.is_empty() {
+            return None;
+        }
+        let index = (self.motion.focus.round() as i32).rem_euclid(books.len() as i32) as usize;
+        books.get(index).map(|book| book.id.clone())
+    }
+
     pub fn current_book_id(&self) -> Option<&str> {
         match &self.screen {
             Screen::Reader(id) => Some(id),

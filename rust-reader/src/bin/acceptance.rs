@@ -631,32 +631,37 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
         initial_title.bounds.height() > 20.,
         "design: expected selected title above the thumbnails"
     );
-    let thumbnail = h
-        .app
-        .hitboxes
-        .iter()
-        .filter(|(id, _)| id.starts_with("shelf-thumbnail-"))
-        .min_by(|(_, a), (_, b)| a.left().total_cmp(&b.left()))
-        .map(|(id, _)| id.clone())
-        .context("design: visible thumbnail tap target is missing")?;
-    // Move away, then select the first actual thumbnail with pointer events.
+    // 藏书一览网格已于 2026-11-23 下线（书架即主体）。改用书架焦点书验证
+    // 「点哪本开哪本」：焦点书 → 详情 → 阅读，三处身份必须一致。
     h.click("shelf-next")?;
     h.frames(40)?;
-    design_touch(h, &thumbnail, None)?;
-    h.click(&thumbnail)?;
+    let focus_id = h
+        .app
+        .shelf_focus_book_id()
+        .context("design: shelf focus book id is missing")?;
+    let focus_title = h
+        .painted_text
+        .iter()
+        .filter(|text| text.bounds.height() > 20.)
+        .map(|text| text.text.clone())
+        .next()
+        .context("design: selected title above the shelf is missing")?;
+    h.click("shelf-center")?;
     h.frames(40)?;
     anyhow::ensure!(
-        h.painted_text.iter().any(|text| text.text == "月光旅人"
-            && text.bounds.height() > 20.
-            && text.bounds.top() < 550.),
-        "design: thumbnail tap did not select its book in the reading stage"
+        h.app.current_book_id() == Some(focus_id.as_str()),
+        "design: tapping the focused cover opened a different book (wanted {focus_id}, got {:?})",
+        h.app.current_book_id()
+    );
+    anyhow::ensure!(
+        h.painted_text.iter().any(|text| text.text == focus_title),
+        "design: detail page does not show the focused title {focus_title}"
     );
     h.click("shelf-read")?;
     h.wait(ReaderApp::page_loaded)?;
-    let expected_id = thumbnail.trim_start_matches("shelf-thumbnail-");
     anyhow::ensure!(
-        h.app.current_book_id() == Some(expected_id),
-        "design: reading after thumbnail selection opened a different book"
+        h.app.current_book_id() == Some(focus_id.as_str()),
+        "design: reading after detail opened a different book"
     );
     h.frame(vec![], None)?;
     h.click("reader-back")?;
