@@ -23,6 +23,20 @@
 
 每段完成 = 可机查证据 + 用户裁决编号，两者缺一不算。
 
+## 版面决策（2026-11-23，用户睡前授权自主决定；已咨询 Gemini Neon）
+
+- **书架是唯一主角**：藏书一览网格下线 → 右侧信息栏下线 → 舞台占满整屏。
+- 信息改为**底部居中「展签」**（书名 34pt / 分类 / 进度 / 继续阅读、详情两个按钮），无卡片边框（Gemini 推荐方案 1）。
+- 书按**高度**放大：`shelf_scale` 上界 1.55→2.6，`cover` 上界 128→190pt；1024×1366 下焦点封面约占视口高 45%（Gemini 目标 46–52%）。
+- 舞台高度 = `shelf_viewport.height() - top - 16`（短视口 clamp 220），展签高度 = 舞台高 30%（clamp 110–200），按钮锚在展签内，避免被挤出屏幕。
+
+### Gemini 建议里尚未实现的（下一步）
+
+1. 边缘书：±1 槽 0.90x、±2 槽 0.82x 缩放 + 每退一槽 12–15% 环境暗化 + 距屏幕边缘 0–48pt smoothstep 渐隐（现在只有硬边裁切）
+2. 重量感：书底 2–4pt 极深接触阴影 + 24–36pt 柔和环境投影 + 一条搁板高光/暗线
+3. 反透视错觉：放大后固定斜轴测显"远端更粗"，建议深度压缩到真实厚度 0.6–0.7 倍
+4. 高清封面：封面纹理需 mipmap + 各向异性过滤；0.4px 闭合描边改受光棱线高光
+
 ## 参考规格（对照 `.tools/wenku-v0.5.6/`；细则原文见 git `9d25566:REFERENCE.md`）
 
 - 书架：`width≤520`；`depthX=0.66 / depthY=−0.30`；`spine=clamp(w·0.043,14,18)`；`pitch=spine+11`；`cover=clamp(w·0.32,100,128)`；`H=(cover−20)·166/118+54`；`railY=d·2.5+d²·0.45`；`pull=cover·0.84·w(1.24−0.24w)`
@@ -66,6 +80,7 @@
 - 2026-11-22 参数外置生效且无需重编译：`paper.base` 17→0 后 frame-045/060/075 哈希全变，日志 `.tools/loop-baseline/stage0-params-live.log`
 - 2026-11-22 ffmpeg 管线可用：`artifacts/rust/stage0/body.mp4`（160 帧 / 121KB）
 - 2026-11-22 kill test 先 FAILED（纸全平仍 PASS），补断言后 **PASSED**：broken EXIT=1 / good EXIT=0，日志 `.tools/loop-baseline/stage0-killtest5.log`
+- 2026-11-23 全屏书架落地：`ui.rs` 舞台吃满视口、底部展签；`shelf.rs` scale 2.6 / cover 190。iPad 8 档矩阵 PASS（`artifacts/rust/fullshelf2/`），全量 acceptance PASS（`artifacts/rust/fullshelf-full2/`）
 - 2026-11-23 录制必须慢动作：`dt=1/240` 时飞行段才铺满 168 帧；固定 1/60 时整段只剩 1–2 帧飞行
 - 2026-11-22 全 workspace 测试 EXIT=0（含新增 2 条纸张曲线断言），日志 `.tools/loop-baseline/stage0-tests2.log`
 

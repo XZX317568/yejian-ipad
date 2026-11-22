@@ -1975,13 +1975,13 @@ impl ReaderApp {
         } else {
             170.
         } + 28. * (self.font_scale - 1.);
-        let height = if short_landscape {
+        // 书架是页面主体：宽屏（iPad）时舞台直接吃掉整屏高度。
+        // 用 shelf_viewport 而不是 area.bottom()：area 可能是可滚动内容区。
+        let height = if side_by_side {
+            (self.shelf_viewport.height() - top - 16.).clamp(220., 4000.)
+        } else if short_landscape {
             224. + (self.font_scale - 1.) * 16. + browse_extra + 28.
-        } else if side_by_side {
-            374. + tall_extra + (self.font_scale - 1.) * 40. + browse_extra + 28.
         } else {
-            // A little extra headroom keeps the pager clear of the lifted
-            // cover corner on phone portrait.
             384. + (self.font_scale - 1.) * 112. + browse_extra + 28.
         };
         let stage = Rect::from_min_size(
@@ -1992,18 +1992,19 @@ impl ReaderApp {
             // 右侧信息栏曾经占掉近一半宽度；书架是主体，把它压到 22%。
             Rect::from_min_size(
                 stage.min + vec2(12., 12.),
-                vec2(width * 0.74 - 12., height - 24.),
+                vec2(width - 24., height - 24.),
             )
         } else {
             Rect::from_min_size(stage.min + vec2(8., 30.), vec2(width - 16., 212.))
         };
         let info = if side_by_side {
+            // 右侧信息栏下线；改成底部居中的「展签」：书名 + 进度 + 两个按钮。
+            // 高度随舞台自适应，短视口（手机横屏 390pt）也不会被挤出屏幕。
+            let info_w = (width * 0.52).clamp(300., 620.);
+            let band = (height * 0.30).clamp(110., 200.);
             Rect::from_min_max(
-                pos2(
-                    books.right() + 20.,
-                    stage.top() + if short_landscape { 14. } else { 76. },
-                ),
-                stage.max - vec2(20., 26.),
+                pos2(stage.center().x - info_w / 2., stage.bottom() - band - 16.),
+                pos2(stage.center().x + info_w / 2., stage.bottom() - 16.),
             )
         } else {
             Rect::from_min_max(
@@ -2845,15 +2846,7 @@ impl ReaderApp {
             Color32::from_rgb(235, 233, 223)
         };
         ui.painter().rect_filled(layout.stage, 22., stage_color);
-        if layout.side_by_side {
-            ui.painter().line_segment(
-                [
-                    pos2(layout.info.left() - 10., layout.stage.top() + 40.),
-                    pos2(layout.info.left() - 10., layout.stage.bottom() - 40.),
-                ],
-                Stroke::new(1., palette.ink.gamma_multiply(0.08)),
-            );
-        }
+        // 右侧栏与竖分隔线已下线：书架占满，信息改到底部展签。
         let volumes = shelf::geometry(shelf_area, books.len(), self.motion.focus, entrance);
         self.rendered_book_nodes = volumes.len();
         let mut keep = HashSet::new();
@@ -3049,7 +3042,10 @@ impl ReaderApp {
         progress.wrap.max_rows = 1;
         let progress = ui.painter().layout_job(progress);
         // Keep the action with the title and progress when the column scrolls.
-        let action_y = progress_pos.y + progress.size().y + 25.;
+        // 展签式布局：按钮必须留在舞台内，不允许被挤到屏幕外。
+        let action_y = (progress_pos.y + progress.size().y + 18.)
+            .min(layout.info.bottom() - 56.)
+            .max(layout.info.top() + 40.);
         let target_fraction = if has_progress {
             (book.current_page + 1) as f32 / book.page_count.max(1) as f32
         } else {

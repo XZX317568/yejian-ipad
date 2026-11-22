@@ -97,7 +97,9 @@ pub fn foreground(volumes: &[Volume], lane: i32, cover: Plane) -> Vec<Volume> {
 }
 
 fn shelf_scale(area: Rect) -> f32 {
-    (area.height() / 416.).clamp(0.2, 1.55)
+    // 上界提到 2.6：网格下线后书架独占整屏，书必须按高度长大，
+    // 焦点封面目标约为视口高的 46–52%（Gemini 建议）。
+    (area.height() / 416.).clamp(0.2, 2.6)
 }
 
 pub fn lane_pitch(area: Rect) -> f32 {
@@ -123,7 +125,7 @@ pub fn geometry(area: Rect, count: usize, focus: f32, entrance: f32) -> Vec<Volu
     let width = area.width();
     let pitch = lane_pitch_for(area, count);
     let spine = lane_pitch(area) - 11. * scale;
-    let cover = (width / scale * 0.32).clamp(100., 128.) * scale;
+    let cover = (width / scale * 0.32).clamp(100., 190.) * scale;
     let height = (cover - 20. * scale) * 166. / 118. + 54. * scale;
     let base_y = -cover * -0.30 + height * 0.60 + 12. * scale;
     let mut start_x = area.center().x - (spine + cover * 0.66) / 2. + cover * 0.84 * 0.66;
