@@ -100,6 +100,7 @@
 - 2026-11-22 kill test 先 FAILED（纸全平仍 PASS），补断言后 **PASSED**：broken EXIT=1 / good EXIT=0，日志 `.tools/loop-baseline/stage0-killtest5.log`
 - 2026-11-23 **iPad 模拟器真机链路打通**：macOS 盒跑通 CI 同款 build-rust-ios.sh --sim → xcodebuild → capture-ipad-simulator.sh → IPadRotationTests **4/4 PASS**；shelf.png 证实竖屏底部标签栏+全屏书架在真模拟器生效（截图拉回到 artifacts/rust/sim-pulled/，经 devin forward + python http.server）。verify-ipad-snapshots.py 崩在缺 relocated-library.json（覆盖率缺口，非 bug）
 - 2026-11-23 **模拟器第三轮全链 PASS**（含 flip+verify 修复）：ipad-sim3 capture 完整跑完 CAPTURE_EXIT=0、legacy-library.json 就位、verify-ipad-snapshots.py PASS（上一轮 pipe2 的"缺 JSON 崩"已修复+根因是 capture 中断非 verify 错）。IPadRotationTests 4/4
+- 2026-11-23 **边缘余项**：fd11ce0 斜扫带 8→自适应 23 段（撕口台阶细化见 agent-bands/close-mid-compare.png）+ 320pt 导航 pill 左右边距 ≥8pt
 - 2026-11-23 **阶段5常量对齐完成**（.tools/const-align-audit.md）：80 键全核，62 一致 + 18 有意偏离 + **0 漂移**；spring_c/select 曲线/close_travel 三个疑似点全部证伪
 - 2026-11-23 **封面 mipmap**（d657882）：egui sampler 无真 mip，改 CPU 预缩放 ≤3 档 box-filter + cover_pick 按足迹选档；焦点书 0 像素变化、远端封面边缘变柔；isotropic 档对斜向拉伸轴偏软是已知取舍
 - 2026-11-23 **阶段4合上规格**（.tools/stage4-close-spec.md）：参考无专属合上实现，coverReturn=840ms 只是 Cupertino pop 倒放；detail→shelf flight.returning 已完整；唯一缺口 reader→detail 的 reader_exit 镜像（spread_clip 收缩 bands 复用）
