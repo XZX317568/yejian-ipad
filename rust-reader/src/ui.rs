@@ -245,6 +245,9 @@ pub struct ReaderApp {
     shelf_shift: f32,
     flight: Option<Flight>,
     covers: HashMap<String, TextureHandle>,
+    /// CPU mip tiers per cover (see `shelf::CoverMips`): the oblique shelf
+    /// face picks a downscaled level instead of aliasing the full artwork.
+    cover_mips: HashMap<String, shelf::CoverMips>,
     cover_usage: HashMap<String, u64>,
     cover_clock: u64,
     visible_covers: HashSet<String>,
@@ -376,6 +379,7 @@ impl ReaderApp {
             shelf_shift: 0.,
             flight: None,
             covers: HashMap::new(),
+            cover_mips: HashMap::new(),
             cover_usage: HashMap::new(),
             cover_clock: 0,
             visible_covers: HashSet::new(),
@@ -1356,6 +1360,10 @@ impl ReaderApp {
                         match result {
                             Ok(image) => {
                                 if let Some(tile) = image.tiles.into_iter().next() {
+                                    self.cover_mips.insert(
+                                        id.clone(),
+                                        shelf::CoverMips::upload(ctx, &format!("cover-{id}"), &tile),
+                                    );
                                     self.covers.insert(
                                         id.clone(),
                                         ctx.load_texture(
@@ -1566,7 +1574,18 @@ impl ReaderApp {
         }
     }
     fn trim_covers(&mut self) {
-        let mut bytes: usize = self.covers.values().map(|texture| texture.size()[0] * texture.size()[1] * 4).sum();
+        // covers holds each base; cover_mips holds the extra downscaled
+        // tiers (its level 0 is a separate upload, counted only in mips).
+        let mip_bytes = |mips: &shelf::CoverMips| {
+            let base = mips.base().size();
+            mips.bytes().saturating_sub(base[0] * base[1] * 4)
+        };
+        let mut bytes: usize = self
+            .covers
+            .values()
+            .map(|texture| texture.size()[0] * texture.size()[1] * 4)
+            .sum::<usize>()
+            + self.cover_mips.values().map(&mip_bytes).sum::<usize>();
         while self.covers.len() > 48 || bytes > 64 * 1024 * 1024 {
             let candidate = self.covers.keys()
                 .filter(|id| !self.visible_covers.contains(*id)
@@ -1576,6 +1595,9 @@ impl ReaderApp {
             let Some(id) = candidate else { break };
             if let Some(texture) = self.covers.remove(&id) {
                 bytes -= texture.size()[0] * texture.size()[1] * 4;
+            }
+            if let Some(mips) = self.cover_mips.remove(&id) {
+                bytes -= mip_bytes(&mips);
             }
             self.cover_usage.remove(&id);
         }
@@ -2556,7 +2578,12 @@ impl ReaderApp {
                 };
                 let t = ((now - flight.started) / duration).clamp(0., 1.) as f32;
                 let progress = if flight.returning { 1. - t } else { t };
-                if let Some(texture) = self.covers.get(&flight.id) {
+                if let Some(texture) = self
+                    .cover_mips
+                    .get(&flight.id)
+                    .map(shelf::CoverMips::base)
+                    .or_else(|| self.covers.get(&flight.id))
+                {
                     shelf::paint_flight(
                         ui.painter(),
                         flight.from,
@@ -2578,7 +2605,13 @@ impl ReaderApp {
                                     &mask,
                                     volume,
                                     &book.title,
-                                    self.covers.get(&cover),
+                                    shelf::cover_pick(
+                                        self.cover_mips.get(&cover),
+                                        self.covers.get(&cover),
+                                        volume.cover,
+                                        shelf::shelf_face(volume.cover),
+                                        ui.ctx().pixels_per_point(),
+                                    ),
                                     self.dark,
                                     false,
                                     self.selected.contains(&book.id),
@@ -3033,6 +3066,7 @@ impl ReaderApp {
         }
         if self.covers.len() > 40 {
             self.covers.retain(|id, _| keep.contains(id));
+            self.cover_mips.retain(|id, _| keep.contains(id));
         }
         let p = ui.painter().with_clip_rect(shelf_area);
         shelf::paint_floor(&p, &volumes, self.dark);
@@ -3045,7 +3079,13 @@ impl ReaderApp {
                 &p,
                 volume,
                 &book.title,
-                self.covers.get(&cover),
+                shelf::cover_pick(
+                    self.cover_mips.get(&cover),
+                    self.covers.get(&cover),
+                    volume.cover,
+                    shelf::shelf_face(volume.cover),
+                    ui.ctx().pixels_per_point(),
+                ),
                 self.dark,
                 hidden,
                 self.selected.contains(&book.id),
@@ -3514,7 +3554,13 @@ fn library_thumbnails(
                         }
                         let cover_id = self.cover_id(&book.id);
                         self.ask_cover(&cover_id);
-                        if let Some(texture) = self.covers.get(&cover_id) {
+                        if let Some(texture) = shelf::cover_pick(
+                            self.cover_mips.get(&cover_id),
+                            self.covers.get(&cover_id),
+                            Plane::rect(cover),
+                            cover.size(),
+                            ui.ctx().pixels_per_point(),
+                        ) {
                             shelf::paint_art(
                                 ui.painter(),
                                 Plane::rect(cover),
@@ -3648,6 +3694,8 @@ fn library_thumbnails(
         if spread > 0.0005 {
             let dir = crate::params::params().spread.dir;
             let texture = self.covers.get(&cover_id);
+            let mips = self.cover_mips.get(&cover_id);
+            let ppp = ui.ctx().pixels_per_point();
             let dark = self.dark;
             let line = palette.line;
             shelf::paint_spread(ui.painter(), area, spread, dir, |p, shift| {
@@ -3659,7 +3707,9 @@ fn library_thumbnails(
                     Stroke::new(1., line),
                     StrokeKind::Inside,
                 );
-                if let Some(texture) = texture {
+                if let Some(texture) =
+                    shelf::cover_pick(mips, texture, Plane::rect(card), card.size(), ppp)
+                {
                     shelf::paint_art(p, Plane::rect(card), card.size(), texture, self.colors().0);
                 }
             });
@@ -5229,7 +5279,13 @@ fn library_thumbnails(
                             StrokeKind::Inside,
                         );
                         let cover = Rect::from_min_size(rect.min + vec2(14., 14.), vec2(58., 82.));
-                        if let Some(texture) = self.covers.get(&cover_id) {
+                        if let Some(texture) = shelf::cover_pick(
+                            self.cover_mips.get(&cover_id),
+                            self.covers.get(&cover_id),
+                            Plane::rect(cover),
+                            cover.size(),
+                            ui.ctx().pixels_per_point(),
+                        ) {
                             shelf::paint_art(
                                 ui.painter(),
                                 Plane::rect(cover),

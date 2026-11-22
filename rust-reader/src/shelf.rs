@@ -427,6 +427,127 @@ fn cover_uv(texture: &TextureHandle, face: Vec2) -> Rect {
     Rect::from_center_size(pos2(0.5, 0.5), Vec2::splat(scale.min_elem()) / scale)
 }
 
+// egui-wgpu uploads every texture with a single mip level and a linear
+// sampler, so a 500px cover shrunk into a ~120px oblique shelf face aliases.
+// GPU mip generation would need a custom blit pipeline inside the vendored
+// renderer; the lightweight stand-in is a CPU mip chain uploaded as extra
+// textures, with the level picked per paint from the projected footprint.
+/// Pre-scaled tiers of one cover: levels[i] is 1/2^i of the artwork.
+pub struct CoverMips {
+    levels: Vec<TextureHandle>,
+}
+impl CoverMips {
+    /// [base, /2, /4, ...] textures for image; the base itself is always
+    /// levels[0] so callers keep one lookup path for every paint.
+    pub fn upload(ctx: &Context, name: &str, image: &ColorImage) -> Self {
+        let levels = cover_mip_tiers(image)
+            .into_iter()
+            .enumerate()
+            .map(|(i, tier)| ctx.load_texture(format!("{name}-m{i}"), tier, TextureOptions::LINEAR))
+            .collect();
+        Self { levels }
+    }
+    /// GPU memory across every tier, for the cover cache byte budget.
+    pub fn bytes(&self) -> usize {
+        self.levels
+            .iter()
+            .map(|level| level.size()[0] * level.size()[1] * 4)
+            .sum()
+    }
+    /// Full-resolution artwork: flight and the detail card want sharpness.
+    pub fn base(&self) -> &TextureHandle {
+        &self.levels[0]
+    }
+    /// Deepest tier whose center-crop texels still oversample the on-screen
+    /// plane footprint (in points) by more than MIP_PICK_RATIO on either
+    /// axis — the isotropic-mip stand-in for the oblique squash. Smaller
+    /// picks trade the remaining shimmer for softness.
+    pub fn pick(&self, plane: Plane, face: Vec2, ppp: f32) -> &TextureHandle {
+        let screen = vec2(
+            plane.horizontal.length() * ppp,
+            plane.vertical.length() * ppp,
+        );
+        let mut level = &self.levels[0];
+        for next in &self.levels[1..] {
+            let scale = next.size_vec2() / face;
+            let texels = face * scale.min_elem();
+            if texels.x / screen.x.max(1.) > MIP_PICK_RATIO
+                || texels.y / screen.y.max(1.) > MIP_PICK_RATIO
+            {
+                level = next;
+            } else {
+                break;
+            }
+        }
+        level
+    }
+}
+/// The cover texture for one paint call: mip tier when the cache has one,
+/// the plain handle otherwise. face is the un-projected cover size that
+/// cover_uv crops against (shelf volumes pass shelf_face(plane)).
+pub fn cover_pick<'a>(
+    mips: Option<&'a CoverMips>,
+    plain: Option<&'a TextureHandle>,
+    plane: Plane,
+    face: Vec2,
+    ppp: f32,
+) -> Option<&'a TextureHandle> {
+    mips.map(|mips| mips.pick(plane, face, ppp)).or(plain)
+}
+/// Halve a tier each step until the small edge would drop below 64px, capped
+/// at three downscales — enough for shelf faces from ~60px to full screen.
+fn cover_mip_tiers(image: &ColorImage) -> Vec<ColorImage> {
+    let mut tiers = vec![image.clone()];
+    for _ in 0..3 {
+        let (w, h) = (tiers.last().unwrap().width(), tiers.last().unwrap().height());
+        if w / 2 < 64 || h / 2 < 64 {
+            break;
+        }
+        tiers.push(halve(tiers.last().unwrap()));
+    }
+    tiers
+}
+/// 2x box downsample in premultiplied alpha so dark edges do not bleed.
+fn halve(image: &ColorImage) -> ColorImage {
+    let (w, h) = (image.width(), image.height());
+    let (tw, th) = (w / 2, h / 2);
+    let mut pixels = Vec::with_capacity(tw * th);
+    for y in 0..th {
+        for x in 0..tw {
+            let mut sum = [0u32; 4];
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let p = image.pixels[(y * 2 + dy) * w + x * 2 + dx];
+                    sum[3] += p.a() as u32;
+                    sum[0] += p.r() as u32 * p.a() as u32;
+                    sum[1] += p.g() as u32 * p.a() as u32;
+                    sum[2] += p.b() as u32 * p.a() as u32;
+                }
+            }
+            let a = (sum[3] + 2) / 4;
+            // sum stores r*a etc, so un-premultiplying the 2x2 mean only
+            // divides by the mean alpha — an extra *255 would clamp to white.
+            let channel = |premul: u32| {
+                (((premul + 2) / 4 + a / 2) / a.max(1)).min(255) as u8
+            };
+            pixels.push(Color32::from_rgba_premultiplied(
+                channel(sum[0]),
+                channel(sum[1]),
+                channel(sum[2]),
+                a as u8,
+            ));
+        }
+    }
+    ColorImage {
+        size: [tw, th],
+        source_size: vec2(w as f32 / 2., h as f32 / 2.),
+        pixels,
+    }
+}
+/// Step to the next tier only while texels still oversample screen pixels by
+/// more than this on the more-compressed axis — ceil(lod) mip selection.
+const MIP_PICK_RATIO: f32 = 1.5;
+
 fn cover_rows(face: Vec2) -> Vec<f32> {
     let mut rows: Vec<_> = (0..=32).map(|i| i as f32 / 32.).collect();
     for i in 1..=8 {
@@ -477,7 +598,7 @@ fn cover_mesh(
     mesh
 }
 
-fn shelf_face(plane: Plane) -> Vec2 {
+pub fn shelf_face(plane: Plane) -> Vec2 {
     vec2(plane.horizontal.x / 0.66, plane.vertical.y)
 }
 
@@ -934,6 +1055,55 @@ pub fn paint_spread(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cover_mip_tiers_halve_until_sixty_four() {
+        let image = ColorImage::filled([520, 700], Color32::WHITE);
+        let tiers = cover_mip_tiers(&image);
+        assert_eq!(tiers.len(), 4, "520x700 -> 260x350 -> 130x175 -> 65x87");
+        assert_eq!(tiers[3].size, [65, 87]);
+        // A small cover never produces a degenerate tier.
+        let small = cover_mip_tiers(&ColorImage::filled([130, 180], Color32::WHITE));
+        assert_eq!(small.len(), 2);
+    }
+    #[test]
+    fn halve_averages_premultiplied_and_stops_bleed() {
+        // Top-left 2x2 block mixes opaque and transparent texels: it must
+        // average to half-strength red, not a dark smear.
+        let mut image = ColorImage::filled([4, 4], Color32::RED);
+        for y in 0..2 {
+            image.pixels[y * 4] = Color32::TRANSPARENT;
+        }
+        let down = halve(&image);
+        assert_eq!(down.size, [2, 2]);
+        let mixed = down.pixels[0];
+        assert!((mixed.a() as i32 - 128).abs() <= 1, "alpha {}", mixed.a());
+        assert!((mixed.r() as i32 - 255).abs() <= 2, "premult: red stays {}", mixed.r());
+        assert!(mixed.g() <= 2);
+        let opaque = down.pixels[1];
+        assert_eq!(opaque, Color32::RED);
+    }
+    #[test]
+    fn mip_pick_follows_the_projected_footprint() {
+        let ctx = Context::default();
+        let image = ColorImage::filled([512, 700], Color32::WHITE);
+        let mips = CoverMips::upload(&ctx, "cover-t", &image);
+        assert_eq!(mips.levels.len(), 4);
+        let face = vec2(200., 300.);
+        // Huge footprint: base art stays.
+        assert!(std::ptr::eq(
+            mips.pick(Plane::rect(Rect::from_min_size(Pos2::ZERO, vec2(400., 600.))), face, 1.),
+            &mips.levels[0]
+        ));
+        // ~70x90pt oblique face on a 512x700 cover drops at least two tiers.
+        let plane = Plane::rect(Rect::from_min_size(Pos2::ZERO, vec2(70., 90.)));
+        let picked = mips.pick(plane, face, 1.);
+        assert!(picked.size()[0] <= 256, "picked {:?}", picked.size());
+        assert!(picked.size()[0] >= 65);
+        assert!(std::ptr::eq(
+            cover_pick(Some(&mips), None, plane, face, 1.).unwrap(),
+            picked
+        ));
+    }
     #[test]
     fn thousand_books_have_bounded_geometry_and_exact_hit_planes() {
         let rect = Rect::from_min_size(Pos2::ZERO, vec2(520., 450.));
