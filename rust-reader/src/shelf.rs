@@ -996,7 +996,20 @@ pub fn paint_flight(
 /// the conservative (unrevealed-side) boundary so the painted region is
 /// always a subset of the true quad — content is never cut short.
 /// With `dir = -1` the bands mirror around `rect.center().x`.
-const SPREAD_BANDS: u32 = 8;
+/// Minimum band count; the real count adapts so a stair step of the
+/// clip edge never exceeds `SPREAD_BAND_STEP_PX` horizontally
+/// (`slant / bands <= 8px`). 8 fixed bands left ~slant/8-px steps
+/// visible mid-sweep.
+const SPREAD_BANDS_MIN: u32 = 8;
+/// Horizontal px budget for one stair step of the clip edge.
+const SPREAD_BAND_STEP_PX: f32 = 8.;
+
+/// Band count for a reveal of width `w`: at least `SPREAD_BANDS_MIN`,
+/// and enough that `slant / bands <= SPREAD_BAND_STEP_PX`.
+fn spread_band_count(w: f32) -> u32 {
+    let slant = motion::spread_slant(w);
+    SPREAD_BANDS_MIN.max((slant / SPREAD_BAND_STEP_PX).ceil() as u32)
+}
 
 /// Clip rects approximating `(0,0) -> (edge,0) -> (edge-slant,h) -> (0,h)`
 /// at eased progress `p`. `dir < 0` mirrors the sweep. Union of the
@@ -1006,22 +1019,23 @@ pub fn spread_clip(rect: Rect, p: f32, dir: f32) -> Vec<Rect> {
     let slant = motion::spread_slant(w);
     let edge = motion::spread_edge(w, slant, p);
     let h = rect.height().max(1.);
+    let bands_n = spread_band_count(w);
     let mirror = dir < 0.;
-    let mut bands = Vec::with_capacity(SPREAD_BANDS as usize);
-    for band in 0..SPREAD_BANDS {
+    let mut bands = Vec::with_capacity(bands_n as usize);
+    for band in 0..bands_n {
         let (top, bottom) = (
-            rect.top() + h * band as f32 / SPREAD_BANDS as f32,
-            rect.top() + h * (band + 1) as f32 / SPREAD_BANDS as f32,
+            rect.top() + h * band as f32 / bands_n as f32,
+            rect.top() + h * (band + 1) as f32 / bands_n as f32,
         );
         // Conservative edge: the true boundary is `edge - slant * y/h`;
         // the smallest value inside a band sits at its lower end.
-        let x_edge = edge - slant * (band + 1) as f32 / SPREAD_BANDS as f32;
+        let x_edge = edge - slant * (band + 1) as f32 / bands_n as f32;
         if x_edge <= 0. {
             continue;
         }
         let band_rect = if mirror {
             Rect::from_min_max(
-                pos2(rect.left() + (w - x_edge.min(w)).max(0.), top),
+                pos2(rect.right() - x_edge.min(w).max(0.), top),
                 pos2(rect.right(), bottom),
             )
         } else {
@@ -1240,6 +1254,43 @@ mod tests {
     }
 
     #[test]
+    fn spread_clip_step_stays_conservative_and_within_budget() {
+        // Adaptive count: enough bands that the stair step never exceeds
+        // 8px of horizontal travel, and never fewer than the old fixed 8.
+        let slant = motion::spread_slant(1024.);
+        let n = spread_band_count(1024.);
+        assert!(n >= SPREAD_BANDS_MIN);
+        if slant > 0. {
+            assert!((slant / n as f32) <= SPREAD_BAND_STEP_PX, "step too coarse");
+        }
+        // Conservative coverage: every band's drawn right edge must sit
+        // inside the true slanted boundary `edge - slant * y/h` — the
+        // union never reveals more than the reference quad (no overdraw),
+        // and adjacent bands abut so no pixel rows are missed.
+        let rect = Rect::from_min_size(pos2(0., 0.), vec2(1024., 900.));
+        for i in 1..=10 {
+            let p = i as f32 / 10.;
+            let edge = motion::spread_edge(rect.width(), slant, p);
+            let bands = spread_clip(rect, p, 1.);
+            // Bands whose whole step still sits left of the leading edge
+            // are dropped (`x_edge <= 0`); count the expected survivors.
+            let expected = (0..n)
+                .filter(|b| edge - slant * (*b + 1) as f32 / n as f32 > 0.01)
+                .count();
+            assert_eq!(bands.len(), expected, "band count at p={p}");
+            for band in &bands {
+                // True boundary at the band's bottom (smallest x inside).
+                let true_x = edge - slant * (band.bottom() / rect.height());
+                let drawn_x = band.right() - rect.left();
+                assert!(
+                    drawn_x <= true_x + 0.02,
+                    "band overdraws slant at p={p}: drawn={drawn_x} true={true_x}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn spread_clip_dir_minus_one_mirrors_around_center() {
         let rect = Rect::from_min_size(pos2(50., 20.), vec2(400., 600.));
         for i in 1..=10 {
@@ -1251,7 +1302,10 @@ mod tests {
             // and b.left = rect.right - a.right for the matching band a.
             let l_area: f32 = left.iter().map(|b| b.width() * b.height()).sum();
             let r_area: f32 = right.iter().map(|b| b.width() * b.height()).sum();
-            assert!((l_area - r_area).abs() < 0.01, "areas differ at p={p}");
+            // Areas are equal in exact math; f32 cancellation in the
+            // mirrored edge formula grows with band count, so allow a bit
+            // more than one band-step of absolute error.
+            assert!((l_area - r_area).abs() < 0.05, "areas differ at p={p}: {l_area} vs {r_area}");
             let left_from_right: Vec<Rect> = right
                 .iter()
                 .map(|b| {

@@ -2779,15 +2779,8 @@ impl ReaderApp {
         if self.nav_pill.is_some_and(|t| t.done(now)) {
             self.nav_pill = None;
         }
-        let i0 = pill_pos.floor().clamp(0., 3.) as usize;
-        let i1 = (i0 + 1).min(3);
-        let frac = (pill_pos - i0 as f32).clamp(0., 1.);
-        let r0 = slots[i0].shrink2(vec2(5., 5.));
-        let r1 = slots[i1].shrink2(vec2(5., 5.));
-        let pill = Rect::from_min_max(
-            r0.min + (r1.min - r0.min) * frac,
-            r0.max + (r1.max - r0.max) * frac,
-        );
+        let pill = Self::nav_pill_rect(&slots, pill_pos);
+        self.hitboxes.insert("nav-pill".into(), pill);
         ui.painter().rect_filled(pill, 16., palette.accent_soft);
         for (i, (tab, label, kind)) in tabs.into_iter().enumerate() {
             let rect = slots[i];
@@ -2855,6 +2848,21 @@ impl ReaderApp {
     }
     /// 竖屏底部标签栏在安全区内的高度；底图再向下加底部安全区。
     const TAB_BAR_HEIGHT: f32 = 54.;
+    /// 选中标签 pill 相对标签槽的水平/垂直内边距（pt）。320pt 分屏
+    /// 下槽宽 80pt，5pt 内边距让 pill 视觉上贴住栏边，故水平用 8pt。
+    const NAV_PILL_INSET: egui::Vec2 = vec2(8., 5.);
+    /// 选中标签高亮 pill 的矩形：`pill_pos` 在槽下标间插值。
+    fn nav_pill_rect(slots: &[Rect; 4], pill_pos: f32) -> Rect {
+        let i0 = pill_pos.floor().clamp(0., 3.) as usize;
+        let i1 = (i0 + 1).min(3);
+        let frac = (pill_pos - i0 as f32).clamp(0., 1.);
+        let r0 = slots[i0].shrink2(Self::NAV_PILL_INSET);
+        let r1 = slots[i1].shrink2(Self::NAV_PILL_INSET);
+        Rect::from_min_max(
+            r0.min + (r1.min - r0.min) * frac,
+            r0.max + (r1.max - r0.max) * frac,
+        )
+    }
     /// 只有横屏才用左侧竖栏——宽 1024 的 iPad 竖屏此前被误判成桌面布局。
     fn side_navigation(area: Rect) -> bool {
         area.width() > area.height() && (area.width() >= 1000. || area.height() < 600.)
@@ -6782,6 +6790,20 @@ mod tests {
         }, |ui| app.history_ui(ui, ui.max_rect())).drop_without_applying_deltas();
         assert!(!app.cover_pending.is_empty());
         assert!(app.cover_pending.len() <= 6, "hidden history rows requested {} covers", app.cover_pending.len());
+    }
+    #[test]
+    fn nav_pill_keeps_edge_gap_in_320pt_split() {
+        // 320pt split view: four 80pt slots in the bottom bar. The pill must
+        // stay at least 8pt off the rail edge even for the edge slots and
+        // mid-way tween positions.
+        let slots = [0usize, 1, 2, 3].map(|i| {
+            Rect::from_min_size(pos2(i as f32 * 80., 0.), vec2(80., 54.))
+        });
+        for tenth in 0..=30 {
+            let pill = ReaderApp::nav_pill_rect(&slots, tenth as f32 / 10.);
+            assert!(pill.left() >= 8. - 0.01, "pill left {pill:?}");
+            assert!(pill.right() <= 320. - 8. + 0.01, "pill right {pill:?}");
+        }
     }
     #[test]
     fn online_chapter_waits_for_pages_and_hands_over_to_the_library_copy_at_the_same_page() {

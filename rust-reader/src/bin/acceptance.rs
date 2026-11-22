@@ -1395,6 +1395,12 @@ fn ipad_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
                 vec![],
                 Some(&format!("ipad-split-{name}-{label}-large-text")),
             )?;
+            // The nav pill must not touch the bar edge (>=6pt gap).
+            let pill = h.app.hitboxes["nav-pill"];
+            anyhow::ensure!(
+                pill.left() >= 6. && size[0] as f32 - pill.right() >= 6.,
+                "{name}: nav pill too close to bar edge: {pill:?}"
+            );
             if tab == "search" {
                 for control in ["读取", "社区源"] {
                     anyhow::ensure!(
