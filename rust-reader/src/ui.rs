@@ -2856,7 +2856,17 @@ impl ReaderApp {
             return;
         }
         let layout = self.shelf_layout(area);
-        let shelf_area = layout.books;
+        // 宽屏：把底部展签让出来，让扇形在"上方可用区域"里垂直居中，
+        // 避免书全都压在屏幕底部（2026-11-23 用 analyze-layout.ps1 量出来的问题）。
+        let shelf_area = if layout.side_by_side {
+            let band = (layout.stage.height() * 0.30).clamp(110., 200.);
+            Rect::from_min_max(
+                pos2(layout.books.left(), layout.books.top() + 12.),
+                pos2(layout.books.right(), layout.stage.bottom() - band - 28.),
+            )
+        } else {
+            layout.books
+        };
         let palette = crate::design::palette(self.dark);
         let stage_color = if self.dark {
             Color32::from_rgb(40, 43, 39)

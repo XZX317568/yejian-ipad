@@ -128,6 +128,17 @@ pub fn geometry(area: Rect, count: usize, focus: f32, entrance: f32) -> Vec<Volu
     let cover = (width / scale * 0.32).clamp(100., 190.) * scale;
     let height = (cover - 20. * scale) * 166. / 118. + 54. * scale;
     let base_y = -cover * -0.30 + height * 0.60 + 12. * scale;
+    // 按可用高度收口：书放大后（cover 190 * scale 2.6）整摞高度会超过画布，
+    // 表现为书的底部被裁掉、上方留白过大。这里等比缩到能完整放下的尺寸。
+    let stacked = base_y + height;
+    let fit = if stacked > area.height() * 0.98 {
+        (area.height() * 0.98) / stacked
+    } else {
+        1.
+    };
+    let cover = cover * fit;
+    let height = height * fit;
+    let base_y = base_y * fit;
     let mut start_x = area.center().x - (spine + cover * 0.66) / 2. + cover * 0.84 * 0.66;
     let first = -(count as i32 / 2);
     let last = first + count as i32 - 1;
