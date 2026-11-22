@@ -1,0 +1,18 @@
+[package]
+name = "yejian-platform"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "GPL-3.0-only"
+description = "Android and iOS platform bridge for the Yejian Rust reader"
+
+[lib]
+name = "yejian_platform"
+path = "src/lib.rs"
+
+[dependencies]
+serde_json = "1"
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21.1"
+ndk-context = "0.1.1"

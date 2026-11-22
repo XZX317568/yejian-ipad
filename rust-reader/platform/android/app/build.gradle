@@ -1,0 +1,47 @@
+plugins {
+    id "com.android.application"
+}
+
+android {
+    namespace "app.yejian.reader.rust"
+    compileSdkVersion 36
+
+    defaultConfig {
+        // A separate install id: the existing Flutter app keeps
+        // `app.yejian.reader` and its Isar data untouched.
+        applicationId "app.yejian.reader.rust"
+        minSdkVersion 24
+        targetSdkVersion 36
+        versionCode 7
+        versionName "0.1.1"
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    sourceSets {
+        main {
+            java.srcDirs = ["src/main/java"]
+            jniLibs.srcDirs = ["src/main/jniLibs"]
+        }
+    }
+
+    packagingOptions {
+        jniLibs {
+            // NativeActivity loads libyejian.so through the normal library
+            // loader; extracted libraries are the least surprising on old
+            // OEM images.
+            useLegacyPackaging true
+        }
+    }
+
+    buildTypes {
+        debug {
+        }
+        release {
+            minifyEnabled false
+        }
+    }
+}

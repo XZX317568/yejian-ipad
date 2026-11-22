@@ -1,0 +1,23 @@
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+// Gradle only allows pluginManagement/plugins before the plugins block, so the
+// version catalog and plugin version must come before any other statement.
+plugins {
+    id "com.android.application" version "9.1.1" apply false
+}
+
+dependencyResolutionManagement {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.name = "YejianRustAndroid"
+include ":app"

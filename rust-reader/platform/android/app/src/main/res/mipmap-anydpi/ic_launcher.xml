@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- API 24–25：整幅矢量图标（无 adaptive icon）。 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <path
+        android:fillColor="#14161C"
+        android:pathData="M0,0 L108,0 L108,108 L0,108 Z" />
+
+    <!-- 左页 -->
+    <path
+        android:fillColor="#F4EBD8"
+        android:pathData="M27,34 L51,30 L51,78 L27,82 Z" />
+    <!-- 右页 -->
+    <path
+        android:fillColor="#EADFC5"
+        android:pathData="M57,30 L81,34 L81,82 L57,78 Z" />
+    <!-- 书脊阴影 -->
+    <path
+        android:fillColor="#C7B998"
+        android:pathData="M51,30 L57,30 L57,78 L51,78 Z" />
+
+    <path
+        android:fillColor="#668E8474"
+        android:pathData="M33,42 L45,40.6 L45,43.2 L33,44.6 Z" />
+    <path
+        android:fillColor="#668E8474"
+        android:pathData="M33,48 L45,46.6 L45,49.2 L33,50.6 Z" />
+    <path
+        android:fillColor="#668E8474"
+        android:pathData="M33,54 L41,53 L41,55.6 L33,56.6 Z" />
+    <path
+        android:fillColor="#668E8474"
+        android:pathData="M63,40.6 L75,42 L75,44.6 L63,43.2 Z" />
+    <path
+        android:fillColor="#668E8474"
+        android:pathData="M63,46.6 L75,48 L75,50.6 L63,49.2 Z" />
+    <path
+        android:fillColor="#668E8474"
+        android:pathData="M67,52.6 L75,53.6 L75,56.2 L67,55.2 Z" />
+
+    <path
+        android:fillColor="#D9A93C"
+        android:pathData="M60,30 L67,30.9 L67,47 L63.5,43 L60,47 Z" />
+</vector>
