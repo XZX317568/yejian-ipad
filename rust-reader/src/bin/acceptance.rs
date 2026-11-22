@@ -1103,11 +1103,19 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
     design_capture(h, "design-settings", &mut captures)?;
     // Round 3: the 存储 group reports managed bytes with confirmed cleanups.
     h.wait(ReaderApp::storage_ready)?;
-    for _ in 0..5 {
+    // Sweep the settings scroll both ways in steps smaller than the
+    // viewport so every row passes fully through the visible window.
+    for _ in 0..10 {
         if design_label_visible(h, "书架漫画") && design_label_visible(h, "封面缓存") {
             break;
         }
-        scroll_page(h, -800.)?;
+        scroll_page(h, -400.)?;
+    }
+    for _ in 0..10 {
+        if design_label_visible(h, "书架漫画") && design_label_visible(h, "封面缓存") {
+            break;
+        }
+        scroll_page(h, 400.)?;
     }
     anyhow::ensure!(
         design_label_visible(h, "书架漫画") && design_label_visible(h, "封面缓存"),
