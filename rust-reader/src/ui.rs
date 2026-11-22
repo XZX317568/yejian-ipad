@@ -1986,9 +1986,18 @@ impl ReaderApp {
         } + 28. * (self.font_scale - 1.);
         // 书架是页面主体：宽屏（iPad）时舞台直接吃掉整屏高度。
         // 用 shelf_viewport 而不是 area.bottom()：area 可能是可滚动内容区。
+        // 竖屏底部标签栏占 TAB_BAR_HEIGHT：舞台/展签让出栏高，不被压住。
+        let viewport = if Self::side_navigation(self.shelf_viewport) {
+            self.shelf_viewport
+        } else {
+            Rect::from_min_max(
+                self.shelf_viewport.min,
+                self.shelf_viewport.max - vec2(0., Self::TAB_BAR_HEIGHT),
+            )
+        };
         let height = if side_by_side {
-            // 再让出 88pt 给底部导航/安全区，避免展签按钮被底栏吃掉。
-            (self.shelf_viewport.height() - top - 104.).clamp(220., 4000.)
+            // 再让出空间给底部导航/安全区，避免展签按钮被底栏吃掉。
+            (viewport.height() - top - 104.).clamp(220., 4000.)
         } else if short_landscape {
             224. + (self.font_scale - 1.) * 16. + browse_extra + 28.
         } else {
@@ -1996,7 +2005,6 @@ impl ReaderApp {
         };
         // 宽屏：舞台严格贴住内容视口，避免出现可滚动的溢出（iPad 上不该滚动）。
         let stage = if side_by_side {
-            let viewport = self.shelf_viewport;
             Rect::from_min_size(
                 pos2(viewport.left(), viewport.top() + top),
                 vec2(viewport.width(), (viewport.height() - top - 8.).max(220.)),
@@ -2239,10 +2247,12 @@ impl ReaderApp {
         let (background, ink, _) = self.colors();
         ui.painter().rect_filled(full, 0., background);
         let tablet = Self::side_navigation(full);
-        let rail_width = if full.width() >= 1280. { 176. } else { 88. };
+        let rail_width = if full.width() >= 1400. { 176. } else { 96. };
         let content = if tablet {
             Rect::from_min_max(full.min + vec2(rail_width, 0.), full.max)
         } else {
+            // 竖屏底栏盖住内容区底部；书架舞台在 shelf_layout 里单独让位，
+            // 其余页沿用与旧浮标胶囊相同的滚动覆盖范围。
             full
         };
         let system_back = yejian_platform::take_back_requested()
@@ -2527,29 +2537,34 @@ impl ReaderApp {
             (Tab::History, "历史", "history"),
             (Tab::Settings, "设置", "settings"),
         ];
-        let expanded = tablet && full.width() >= 1280.;
+        let expanded = tablet && full.width() >= 1400.;
+        // 竖屏底部标签栏：可点区只占安全区内 54pt，底图向下延伸盖住
+        // home-indicator 区（高度 54 + inset，不写死，避免安全区双重扣减）。
+        let bottom_inset = if tablet {
+            0.
+        } else {
+            yejian_platform::safe_insets()
+                .map(|insets| insets.bottom as f32 / ui.ctx().pixels_per_point())
+                .unwrap_or(0.)
+        };
         let rail = if tablet {
             Rect::from_min_size(
                 full.min,
-                vec2(if expanded { 176. } else { 88. }, full.height()),
+                vec2(if expanded { 176. } else { 96. }, full.height()),
             )
         } else {
-            Rect::from_min_size(
-                pos2(
-                    full.center().x - (full.width() - 32.).min(480.) / 2.,
-                    full.bottom() - 72.,
-                ),
-                vec2((full.width() - 32.).min(480.), 64.),
+            Rect::from_min_max(
+                pos2(full.left(), full.bottom() - Self::TAB_BAR_HEIGHT),
+                pos2(full.right(), full.bottom() + bottom_inset),
             )
         };
-        if !tablet {
-            crate::design::soft_shadow(ui.painter(), rail, 23., 1.2, self.dark);
-        }
         ui.painter()
-            .rect_filled(rail, if tablet { 0. } else { 23. }, palette.surface);
+            .rect_filled(rail, 0., palette.surface);
         if !tablet {
-            ui.painter()
-                .rect_stroke(rail, 23., Stroke::new(1., palette.line), StrokeKind::Inside);
+            ui.painter().line_segment(
+                [rail.left_top(), rail.right_top()],
+                Stroke::new(1., palette.line),
+            );
         } else {
             ui.painter().line_segment(
                 [rail.right_top(), rail.right_bottom()],
@@ -2579,9 +2594,10 @@ impl ReaderApp {
                     vec2(rail.width() - 20., 64.),
                 )
             } else {
+                // 4 个等宽标签；可点区 54pt 全部待在安全区内。
                 Rect::from_min_size(
                     pos2(rail.left() + i as f32 * rail.width() / 4., rail.top()),
-                    vec2(rail.width() / 4., 64.),
+                    vec2(rail.width() / 4., Self::TAB_BAR_HEIGHT),
                 )
             };
         }
@@ -2627,14 +2643,14 @@ impl ReaderApp {
             let row_clicked = ui
                 .interact(rect, Id::unique(("nav-row", i)), Sense::click())
                 .clicked();
-            let icon_rect = Rect::from_center_size(
-                if expanded {
-                    pos2(rect.left() + 28., rect.center().y)
-                } else {
-                    rect.center() - vec2(0., 9.)
-                },
-                vec2(32., 29.),
-            );
+            let icon_rect = if expanded {
+                Rect::from_center_size(pos2(rect.left() + 28., rect.center().y), vec2(32., 29.))
+            } else if tablet {
+                Rect::from_center_size(rect.center() - vec2(0., 9.), vec2(32., 29.))
+            } else {
+                // 底部标签栏：26×26 图标压在 54pt 可点区上半部。
+                Rect::from_center_size(rect.center() - vec2(0., 7.), vec2(26., 26.))
+            };
             let clicked = self.icon(ui, &format!("nav-{kind}"), icon_rect, kind, label);
             self.hitboxes.insert(format!("nav-{kind}"), rect);
             let fresh = if tab == Tab::Sources { self.sources.fresh_follows() } else { 0 };
@@ -2652,8 +2668,10 @@ impl ReaderApp {
             ui.painter().text(
                 if expanded {
                     pos2(rect.left() + 55., rect.center().y)
-                } else {
+                } else if tablet {
                     rect.center() + vec2(0., 8.)
+                } else {
+                    rect.center() + vec2(0., 11.)
                 },
                 if expanded {
                     Align2::LEFT_CENTER
@@ -2682,8 +2700,11 @@ impl ReaderApp {
             }
         }
     }
+    /// 竖屏底部标签栏在安全区内的高度；底图再向下加底部安全区。
+    const TAB_BAR_HEIGHT: f32 = 54.;
+    /// 只有横屏才用左侧竖栏——宽 1024 的 iPad 竖屏此前被误判成桌面布局。
     fn side_navigation(area: Rect) -> bool {
-        area.width() >= 1000. || (area.width() >= 700. && area.height() < 600.)
+        area.width() > area.height() && (area.width() >= 1000. || area.height() < 600.)
     }
     fn library_viewport(&mut self, ui: &mut Ui, area: Rect, now: f64, entrance: f32) {
         self.shelf_viewport = area;
@@ -2691,7 +2712,7 @@ impl ReaderApp {
         let bottom = if Self::side_navigation(ui.ctx().content_rect()) {
             16.
         } else {
-            80.
+            Self::TAB_BAR_HEIGHT + 16.
         };
         if area.height() >= height + bottom {
             self.shelf_shift = 0.;
