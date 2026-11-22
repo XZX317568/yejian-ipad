@@ -1536,39 +1536,57 @@ impl ReaderApp {
                 }
             }
         }
-        if let Some((text, at)) = &self.notice {
-            if now - *at < 5. {
+        if let Some((text, at)) = self.notice.clone() {
+            if now - at < 5. {
                 let crash = matches!(
                     self.exit_notice,
                     Some(crate::diagnostics::ExitNotice::Crash)
-                );
+                ) && text.contains("意外退出");
+                let fg = self.colors().0;
+                let height = if crash { 54. } else { 42. };
                 let rect = Rect::from_center_size(
                     pos2(full.center().x, full.bottom() - 100.),
-                    vec2((full.width() - 32.).min(560.), 40.),
+                    vec2((full.width() - 32.).min(560.), height),
                 );
                 ui.painter().rect_filled(rect, 10., ink);
                 let text_rect = if crash {
-                    rect.shrink2(vec2(16., 0.)).with_max_x(rect.max.x - 96.)
+                    rect.shrink2(vec2(16., 0.)).with_max_x(rect.max.x - 108.)
                 } else {
-                    rect
+                    rect.shrink2(vec2(16., 0.))
                 };
-                ui.painter().text(
-                    text_rect.center(),
-                    Align2::CENTER_CENTER,
+                let mut job = egui::text::LayoutJob::simple(
                     text,
-                    FontId::proportional(12.),
-                    self.colors().0,
+                    FontId::proportional(12.5),
+                    fg,
+                    text_rect.width().max(40.),
                 );
+                job.wrap.max_rows = 1;
+                job.wrap.break_anywhere = true;
+                let galley = ui.painter().layout_job(job);
+                let text_pos = if crash {
+                    pos2(text_rect.min.x, rect.center().y - galley.size().y * 0.5)
+                } else {
+                    pos2(
+                        text_rect.center().x - galley.size().x * 0.5,
+                        rect.center().y - galley.size().y * 0.5,
+                    )
+                };
+                ui.painter().galley(text_pos, galley, fg);
                 if crash {
+                    let btn_rect = Rect::from_center_size(
+                        pos2(rect.max.x - 54., rect.center().y),
+                        vec2(92., 44.),
+                    );
                     let button = ui.put(
-                        Rect::from_center_size(
-                            pos2(rect.max.x - 52., rect.center().y),
-                            vec2(84., 30.),
-                        ),
-                        Button::new("导出日志"),
+                        btn_rect,
+                        Button::new(RichText::new("导出日志").size(12.5).color(fg))
+                            .fill(fg.gamma_multiply(0.16))
+                            .stroke(Stroke::new(1., fg))
+                            .corner_radius(8.),
                     );
                     self.hitboxes.insert("crash-export".into(), button.rect);
                     if button.clicked() {
+                        self.exit_notice = None;
                         self.export_diagnostics();
                     }
                 }
@@ -1581,17 +1599,22 @@ impl ReaderApp {
         if self.perf_overlay {
             let text = crate::perf::overlay_text();
             let font = FontId::monospace(11.);
-            let galley = ui.painter().layout_no_wrap(
-                text,
-                font,
-                Color32::from_rgb(230, 235, 240),
-            );
+            let fg = Color32::from_rgb(242, 239, 233);
+            let galley = ui.painter().layout_no_wrap(text, font, fg);
+            let size = galley.size() + vec2(16., 10.);
             let rect = Rect::from_min_size(
-                full.min + vec2(8., 8.),
-                galley.size() + vec2(12., 8.),
+                pos2((full.max.x - 12. - size.x).max(full.min.x + 8.), full.min.y + 12.),
+                size,
             );
-            ui.painter().rect_filled(rect, 6., Color32::from_black_alpha(170));
-            ui.painter().galley(rect.min + vec2(6., 4.), galley, Color32::WHITE);
+            ui.painter()
+                .rect_filled(rect, 8., Color32::from_rgb(28, 26, 24));
+            ui.painter().rect_stroke(
+                rect,
+                8.,
+                Stroke::new(1., Color32::from_rgb(68, 64, 60)),
+                StrokeKind::Inside,
+            );
+            ui.painter().galley(rect.min + vec2(8., 5.), galley, fg);
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
         // Covers are "all here" once the shelf's pending requests drain.

@@ -212,6 +212,7 @@ impl ReaderApp {
     #[cfg(debug_assertions)]
     pub fn clear_notice(&mut self) {
         self.notice = None;
+        self.pending_notice = None;
         self.exit_notice = None;
     }
     /// Acceptance seam: whether an exit notice is pending announcement.

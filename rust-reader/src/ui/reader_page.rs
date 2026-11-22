@@ -802,12 +802,12 @@ impl ReaderApp {
             self.cover_usage.remove(&id);
         }
     }
-    /// Decode target width for page requests: the viewport's physical
-    /// width (halved for two-page spreads) with 25% headroom, clamped to
-    /// [1024, 3072]. Downscale only — smaller pages stay as-is.
+    /// Decode target width for page requests: the viewport's physical slot
+    /// width (halved for two-page spreads), clamped to [1024, 3072]. Pages
+    /// under 2x this width stay untouched so GPU linear filtering handles them.
     pub(super) fn page_target_width(&self) -> u32 {
         let factor = if self.spread && !self.vertical { 0.5 } else { 1. };
-        (self.page_target_px * factor * 1.25).clamp(1024., 3072.) as u32
+        (self.page_target_px * factor).clamp(1024., 3072.) as u32
     }
     /// Zoom past 1.5x asks for a 3072-wide decode of the current page; the
     /// arriving texture swaps in through the normal image path.

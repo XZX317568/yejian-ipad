@@ -1697,8 +1697,9 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
     design_capture(h, "webdav-synced", &mut captures)?;
 
     // E3: 关于 → 导出诊断日志 produces a share-staged zip with no secrets.
+    h.app.clear_notice();
+    h.frames(2)?;
     scroll_until_row_visible(h, "diagnostics-export", "导出诊断日志")?;
-    design_capture(h, "diagnostics-export", &mut captures)?;
     h.click("diagnostics-export")?;
     h.frames(3)?;
     h.wait(|app| {
@@ -1706,6 +1707,13 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
             .map(|p| p.extension().is_some_and(|e| e == "zip"))
             .unwrap_or(false)
     })?;
+    anyhow::ensure!(
+        h.painted_text
+            .iter()
+            .any(|t| t.text.contains("诊断日志已导出") || t.text.contains("已生成诊断日志")),
+        "diagnostics-export: export notice not painted"
+    );
+    design_capture(h, "diagnostics-export", &mut captures)?;
     let staged = h.app.last_shared().unwrap().to_path_buf();
     let mut zip = zip::ZipArchive::new(std::fs::File::open(&staged)?)?;
     let entries: Vec<String> = (0..zip.len())
@@ -1726,7 +1734,9 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
         );
     }
 
-    // E2: the 性能信息 overlay paints decode/frame/texture counters.
+    // E2: the 性能信息 overlay paints decode/frame/texture counters in top-right.
+    h.app.clear_notice();
+    h.frames(2)?;
     scroll_until_row_visible(h, "diagnostics-export", "导出诊断日志")?;
     h.click_text("性能信息")?;
     h.frames(3)?;
@@ -1741,9 +1751,18 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
     // E3 notices: crash / oom exit assessment and a supervised restart.
     h.app.fake_exit_notice(true);
     h.frames(4)?;
+    let crash_btn = *h
+        .app
+        .hitboxes
+        .get("crash-export")
+        .context("crash-notice: 导出日志 affordance missing")?;
     anyhow::ensure!(
-        h.app.hitboxes.contains_key("crash-export"),
-        "crash-notice: 导出日志 affordance missing"
+        crash_btn.width() >= 44. && crash_btn.height() >= 44.,
+        "crash-notice: 导出日志 touch target too small: {crash_btn:?}"
+    );
+    anyhow::ensure!(
+        h.painted_text.iter().any(|t| t.text == "导出日志"),
+        "crash-notice: 导出日志 caption not painted"
     );
     design_capture(h, "crash-notice", &mut captures)?;
     h.app.clear_notice();

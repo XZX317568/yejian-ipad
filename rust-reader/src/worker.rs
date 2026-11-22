@@ -876,21 +876,44 @@ pub(super) fn image_reader(
     Ok(reader)
 }
 
-pub fn decode(bytes: &[u8], cover: bool, target: u32) -> anyhow::Result<DecodedPage> {
-    let mut image = image_reader(bytes)?.decode()?;
-    if cover {
-        image = image.thumbnail(512, 768);
-    } else {
-        let width = if target > 0 { target.min(3072) } else { 3072 };
-        // Downscale only: pages smaller than the target stay untouched.
-        if image.width() > width {
-            let height = (image.height() as f64 * width as f64 / image.width() as f64)
-                .round()
-                .max(1.) as u32;
-            image = image.resize_exact(width, height, image::imageops::FilterType::Triangle);
+fn half_rgba8(src: &image::RgbaImage) -> image::RgbaImage {
+    let dst_w = (src.width() / 2).max(1);
+    let dst_h = (src.height() / 2).max(1);
+    let raw = src.as_raw();
+    let stride = src.width() as usize * 4;
+    let mut out = vec![0u8; dst_w as usize * dst_h as usize * 4];
+    for y in 0..dst_h as usize {
+        let y0 = (y * 2).min(src.height() as usize - 1) * stride;
+        let y1 = (y * 2 + 1).min(src.height() as usize - 1) * stride;
+        let row_out = y * dst_w as usize * 4;
+        for x in 0..dst_w as usize {
+            let x0 = (x * 2).min(src.width() as usize - 1) * 4;
+            let x1 = (x * 2 + 1).min(src.width() as usize - 1) * 4;
+            let dst = row_out + x * 4;
+            for c in 0..4 {
+                let sum = raw[y0 + x0 + c] as u16
+                    + raw[y0 + x1 + c] as u16
+                    + raw[y1 + x0 + c] as u16
+                    + raw[y1 + x1 + c] as u16;
+                out[dst + c] = ((sum + 2) >> 2) as u8;
+            }
         }
     }
-    let image = image.into_rgba8();
+    image::RgbaImage::from_raw(dst_w, dst_h, out).expect("half_rgba8 buffer matches dimensions")
+}
+
+pub fn decode(bytes: &[u8], cover: bool, target: u32) -> anyhow::Result<DecodedPage> {
+    let image = image_reader(bytes)?.decode()?;
+    let image = if cover {
+        image.thumbnail(512, 768).into_rgba8()
+    } else {
+        let mut rgba = image.into_rgba8();
+        let floor = target.max(1024);
+        while rgba.width() > 3072 || (target > 0 && rgba.width() >= floor.saturating_mul(2)) {
+            rgba = half_rgba8(&rgba);
+        }
+        rgba
+    };
     let size = [image.width() as usize, image.height() as usize];
     let content = if cover {
         [0., 0., 1., 1.]
@@ -1543,6 +1566,26 @@ mod tests {
             }
             top += tile.size[1];
         }
+    }
+
+    #[test]
+    fn oversized_and_display_targeted_pages_halve_cleanly() {
+        let image = image::RgbImage::from_fn(2480, 1600, |x, _| {
+            if x % 2 == 0 {
+                image::Rgb([20, 60, 100])
+            } else {
+                image::Rgb([60, 100, 140])
+            }
+        });
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+        let untouched = super::decode(encoded.get_ref(), false, 1668).unwrap();
+        assert_eq!(untouched.size, [2480, 1600]);
+        let halved = super::decode(encoded.get_ref(), false, 1194).unwrap();
+        assert_eq!(halved.size, [1240, 800]);
+        assert_eq!(halved.tiles[0].pixels[0], egui::Color32::from_rgb(40, 80, 120));
     }
 
     fn bordered_image(border: u8, border_px: u32) -> image::RgbaImage {

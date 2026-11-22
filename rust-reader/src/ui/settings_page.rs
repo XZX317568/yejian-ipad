@@ -988,7 +988,7 @@ impl ReaderApp {
                                 ui,
                                 &mut self.perf_overlay,
                                 "性能信息",
-                                "在左上角显示解码、帧时间和纹理内存",
+                                "在右上角显示解码、帧时间和纹理内存",
                             ) {
                                 self.setting(
                                     "perf-overlay",
@@ -998,7 +998,7 @@ impl ReaderApp {
                             ui.add_space(8.);
                             ui.horizontal(|ui| {
                                 let export = ui.add(
-                                    Button::new("导出诊断日志").min_size(vec2(132., 36.)),
+                                    Button::new("导出诊断日志").min_size(vec2(132., 44.)),
                                 );
                                 self.hitboxes
                                     .insert("diagnostics-export".into(), export.rect);
@@ -1006,7 +1006,7 @@ impl ReaderApp {
                                     self.export_diagnostics();
                                 }
                                 let clear = ui.add(
-                                    Button::new("清除日志").min_size(vec2(96., 36.)),
+                                    Button::new("清除日志").min_size(vec2(96., 44.)),
                                 );
                                 self.hitboxes.insert("logs-clear".into(), clear.rect);
                                 if clear.clicked() {
@@ -1743,12 +1743,16 @@ impl ReaderApp {
         let summary = self.diagnostics_summary();
         match crate::diagnostics::export_diagnostics(&self.root, &summary) {
             Ok(path) => {
+                let file_name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("diagnostics.zip")
+                    .to_string();
                 self.last_shared = Some(path.clone());
                 match yejian_platform::share_file(&path) {
                     Ok(()) => self.pending_notice = Some("诊断日志已导出".into()),
                     Err(_) => {
-                        self.pending_notice =
-                            Some(format!("诊断日志已保存：{}", path.display()));
+                        self.pending_notice = Some(format!("已生成诊断日志（{file_name}）"));
                     }
                 }
             }
