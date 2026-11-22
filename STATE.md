@@ -43,6 +43,8 @@
 | 云 macOS | `devin ssh 90712f860a83471a97ad0584fbeac1e5 '<cmd>'` —— **不消耗模型额度**；有 Xcode 26.6 + 6 台 iPad 模拟器；磁盘仅 17GB 空闲 |
 | 代码同步 | 推 `work/*` 分支到 `XZX317568/yejian-ipad`（PUBLIC），云端 `git clone` |
 | 外部顾问 | Gemini Neon（驱动桌面端，截图读回）／SWE-2 子代理（免费，262K 窗口） |
+| 每轮收尾 | `tools/loop-check.ps1`（环境闸门 + 锁 + git + 测试 + STATE 证据核对；`-Full` 加跑离屏验收）。**每轮必须 LOOP-CHECK PASS 才能报完成** |
+| 裁决录制 | `tools/record.ps1 -Variants <a,b,c> -Out <dir>` → 每变体 mp4 + `compare.mp4`（iPad 1024×1366、8s、30fps） |
 
 ## 裁决记录（用户只回编号，永不重复问）
 
