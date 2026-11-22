@@ -37,7 +37,10 @@ function Invoke-Acceptance([string]$dir) {
     $env:TMP = Join-Path $repo '.tools\loop-tmp'
     $env:TEMP = $env:TMP
     New-Item -ItemType Directory -Force -Path $env:TMP | Out-Null
+    # 裁决用素材要够长：240 帧 @30fps = 8 秒
+    $env:YEJIAN_MOTION_FRAMES = '240'
     cargo run --locked -j 1 --features acceptance --bin acceptance -- $dir 2>&1 | Select-Object -Last 3
+    Remove-Item Env:YEJIAN_MOTION_FRAMES -ErrorAction SilentlyContinue
     if ($LASTEXITCODE -ne 0) { throw "acceptance failed in $dir (exit $LASTEXITCODE)" }
   } finally { Pop-Location }
 }

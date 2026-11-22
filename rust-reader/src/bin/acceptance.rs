@@ -1813,6 +1813,23 @@ fn main() -> Result<()> {
     }
     let paths = fixtures(&data.join("fixtures"))?;
     let mut h = Harness::new(data.join("library"), output.clone())?;
+    // 阶段 0 闸门：先确认纸张真的在弯。没有这条，把曲率参数改坏也能全绿。
+    {
+        let mut peak = 0f32;
+        for i in 0..=80 {
+            let t = i as f32 / 80.;
+            for u in [0., 0.25, 0.5, 0.75, 1.] {
+                for v in [0., 0.25, 0.5, 0.75, 1.] {
+                    peak = peak.max(yejian::motion_paper_depth(t, u, v));
+                }
+            }
+        }
+        anyhow::ensure!(
+            (12.0..=30.0).contains(&peak),
+            "paper lift peak {peak:.2} outside 12..=30 — params.json 被改坏或曲率回归"
+        );
+        println!("paper lift peak: {peak:.2}");
+    }
     h.wait(ReaderApp::ready)?;
     h.frame(vec![], Some("empty-phone"))?;
     h.app.import_files(paths);
@@ -1863,15 +1880,24 @@ fn main() -> Result<()> {
     h.frame(vec![], Some("phone-shelf"))?;
     anyhow::ensure!(h.app.rendered_book_nodes < 45);
     anyhow::ensure!(h.texts.iter().any(|(text, _)| text == "开始阅读"));
+    // 录制长度由 YEJIAN_MOTION_FRAMES 控制（默认 100 帧 ≈ 2.7s@60fps）。
+    // 裁决用的对比视频设 240 帧，30fps 播放约 8 秒。
+    let motion_frames: usize = std::env::var("YEJIAN_MOTION_FRAMES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n: &usize| *n >= 100)
+        .unwrap_or(100);
+    let scroll_n = motion_frames * 35 / 100;
+    let open_n = motion_frames - scroll_n;
     h.click("shelf-next")?;
-    for i in 0..35 {
+    for i in 0..scroll_n {
         h.frame(vec![], Some(&format!("motion/frame-{i:03}")))?;
     }
     h.wait(ReaderApp::covers_loaded)?;
     h.frame(vec![], Some("phone-selected"))?;
     h.click("shelf-center")?;
-    for i in 0..65 {
-        let name = format!("motion/frame-{:03}", i + 35);
+    for i in 0..open_n {
+        let name = format!("motion/frame-{:03}", i + scroll_n);
         h.frame(vec![], Some(&name))?;
         if [4, 12, 24, 36, 48, 60].contains(&i) {
             std::fs::copy(

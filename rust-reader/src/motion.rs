@@ -379,6 +379,36 @@ mod tests {
             assert!(stopped);
         }
     }
+    /// 阶段 0 kill-test 闸门：纸张必须真的在弯，而且弯得在合理范围内。
+    /// 全平（base/arch/breeze 被置 0）或参数被改爆都会让这条红。
+    #[test]
+    fn paper_curve_peak_stays_in_band() {
+        let mut peak = 0f32;
+        for i in 0..=80 {
+            let t = i as f32 / 80.;
+            for u in [0., 0.25, 0.5, 0.75, 1.] {
+                for v in [0., 0.25, 0.5, 0.75, 1.] {
+                    peak = peak.max(paper_depth(t, u, v));
+                }
+            }
+        }
+        println!("paper lift peak = {peak:.3}");
+        assert!(peak > 12., "paper barely lifts: peak {peak:.3}");
+        // 默认参数实测峰值 26.21；上界给到 30，既能挡住"改爆"，又留出调参空间。
+        assert!(peak < 30., "paper lift exploded: peak {peak:.3}");
+    }
+
+    /// 头部与尾部必须有可测的弯曲差，防止"整张纸刚性平移"冒充弯曲。
+    #[test]
+    fn paper_curve_is_not_rigid() {
+        let mid = paper_depth(0.62, 0.5, 0.5);
+        let spine = paper_depth(0.62, 0.5, 0.0);
+        let fore = paper_depth(0.62, 0.5, 1.0);
+        let span = (mid - spine).abs().max((mid - fore).abs());
+        println!("paper profile span at t=0.62: {span:.3}");
+        assert!(span > 1.5, "paper profile is flat across v: span {span:.3}");
+    }
+
     #[test]
     fn paper_meets_both_endpoints_and_idle_stops() {
         for u in [0., 0.5, 1.] {

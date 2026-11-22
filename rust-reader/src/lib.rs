@@ -16,6 +16,12 @@ mod vertical;
 mod worker;
 pub use ui::ReaderApp;
 
+/// 供 acceptance 在渲染前做参数闸门（阶段 0 kill-test 用）。
+/// 纸张曲率被改坏（例如全部置 0 变成平纸）时，任何"全绿"都是假的。
+pub fn motion_paper_depth(t: f32, u: f32, v: f32) -> f32 {
+    motion::paper_depth(t, u, v)
+}
+
 use std::path::PathBuf;
 
 pub fn configure_fonts(ctx: &egui::Context) {
