@@ -1,9 +1,6 @@
 import 'package:mangayomi/utils/platform_utils.dart';
 import 'package:flutter/foundation.dart';
 import 'package:material_ui/material_ui.dart';
-import 'package:mangayomi/modules/widgets/collapsing_header.dart';
-import 'package:mangayomi/modules/main_view/nav_groups.dart';
-import 'package:mangayomi/modules/main_view/widgets/nav_group_switcher.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:mangayomi/models/manga.dart';
 import 'package:mangayomi/models/settings.dart';
@@ -19,10 +16,10 @@ import 'package:mangayomi/modules/widgets/progress_center.dart';
 import 'package:mangayomi/modules/library/widgets/library_update_runner.dart';
 import 'package:mangayomi/providers/l10n_providers.dart';
 import 'package:mangayomi/services/library_updater.dart';
-import 'package:mangayomi/utils/item_type_localization.dart';
 import 'package:mangayomi/modules/manga/widgets/manga_image_card_widget.dart';
 import 'package:mangayomi/modules/widgets/tv_menu.dart';
 import 'package:mangayomi/modules/library/widgets/library_entry_utils.dart';
+import 'package:mangayomi/core/app_identity.dart';
 import 'package:shiori/shiori.dart';
 
 /// AppBar for the library screen.
@@ -45,8 +42,8 @@ class LibraryAppBar extends ConsumerWidget implements PreferredSizeWidget {
   final ValueChanged<bool> onIgnoreFiltersChanged;
   final TickerProvider vsync;
 
-  /// Whether the library's switcher has scrolled out of sight; grouped, the
-  /// title then names the media instead of the group.
+  /// Retained for the library header's existing contract. The archive
+  /// masthead is the app's name, so it does not change as the header folds.
   final ValueListenable<bool>? headerCollapsed;
 
   const LibraryAppBar({
@@ -70,7 +67,8 @@ class LibraryAppBar extends ConsumerWidget implements PreferredSizeWidget {
   });
 
   @override
-  Size get preferredSize => Size.fromHeight(AppBar().preferredSize.height);
+  Size get preferredSize =>
+      const Size.fromHeight(ShioriArchiveMasthead.height);
 
   /// The library menu actions, shared by the popup off-TV and the centred TV
   /// menu.
@@ -148,8 +146,14 @@ class LibraryAppBar extends ConsumerWidget implements PreferredSizeWidget {
     }
 
     return AppBar(
+      // The archive masthead is pinned at the reference's 56 px. The search
+      // field and every action below still live in this same plane.
+      toolbarHeight: ShioriArchiveMasthead.height,
       elevation: 0,
+      scrolledUnderElevation: 0,
       backgroundColor: Colors.transparent,
+      surfaceTintColor: Colors.transparent,
+      titleSpacing: ShioriSpace.s16,
       // The search field has its own back button.
       automaticallyImplyLeading: !isSearch,
       title: isSearch
@@ -157,19 +161,10 @@ class LibraryAppBar extends ConsumerWidget implements PreferredSizeWidget {
           : Row(
               spacing: ShioriSpace.s8,
               children: [
-                Flexible(
-                  child: ValueListenableBuilder<bool>(
-                    valueListenable:
-                        headerCollapsed ?? const AlwaysStoppedAnimation(false),
-                    builder: (context, collapsed, _) => CollapsingTitle(
-                      isGroupedNavRoute(ref, libraryRouteFor(itemType)) &&
-                              !collapsed
-                          ? navGroupTitle(context, libraryRouteFor(itemType))
-                          : itemType.localized(l10n),
-                      style: context.shiori.text.screenTitle.copyWith(
-                        color: context.shiori.color.fg,
-                      ),
-                    ),
+                Expanded(
+                  child: ShioriArchiveMasthead(
+                    title: AppIdentity.productName,
+                    code: AppIdentity.englishName.toUpperCase(),
                   ),
                 ),
                 if (showNumbersOfItems)

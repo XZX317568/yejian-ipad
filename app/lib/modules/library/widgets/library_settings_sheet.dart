@@ -352,7 +352,11 @@ class _DisplayTab extends ConsumerWidget {
               spacing: ShioriSpace.s8,
               runSpacing: ShioriSpace.s8,
               children: [
+                // The shelf lays out a whole manga collection; anime and
+                // novels keep their existing grid/list choices.
                 for (final e in DisplayType.values)
+                  if (itemType == ItemType.manga ||
+                      e != DisplayType.shelf)
                   ChoiceChip(
                     label: Text(displayV.getLibraryDisplayTypeName(e, context)),
                     selected: e == display,
@@ -362,8 +366,9 @@ class _DisplayTab extends ConsumerWidget {
             ),
           ),
 
-          // Grid size
-          _GridSizeSlider(itemType: itemType),
+          // Grid size only affects the grid layouts; the shelf sizes its own
+          // volumes from the available width.
+          if (display != DisplayType.shelf) _GridSizeSlider(itemType: itemType),
 
           // Badges section
           _SectionLabel(l10n.badges),

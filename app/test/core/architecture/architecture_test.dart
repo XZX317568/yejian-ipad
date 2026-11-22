@@ -242,7 +242,11 @@ void main() {
         ]),
         ..._findImportViolations('lib/services', const [
           'package:mangayomi/repositories/db.dart',
-        ]).where((v) => !v.startsWith('lib/services/isolate_service.dart ->')),
+        ]).where(
+          (v) => !v
+              .replaceAll('\\', '/')
+              .startsWith('lib/services/isolate_service.dart ->'),
+        ),
       ];
       expect(
         violations,

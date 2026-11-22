@@ -7,6 +7,7 @@ import 'package:mangayomi/models/settings.dart';
 import 'package:mangayomi/modules/library/providers/local_archive.dart';
 import 'package:mangayomi/services/local_directory_resolver.dart';
 import 'package:mangayomi/services/local_folders.dart';
+import 'package:mangayomi/services/local_import_batch.dart';
 import 'package:mangayomi/modules/library/providers/local_file_classifier.dart';
 import 'package:mangayomi/services/archive_reader/providers/archive_reader_providers.dart';
 import 'package:mangayomi/src/rust/api/epub.dart';
@@ -442,71 +443,76 @@ Future<void> _scanDirectory(
   };
 
   // iterate through newChapters elements, which are: ["full_path/to/chapter1", "true"]
-  for (var pathBool in newChapters) {
-    final chapterPath = pathBool[0] as String;
-    final virtualChapterPath = pathBool[2] as String;
-    // pathBool[0] = first element of list (path)
-    // dirname = remove last part of path (chapter name), = "full_path/to"
-    // basename = remove everything except last (manga name) = "to"
-    final mangaPath = p.posix.dirname(virtualChapterPath);
-    final manga = mangaByPath[mangaPath];
-    if (manga != null) {
-      if (manga.itemType == ItemType.novel) {
-        final book = await parseEpubFromPath(
-          epubPath: chapterPath,
-          fullData: true,
-        );
+  final chapterImport = await importLocalFiles(
+    newChapters,
+    pathOf: (pathBool) => pathBool[0] as String,
+    importFile: (pathBool) async {
+      final chapterPath = pathBool[0] as String;
+      final virtualChapterPath = pathBool[2] as String;
+      // pathBool[0] = first element of list (path)
+      // dirname = remove last part of path (chapter name), = "full_path/to"
+      // basename = remove everything except last (manga name) = "to"
+      final mangaPath = p.posix.dirname(virtualChapterPath);
+      final manga = mangaByPath[mangaPath];
+      if (manga != null) {
+        if (manga.itemType == ItemType.novel) {
+          final book = await parseEpubFromPath(
+            epubPath: chapterPath,
+            fullData: true,
+          );
 
-        if (book.cover != null) {
-          manga.customCoverImage = book.cover!.getCoverImage;
-          saveManga++;
-        }
-        final chaps = book.chapters;
-        if (chaps.isNotEmpty) {
-          for (int i = 0; i < chaps.length; i++) {
-            final epubChapter = chaps[i];
+          if (book.cover != null) {
+            manga.customCoverImage = book.cover!.getCoverImage;
+            saveManga++;
+          }
+          final chaps = book.chapters;
+          if (chaps.isNotEmpty) {
+            for (int i = 0; i < chaps.length; i++) {
+              final epubChapter = chaps[i];
+              chaptersToSave.add(
+                Chapter(
+                  mangaId: manga.id,
+                  name: epubChapter.name,
+                  archivePath: virtualChapterPath,
+                  url: epubChapter.path,
+                  downloadSize: null,
+                )..manga.value = manga,
+              );
+            }
+          } else {
             chaptersToSave.add(
               Chapter(
                 mangaId: manga.id,
-                name: epubChapter.name,
+                name: book.name,
                 archivePath: virtualChapterPath,
-                url: epubChapter.path,
                 downloadSize: null,
               )..manga.value = manga,
             );
           }
         } else {
-          chaptersToSave.add(
-            Chapter(
-              mangaId: manga.id,
-              name: book.name,
-              archivePath: virtualChapterPath,
-              downloadSize: null,
-            )..manga.value = manga,
+          final chapterFile = File(chapterPath);
+          final chap = Chapter(
+            mangaId: manga.id,
+            name:
+                pathBool[1] // If Chapter is an image folder or archive/video
+                ? p.basename(chapterPath)
+                : p.basenameWithoutExtension(chapterPath),
+            dateUpload: dateNow.toString(),
+            archivePath: virtualChapterPath,
+            downloadSize: chapterFile.existsSync()
+                ? chapterFile.lengthSync().formattedFileSize()
+                : null,
           );
+          chaptersToSave.add(chap);
         }
-      } else {
-        final chapterFile = File(chapterPath);
-        final chap = Chapter(
-          mangaId: manga.id,
-          name:
-              pathBool[1] // If Chapter is an image folder or archive/video
-              ? p.basename(chapterPath)
-              : p.basenameWithoutExtension(chapterPath),
-          dateUpload: dateNow.toString(),
-          archivePath: virtualChapterPath,
-          downloadSize: chapterFile.existsSync()
-              ? chapterFile.lengthSync().formattedFileSize()
-              : null,
-        );
-        chaptersToSave.add(chap);
+        if (manga.lastUpdate != dateNow) {
+          manga.lastUpdate = dateNow;
+          saveManga++;
+        }
       }
-      if (manga.lastUpdate != dateNow) {
-        manga.lastUpdate = dateNow;
-        saveManga++;
-      }
-    }
-  }
+    },
+  );
+  reportLocalImportFailures(chapterImport);
   try {
     if (saveManga > 0) {
       // Just to update the lastUpdate value of not new Mangas

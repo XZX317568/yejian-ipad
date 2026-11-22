@@ -35,7 +35,8 @@ class LibraryDisplayTypeState extends _$LibraryDisplayTypeState {
       DisplayType.compactGrid => l10n.compact_grid,
       DisplayType.comfortableGrid => l10n.comfortable_grid,
       DisplayType.coverOnlyGrid => l10n.cover_only_grid,
-      _ => l10n.list,
+      DisplayType.list => l10n.list,
+      DisplayType.shelf => l10n.library,
     };
   }
 

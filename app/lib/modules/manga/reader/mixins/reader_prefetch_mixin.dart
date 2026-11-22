@@ -117,10 +117,21 @@ mixin ReaderPrefetchMixin<T extends ConsumerStatefulWidget>
           !page.isTransitionPage &&
           page.isLocale == true &&
           page.archiveImage == null &&
+          page.archivePage == null &&
           page.localImagePath == null) {
         needsReload = true;
         break;
       }
+    }
+
+    if (!needsReload &&
+        pages.any(
+          (page) => page.chapter?.id == chapterId && page.archivePage != null,
+        )) {
+      // Eviction releases decoded pixels but keeps the lightweight entry.
+      // Re-register it so subsequent chapter eviction still has an active anchor.
+      preloadManager.markChapterAsLoaded(currentChapter);
+      return;
     }
 
     if (needsReload) {
@@ -142,6 +153,8 @@ mixin ReaderPrefetchMixin<T extends ConsumerStatefulWidget>
                 imgIdx != null &&
                 imgIdx < images.length) {
               page.archiveImage = images[imgIdx].image;
+              page.archivePage = images[imgIdx].archivePage;
+              page.localImagePath = images[imgIdx].path;
             }
           }
           preloadManager.markChapterAsLoaded(currentChapter);
@@ -186,7 +199,7 @@ mixin ReaderPrefetchMixin<T extends ConsumerStatefulWidget>
         final page = pages[i];
         if (page.isTransitionPage) continue;
         try {
-          if (page.resolvedFilePath == null) {
+          if (page.resolvedFilePath == null || page.archivePage != null) {
             final path = await page.getLocalFilePath;
             if (path != null) {
               page.resolvedFilePath = path;
@@ -264,6 +277,7 @@ mixin ReaderPrefetchMixin<T extends ConsumerStatefulWidget>
             page.pageIndex,
             srcRect: firstRect,
             localImagePath: page.localImagePath,
+            archivePage: page.archivePage,
           )
           ..loadedWidth = halfWidth
           ..loadedHeight = height;
@@ -280,6 +294,7 @@ mixin ReaderPrefetchMixin<T extends ConsumerStatefulWidget>
             page.pageIndex,
             srcRect: secondRect,
             localImagePath: page.localImagePath,
+            archivePage: page.archivePage,
           )
           ..loadedWidth = halfWidth
           ..loadedHeight = height;
@@ -310,6 +325,7 @@ mixin ReaderPrefetchMixin<T extends ConsumerStatefulWidget>
             page.pageIndex,
             srcRect: slice,
             localImagePath: page.localImagePath,
+            archivePage: page.archivePage,
           )
           ..resolvedFilePath = page.resolvedFilePath
           ..loadedWidth = slice.width

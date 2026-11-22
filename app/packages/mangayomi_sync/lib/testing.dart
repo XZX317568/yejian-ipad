@@ -271,6 +271,75 @@ void syncStoreSuite({
     });
   });
 
+  test('entities with different page counts do not restart finished pages', () {
+    engine = SyncEngine(store, clock: () => now, pageSize: 2);
+    engine.handle({
+      'manga': [for (var i = 1; i <= 3; i++) manga(i, link: '/t$i')],
+      'chapters': [
+        for (var i = 1; i <= 5; i++) chapter(i + 10, 3, url: '/c$i'),
+      ],
+    });
+    final seenManga = <int>[];
+    final seenChapters = <int>[];
+    Map<String, dynamic>? cursors;
+    for (var page = 0; page < 3; page++) {
+      final response = engine.handle({'since': 0, 'cursors': ?cursors});
+      seenManga.addAll(ids(response, 'manga'));
+      seenChapters.addAll(ids(response, 'chapters'));
+      expect(response['hasMore'], page < 2);
+      cursors = Map<String, dynamic>.from(response['cursors'] as Map);
+    }
+    expect(seenManga, [1, 2, 3]);
+    expect(seenChapters, [11, 12, 13, 14, 15]);
+  });
+
+  test('a newer reread keeps its lower page and explicit unread mark', () {
+    engine.handle({
+      'manga': [manga(1)],
+      'chapters': [
+        {
+          ...chapter(11, 1, updatedAt: 20, isRead: true),
+          'lastPageRead': '40',
+          'isBookmarked': true,
+        },
+      ],
+    });
+    engine.handle({
+      'chapters': [
+        {
+          ...chapter(11, 1, updatedAt: 30),
+          'lastPageRead': '2',
+          'isBookmarked': false,
+        },
+      ],
+    });
+    // Delayed old progress must not undo the newer explicit state.
+    engine.handle({
+      'chapters': [
+        {
+          ...chapter(11, 1, updatedAt: 20, isRead: true),
+          'lastPageRead': '40',
+          'isBookmarked': true,
+        },
+      ],
+    });
+    final row = (engine.handle({})['chapters'] as List).single;
+    expect(row['lastPageRead'], '2');
+    expect(row['isRead'], false);
+    expect(row['isBookmarked'], false);
+  });
+
+  test(
+    'long source links round trip through every store without truncation',
+    () {
+      final link = '/title?data=${'x' * 5000}';
+      engine.handle({
+        'manga': [manga(1, link: link)],
+      });
+      expect((engine.handle({})['manga'] as List).single['link'], link);
+    },
+  );
+
   test('the host clock going back never reuses a stamp', () {
     final first = engine.handle({
       'manga': [manga(1)],

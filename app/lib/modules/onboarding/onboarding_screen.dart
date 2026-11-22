@@ -102,11 +102,10 @@ class _OnboardingScreenState extends ConsumerState<_OnboardingBody>
   bool _forward = true;
 
   /// A television only ever reads anime, so the question is not asked there
-  /// and this is the answer. Everywhere else it starts with everything ticked
-  /// and the reader narrows it.
-  final Set<ItemType> _libraries = isTv
-      ? {ItemType.anime}
-      : {...ItemType.values};
+  /// and this is the answer. Everywhere else it follows the libraries this
+  /// install already shows; a brand-new settings row hides anime and novel,
+  /// so 页间 opens as the manga reader it is.
+  late final Set<ItemType> _libraries;
 
   /// Whether the navigation groups the libraries behind one Library tab, and
   /// Updates and History behind one Activity tab. Starts on the app's own
@@ -133,6 +132,7 @@ class _OnboardingScreenState extends ConsumerState<_OnboardingBody>
   @override
   void initState() {
     super.initState();
+    _libraries = _initialLibraries();
     // Back has to be claimed from the binding, not from a route or a Router.
     // This screen replaces MaterialApp.builder's child, which puts it above
     // both the router and its Navigator, so a PopScope never sees the press
@@ -157,6 +157,15 @@ class _OnboardingScreenState extends ConsumerState<_OnboardingBody>
         if (mounted) _applyLibraries();
       });
     }
+  }
+
+  Set<ItemType> _initialLibraries() {
+    if (isTv) return {ItemType.anime};
+    final hidden = ref.read(hideItemsStateProvider).toSet();
+    final shown = ItemType.values
+        .where((type) => !hidden.contains(_libraryRoutes[type]))
+        .toSet();
+    return shown.isEmpty ? {ItemType.manga} : shown;
   }
 
   @override

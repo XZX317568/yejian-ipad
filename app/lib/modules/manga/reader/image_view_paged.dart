@@ -86,11 +86,14 @@ class _ImageViewPagedState extends ConsumerState<ImageViewPaged> {
     } else if (widget.data.archiveImage != null &&
         widget.data.archiveImage!.length > 5) {
       if (isGifImage(widget.data.archiveImage!)) isAnimated = true;
-    } else if (widget.data.localImagePath != null) {
+    } else if (widget.data.localImagePath != null ||
+        widget.data.archivePage != null) {
       // Local image-folder page: sniff the real file's bytes directly rather
       // than trusting its extension.
       try {
-        final raf = await File(widget.data.localImagePath!).open();
+        final path = await widget.data.getLocalFilePath;
+        if (path == null) return;
+        final raf = await File(path).open();
         try {
           if (isGifImage(await raf.read(6))) isAnimated = true;
         } finally {
@@ -127,7 +130,8 @@ class _ImageViewPagedState extends ConsumerState<ImageViewPaged> {
   }
 
   Future<void> _resolveFilePath() async {
-    if (widget.data.resolvedFilePath != null) {
+    if (widget.data.resolvedFilePath != null &&
+        widget.data.archivePage == null) {
       if (mounted) {
         setState(() {
           _resolvedFilePath = widget.data.resolvedFilePath;
@@ -135,7 +139,14 @@ class _ImageViewPagedState extends ConsumerState<ImageViewPaged> {
       }
       return;
     }
-    final path = await widget.data.getLocalFilePath;
+    // The image provider owns the visible error/retry state. This optional
+    // warm-up must not leak an asynchronous page error.
+    String? path;
+    try {
+      path = await widget.data.getLocalFilePath;
+    } catch (_) {
+      return;
+    }
     if (path != null) {
       widget.data.resolvedFilePath = path;
       if (mounted) {

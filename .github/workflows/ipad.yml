@@ -1,0 +1,39 @@
+name: 页间 iPad 安装包
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  ipad:
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: "3"
+      CARGO_INCREMENTAL: "0"
+      RUSTUP_TOOLCHAIN: "1.97.0"
+      IPHONEOS_DEPLOYMENT_TARGET: "15.0"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: 准备真机工具链
+        run: |
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --target aarch64-apple-ios
+          xcodebuild -version
+
+      - name: 编译并打包
+        run: bash tools/build-rust-ios.sh --device --release --ipa
+
+      - name: 保存 iPad 安装包
+        uses: actions/upload-artifact@v7
+        with:
+          name: Yejian-iPad
+          path: artifacts/rust/ipad/*.ipa
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0

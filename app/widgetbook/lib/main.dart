@@ -2,6 +2,7 @@ import 'package:flex_color_scheme/flex_color_scheme.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:shiori/shiori.dart';
 import 'package:widgetbook/widgetbook.dart';
+import 'reading_shelf_case.dart';
 
 void main() => runApp(const ShioriCatalogue());
 
@@ -112,6 +113,15 @@ final catalogue = <WidgetbookNode>[
   WidgetbookFolder(
     name: 'Components',
     children: [
+      WidgetbookComponent(
+        name: 'ShioriReadingShelf',
+        useCases: [
+          WidgetbookUseCase(
+            name: 'Reading archive',
+            builder: (_) => const ReadingShelfCase(),
+          ),
+        ],
+      ),
       WidgetbookComponent(
         name: 'ShioriButton',
         useCases: [WidgetbookUseCase(name: 'Variants', builder: _buttons)],

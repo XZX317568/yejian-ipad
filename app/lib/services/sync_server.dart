@@ -71,11 +71,16 @@ const _desktopOAuthCallbackPort = 48765;
 @riverpod
 class SyncServer extends _$SyncServer {
   final http = MClient.init(reqcopyWith: {'useDartHttpClient': true});
-  final _entityApplier = const SyncEntityApplier();
+  final _entityApplier = SyncEntityApplier();
   late final _apiClient = SyncApiClient(http);
 
   /// Where this sync's requests go; set when it starts.
   late SyncTransport _transport;
+  bool _running = false;
+
+  /// The most recent upload's rejected local rows. The error report keeps
+  /// the same details after this notifier is disposed.
+  List<UnsentSyncRow> unsentRows = const [];
 
   @override
   void build({required int syncId}) {
@@ -192,6 +197,8 @@ class SyncServer extends _$SyncServer {
       }
       return false;
     }
+    if (_running) return false;
+    _running = true;
     if (!silent && l10n != null) {
       botToast(l10n.sync_starting, second: 500);
     }
@@ -233,12 +240,15 @@ class SyncServer extends _$SyncServer {
         botToast(l10n.sync_finished, second: 2);
       }
       return true;
-    } catch (error) {
-      if (!silent) {
-        botToast(error.toString(), second: 5);
+    } catch (error, stack) {
+      if (silent) {
+        recordError(error, stack: stack, source: 'sync');
+      } else {
+        toastError(error, stack: stack, source: 'sync');
       }
       return false;
     } finally {
+      _running = false;
       progress.finish();
       BackgroundWork.end(BackgroundWorkKind.sync);
     }
@@ -267,13 +277,19 @@ class SyncServer extends _$SyncServer {
     required int since,
     ChangedRows? changed,
   }) async {
+    // Collection is synchronous. Save the beginning, not the end, so an
+    // edit made while the network request is in flight is sent next time.
+    final uploadStartedAt = DateTime.now().millisecondsSinceEpoch;
     final chunks = changed?.chunked(_maxRowsPerEntity) ?? const [];
+    unsentRows = changed?.unsent ?? const [];
+    _entityApplier.beginSync();
     final progress = ref.read(syncProgressProvider(syncId: syncId).notifier);
     progress.addTotal(chunks.length);
 
     Map<String, String?>? cursors;
     String? sessionToken;
     var chunkIndex = 0;
+    final seenPages = <String>{};
 
     while (true) {
       if (!ref.mounted) return false;
@@ -287,7 +303,6 @@ class SyncServer extends _$SyncServer {
       if (hasChunk) chunkIndex += 1;
 
       final response = await _postSync(body);
-      if (response == null) return false;
       if (hasChunk) progress.addDone(1);
       _trackDownloadProgress(progress, response);
 
@@ -295,17 +310,35 @@ class SyncServer extends _$SyncServer {
       sessionToken = response['sessionToken'] as String?;
       cursors = _apiClient.decodeCursors(response['cursors']);
       final hasMore = response['hasMore'] == true;
+      if (!hasChunk &&
+          hasMore &&
+          !seenPages.add(jsonEncode([sessionToken, cursors]))) {
+        throw const FormatException(
+          'Sync pagination did not advance. Update the host and retry.',
+        );
+      }
 
       if (chunkIndex >= chunks.length && !hasMore) {
+        _entityApplier.requireComplete();
+        if (unsentRows.isNotEmpty) {
+          // Keep both upload and download watermarks for a retry. The
+          // accepted rows are safely committed, but skipped rows must not
+          // fall behind a successful watermark and disappear forever.
+          throw SyncIncomplete(unsentRows);
+        }
         final syncedAt = response['syncedAt'] as int?;
-        if (syncedAt != null) {
+        if (syncedAt == null) {
+          throw const FormatException('Sync response has no completion cursor');
+        } else {
           // One awaited write for both: see Synching.setSynced for why two
           // back-to-back setters here silently lost `since`.
           await notifier.setSynced(
             since: syncedAt,
-            lastSync: DateTime.now().millisecondsSinceEpoch,
+            lastSync: changed != null
+                ? uploadStartedAt
+                : ref.read(synchingProvider(syncId: syncId)).lastSync ?? 0,
           );
-          await changed?.clearUploaded(notifier);
+          await changed?.acknowledgeUploaded(notifier);
         }
         return true;
       }
@@ -374,8 +407,16 @@ class SyncServer extends _$SyncServer {
   // Wire transport
   // ------------------------------------------------------------------
 
-  Future<Map<String, dynamic>?> _postSync(Map<String, dynamic> body) =>
-      _transport.postSync(body);
+  Future<Map<String, dynamic>> _postSync(Map<String, dynamic> body) async {
+    try {
+      return await _transport.postSync(body);
+    } on SyncRefused catch (refused, stack) {
+      Error.throwWithStackTrace(
+        SyncRefused(refused.status, refused.describe(body)),
+        stack,
+      );
+    }
+  }
 
   Future<SyncTransport> _openTransport() async {
     final prefs = ref.read(synchingProvider(syncId: syncId));
@@ -443,6 +484,18 @@ class SyncServer extends _$SyncServer {
   }
 }
 
+/// Valid rows reached the host; these rows remain local and will be retried.
+class SyncIncomplete implements Exception {
+  SyncIncomplete(this.rows);
+  final List<UnsentSyncRow> rows;
+
+  @override
+  String toString() =>
+      'Sync incomplete: ${rows.length} item(s) not sent. '
+      'Fix the listed fields or update the host, then sync again.\n'
+      '${rows.join('\n')}';
+}
+
 /// Triggers auto sync if sync is enabled, user is logged in, autoSyncFrequency > 0,
 /// and enough time has elapsed since lastSync.
 Future<void> autoSyncIfDue(dynamic ref, {int syncId = 1}) async {
@@ -458,7 +511,7 @@ Future<void> autoSyncIfDue(dynamic ref, {int syncId = 1}) async {
   final now = DateTime.now().millisecondsSinceEpoch;
   final lastSync = syncPrefs.lastSync ?? 0;
   final elapsedMs = now - lastSync;
-  if (elapsedMs < autoSyncFrequency * 1000) return;
+  if (elapsedMs >= 0 && elapsedMs < autoSyncFrequency * 1000) return;
 
   if (ref.read(syncProgressProvider(syncId: syncId)).active) return;
   if (ref.read(restoreSyncGuardProvider)) return;

@@ -3,6 +3,8 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:isar_community/isar.dart';
+import 'package:mangayomi/core/app_identity.dart';
+import 'package:mangayomi/core/writable_directory.dart';
 import 'package:mangayomi/eval/model/source_preference.dart';
 import 'package:mangayomi/models/category.dart';
 import 'package:mangayomi/repositories/settings_repository.dart';
@@ -31,6 +33,23 @@ import 'package:mangayomi/utils/platform_utils.dart';
 String? linuxDocumentsFallbackPath(Map<String, String> environment) {
   final home = environment['HOME']?.trim();
   return home == null || home.isEmpty ? null : home;
+}
+
+/// Writes the starting preferences only when no Settings row exists yet.
+///
+/// An existing row is never updated: its values belong to the reader, even
+/// when a value happens to equal the old upstream default.
+@visibleForTesting
+Future<bool> seedNewInstallSettingsIfMissing(
+  Isar db, {
+  required bool isTvDevice,
+}) async {
+  final settings = await db.settings.get(227);
+  if (settings != null) return false;
+  await db.writeTxn(
+    () async => db.settings.put(newInstallSettings(isTvDevice: isTvDevice)),
+  );
+  return true;
 }
 
 class StorageProvider {
@@ -70,14 +89,12 @@ class StorageProvider {
   Future<Directory?> getDefaultDirectory() async {
     Directory? directory;
     if (Platform.isAndroid) {
-      directory = Directory("/storage/emulated/0/Mangayomi/");
+      directory = Directory(
+        "/storage/emulated/0/${AppIdentity.storageFolderName}/",
+      );
     } else {
       final dir = await _documentsDirectory();
-      // The documents dir in iOS is already named "Mangayomi".
-      // Appending "Mangayomi" to the documents dir would create
-      // unnecessarily nested Mangayomi/Mangayomi/ folder.
-      if (Platform.isIOS) return dir;
-      directory = Directory(path.join(dir.path, 'Mangayomi'));
+      directory = Directory(path.join(dir.path, AppIdentity.storageFolderName));
     }
     return directory;
   }
@@ -162,16 +179,19 @@ class StorageProvider {
     }
     if (Platform.isAndroid) {
       directory = Directory(
-        dPath.isEmpty ? "/storage/emulated/0/Mangayomi/" : "$dPath/",
+        dPath.isEmpty
+            ? "/storage/emulated/0/${AppIdentity.storageFolderName}/"
+            : "$dPath/",
       );
     } else {
       final dir = await _documentsDirectory();
       final p = dPath.isEmpty ? dir.path : dPath;
-      // The documents dir in iOS is already named "Mangayomi".
-      // Appending "Mangayomi" to the documents dir would create
-      // unnecessarily nested Mangayomi/Mangayomi/ folder.
-      if (Platform.isIOS) return Directory(p);
-      directory = Directory(path.join(p, 'Mangayomi'));
+      if (dPath.isNotEmpty) {
+        if (Platform.isIOS) return Directory(p);
+        directory = Directory(path.join(p, 'Mangayomi'));
+      } else {
+        directory = Directory(path.join(p, AppIdentity.storageFolderName));
+      }
     }
     return directory;
   }
@@ -215,7 +235,12 @@ class StorageProvider {
     );
   }
 
-  Future<Directory?> getDatabaseDirectory() async {
+  /// Where the database lives, without creating, probing or migrating it.
+  ///
+  /// The startup failure screen calls this while the database is unusable, so
+  /// it must stay side-effect free: creating the directory or writing a probe
+  /// file there would turn a display-only lookup into another write attempt.
+  Future<Directory> resolveDatabaseDirectory() async {
     // On macOS, host the libmdbx / Isar database under Application Support
     // (app-private, not TCC-gated) instead of Documents. macOS denies
     // unsigned/sideloaded/dev builds access to ~/Documents when iCloud
@@ -227,61 +252,23 @@ class StorageProvider {
     final dir = Platform.isMacOS
         ? await getApplicationSupportDirectory()
         : await _documentsDirectory();
-    String dbDir;
     if (Platform.isAndroid) return dir;
-    if (Platform.isIOS) {
-      // Put the database files inside /databases like on Windows, Linux
-      // So they are not just in the app folders root dir
-      dbDir = path.join(dir.path, 'databases');
-    } else {
-      dbDir = path.join(dir.path, 'Mangayomi', 'databases');
-    }
-    if (Platform.isMacOS) {
-      await _migrateLegacyMacosDatabase(dbDir);
-    }
-    await createDirectorySafely(dbDir);
-    return Directory(dbDir);
+    // Do not adopt ~/Documents/Mangayomi/databases here: that directory
+    // belongs to an upstream Mangayomi install. Moving or renaming it would
+    // break that app and make this identity depend on shared upstream data.
+    return Directory(
+      path.join(dir.path, AppIdentity.storageFolderName, 'databases'),
+    );
   }
 
-  /// One-shot migration: if a pre-existing macOS user has their database
-  /// under the legacy Documents path and the new Application Support path
-  /// is empty, rename it across so library / history / progress are not
-  /// silently reset. Subsequent launches skip this branch because the new
-  /// path already exists.
-  Future<void> _migrateLegacyMacosDatabase(String newDbDir) async {
-    try {
-      final docs = await getApplicationDocumentsDirectory();
-      final legacyDir = Directory(
-        path.join(docs.path, 'Mangayomi', 'databases'),
-      );
-      if (!await legacyDir.exists()) return;
-      final newDir = Directory(newDbDir);
-      if (await newDir.exists()) {
-        // Only migrate when the new location is empty — never overwrite.
-        final entries = await newDir.list(followLinks: false).take(1).toList();
-        if (entries.isNotEmpty) return;
-      }
-      await Directory(path.dirname(newDbDir)).create(recursive: true);
-      await legacyDir.rename(newDbDir);
-      if (kDebugMode) {
-        debugPrint(
-          '[storage] Migrated macOS DB from ${legacyDir.path} to $newDbDir',
-        );
-      }
-    } catch (e) {
-      // Migration is best-effort. Falling back to a fresh DB is preferable
-      // to crashing on launch — the user can manually move the legacy
-      // ~/Documents/Mangayomi/databases/ contents if needed.
-      if (kDebugMode) {
-        debugPrint('[storage] macOS DB migration skipped: $e');
-      }
-    }
+  Future<Directory?> getDatabaseDirectory() async {
+    return ensureWritableDirectory(await resolveDatabaseDirectory());
   }
 
   Future<Directory?> getGalleryDirectory() async {
     String gPath;
     if (Platform.isAndroid) {
-      gPath = "/storage/emulated/0/Pictures/Mangayomi/";
+      gPath = "/storage/emulated/0/Pictures/${AppIdentity.storageFolderName}/";
     } else {
       gPath = path.join((await getDirectory())!.path, 'Pictures');
     }
@@ -343,34 +330,17 @@ class StorageProvider {
       inspector: inspector,
     );
     try {
-      final settings = await isar.settings.get(227);
-      if (settings == null) {
-        // TV defaults to dark on first run (a fresh library). Only the
-        // initial Settings row is seeded, so switching to light later sticks.
-        await isar.writeTxn(
-          () async => isar.settings.put(Settings()..themeIsDark = isTv),
-        );
+      await seedNewInstallSettingsIfMissing(isar, isTvDevice: isTv);
+    } catch (error, stack) {
+      if (!await requestPermission()) {
+        Error.throwWithStackTrace(error, stack);
       }
-    } catch (_) {
-      if (await requestPermission()) {
-        try {
-          final settings = await isar.settings.get(227);
-          if (settings == null) {
-            // TV defaults to dark on first run (a fresh library). Only the
-            // initial Settings row is seeded, so switching to light later sticks.
-            await isar.writeTxn(
-              () async => isar.settings.put(Settings()..themeIsDark = isTv),
-            );
-          }
-        } catch (e) {
-          if (kDebugMode) {
-            debugPrint("Failed after retry with permission: $e");
-          }
-        }
-      } else {
-        if (kDebugMode) {
-          debugPrint("Permission denied during Database init fallback.");
-        }
+      try {
+        await seedNewInstallSettingsIfMissing(isar, isTvDevice: isTv);
+      } catch (retryError, retryStack) {
+        // Launching with no Settings row would crash every screen that reads
+        // it. Surface the real failure instead of silently continuing.
+        Error.throwWithStackTrace(retryError, retryStack);
       }
     }
 

@@ -286,7 +286,11 @@ class SyncEngine {
       final more = rows.length > pageSize;
       final page = more ? rows.sublist(0, pageSize) : rows;
       hasMore |= more;
-      cursors[entity] = more ? '${page.last.receivedAt}' : null;
+      // Keep each entity's position even after its last page. Another
+      // entity may still have pages; resetting to null would start this
+      // entity over and can make mixed-size libraries loop forever.
+      cursors[entity] =
+          '${page.isEmpty ? cursor ?? since : page.last.receivedAt}';
       if (cursor == null) {
         totalCounts[entity] = _store.countChanges(
           entity: entity,
@@ -311,9 +315,8 @@ class SyncEngine {
     final moreDeleted = deleted.length > pageSize;
     final deletedPage = moreDeleted ? deleted.sublist(0, pageSize) : deleted;
     hasMore |= moreDeleted;
-    cursors['tombstones'] = moreDeleted
-        ? '${deletedPage.last.receivedAt}'
-        : null;
+    cursors['tombstones'] =
+        '${deletedPage.isEmpty ? tombstoneCursor ?? since : deletedPage.last.receivedAt}';
     if (tombstoneCursor == null) {
       totalCounts['tombstones'] = _store.countChanges(
         deleted: true,

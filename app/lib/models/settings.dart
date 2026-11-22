@@ -1523,7 +1523,12 @@ enum AudioChannel {
 
 enum SectionType { all, anime, manga }
 
-enum DisplayType { compactGrid, comfortableGrid, coverOnlyGrid, list }
+/// How a library is laid out.
+///
+/// The first four values keep the upstream order because the Isar field is
+/// stored as the enum index. [shelf] is appended, so a library that was saved
+/// as a grid or list stays on that mode after this build.
+enum DisplayType { compactGrid, comfortableGrid, coverOnlyGrid, list, shelf }
 
 enum ScaleType {
   fitScreen,

@@ -11,7 +11,9 @@ import 'package:mangayomi/modules/library/providers/library_source_badge_provide
 import 'package:mangayomi/modules/library/providers/library_state_provider.dart';
 import 'package:mangayomi/modules/library/widgets/library_gridview_widget.dart';
 import 'package:mangayomi/modules/library/widgets/library_listview_widget.dart';
+import 'package:mangayomi/modules/library/widgets/library_archive_shelf.dart';
 import 'package:mangayomi/modules/library/widgets/library_entry_utils.dart';
+import 'package:mangayomi/modules/library/widgets/library_dialogs.dart';
 import 'package:mangayomi/modules/widgets/cover_grid_skeleton.dart';
 import 'package:mangayomi/modules/widgets/error_state.dart';
 import 'package:mangayomi/modules/library/widgets/library_update_runner.dart';
@@ -131,9 +133,12 @@ class LibraryBody extends ConsumerWidget {
                 : Symbols.collections_bookmark_rounded,
             title: narrowed ? l10n.no_result : l10n.empty_library,
             message: narrowed ? null : l10n.empty_library_hint,
-            // An empty library leads somewhere: the sources for this media.
-            actionLabel: narrowed ? null : l10n.browse,
+            actionLabel: narrowed ? null : l10n.import,
             onAction: narrowed
+                ? null
+                : () => showImportLocalDialog(context, itemType),
+            secondaryActionLabel: narrowed ? null : l10n.browse,
+            onSecondaryAction: narrowed
                 ? null
                 : () {
                     ref
@@ -154,6 +159,21 @@ class LibraryBody extends ConsumerWidget {
                     )
                   : entries.reversed.toList()
             : entries;
+        if (displayType == DisplayType.shelf && itemType == ItemType.manga) {
+          // The shelf already owns the whole visible collection; a refresh
+          // updates the same real rows the grid and list show.
+          return LibraryArchiveShelf(
+            itemType: itemType,
+            entries: entriesManga,
+            selectedIds: mangaIdsList,
+            onRefresh: () => updateLibrary(
+              ref: ref,
+              context: context,
+              mangaList: data,
+              itemType: itemType,
+            ),
+          );
+        }
         return RefreshIndicator(
           onRefresh: () async {
             await updateLibrary(

@@ -186,8 +186,10 @@ class Synching extends _$Synching {
     );
   }
 
-  Future<void> clearChangedParts(List<ActionType> actions, bool txn) =>
-      changedPartRepository.clear(actions, txn);
+  Future<void> acknowledgeChangedParts(
+    List<ChangedPartVersion> versions,
+    bool txn,
+  ) => changedPartRepository.clearVersions(versions, txn);
 
   void clearAllChangedParts(bool txn) => changedPartRepository.clearAll(txn);
 }

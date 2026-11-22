@@ -1,0 +1,87 @@
+name: 页间 iPad 模拟器截图
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "rust-reader/src/**"
+      - "rust-reader/crates/reader-core/**"
+      - "rust-reader/crates/source-engine/**"
+      - "rust-reader/vendor/**"
+      - "rust-reader/platform/**"
+      - "rust-reader/Cargo*"
+      - "tools/*ipad*"
+      - "tools/build-rust-ios.sh"
+      - ".github/workflows/ipad-sim.yml"
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    # The unspecified shell does not enable pipefail. A failed capture must
+    # fail the job even when tee successfully saves its diagnostics.
+    shell: bash
+
+jobs:
+  sim:
+    runs-on: macos-15
+    timeout-minutes: 50
+    env:
+      CARGO_BUILD_JOBS: "3"
+      CARGO_INCREMENTAL: "0"
+      RUSTUP_TOOLCHAIN: "1.97.0"
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: 检查验收关卡
+        run: python3 tools/test-ipad-snapshots.py
+
+      - name: 准备模拟器工具链
+        run: |
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --target aarch64-apple-ios-sim
+          xcodebuild -version
+
+      - name: 编译模拟器版本
+        run: |
+          bash tools/build-rust-ios.sh --sim
+          xcodebuild -project rust-reader/platform/ios/Yejian.xcodeproj -scheme Yejian \
+            -configuration Debug -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
+            ENABLE_DEBUG_DYLIB=NO \
+            -derivedDataPath "$RUNNER_TEMP/sim-build" build-for-testing CODE_SIGN_IDENTITY=-
+
+      - name: 启动 iPad 模拟器并截图
+        run: |
+          mkdir -p artifacts/rust/ipad-sim
+          bash tools/capture-ipad-simulator.sh \
+            "$RUNNER_TEMP/sim-build/Build/Products/Debug-iphonesimulator/Yejian.app" \
+            artifacts/rust/ipad-sim "$RUNNER_TEMP/sim-build" \
+            2>&1 | tee artifacts/rust/ipad-sim/capture.log
+
+      - name: 核对全部画面证据
+        run: python3 tools/verify-ipad-snapshots.py artifacts/rust/ipad-sim
+
+      - name: 保存截图
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: Yejian-iPad-Sim
+          path: |
+            artifacts/rust/ipad-sim/*.png
+            artifacts/rust/ipad-sim/*.txt
+            artifacts/rust/ipad-sim/*.log
+            artifacts/rust/ipad-sim/*.json
+            artifacts/rust/ipad-sim/*.ips
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 6
+
+  package:
+    needs: sim
+    uses: ./.github/workflows/ipad.yml

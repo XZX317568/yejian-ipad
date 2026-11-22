@@ -376,7 +376,13 @@ class _MangaInfoHeaderState extends ConsumerState<MangaInfoHeader> {
             // The library cover lands here when the page opens.
             child: id == null
                 ? cover
-                : Hero(tag: coverHeroTag(id), child: cover),
+                : ShioriPaperCoverHero(
+                    tag: coverHeroTag(id),
+                    image: imageProvider,
+                    faceSize: Size(100, 100 / coverAspect),
+                    isDetail: true,
+                    child: cover,
+                  ),
           ),
         ),
       ),

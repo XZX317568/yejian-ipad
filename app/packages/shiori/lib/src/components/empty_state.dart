@@ -16,6 +16,8 @@ class ShioriEmptyState extends StatelessWidget {
     this.message,
     this.actionLabel,
     this.onAction,
+    this.secondaryActionLabel,
+    this.onSecondaryAction,
     this.compact = false,
   });
 
@@ -29,6 +31,8 @@ class ShioriEmptyState extends StatelessWidget {
   /// The next step, shown as the screen's primary button with [onAction].
   final String? actionLabel;
   final VoidCallback? onAction;
+  final String? secondaryActionLabel;
+  final VoidCallback? onSecondaryAction;
 
   /// Tighter, for use inside a list or a sheet rather than a whole page.
   final bool compact;
@@ -77,6 +81,14 @@ class ShioriEmptyState extends StatelessWidget {
               if (actionLabel != null && onAction != null) ...[
                 SizedBox(height: compact ? ShioriSpace.s16 : ShioriSpace.s24),
                 ShioriButton(label: actionLabel!, onPressed: onAction),
+              ],
+              if (secondaryActionLabel != null &&
+                  onSecondaryAction != null) ...[
+                const SizedBox(height: ShioriSpace.s8),
+                ShioriButton.quiet(
+                  label: secondaryActionLabel!,
+                  onPressed: onSecondaryAction,
+                ),
               ],
             ],
           ),

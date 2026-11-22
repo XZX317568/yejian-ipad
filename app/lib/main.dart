@@ -20,6 +20,7 @@ import 'package:mangayomi/models/settings.dart';
 import 'package:mangayomi/models/source.dart';
 import 'package:mangayomi/repositories/custom_button_repository.dart';
 import 'package:mangayomi/repositories/db.dart';
+import 'package:mangayomi/repositories/settings_repository.dart';
 import 'package:mangayomi/repositories/track_repository.dart';
 export 'package:mangayomi/repositories/db.dart';
 export 'package:mangayomi/services/http/m_client.dart'
@@ -75,14 +76,19 @@ import 'package:mangayomi/modules/widgets/memory_overlay.dart';
 import 'package:mangayomi/modules/widgets/app_ui_scale.dart';
 import 'package:mangayomi/modules/more/settings/appearance/providers/app_ui_scale_state_provider.dart';
 import 'package:mangayomi/utils/error_toast.dart';
-import 'package:mangayomi/utils/startup_error_hint.dart';
+import 'package:mangayomi/core/app_identity.dart';
+import 'package:mangayomi/core/startup_failure.dart';
+import 'package:mangayomi/services/startup_controller.dart';
+import 'package:mangayomi/modules/startup/startup_recovery_screen.dart';
 export 'package:mangayomi/services/discord_rpc.dart' show discordRpc;
 
 void main(List<String> args) async {
+  StartupController? startup;
   // Zone-level catch-all for anything that slips through both layers
   runZonedGuarded(
     () async {
       WidgetsFlutterBinding.ensureInitialized();
+      registerShioriLicenses();
 
       // Cap the decoded image cache so a large library grid can't fill the
       // default 100 MB ceiling with full-resolution covers and OOM constrained
@@ -116,59 +122,18 @@ void main(List<String> args) async {
           error: error,
           stack: stack,
         );
+        startup?.reportUnhandled(error, stack);
         return true; // handled — prevent app termination
       };
 
-      MediaKit.ensureInitialized();
-      await RustLib.init();
-      // Detect Android TV / leanback so the UI can branch on form factor.
-      // No-op on other platforms. See #729.
-      await initIsTv();
-      // Expensive worker isolates start lazily on first use instead of delaying
-      // the first frame.
-      if (!isMobile) {
-        await windowManager.ensureInitialized();
-        await WindowGeometry.restore();
-      }
-      if (Platform.isWindows) {
-        registerProtocolHandler("mangayomi");
-      }
       final storage = StorageProvider();
-      // Don't force the Android "all files access" (MANAGE_EXTERNAL_STORAGE)
-      // prompt at launch. The database lives in scoped app storage, so the app
-      // can start, browse and read online without it. The permission is still
-      // requested lazily by `createDirectorySafely` / `initDB` the first time a
-      // public path actually needs to be written (e.g. a download). See #740.
-      // Caught errors are kept for everyone, unlike the verbose log behind
-      // "Enable logs". Anything raised before this is held in memory and
-      // written out here.
-      unawaited(
-        storage
-            .getDefaultDirectory()
-            .then((directory) async {
-              await CrashReports.init(directory);
-              // After CrashReports, because a native crash from the last run
-              // is recorded into it.
-              await NativeCrashHandler.init(directory);
-            })
-            .catchError((_) {}),
+      startup = StartupController(
+        initialize: (controller) => _initializeApplication(storage, controller),
       );
-      Object? startupError;
-      try {
-        isar = await storage.initDB(null, inspector: kDebugMode);
-      } catch (e, st) {
-        AppLogger.log('DB init failed: $e\n$st', logLevel: LogLevel.error);
-        startupError = e;
-      }
-      // The background work notification's buttons reach the app through
-      // this port.
-      if (Platform.isAndroid) FlutterForegroundTask.initCommunicationPort();
-      runApp(
-        startupError != null
-            ? _StartupErrorApp(error: startupError.toString())
-            : ProviderScope(child: MyApp(), retry: (retryCount, error) => null),
-      );
-      if (startupError == null) unawaited(_postLaunchInit(storage));
+      // Give the launch screen a frame before native initialization, so a
+      // Rust or database failure is visible instead of a blank window.
+      runApp(_BootstrapApp(controller: startup!));
+      unawaited(startup!.start());
     },
     (Object error, StackTrace stack) {
       AppLogger.log(
@@ -180,50 +145,180 @@ void main(List<String> args) async {
         error: error,
         stack: stack,
       );
+      startup?.reportUnhandled(error, stack);
     },
   );
 }
 
-class _StartupErrorApp extends StatelessWidget {
-  final String error;
-  const _StartupErrorApp({required this.error});
+Future<void> _initializeApplication(
+  StorageProvider storage,
+  StartupController controller,
+) async {
+  await _startupStage(controller, StartupStage.rust, () async {
+    MediaKit.ensureInitialized();
+    // A previous attempt may have half-loaded the bridge. Disposing its Dart
+    // state is safe and is what makes Retry a real retry.
+    try {
+      RustLib.dispose();
+    } catch (_) {}
+    await RustLib.init();
+    // Detect Android TV / leanback so the UI can branch on form factor.
+    // No-op on other platforms. See #729.
+    await initIsTv();
+  });
+
+  await _startupStage(controller, StartupStage.database, () async {
+    // Expensive worker isolates start lazily on first use instead of delaying
+    // the first frame.
+    if (!isMobile) {
+      await windowManager.ensureInitialized();
+      await WindowGeometry.restore();
+    }
+    if (Platform.isWindows) {
+      registerProtocolHandler(AppIdentity.linkScheme);
+    }
+    if (Platform.isAndroid) FlutterForegroundTask.initCommunicationPort();
+
+    // Logs stay with the visible reader data.
+    try {
+      final directory = await storage.getDefaultDirectory();
+      await CrashReports.init(directory);
+      // After CrashReports, because a native crash from the last run is
+      // recorded into it.
+      await NativeCrashHandler.init(directory);
+    } catch (error, stack) {
+      // Crash reporting is best-effort and never blocks opening the reader.
+      recordError(error, stack: stack, source: 'startup');
+    }
+
+    // The recovery screen shows the database location, because that is the
+    // step that failed. Resolving it must not create or migrate anything.
+    try {
+      final databaseDirectory = await storage.resolveDatabaseDirectory();
+      controller.setDataPath(databaseDirectory.path);
+    } catch (error, stack) {
+      recordError(error, stack: stack, source: 'startup.dataPath');
+    }
+
+    try {
+      isar = await storage.initDB(null, inspector: kDebugMode);
+    } catch (error, stack) {
+      // Close a handle that opened before a later step failed; never delete it.
+      try {
+        await isar.close(deleteFromDisk: false);
+      } catch (_) {}
+      Error.throwWithStackTrace(error, stack);
+    }
+  });
+
+  unawaited(_postLaunchInit(storage));
+}
+
+Future<void> _startupStage(
+  StartupController controller,
+  StartupStage stage,
+  Future<void> Function() body,
+) async {
+  try {
+    await body();
+  } catch (error, stack) {
+    AppLogger.log(
+      '${stage.name} startup failed: $error\n$stack',
+      logLevel: LogLevel.error,
+    );
+    CrashReports.record(
+      source: 'startup.${stage.name}',
+      error: error,
+      stack: stack,
+    );
+    controller.fail(stage, error, stack);
+  }
+}
+
+class _BootstrapApp extends StatelessWidget {
+  const _BootstrapApp({required this.controller});
+
+  final StartupController controller;
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      home: Scaffold(
-        body: Center(
-          child: Padding(
-            padding: const EdgeInsets.all(24),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const Icon(
-                  Symbols.error_outline_rounded,
-                  fill: 1,
-                  size: 64,
-                  color: Colors.red,
-                ),
-                const SizedBox(height: 16),
-                const Text(
-                  'Failed to start Mangayomi',
-                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-                ),
-                if (startupErrorHint(error) case final hint?) ...[
-                  const SizedBox(height: 12),
-                  ConstrainedBox(
-                    constraints: const BoxConstraints(maxWidth: 520),
-                    child: Text(hint, textAlign: TextAlign.center),
-                  ),
-                ],
-                const SizedBox(height: 8),
-                SelectableText(
-                  error,
-                  style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
-                ),
-              ],
+    return AnimatedBuilder(
+      animation: controller,
+      builder: (context, _) {
+        if (controller.ready) {
+          return ProviderScope(
+            child: const MyApp(),
+            retry: (retryCount, error) => null,
+          );
+        }
+        final failure = controller.failure;
+        return MaterialApp(
+          title: AppIdentity.englishName,
+          debugShowCheckedModeBanner: false,
+          theme: ThemeData(
+            colorScheme: ColorScheme.fromSeed(
+              seedColor: const Color(0xFF5B6B5A),
             ),
+            useMaterial3: true,
           ),
+          darkTheme: ThemeData(
+            colorScheme: ColorScheme.fromSeed(
+              seedColor: const Color(0xFF9DB39A),
+              brightness: Brightness.dark,
+            ),
+            useMaterial3: true,
+          ),
+          home: failure != null
+              ? StartupRecoveryScreen(
+                  failure: failure,
+                  dataPath: controller.dataPath ?? '尚无法确定，请先重试一次',
+                  onRetry: () => unawaited(controller.start()),
+                  retrying: controller.running,
+                )
+              : const _LaunchingScreen(),
+        );
+      },
+    );
+  }
+}
+
+class _LaunchingScreen extends StatelessWidget {
+  const _LaunchingScreen();
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Scaffold(
+      body: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              Symbols.menu_book_rounded,
+              size: 56,
+              color: theme.colorScheme.primary,
+            ),
+            const SizedBox(height: 16),
+            Text(
+              AppIdentity.productName,
+              style: theme.textTheme.headlineSmall?.copyWith(
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              '正在打开书库…',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+            const SizedBox(height: 24),
+            const SizedBox(
+              width: 22,
+              height: 22,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            ),
+          ],
         ),
       ),
     );
@@ -234,13 +329,9 @@ class _StartupErrorApp extends StatelessWidget {
 /// left behind, in the directory `Hive.initFlutter` used to open it.
 Future<void> _deleteLegacyHiveCache() async {
   try {
-    final docs = await getApplicationDocumentsDirectory();
-    final dir = Platform.isAndroid
-        ? docs.path
-        : p.join(
-            docs.path,
-            isApple ? "databases" : p.join("Mangayomi", "databases"),
-          );
+    // Only this app's database directory. An upstream Mangayomi install, if
+    // present, owns its own Hive files and they are left alone.
+    final dir = (await StorageProvider().getDatabaseDirectory())!.path;
     for (final name in ["tracker_library.hive", "tracker_library.lock"]) {
       final file = File(p.join(dir, name));
       if (await file.exists()) await file.delete();
@@ -258,7 +349,10 @@ Future<void> _postLaunchInit(StorageProvider storage) async {
   unawaited(backfillMissingClientIds());
   unawaited(MDownloader.initializeIsolatePool(poolSize: 6));
   unawaited(_deleteLegacyHiveCache());
-  if (isDesktop && !kDebugMode) {
+  // A new install turns Discord off. Do not even load the plugin then.
+  final discordEnabled =
+      settingsRepository.currentOrNull?.enableDiscordRpc ?? false;
+  if (isDesktop && !kDebugMode && discordEnabled) {
     discordRpc = DiscordRPC(applicationId: "1395040506677039157");
     await discordRpc?.initialize();
   }
@@ -520,7 +614,7 @@ class _MyAppState extends ConsumerState<MyApp>
       routeInformationParser: router.routeInformationParser,
       routerDelegate: router.routerDelegate,
       routeInformationProvider: router.routeInformationProvider,
-      title: 'MangaYomi',
+      title: AppIdentity.productName,
       scrollBehavior: AllowScrollBehavior(),
     );
   }

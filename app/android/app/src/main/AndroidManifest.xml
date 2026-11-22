@@ -1,5 +1,5 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.kodjodevf.mangayomi">
+    package="app.yejian.reader">
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.USE_BIOMETRIC"/>
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
@@ -22,7 +22,7 @@
         android:required="false" />
 
    <application
-        android:label="Mangayomi"
+        android:label="页间"
         android:name="${applicationName}"
         android:icon="@mipmap/launcher_icon"
         android:banner="@drawable/tv_banner"
@@ -57,13 +57,13 @@
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="mangayomi" android:host="add-repo" />
+                <data android:scheme="yejian" android:host="add-repo" />
             </intent-filter>
             <intent-filter android:label="Add custom button">
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="mangayomi" android:host="add-button" />
+                <data android:scheme="yejian" android:host="add-button" />
             </intent-filter>
         </activity>
         <activity
@@ -73,13 +73,17 @@
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="yejian" />
+                <!-- Temporary: tracker and sync OAuth still request the
+                     upstream scheme. Move those callbacks to yejian and this
+                     filter can go. -->
                 <data android:scheme="mangayomi" />
             </intent-filter>
         </activity>
         
         <provider
         android:name="androidx.core.content.FileProvider"
-        android:authorities="com.kodjodevf.mangayomi.fileprovider"
+        android:authorities="${applicationId}.fileprovider"
         android:exported="false"
         android:grantUriPermissions="true">
         <meta-data

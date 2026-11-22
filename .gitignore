@@ -13,3 +13,10 @@ artifacts/
 **/pubspec_overrides.yaml
 **/.flutter-plugins*
 **/*.log
+rust-reader/data/
+
+# 构建缓存与临时产物（2026-11-22 补：target-main-check 不匹配 **/target/）
+**/target*/
+.tmp-sim/
+NUL
+**/Dtmpcheck.json

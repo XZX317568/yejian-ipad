@@ -1,6 +1,7 @@
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:mangayomi/services/archive_reader/archive_page.dart';
 import 'package:mangayomi/services/reader/u_chap_data_preload.dart';
 import 'package:mangayomi/providers/browse_state_provider.dart';
 import 'package:mangayomi/services/isolate_service.dart';
@@ -22,6 +23,7 @@ class GetChapterPagesModel {
   List<PageUrl> pageUrls = [];
   List<bool> isLocaleList = [];
   List<Uint8List?> archiveImages = [];
+  List<ArchivePage?> archivePages = [];
   // Parallel to archiveImages: the real on-disk path for pages that are
   // standalone files (local image-folder chapters), so they never have to be
   // read into memory just to get a path back out. Null for every page that
@@ -121,11 +123,10 @@ Future<GetChapterPagesModel> getChapterPages(
           getArchiveDataFromFileProvider(archivePath).future,
         );
         for (var image in local.images!) {
-          // Folder pages carry a real path instead of pre-read bytes (see
-          // LocalImage.path) - keep archiveImages/localImagePaths parallel
-          // to isLocaleList so index i always refers to the same page across
-          // all three lists.
+          // Keep the payload lists parallel: folders carry paths, ZIP/TAR
+          // pages carry lazy entries, and the native RAR decoder carries bytes.
           archiveImages.add(image.image);
+          chapterModel.archivePages.add(image.archivePage);
           chapterModel.localImagePaths.add(image.path);
           isLocaleList.add(true);
         }
@@ -174,6 +175,9 @@ Future<GetChapterPagesModel> getChapterPages(
             i,
             localImagePath: i < chapterModel.localImagePaths.length
                 ? chapterModel.localImagePaths[i]
+                : null,
+            archivePage: i < chapterModel.archivePages.length
+                ? chapterModel.archivePages[i]
                 : null,
           ),
         );

@@ -162,12 +162,14 @@ class _MainScreenState extends ConsumerState<MainScreen>
         .when(
           data: (_) => Consumer(
             builder: (context, ref, child) {
-              final useFloatingNav = shouldUseFloatingNav(
-                enabled: ref.watch(floatingNavigationBarStateProvider),
-              );
               final prefersNavRail = context.prefersNavRail(
-                useFloatingNav: useFloatingNav,
+                useFloatingNav: false,
               );
+              final useFloatingNav =
+                  !prefersNavRail &&
+                  shouldUseFloatingNav(
+                    enabled: ref.watch(floatingNavigationBarStateProvider),
+                  );
               final isReadingScreen = _isReadingScreen(location);
               bool uniqueSwitch = false;
               List<String> dest = !prefersNavRail && isLibSwitch

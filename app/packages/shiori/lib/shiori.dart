@@ -7,6 +7,8 @@ library;
 export 'package:material_symbols_icons/symbols.dart' show Symbols;
 
 export 'src/alphas.dart';
+export 'src/licenses.dart';
+export 'src/components/archive_navigation.dart';
 export 'src/components/badge.dart';
 export 'src/components/button.dart';
 export 'src/components/choice.dart';
@@ -21,6 +23,9 @@ export 'src/components/menu.dart';
 export 'src/components/overlay_controls.dart';
 export 'src/components/overlay_label.dart';
 export 'src/components/prompt.dart';
+export 'src/components/reading_shelf.dart';
+export 'src/components/archive_shelf/paper_cover.dart' show ShioriPaperCoverHero;
+export 'src/components/archive_shelf/paper_page.dart' show ShioriPaperPage;
 export 'src/components/section_header.dart';
 export 'src/components/segmented_control.dart';
 export 'src/components/settings.dart';

@@ -111,7 +111,7 @@ class NavDestinationBuilders {
         ),
         label: Padding(
           padding: const EdgeInsets.only(top: ShioriSpace.s4),
-          child: Text(l10n.manga),
+          child: Text(l10n.library),
         ),
       );
     }
@@ -301,7 +301,7 @@ class NavDestinationBuilders {
       destinations[dest.indexOf("/MangaLibrary")] = NavigationDestination(
         selectedIcon: const Icon(Symbols.book_rounded, fill: 1),
         icon: const Icon(Symbols.book_rounded),
-        label: l10n.manga,
+        label: l10n.library,
         tooltip: showTooltip ? l10n.double_tap_search_hint(l10n.manga) : '',
       );
     }

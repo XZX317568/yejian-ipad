@@ -3,7 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:go_router/go_router.dart';
 import 'package:mangayomi/modules/main_view/widgets/mobile_bottom_navigation.dart';
-import 'package:mangayomi/modules/widgets/floating_nav_bar.dart';
+import 'package:shiori/shiori.dart';
 
 void main() {
   late GoRouter router;
@@ -50,21 +50,31 @@ void main() {
     );
   }
 
-  testWidgets('uses the standard attached bar when the preference is off', (
+  testWidgets('uses the archive dock attached when the preference is off', (
     tester,
   ) async {
     await tester.pumpWidget(app(useFloatingNav: false));
 
-    expect(find.byType(NavigationBar), findsOneWidget);
-    expect(find.byType(FloatingNavBar), findsNothing);
+    final dock = tester.widget<ShioriArchiveDock>(
+      find.byType(ShioriArchiveDock),
+    );
+    expect(dock.floating, isFalse);
+    expect(find.byType(NavigationBar), findsNothing);
+    expect(find.text('Browse'), findsOneWidget);
+    expect(find.text('More'), findsOneWidget);
   });
 
-  testWidgets('uses the floating bar when the preference is on', (
+  testWidgets('uses the archive dock floating when the preference is on', (
     tester,
   ) async {
     await tester.pumpWidget(app(useFloatingNav: true));
 
-    expect(find.byType(FloatingNavBar), findsOneWidget);
+    final dock = tester.widget<ShioriArchiveDock>(
+      find.byType(ShioriArchiveDock),
+    );
+    expect(dock.floating, isTrue);
     expect(find.byType(NavigationBar), findsNothing);
+    expect(find.text('Browse'), findsOneWidget);
+    expect(find.text('More'), findsOneWidget);
   });
 }

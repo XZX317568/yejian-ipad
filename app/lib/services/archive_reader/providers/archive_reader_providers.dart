@@ -1,7 +1,10 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:archive/archive_io.dart';
+import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
+import 'package:mangayomi/services/archive_reader/archive_page.dart';
 import 'package:mangayomi/services/archive_reader/models/models.dart';
 import 'package:mangayomi/src/rust/api/rar.dart';
 import 'package:mangayomi/utils/downloaded_page_file.dart';
@@ -319,10 +322,25 @@ LocalArchive _extractFromArchiveFile(String path) {
   try {
     inputStream = InputFileStream(path);
     final archive = _decodeArchive(inputStream, extensionType);
+    final stat = File(path).statSync();
+    final cacheKey = md5
+        .convert(
+          utf8.encode(
+            '${File(path).absolute.path}|${stat.size}|'
+            '${stat.modified.microsecondsSinceEpoch}',
+          ),
+        )
+        .toString();
+    final cacheDirectory = p.join(ArchivePageCache.root.path, cacheKey);
 
     final imageFiles =
         archive.files
-            .where((file) => file.isFile && _isImageFile(file.name))
+            .where(
+              (file) =>
+                  file.isFile &&
+                  !file.isSymbolicLink &&
+                  _isImageFile(file.name),
+            )
             .toList()
           ..sort((a, b) => compareArchiveReaderPaths(a.name, b.name));
 
@@ -330,28 +348,46 @@ LocalArchive _extractFromArchiveFile(String path) {
       throw Exception('No images found in archive: $path');
     }
 
-    // Extract images
+    final entryIndices = {
+      for (final (index, file) in archive.files.indexed) file: index,
+    };
+    // Index entries without inflating the chapter into memory. The reader,
+    // share/save actions and image providers resolve one page when needed.
     for (final file in imageFiles) {
       final filename = file.name;
-      final data = file.content;
-
-      if (filename.toLowerCase().contains('cover')) {
-        localArchive.coverImage = data;
-      }
-
       localArchive.images!.add(
         LocalImage()
-          ..image = data
+          ..archivePage = ArchivePage(
+            archivePath: path,
+            entryIndex: entryIndices[file]!,
+            entryName: filename,
+            size: file.size,
+            archiveSize: stat.size,
+            archiveModified: stat.modified.microsecondsSinceEpoch,
+            cachePath: archivePageCachePath(
+              cacheDirectory,
+              entryIndices[file]!,
+              filename,
+            ),
+            isTar:
+                extensionType == LocalExtensionType.tar ||
+                extensionType == LocalExtensionType.cbt,
+          )
           ..name = p.basename(filename),
       );
     }
 
-    // Set cover image if not explicitly found
-    localArchive.coverImage ??= localArchive.images!.first.image;
+    // Keep the cover contract for existing consumers, retaining just one
+    // encoded image rather than every encoded image in the chapter.
+    final cover = imageFiles.lastWhere(
+      (file) => file.name.toLowerCase().contains('cover'),
+      orElse: () => imageFiles.first,
+    );
+    localArchive.coverImage = readArchiveCover(cover);
 
     return localArchive;
   } finally {
-    inputStream?.close();
+    inputStream?.closeSync();
   }
 }
 
@@ -419,13 +455,19 @@ _extractMetadataFromImageFolder(String path) async {
     final coverFile = archive.files.firstWhere(
       (file) =>
           file.isFile &&
+          !file.isSymbolicLink &&
           _isImageFile(file.name) &&
           file.name.toLowerCase().contains('cover'),
       orElse: () {
         // If no cover, get first image alphabetically
         final imageFiles =
             archive.files
-                .where((file) => file.isFile && _isImageFile(file.name))
+                .where(
+                  (file) =>
+                      file.isFile &&
+                      !file.isSymbolicLink &&
+                      _isImageFile(file.name),
+                )
                 .toList()
               ..sort((a, b) => compareArchiveReaderPaths(a.name, b.name));
 
@@ -437,10 +479,10 @@ _extractMetadataFromImageFolder(String path) async {
       },
     );
 
-    final coverImage = coverFile.content;
+    final coverImage = readArchiveCover(coverFile);
     return (name, extensionType, coverImage, path);
   } finally {
-    inputStream?.close();
+    inputStream?.closeSync();
   }
 }
 
@@ -449,13 +491,13 @@ Archive _decodeArchive(InputFileStream stream, LocalExtensionType type) {
   switch (type) {
     case LocalExtensionType.cbt:
     case LocalExtensionType.tar:
-      return TarDecoder().decodeStream(stream);
+      return decodePageArchive(stream, isTar: true);
     case LocalExtensionType.zip:
     case LocalExtensionType.cbz:
     case LocalExtensionType.cbr:
     case LocalExtensionType.rar:
     case LocalExtensionType.folder:
-      return ZipDecoder().decodeStream(stream);
+      return decodePageArchive(stream, isTar: false);
   }
 }
 

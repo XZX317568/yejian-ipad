@@ -125,18 +125,32 @@ class ChangedPartRepository {
     }
   }
 
-  Future<void> clear(List<ActionType> actions, bool txn) async {
-    var temp = isar.changedParts.filter().actionTypeEqualTo(actions.first);
-    for (ActionType action in actions.skip(1)) {
-      temp = temp.or().actionTypeEqualTo(action);
+  /// Acknowledges exactly the versions that were uploaded.
+  ///
+  /// The lookup and delete happen in one write transaction. A change added
+  /// after the upload was captured has a different row id, and a change to
+  /// the same row has a different version, so neither is removed here. It
+  /// stays queued for the next sync.
+  Future<void> clearVersions(
+    List<ChangedPartVersion> versions,
+    bool txn,
+  ) async {
+    if (versions.isEmpty) return;
+
+    void clearInTransaction() {
+      for (final version in versions) {
+        final current = isar.changedParts.getSync(version.id);
+        if (current != null && version.matches(current)) {
+          isar.changedParts.deleteSync(version.id);
+        }
+      }
     }
-    final ids = await temp.idProperty().findAll();
+
     if (txn) {
-      await dbWriteQueue.run(
-        () => isar.writeTxn(() => isar.changedParts.deleteAll(ids)),
-      );
+      await dbWriteQueue.run(() => isar.writeTxnSync(clearInTransaction));
     } else {
-      await isar.changedParts.deleteAll(ids);
+      // The caller already holds the only write transaction.
+      clearInTransaction();
     }
   }
 

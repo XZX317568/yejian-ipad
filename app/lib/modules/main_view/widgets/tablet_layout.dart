@@ -125,10 +125,21 @@ class _TabletLayoutState extends State<MainTabletLayout> {
       widget.dest,
       context,
     );
-    final railWidth = _getNavigationRailWidth(
+    final expandedRail =
+        !isTv &&
+        MediaQuery.sizeOf(context).width >= 1200 &&
+        MediaQuery.textScalerOf(context).scale(1) < 1.5;
+    final baseWidth = _getNavigationRailWidth(
       widget.isLongPressed,
       widget.location,
     );
+    final railWidth = baseWidth == 0
+        ? 0.0
+        : isTv
+        ? baseWidth
+        : expandedRail
+        ? 240.0
+        : 96.0;
     final railVisible = railWidth > 0;
 
     // On a TV, open with the tab rail focused so the user lands on the tabs and
@@ -142,13 +153,43 @@ class _TabletLayoutState extends State<MainTabletLayout> {
 
     final scheme = Theme.of(context).colorScheme;
     Widget navRail = NavigationRail(
-      labelType: NavigationRailLabelType.all,
+      extended: expandedRail,
+      minExtendedWidth: 240,
+      backgroundColor: context.shiori.color.ink0,
+      minWidth: isTv ? null : 96,
+      indicatorColor: isTv ? null : context.shiori.color.ink2,
+      labelType: expandedRail
+          ? NavigationRailLabelType.none
+          : NavigationRailLabelType.all,
       useIndicator: true,
       // Centre the tabs rather than bunching them under the logo with dead
       // space below. Off-TV keeps the default top alignment.
       groupAlignment: isTv ? 0.0 : null,
       // Brand the rail on TV: the app glyph, then the beta flag under it.
-      leading: isTv ? const _TvRailHeader() : null,
+      leading: isTv
+          ? const _TvRailHeader()
+          : Padding(
+              padding: const EdgeInsets.symmetric(
+                vertical: ShioriSpace.s32,
+                horizontal: ShioriSpace.s16,
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Symbols.menu_book_rounded),
+                  if (expandedRail) ...[
+                    const SizedBox(width: ShioriSpace.s12),
+                    Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text('页间', style: context.shiori.text.seriesTitle),
+                        Text('YEJIAN', style: context.shiori.caption),
+                      ],
+                    ),
+                  ],
+                ],
+              ),
+            ),
       // A TV is read from across a room, so the desktop defaults (24px icons,
       // regular labels) are undersized. Colours are restated rather than left
       // null, because supplying an IconThemeData/TextStyle replaces the rail's
@@ -156,10 +197,10 @@ class _TabletLayoutState extends State<MainTabletLayout> {
       // unselected colouring. All null off TV, so desktop keeps its defaults.
       selectedIconTheme: isTv
           ? IconThemeData(size: 28, color: scheme.onSecondaryContainer)
-          : null,
+          : IconThemeData(color: context.shiori.color.fg),
       unselectedIconTheme: isTv
           ? IconThemeData(size: 28, color: context.shiori.color.fgMuted)
-          : null,
+          : IconThemeData(color: context.shiori.color.fgMuted),
       selectedLabelTextStyle: isTv
           ? TextStyle(
               fontSize: context.shiori.text.meta.fontSize,

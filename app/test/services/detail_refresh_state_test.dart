@@ -9,6 +9,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:isar_community/isar.dart';
 import 'package:mangayomi/main.dart' as app;
+import 'package:mangayomi/core/app_identity.dart';
 import 'package:mangayomi/eval/model/m_chapter.dart';
 import 'package:mangayomi/eval/model/m_manga.dart';
 import 'package:mangayomi/models/chapter.dart';
@@ -33,6 +34,7 @@ import 'package:mangayomi/services/chapter_cache.dart';
 import 'package:mangayomi/services/get_chapter_pages.dart';
 import 'package:mangayomi/services/downloaded_chapter.dart';
 import 'package:mangayomi/utils/reg_exp_matcher.dart';
+import 'package:mangayomi/utils/extensions/others.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider_platform_interface/path_provider_platform_interface.dart';
 
@@ -51,7 +53,7 @@ Future<File> _archive(Directory root, String name) async {
   final file = File(
     p.join(
       root.path,
-      'Mangayomi',
+      AppIdentity.storageFolderName,
       'downloads',
       'Manga',
       'Fixture (EN)',
@@ -72,7 +74,7 @@ Future<File> _page(Directory root, String name) async {
   final file = File(
     p.join(
       root.path,
-      'Mangayomi',
+      AppIdentity.storageFolderName,
       'downloads',
       'Manga',
       'Fixture (EN)',
@@ -417,7 +419,8 @@ void main() {
           getChapterPagesProvider(chapter: survivor).future,
         );
         if (asArchive) {
-          expect(pages.archiveImages.single, _image);
+          expect(pages.archiveImages.single, isNull);
+          expect(await pages.uChapDataPreload.single.getImageBytes, _image);
         } else {
           expect(
             await File(p.join(pages.path!.path, '${padIndex(0)}.png'))

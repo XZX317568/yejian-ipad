@@ -1,4 +1,4 @@
-package com.kodjodevf.mangayomi
+package app.yejian.reader
 
 import androidx.annotation.NonNull
 import libmtorrentserver.Libmtorrentserver

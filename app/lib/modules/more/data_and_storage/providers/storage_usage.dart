@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:mangayomi/eval/model/m_bridge.dart';
 import 'package:mangayomi/providers/storage_provider.dart';
 import 'package:mangayomi/repositories/settings_repository.dart';
+import 'package:mangayomi/services/archive_reader/archive_page.dart';
 import 'package:mangayomi/utils/extensions/others.dart';
 import 'package:mangayomi/utils/localized_message.dart';
 import 'package:riverpod_annotation/riverpod_annotation.dart';
@@ -34,6 +35,7 @@ class TotalChapterCacheSizeState extends _$TotalChapterCacheSizeState {
       if (chapterCacheDir.existsSync()) {
         await chapterCacheDir.delete(recursive: true);
       }
+      await ArchivePageCache.clear();
       msg = "0.00 B";
     } catch (_) {}
     try {
@@ -53,7 +55,8 @@ class TotalChapterCacheSizeState extends _$TotalChapterCacheSizeState {
       final chapterCacheSize = await _getdirectorySize(
         await _storage.getCacheDirectory('chapter_disk_cache'),
       );
-      return imageCacheSize + chapterCacheSize;
+      final archivePageCacheSize = await ArchivePageCache.size();
+      return imageCacheSize + chapterCacheSize + archivePageCacheSize;
     } catch (_) {}
     return 0;
   }

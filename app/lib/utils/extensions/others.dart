@@ -10,6 +10,7 @@ import 'package:material_ui/material_ui.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:intl/intl.dart';
 import 'package:mangayomi/services/reader/u_chap_data_preload.dart';
+import 'package:mangayomi/services/reader/archive_page_image_provider.dart';
 import 'package:mangayomi/services/http/custom_extended_image_provider.dart';
 import 'package:mangayomi/providers/storage_provider.dart';
 import 'package:mangayomi/utils/constant.dart';
@@ -81,6 +82,7 @@ extension ImageProviderExtension on ImageProvider {
 extension UChapDataPreloadExtensions on UChapDataPreload {
   Future<String?> get getLocalFilePath async {
     if (isTransitionPage) return null;
+    if (archivePage != null) return archivePage!.resolveFilePath();
     if (resolvedFilePath != null) return resolvedFilePath;
     if (localImagePath != null) {
       // Local image-folder page: this already IS a real file on disk, so
@@ -120,7 +122,10 @@ extension UChapDataPreloadExtensions on UChapDataPreload {
 
   Future<Uint8List?> get getImageBytes async {
     Uint8List? imageBytes;
-    if (archiveImage != null) {
+    if (archivePage != null) {
+      imageBytes = await File(await archivePage!.resolveFilePath())
+          .readAsBytes();
+    } else if (archiveImage != null) {
       imageBytes = archiveImage;
     } else if (localImagePath != null) {
       imageBytes = await File(localImagePath!).readAsBytes();
@@ -153,6 +158,9 @@ extension UChapDataPreloadExtensions on UChapDataPreload {
 
     final isLocale = data.isLocale!;
     final archiveImage = data.archiveImage;
+    if (isLocale && data.archivePage != null) {
+      return ArchivePageImageProvider(data.archivePage!);
+    }
     return isLocale
         ? archiveImage != null
               ? MemoryImage(archiveImage)

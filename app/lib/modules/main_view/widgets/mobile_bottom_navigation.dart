@@ -2,8 +2,6 @@ import 'package:material_ui/material_ui.dart';
 import 'package:shiori/shiori.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
-import 'package:mangayomi/modules/widgets/floating_nav_bar.dart';
-import 'package:mangayomi/utils/extensions/build_context_extensions.dart';
 
 class MainMobileBottomNavigation extends StatelessWidget {
   const MainMobileBottomNavigation({
@@ -36,60 +34,33 @@ class MainMobileBottomNavigation extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final height = _getBottomNavigationHeight(isLongPressed, location);
-    if (height == 0) {
+    if (!_isVisible(isLongPressed, location)) {
       return const SizedBox.shrink();
     }
 
-    if (useFloatingNav) {
-      return SizedBox(
-        width: context.width(1),
-        height: height,
-        child: FloatingNavBar(
-          destinations: buildNavigationWidgetsMobile(
-            ref,
-            dest,
-            context,
-          ).cast<NavigationDestination>(),
-          currentIndex: currentIndex,
-          onSelected: (newIndex) => onDestinationSelected(dest[newIndex]),
-          showLabels: context.isLandscape,
-          shrink: shrink,
-          onWake: onWake,
-        ),
-      );
-    }
-
-    return SizedBox(
-      width: context.width(1),
-      height: height,
-      child: NavigationBarTheme(
-        data: NavigationBarThemeData(
-          labelTextStyle: const WidgetStatePropertyAll(
-            TextStyle(overflow: TextOverflow.ellipsis),
-          ),
-          indicatorShape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(ShioriShape.sheet),
-          ),
-        ),
-        child: NavigationBar(
-          animationDuration: ShioriMotion.exitSlow,
-          selectedIndex: currentIndex,
-          labelBehavior: NavigationDestinationLabelBehavior.alwaysShow,
-          destinations: buildNavigationWidgetsMobile(ref, dest, context),
-          onDestinationSelected: (newIndex) {
-            onDestinationSelected(dest[newIndex]);
-          },
-        ),
-      ),
+    // The destinations keep the app's own labels, selected glyphs and update
+    // badges; only their presentation changes. The dock owns the capsule,
+    // underline and press response, so the Material navigation bar's blue
+    // indicator is no longer used here.
+    return ShioriArchiveDock(
+      destinations: buildNavigationWidgetsMobile(
+        ref,
+        dest,
+        context,
+      ).cast<NavigationDestination>(),
+      currentIndex: currentIndex,
+      floating: useFloatingNav,
+      shrink: useFloatingNav ? shrink : 0,
+      onWake: onWake,
+      onSelected: (index) {
+        onWake?.call();
+        onDestinationSelected(dest[index]);
+      },
     );
   }
 
-  static double? _getBottomNavigationHeight(
-    bool isLongPressed,
-    String? location,
-  ) {
-    if (isLongPressed) return 0;
+  static bool _isVisible(bool isLongPressed, String? location) {
+    if (isLongPressed) return false;
 
     const validLocations = {
       '/MangaLibrary',
@@ -102,6 +73,6 @@ class MainMobileBottomNavigation extends StatelessWidget {
       '/trackerLibrary',
     };
 
-    return (location == null || validLocations.contains(location)) ? null : 0;
+    return location == null || validLocations.contains(location);
   }
 }

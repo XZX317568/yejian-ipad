@@ -156,8 +156,22 @@ class _MinSubsamplingImageState extends ConsumerState<MinSubsamplingImage> {
       });
     }
 
-    final String? path =
-        widget.data.resolvedFilePath ?? await widget.data.getLocalFilePath;
+    String? path;
+    try {
+      path = widget.data.archivePage != null
+          ? await widget.data.getLocalFilePath
+          : widget.data.resolvedFilePath ?? await widget.data.getLocalFilePath;
+    } catch (_) {
+      if (mounted) {
+        setState(() {
+          _hasError = true;
+          _isLoading = false;
+          _loadingProgress = null;
+        });
+        widget.failedToLoadImage(true);
+      }
+      return;
+    }
     if (path != null) {
       widget.data.resolvedFilePath = path;
     }

@@ -85,8 +85,6 @@ class ContinueShelf extends ConsumerWidget {
 
   final ItemType itemType;
 
-  static const double _coverWidth = 96;
-
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     if (!ref.watch(continueShelfProvider)) return const SizedBox.shrink();
@@ -116,68 +114,25 @@ class ContinueShelf extends ConsumerWidget {
     );
     if (entries == null || entries.isEmpty) return const SizedBox.shrink();
 
-    final tokens = context.shiori;
-    final text = tokens.text;
-    // A cover, then two lines of title and one of chapter under it,
-    // measured in the fonts and text size they are drawn in: an estimate
-    // from the font sizes alone fell a few pixels short of a two-line title.
-    // Each style is merged into the ambient one, as Text does, so the
-    // measure uses the theme's font family and not the default one.
-    final scaler = MediaQuery.textScalerOf(context);
-    final ambient = DefaultTextStyle.of(context).style;
-    double linesOf(TextStyle style, int count) {
-      final painter = TextPainter(
-        text: TextSpan(
-          text: List.filled(count, 'Hg').join('\n'),
-          style: ambient.merge(style),
-        ),
-        textDirection: TextDirection.ltr,
-        textScaler: scaler,
-      )..layout();
-      final height = painter.height;
-      painter.dispose();
-      return height;
-    }
-
-    final tileHeight =
-        _coverWidth / coverAspect +
-        ShioriSpace.s4 +
-        linesOf(text.card, 2) +
-        linesOf(text.meta, 1);
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        ShioriSectionHeader(
-          title: context.l10n.continue_reading,
-          overline: true,
-        ),
-        SizedBox(
-          height: tileHeight,
-          child: ListView.separated(
-            scrollDirection: Axis.horizontal,
-            padding: const EdgeInsets.symmetric(horizontal: ShioriSpace.s16),
-            itemCount: entries.length,
-            separatorBuilder: (_, _) => const SizedBox(width: ShioriSpace.s12),
-            itemBuilder: (context, i) {
-              final e = entries[i];
-              return SizedBox(
-                width: _coverWidth,
-                child: ShioriCoverTile(
-                  subtitle: e.chapter.name,
-                  cover: ShioriCover(
-                    image: resolveCoverImage(e.manga, ref),
-                    title: e.manga.name ?? '',
-                    progress: e.progress,
-                    onTap: () => e.chapter.pushToReaderView(context),
-                    onLongPress: () =>
-                        context.push('/manga-reader/detail', extra: e.manga.id),
-                  ),
-                ),
-              );
-            },
+    return ShioriReadingShelf(
+      title: context.l10n.continue_reading,
+      openLabel: context.l10n.continue_reading,
+      entries: [
+        for (final e in entries)
+          ShioriReadingEntry(
+            id: e.manga.id!,
+            title: e.manga.name ?? '',
+            subtitle: [
+              e.chapter.name ?? '',
+              if ((int.tryParse(e.chapter.lastPageRead ?? '') ?? 0) > 0)
+                context.l10n.page(e.chapter.lastPageRead!),
+            ].where((text) => text.isNotEmpty).join(' · '),
+            image: resolveCoverImage(e.manga, ref),
+            progress: e.progress,
+            onOpen: () => e.chapter.pushToReaderView(context, ignoreIsRead: true),
+            onDetails: () =>
+                context.push('/manga-reader/detail', extra: e.manga.id),
           ),
-        ),
-        const SizedBox(height: ShioriSpace.s8),
       ],
     );
   }

@@ -6,9 +6,11 @@ import 'package:mangayomi/models/manga.dart';
 import 'package:mangayomi/modules/manga/archive_reader/models/models.dart';
 import 'package:mangayomi/repositories/chapter_repository.dart';
 import 'package:mangayomi/repositories/manga_repository.dart';
+import 'package:mangayomi/services/local_import_batch.dart';
 import 'package:mangayomi/modules/manga/archive_reader/providers/archive_reader_providers.dart';
 import 'package:mangayomi/src/rust/api/epub.dart';
 import 'package:mangayomi/utils/manga_cover_actions.dart';
+import 'package:mangayomi/utils/error_toast.dart';
 import 'package:riverpod_annotation/riverpod_annotation.dart';
 export 'package:mangayomi/utils/manga_cover_actions.dart'
     show Uint8ListExtensions;
@@ -46,7 +48,7 @@ Future importArchivesFromFile(
             imageUrl: '',
             lang: '',
             link: '',
-            name: _getName(files.first.path!),
+            name: _getName(files.first.path ?? files.first.name),
             dateAdded: dateNow,
             lastUpdate: dateNow,
             status: Status.unknown,
@@ -57,83 +59,106 @@ Future importArchivesFromFile(
             sourceId: null,
           );
 
-      for (var file in files.reversed) {
-        (String, LocalExtensionType, Uint8List, String)? data =
-            itemType == ItemType.manga
-            ? await ref.watch(
-                getArchivesDataFromFileProvider(file.path!).future,
-              )
-            : null;
-        String name = _getName(file.path!);
-
-        if (init) {
-          if (itemType == ItemType.manga) {
-            manga.customCoverImage = data!.$3.getCoverImage;
+      final result = await importLocalFiles(
+        files.reversed,
+        pathOf: (file) => file.path ?? file.name,
+        importFile: (file) async {
+          final filePath = file.path;
+          if (filePath == null || filePath.isEmpty) {
+            throw StateError('No readable local path for ${file.name}');
           }
-        }
-        await mangaRepository.writeTransactionAsync(() async {
-          final mangaId = await mangaRepository.putAsync(manga);
-          final List<Chapter> chapters = [];
-          if (itemType == ItemType.novel) {
-            final book = await parseEpubFromPath(
-              epubPath: file.path!,
-              fullData: splitChapters,
-            );
+          (String, LocalExtensionType, Uint8List, String)? data =
+              itemType == ItemType.manga
+              ? await ref.read(getArchivesDataFromFileProvider(filePath).future)
+              : null;
+          String name = _getName(filePath);
 
-            if (book.cover != null) {
-              await mangaRepository.putAsync(
-                manga..customCoverImage = book.cover!.getCoverImage,
-              );
+          // Parse before opening a write transaction. A malformed EPUB must not
+          // leave a new empty title or hold the database lock while it decodes.
+          final book = itemType == ItemType.novel
+              ? await parseEpubFromPath(
+                  epubPath: filePath,
+                  fullData: splitChapters,
+                )
+              : null;
+
+          if (init) {
+            if (itemType == ItemType.manga) {
+              manga.customCoverImage = data!.$3.getCoverImage;
             }
-            final chaps = book.chapters;
+          }
+          await mangaRepository.writeTransactionAsync(() async {
+            final mangaId = await mangaRepository.putAsync(manga);
+            final List<Chapter> chapters = [];
+            if (itemType == ItemType.novel) {
+              if (book!.cover != null) {
+                await mangaRepository.putAsync(
+                  manga..customCoverImage = book.cover!.getCoverImage,
+                );
+              }
+              final chaps = book.chapters;
 
-            if (splitChapters && chaps.isNotEmpty) {
-              for (int i = 0; i < chaps.length; i++) {
-                final epubChapter = chaps[i];
+              if (splitChapters && chaps.isNotEmpty) {
+                for (int i = 0; i < chaps.length; i++) {
+                  final epubChapter = chaps[i];
+                  chapters.add(
+                    Chapter(
+                      mangaId: mangaId,
+                      name: epubChapter.name,
+                      archivePath: file.path,
+                      url: epubChapter.path,
+                      updatedAt: DateTime.now().millisecondsSinceEpoch,
+                    )..manga.value = manga,
+                  );
+                }
+              } else {
+                // Fallback: single chapter if no spine chapters found
                 chapters.add(
                   Chapter(
                     mangaId: mangaId,
-                    name: epubChapter.name,
+                    name: book.name,
                     archivePath: file.path,
-                    url: epubChapter.path,
                     updatedAt: DateTime.now().millisecondsSinceEpoch,
                   )..manga.value = manga,
                 );
               }
             } else {
-              // Fallback: single chapter if no spine chapters found
               chapters.add(
                 Chapter(
-                  mangaId: mangaId,
-                  name: book.name,
-                  archivePath: file.path,
+                  name: itemType == ItemType.manga ? data!.$1 : name,
+                  archivePath: itemType == ItemType.manga
+                      ? data!.$4
+                      : file.path,
+                  mangaId: manga.id,
                   updatedAt: DateTime.now().millisecondsSinceEpoch,
                 )..manga.value = manga,
               );
             }
-          } else {
-            chapters.add(
-              Chapter(
-                name: itemType == ItemType.manga ? data!.$1 : name,
-                archivePath: itemType == ItemType.manga ? data!.$4 : file.path,
-                mangaId: manga.id,
-                updatedAt: DateTime.now().millisecondsSinceEpoch,
-              )..manga.value = manga,
-            );
-          }
-          for (final chapter in chapters) {
-            await chapterRepository.putAsync(chapter);
-            await chapter.manga.save();
-          }
-        });
-      }
+            for (final chapter in chapters) {
+              await chapterRepository.putAsync(chapter);
+              await chapter.manga.save();
+            }
+          });
+        },
+      );
+      reportLocalImportFailures(result);
     }
-    keepAlile.close();
     return "";
-  } catch (e) {
+  } finally {
     keepAlile.close();
-    rethrow;
   }
+}
+
+/// One visible partial-success summary, with every failed file retained in
+/// the existing error-report screen instead of toasts replacing each other.
+void reportLocalImportFailures(LocalImportResult result) {
+  if (result.failures.isEmpty) return;
+  toastError(
+    'Import failed for ${result.failures.length} file(s); '
+    'imported ${result.succeeded.length}.\n'
+    '${result.failures.map((failure) => '${failure.path}: ${failure.error}').join('\n')}',
+    source: 'local_import',
+  );
 }
 
 String _getName(String path) {

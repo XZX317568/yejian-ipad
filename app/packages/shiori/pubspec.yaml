@@ -20,6 +20,10 @@ dev_dependencies:
   flutter_lints: ^6.0.0
 
 flutter:
+  assets:
+    - third_party/wenku8/LICENSE
+    - third_party/wenku8/NOTICE
+    - third_party/wenku8/GPL-3.0.txt
   fonts:
     # The interface face. One variable file covers every weight the type
     # scale uses (400 to 800). Referenced as packages/shiori/Figtree.

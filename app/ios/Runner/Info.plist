@@ -12,15 +12,15 @@
 		<true/>
 	</dict>
 	<key>NSPhotoLibraryUsageDescription</key>
-	<string>Mangayomi needs access to your photo library to save and restore backups.</string>
+	<string>页间需要访问照片图库，以便保存和恢复备份。</string>
 	<key>NSDocumentUsageDescription</key>
-	<string>Mangayomi needs access to your files to create and restore backups.</string>
+	<string>页间需要访问文件，以便创建和恢复备份。</string>
 	<key>CADisableMinimumFrameDurationOnPhone</key>
 	<true/>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>Mangayomi</string>
+	<string>页间</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -28,7 +28,7 @@
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>mangayomi</string>
+	<string>Yejian</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
@@ -47,7 +47,7 @@
 		<string>fetch</string>
 	</array>
 	<key>NSFaceIDUsageDescription</key>
-	<string>Mangayomi needs to authenticate using Face ID.</string>
+	<string>页间需要使用面容 ID 验证身份。</string>
 	<key>UILaunchStoryboardName</key>
 	<string>LaunchScreen</string>
 	<key>UIApplicationSceneManifest</key>
@@ -100,9 +100,19 @@
     <array>
         <dict>
             <key>CFBundleURLName</key>
-            <string>mangayomi</string>
+            <string>Yejian</string>
             <key>CFBundleURLSchemes</key>
             <array>
+                <string>yejian</string>
+            </array>
+        </dict>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>Mangayomi OAuth compatibility</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <!-- Temporary: tracker and sync OAuth still request the
+                     upstream scheme. -->
                 <string>mangayomi</string>
             </array>
         </dict>

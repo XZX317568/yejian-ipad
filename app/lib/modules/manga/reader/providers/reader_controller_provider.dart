@@ -1,4 +1,5 @@
 import 'package:material_ui/material_ui.dart';
+import 'package:mangayomi/utils/error_toast.dart';
 import 'package:flutter_riverpod/misc.dart';
 import 'package:mangayomi/models/chapter.dart';
 import 'package:mangayomi/providers/reader_state_provider.dart';
@@ -107,7 +108,10 @@ class ReaderController extends _$ReaderController
 
   int? _cachedPageLength;
   int getCachedPageLength([List fallback = const []]) {
-    return _cachedPageLength ??= getPageLength(fallback);
+    if ((_cachedPageLength ?? 0) <= 0) {
+      _cachedPageLength = getPageLength(fallback);
+    }
+    return _cachedPageLength!;
   }
 
   bool? _cachedIsContinuousLike;
@@ -117,15 +121,15 @@ class ReaderController extends _$ReaderController
 
   int getPageIndex() {
     if (incognitoMode) return 0;
+    // The chapter's page travels with sync; the settings list is a legacy,
+    // device-local fallback. Completion and current position are independent.
+    final savedPage = int.tryParse(chapter.lastPageRead ?? '');
+    if (savedPage != null && savedPage > 0) return savedPage - 1;
     final chapterPageIndexList = getIsarSetting().chapterPageIndexList ?? [];
     final index = chapterPageIndexList.where(
       (element) => element.chapterId == chapter.id,
     );
-    return chapter.isRead!
-        ? 0
-        : index.isNotEmpty
-        ? index.first.index!
-        : 0;
+    return index.isNotEmpty ? index.first.index! : 0;
   }
 
   int getPageLength(List pages) {
@@ -138,98 +142,105 @@ class ReaderController extends _$ReaderController
     bool save, [
     List pageUrlsFallback = const [],
   ]) {
-    if (chapter.isRead! || incognitoMode) return;
+    if (incognitoMode) return;
     final pageLength = getCachedPageLength(pageUrlsFallback);
-    if (pageLength == 0 || (!save && newIndex == _lastSavedIndex)) return;
+    if (pageLength == 0 ||
+        newIndex < 0 ||
+        newIndex >= pageLength ||
+        (!save && newIndex == _lastSavedIndex))
+      return;
     _lastSavedIndex = newIndex;
     final isContinuousLike = getCachedIsContinuousLike();
-    final isRead = isContinuousLike
+    final reachedEnd = isContinuousLike
         ? (newIndex + 2) >= pageLength - 1
         : (newIndex + 2) >= pageLength;
-    if (isRead || save) {
-      void executeSave() {
-        if (chapter.isRead! || incognitoMode) return;
-        List<ChapterPageIndex>? chapterPageIndexs = [];
-        for (var chapterPageIndex
-            in getIsarSetting().chapterPageIndexList ?? []) {
-          if (chapterPageIndex.chapterId != chapter.id &&
-              (chapterPageIndex.index ?? 0) > 0) {
-            chapterPageIndexs.add(chapterPageIndex);
-          }
-        }
-        if (!isRead && newIndex > 0) {
-          chapterPageIndexs.add(
-            ChapterPageIndex()
-              ..chapterId = chapter.id
-              ..index = newIndex,
+    final newlyCompleted = reachedEnd && !(chapter.isRead ?? false);
+    void executeSave() {
+      if (incognitoMode) return;
+      if (!ref.mounted) return;
+      final autoReadDuplChap = ref.read(autoReadDuplicateChaptersStateProvider);
+      final now = DateTime.now().millisecondsSinceEpoch;
+      final List<Chapter> siblings = [];
+      if (newlyCompleted && autoReadDuplChap) {
+        final manga = chapter.manga.value;
+        if (manga != null) {
+          final chapterNumber = ChapterRecognition().parseChapterNumber(
+            manga.name!,
+            chapter.name!,
           );
-        }
-        if (!ref.mounted) return;
-        final autoReadDuplChap = ref.read(
-          autoReadDuplicateChaptersStateProvider,
-        );
-        final now = DateTime.now().millisecondsSinceEpoch;
-        final List<Chapter> siblings = [];
-        if (isRead && autoReadDuplChap) {
-          final manga = chapter.manga.value;
-          if (manga != null) {
-            final chapterNumber = ChapterRecognition().parseChapterNumber(
+          for (final c in manga.chapters) {
+            if (c.id == chapter.id || (c.isRead ?? false)) continue;
+            final n = ChapterRecognition().parseChapterNumber(
               manga.name!,
-              chapter.name!,
+              c.name!,
             );
-            for (final c in manga.chapters) {
-              if (c.id == chapter.id || (c.isRead ?? false)) continue;
-              final n = ChapterRecognition().parseChapterNumber(
-                manga.name!,
-                c.name!,
-              );
-              if (n == chapterNumber) {
-                c.isRead = true;
-                c.lastPageRead = '1';
-                c.updatedAt = now;
-                siblings.add(c);
-              }
+            if (n == chapterNumber) {
+              c.isRead = true;
+              c.lastPageRead = '1';
+              c.updatedAt = now;
+              siblings.add(c);
             }
           }
         }
-        final chap = chapter;
-        chapterRepository.writeTransaction(() {
-          settingsRepository.putSync(
-            getIsarSetting()
-              ..chapterPageIndexList = chapterPageIndexs
-              ..updatedAt = now,
-          );
-          chap.isRead = isRead;
-          chap.lastPageRead = isRead ? '1' : (newIndex + 1).toString();
-          chap.updatedAt = now;
-          chapterRepository.putSync(chap);
-          if (siblings.isNotEmpty) chapterRepository.putAllSync(siblings);
-        });
-        onSettingsMutated();
-        if (isRead) {
-          chapter.updateTrackChapterRead(ref);
-          if (ref.read(deleteDownloadAfterReadingStateProvider)) {
-            // Not now: the reader still shows this chapter, and may still
-            // show the earlier ones it keeps loaded.
-            final target = chapterToDeleteAfterReading(
-              getManga().getChapterListForReading(),
-              chapter,
-              slot: ref.read(deleteAfterReadingSlotStateProvider),
-              deleteBookmarked: ref.read(
-                deleteBookmarkedAfterReadingStateProvider,
-              ),
+      }
+      final chap = chapter;
+      if (newlyCompleted) chap.isRead = true;
+      chapterRepository
+          .writeTransaction(() {
+            final settings = getIsarSetting();
+            final positions = [
+              for (final position
+                  in settings.chapterPageIndexList ?? <ChapterPageIndex>[])
+                if (position.chapterId != chap.id && (position.index ?? 0) > 0)
+                  position,
+              if (newIndex > 0)
+                ChapterPageIndex(chapterId: chap.id, index: newIndex),
+            ];
+            settingsRepository.putSync(
+              settings..chapterPageIndexList = positions,
             );
-            if (target != null) PendingDownloadDeletions.add(target);
-          }
+            final persisted = chapterRepository.findByIdSync(chap.id!);
+            if (persisted == null) return;
+            persisted.isRead = (persisted.isRead ?? false) || reachedEnd;
+            persisted.lastPageRead = (newIndex + 1).toString();
+            persisted.updatedAt = now;
+            chapterRepository.putSync(persisted);
+            chap.isRead = persisted.isRead;
+            chap.lastPageRead = persisted.lastPageRead;
+            chap.updatedAt = now;
+            for (final sibling in siblings) {
+              final stored = chapterRepository.findByIdSync(sibling.id!);
+              if (stored == null) continue;
+              stored.isRead = true;
+              stored.updatedAt = now;
+              chapterRepository.putSync(stored);
+            }
+          })
+          .catchError((Object error, StackTrace stack) {
+            _lastSavedIndex = null;
+            toastError(error, stack: stack, source: 'reading_position');
+          });
+      onSettingsMutated();
+      if (newlyCompleted) {
+        chapter.updateTrackChapterRead(ref);
+        if (ref.read(deleteDownloadAfterReadingStateProvider)) {
+          // Not now: the reader still shows this chapter, and may still
+          // show the earlier ones it keeps loaded.
+          final target = chapterToDeleteAfterReading(
+            getManga().getChapterListForReading(),
+            chapter,
+            slot: ref.read(deleteAfterReadingSlotStateProvider),
+            deleteBookmarked: ref.read(
+              deleteBookmarkedAfterReadingStateProvider,
+            ),
+          );
+          if (target != null) PendingDownloadDeletions.add(target);
         }
       }
-
-      if (save) {
-        executeSave();
-      } else {
-        Future.microtask(executeSave);
-      }
-      return;
     }
+
+    // Queue each visible page immediately. A forced close may never deliver
+    // pause/dispose, and already-read chapters still need a resume position.
+    executeSave();
   }
 }

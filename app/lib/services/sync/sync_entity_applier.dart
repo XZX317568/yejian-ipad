@@ -26,7 +26,30 @@ import 'package:mangayomi/repositories/update_repository.dart';
 import 'package:mangayomi/services/sync/sync_wire_types.dart';
 
 class SyncEntityApplier {
-  const SyncEntityApplier();
+  SyncEntityApplier();
+
+  final _deferred = <String, Map<int, Map<String, dynamic>>>{};
+
+  void beginSync() => _deferred.clear();
+
+  void requireComplete() {
+    final pending = _deferred.values.fold(0, (int n, rows) => n + rows.length);
+    if (pending != 0) {
+      throw StateError(
+        '$pending sync item(s) still have a missing parent. Sync again to retry.',
+      );
+    }
+  }
+
+  void _defer(String entity, Map<String, dynamic> row) {
+    final rows = _deferred[entity] ??= {};
+    final id = row['clientId'] as int;
+    final previous = rows[id];
+    if (previous == null ||
+        (row['updatedAt'] as int) > (previous['updatedAt'] as int)) {
+      rows[id] = row;
+    }
+  }
 
   // Isar requires every write - even a single put() - to run inside an
   // explicit transaction; it does not open one on its own the way some other
@@ -63,17 +86,20 @@ class SyncEntityApplier {
       for (final row in (response['manga'] as List? ?? [])) {
         _applyManga(row as Map<String, dynamic>);
       }
-      for (final row in (response['chapters'] as List? ?? [])) {
-        _applyChapter(row as Map<String, dynamic>);
-      }
-      for (final row in (response['tracks'] as List? ?? [])) {
-        _applyTrack(row as Map<String, dynamic>);
-      }
-      for (final row in (response['histories'] as List? ?? [])) {
-        _applyHistory(row as Map<String, dynamic>);
-      }
-      for (final row in (response['updates'] as List? ?? [])) {
-        _applyUpdate(row as Map<String, dynamic>);
+      final applyChildren = {
+        'chapters': _applyChapter,
+        'tracks': _applyTrack,
+        'histories': _applyHistory,
+        'updates': _applyUpdate,
+      };
+      for (final entry in applyChildren.entries) {
+        final pending = _deferred.remove(entry.key)?.values.toList() ?? [];
+        for (final row in [
+          ...pending,
+          ...(response[entry.key] as List? ?? []),
+        ]) {
+          entry.value(row as Map<String, dynamic>);
+        }
       }
       if (response['settings'] != null) {
         settingsChanged = _applySettings(
@@ -193,7 +219,10 @@ class SyncEntityApplier {
     final mangaLocal = mangaRepository.getByClientId(
       wire['mangaClientId'] as int,
     );
-    if (mangaLocal == null) return; // orphaned reference, nothing to attach to
+    if (mangaLocal == null) {
+      _defer('chapters', wire);
+      return;
+    }
 
     var existing = chapterRepository.getByClientId(clientId);
     existing ??= chapterRepository.findByUrlAndMangaId(
@@ -217,9 +246,11 @@ class SyncEntityApplier {
       ..description = wire['description'] as String?
       ..downloadSize = (wire['downloadSize'] as int?)?.toString()
       ..duration = (wire['duration'] as int?)?.toString()
-      ..isRead = wire['isRead'] as bool?
-      ..isBookmarked = wire['isBookmarked'] as bool?
-      ..lastPageRead = wire['lastPageRead'] as String?
+      ..isRead = wire['isRead'] as bool? ?? chapter.isRead ?? false
+      ..isBookmarked =
+          wire['isBookmarked'] as bool? ?? chapter.isBookmarked ?? false
+      ..lastPageRead =
+          wire['lastPageRead'] as String? ?? chapter.lastPageRead ?? ''
       ..manga.value = mangaLocal
       ..updatedAt = incoming;
     chapterRepository.putSync(chapter);
@@ -232,7 +263,10 @@ class SyncEntityApplier {
     final mangaLocal = mangaRepository.getByClientId(
       wire['mangaClientId'] as int,
     );
-    if (mangaLocal == null) return;
+    if (mangaLocal == null) {
+      _defer('tracks', wire);
+      return;
+    }
 
     var existing = trackRepository.getByClientId(clientId);
     existing ??= trackRepository.findBySyncIdAndMangaId(
@@ -272,7 +306,10 @@ class SyncEntityApplier {
     final chapterLocal = chapterRepository.getByClientId(
       wire['chapterClientId'] as int,
     );
-    if (mangaLocal == null || chapterLocal == null) return;
+    if (mangaLocal == null || chapterLocal == null) {
+      _defer('histories', wire);
+      return;
+    }
 
     var existing = historyRepository.getByClientId(clientId);
     existing ??= historyRepository.findByChapterId(chapterLocal.id);
@@ -305,7 +342,10 @@ class SyncEntityApplier {
     final mangaLocal = mangaRepository.getByClientId(
       wire['mangaClientId'] as int,
     );
-    if (mangaLocal == null) return;
+    if (mangaLocal == null) {
+      _defer('updates', wire);
+      return;
+    }
 
     var existing = updateRepository.getByClientId(clientId);
     existing ??= updateRepository.findByMangaIdAndChapterName(
@@ -359,6 +399,18 @@ class SyncEntityApplier {
   // row locally too, straight through the collection - no need to record
   // this back into ChangedPart, it's not this device's outgoing change.
   void _applyTombstones(Map<String, dynamic> tombstones) {
+    for (final entity in _deferred.keys.toList()) {
+      final deletedIds = (tombstones[entity] as List? ?? []).toSet();
+      final deletedManga = (tombstones['manga'] as List? ?? []).toSet();
+      final deletedChapters = (tombstones['chapters'] as List? ?? []).toSet();
+      _deferred[entity]!.removeWhere(
+        (id, row) =>
+            deletedIds.contains(id) ||
+            deletedManga.contains(row['mangaClientId']) ||
+            (entity == 'histories' &&
+                deletedChapters.contains(row['chapterClientId'])),
+      );
+    }
     for (final clientId in (tombstones['categories'] as List? ?? [])) {
       final row = categoryRepository.getByClientId(clientId as int);
       if (row != null) categoryRepository.deleteSync(row.id!);

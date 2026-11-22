@@ -3562,12 +3562,14 @@ const _SettingsanimeDisplayTypeEnumValueMap = {
   'comfortableGrid': 1,
   'coverOnlyGrid': 2,
   'list': 3,
+  'shelf': 4,
 };
 const _SettingsanimeDisplayTypeValueEnumMap = {
   0: DisplayType.compactGrid,
   1: DisplayType.comfortableGrid,
   2: DisplayType.coverOnlyGrid,
   3: DisplayType.list,
+  4: DisplayType.shelf,
 };
 const _SettingsaudioChannelsEnumValueMap = {
   'auto': 0,
@@ -3664,36 +3666,42 @@ const _SettingsdisplayTypeEnumValueMap = {
   'comfortableGrid': 1,
   'coverOnlyGrid': 2,
   'list': 3,
+  'shelf': 4,
 };
 const _SettingsdisplayTypeValueEnumMap = {
   0: DisplayType.compactGrid,
   1: DisplayType.comfortableGrid,
   2: DisplayType.coverOnlyGrid,
   3: DisplayType.list,
+  4: DisplayType.shelf,
 };
 const _SettingsmangaHomeDisplayTypeEnumValueMap = {
   'compactGrid': 0,
   'comfortableGrid': 1,
   'coverOnlyGrid': 2,
   'list': 3,
+  'shelf': 4,
 };
 const _SettingsmangaHomeDisplayTypeValueEnumMap = {
   0: DisplayType.compactGrid,
   1: DisplayType.comfortableGrid,
   2: DisplayType.coverOnlyGrid,
   3: DisplayType.list,
+  4: DisplayType.shelf,
 };
 const _SettingsnovelDisplayTypeEnumValueMap = {
   'compactGrid': 0,
   'comfortableGrid': 1,
   'coverOnlyGrid': 2,
   'list': 3,
+  'shelf': 4,
 };
 const _SettingsnovelDisplayTypeValueEnumMap = {
   0: DisplayType.compactGrid,
   1: DisplayType.comfortableGrid,
   2: DisplayType.coverOnlyGrid,
   3: DisplayType.list,
+  4: DisplayType.shelf,
 };
 const _SettingsnovelTextAlignEnumValueMap = {
   'left': 0,

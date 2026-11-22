@@ -3,6 +3,7 @@ import 'dart:typed_data';
 import 'dart:ui';
 
 import 'package:mangayomi/models/chapter.dart';
+import 'package:mangayomi/services/archive_reader/archive_page.dart';
 import 'package:mangayomi/services/reader/decoded_image_budget.dart';
 import 'package:mangayomi/models/page.dart';
 import 'package:mangayomi/services/get_chapter_pages.dart';
@@ -13,6 +14,7 @@ class UChapDataPreload {
   PageUrl? pageUrl;
   bool? isLocale;
   Uint8List? archiveImage;
+  ArchivePage? archivePage;
   int? index;
   GetChapterPagesModel? chapterUrlModel;
   int? pageIndex;
@@ -86,6 +88,7 @@ class UChapDataPreload {
     this.isLastChapter = false,
     this.srcRect,
     this.localImagePath,
+    this.archivePage,
   });
 
   /// Identifies this page among its neighbours in a list or page view, for

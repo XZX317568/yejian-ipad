@@ -182,6 +182,10 @@ class _LibraryScreenState extends ConsumerState<LibraryScreen>
   /// The settings of the build in progress, for the header's filter chips.
   late Settings _settings;
 
+  /// The layout of the build in progress, so the header does not put the
+  /// "Continue" carousel above the full shelf that already is the library.
+  late DisplayType _displayType;
+
   Widget _buildWithSettings(Settings settings) {
     _settings = settings;
     // On Android TV the anime library shows the dedicated rows-based home
@@ -247,6 +251,7 @@ class _LibraryScreenState extends ConsumerState<LibraryScreen>
     );
     final language = watchWithSettings(libraryLanguageStateProvider.call);
     final displayType = watchWithSettings(libraryDisplayTypeStateProvider.call);
+    _displayType = displayType;
     final downloadFilterType = watchWithSettingsAndManga(
       mangaFilterDownloadedStateProvider.call,
     );
@@ -684,7 +689,9 @@ class _LibraryScreenState extends ConsumerState<LibraryScreen>
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
                   NavGroupSwitcher(route: route),
-                  ContinueShelf(itemType: widget.itemType),
+                  if (!(_displayType == DisplayType.shelf &&
+                      widget.itemType == ItemType.manga))
+                    ContinueShelf(itemType: widget.itemType),
                   ActiveFilterChips(
                     itemType: widget.itemType,
                     settings: _settings,

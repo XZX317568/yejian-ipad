@@ -233,9 +233,16 @@ class RouterNotifier extends ChangeNotifier {
       name: "mangaHomeGenre",
       builder: (id) => MangaHomeScreen(source: id.$1!, genre: id.$2),
     ),
-    _genericRoute<int>(
+    GoRoute(
       path: "/manga-reader/detail",
-      builder: (id) => MangaReaderDetail(mangaId: id),
+      pageBuilder: (context, state) => ShioriPaperPage(
+        key: state.pageKey,
+        child: routeChild<int>(
+          route: '/manga-reader/detail',
+          builder: (id) => MangaReaderDetail(mangaId: id),
+          extra: state.extra,
+        ),
+      ),
     ),
     _genericRoute<int>(
       name: "mangaReaderView",
