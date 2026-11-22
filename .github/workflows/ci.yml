@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: "0"
+  RUSTUP_TOOLCHAIN: "1.97.0"
+
+jobs:
+  test-windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: 准备 Rust 工具链
+        run: rustup toolchain install "$env:RUSTUP_TOOLCHAIN" --profile minimal
+
+      - name: 缓存 Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-reader/target
+          key: ${{ runner.os }}-cargo-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('rust-reader/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ env.RUSTUP_TOOLCHAIN }}-
+
+      - name: 测试
+        working-directory: rust-reader
+        run: cargo test --locked --workspace -j 2 -- --test-threads=1
+
+      - name: 检查发布构建
+        working-directory: rust-reader
+        run: cargo check --release --locked -p yejian --bins
+
+  check-ios:
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      IPHONEOS_DEPLOYMENT_TARGET: "15.0"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: 准备 iOS 工具链
+        run: |
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --target aarch64-apple-ios
+          xcodebuild -version
+
+      - name: 缓存 Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-reader/target
+          key: ${{ runner.os }}-cargo-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('rust-reader/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ env.RUSTUP_TOOLCHAIN }}-
+
+      - name: 检查 iOS 构建
+        working-directory: rust-reader
+        run: cargo check --release --locked -p yejian --target aarch64-apple-ios
+
+      - name: 检查 Swift 桥接
+        run: |
+          xcrun --sdk iphonesimulator swiftc -typecheck \
+            -target arm64-apple-ios16.0-simulator \
+            rust-reader/platform/ios/Yejian/*.swift
+
+  check-android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: 准备 Android 工具链
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --target aarch64-linux-android
+
+      - name: 缓存 Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-reader/target
+          key: ${{ runner.os }}-cargo-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('rust-reader/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ env.RUSTUP_TOOLCHAIN }}-
+
+      - name: 检查 Android 构建
+        working-directory: rust-reader
+        run: cargo check --release --locked -p yejian-platform --target aarch64-linux-android
+
+      - name: 编译 Java Activity
+        run: |
+          JAR="$(ls -d "$ANDROID_HOME"/platforms/android-*/android.jar | sort -V | tail -1)"
+          echo "android.jar: $JAR"
+          javac -cp "$JAR" -d /tmp/yejian-javac \
+            rust-reader/platform/android/app/src/main/java/app/yejian/reader/*.java
