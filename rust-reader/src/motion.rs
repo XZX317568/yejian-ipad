@@ -7,7 +7,8 @@ use crate::params::params;
 pub const ENTRANCE: f64 = 0.520;
 pub const SELECT: f64 = 0.420;
 pub const OPEN: f64 = 0.720;
-pub const CLOSE: f64 = 0.580;
+// The detail -> shelf return duration moved into params (close.close_travel_ms
+// -> close_travel_seconds); OPEN stays a constant for now.
 
 /// Standard ease-out deceleration for UI transitions.
 pub fn ease_out(t: f32) -> f32 {
@@ -94,6 +95,39 @@ pub fn flip_ease(t: f32) -> f32 {
 pub fn flip_entry_ease(t: f32) -> f32 {
     let f = params().flip.clone();
     cubic(t, f.entry_ease_x1, f.entry_ease_y1, f.entry_ease_x2, f.entry_ease_y2)
+}
+
+/// Reader -> target peel-exit coverage: the entry easing run backwards,
+/// `close_p(raw) = 1 - exit_ease(raw)` — raw=0 covers the whole plane,
+/// raw=1 leaves nothing. (`close.exit_ease_*` defaults to the entry
+/// cubic, so the closing edge retraces the opening one.)
+pub fn close_p(raw: f32) -> f32 {
+    let c = params().close.clone();
+    1. - cubic(raw, c.exit_ease_x1, c.exit_ease_y1, c.exit_ease_x2, c.exit_ease_y2)
+}
+
+/// Band direction for the exit sweep: `close.peel_dir` non-zero forces a
+/// side, 0 mirrors the reader entry (right-to-left for RTL).
+pub fn close_dir(rtl: bool) -> f32 {
+    let c = params().close.clone();
+    if c.peel_dir.abs() > 0.5 {
+        c.peel_dir.signum()
+    } else if rtl {
+        -1.
+    } else {
+        1.
+    }
+}
+
+/// Reader -> target peel-exit duration in seconds.
+pub fn close_seconds() -> f64 {
+    params().close.exit_ms.max(0.) as f64 / 1000.
+}
+
+/// Detail -> shelf cover-return duration in seconds (`close.close_travel_ms`,
+/// the former `CLOSE` constant lifted into params for variant tuning).
+pub fn close_travel_seconds() -> f64 {
+    params().close.close_travel_ms.max(0.) as f64 / 1000.
 }
 
 /// Page-flip depth field over a page for column `u` in `0..=1` (0 = binding
@@ -717,6 +751,27 @@ mod tests {
         // eased midpoint).
         let mid = cubic(0.5, 0.18, 0.72, 0.18, 1.);
         assert!((mid - 0.9372).abs() < 0.01, "easing midpoint {mid}");
+    }
+
+    #[test]
+    fn close_p_endpoints_and_monotonic() {
+        assert_eq!(close_p(0.), 1.);
+        assert_eq!(close_p(1.), 0.);
+        let mut prev = f32::INFINITY;
+        for i in 0..=100 {
+            let p = close_p(i as f32 / 100.);
+            assert!(p <= prev + 1e-6, "close_p increased at step {i}: {prev} -> {p}");
+            prev = p;
+        }
+        // The exit replays the entry easing backwards: p is the
+        // still-covered fraction the band machinery clips to.
+        assert_eq!(close_p(0.5), 1. - flip_entry_ease(0.5));
+    }
+
+    #[test]
+    fn close_dir_mirrors_entry_and_honours_peel_dir() {
+        assert_eq!(close_dir(false), 1.);
+        assert_eq!(close_dir(true), -1.);
     }
 
     #[test]

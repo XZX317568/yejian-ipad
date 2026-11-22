@@ -22,6 +22,16 @@ pub fn motion_paper_depth(t: f32, u: f32, v: f32) -> f32 {
     motion::paper_depth(t, u, v)
 }
 
+/// 供 acceptance 定位合上中点帧（p≈0.5）使用。
+pub fn motion_close_p(raw: f32) -> f32 {
+    motion::close_p(raw)
+}
+
+/// 合上（reader→目标屏）时长（秒），供 acceptance 按帧推进 p。
+pub fn motion_close_seconds() -> f64 {
+    motion::close_seconds()
+}
+
 use std::path::PathBuf;
 
 pub fn configure_fonts(ctx: &egui::Context) {

@@ -83,5 +83,16 @@
     "entry_ease_y1": 0.72,
     "entry_ease_x2": 0.18,
     "entry_ease_y2": 1
+  },
+  "close": {
+    "exit_ms": 320,
+    "exit_ease_x1": 0.18,
+    "exit_ease_y1": 0.72,
+    "exit_ease_x2": 0.18,
+    "exit_ease_y2": 1,
+    "peel_dir": 0,
+    "under_alpha_start": 0.5,
+    "chrome_ms": 160,
+    "close_travel_ms": 580
   }
 }

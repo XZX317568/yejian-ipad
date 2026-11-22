@@ -280,6 +280,11 @@ pub struct ReaderApp {
     /// on the first reader frame with a decoded page), then the start
     /// timestamp, cleared when the entry finishes.
     reader_entry: Option<f64>,
+    /// Reader -> target peel-exit clock: (start, outgoing book id). Armed
+    /// by back() with `INFINITY` (starts on the first exit frame), run to
+    /// raw=1 in `close.exit_ms`, then cleared. While set, the target
+    /// screen paints underneath shrinking spread bands.
+    reader_exit: Option<(f64, String)>,
     zoom_anim: motion::ZoomAnim,
     nav_pill: Option<motion::TimedTween>,
     last_nav_tab: Tab,
@@ -398,6 +403,7 @@ impl ReaderApp {
             page_slide: motion::PageSlide::default(),
             slide_turn_gap: 0.,
             reader_entry: None,
+            reader_exit: None,
             zoom_anim: motion::ZoomAnim::default(),
             nav_pill: None,
             last_nav_tab: Tab::Library,
@@ -1719,6 +1725,9 @@ impl ReaderApp {
         } else {
             self.reader_entry = None;
         }
+        // Re-entering the reader (e.g. from a button exposed mid-exit)
+        // cancels a closing book outright.
+        self.reader_exit = None;
         self.page = book.current_page.min(book.page_count.saturating_sub(1));
         self.screen = Screen::Reader(book.id.clone());
         self.vertical_reader.reset(self.page, book.page_fraction);
@@ -1821,6 +1830,7 @@ impl ReaderApp {
         self.motion.active()
             || entrance < 1.
             || self.flight.is_some()
+            || self.reader_exit.is_some()
             || reader_motion
             || (matches!(self.screen, Screen::Reader(_))
                 && self.vertical
@@ -1841,7 +1851,7 @@ impl ReaderApp {
     }
     fn back(&mut self, now: f64, area: Rect) {
         match self.screen.clone() {
-            Screen::Reader(_) => {
+            Screen::Reader(id) => {
                 self.flush_position();
                 self.vertical_reader.stop();
                 self.vertical_prev = None;
@@ -1855,6 +1865,20 @@ impl ReaderApp {
                 self.screen = self.reader_return.clone();
                 self.reader_options = false;
                 self.pending_reader_tap = None;
+                self.reader_entry = None;
+                // The slide/zoom tweens are left running: the overlay reads
+                // them live so a back mid-turn hands off with no snap.
+                // R2: a flight still playing under the reader would keep
+                // drawing its cover after the exit bands open — drop it.
+                self.flight = None;
+                // R5: vertical/reduced cut straight to the target.
+                // 裁决：screen 立即切到 reader_return，exit 是纯叠加层（
+                // screen_name 报目标名）——两段连打与既有断言都要求这样。
+                self.reader_exit = if self.reduced || self.vertical {
+                    None
+                } else {
+                    Some((f64::INFINITY, id))
+                };
                 self.send(Command::Refresh);
             }
             Screen::Detail(id) => {
@@ -1878,7 +1902,7 @@ impl ReaderApp {
                             .filter(|f| !f.returning && f.book_id == id)
                         {
                             let progress = ((now - out.started) / motion::OPEN).clamp(0., 1.);
-                            (now - (1. - progress) * motion::CLOSE, out.from)
+                            (now - (1. - progress) * motion::close_travel_seconds(), out.from)
                         } else {
                             (now, volume.cover)
                         };
@@ -2393,7 +2417,7 @@ impl ReaderApp {
         } else {
             let transition = self.flight.as_ref().map(|flight| {
                 let duration = if flight.returning {
-                    motion::CLOSE
+                    motion::close_travel_seconds()
                 } else {
                     motion::OPEN
                 };
@@ -2526,7 +2550,7 @@ impl ReaderApp {
             }
             if let Some(flight) = &self.flight {
                 let duration = if flight.returning {
-                    motion::CLOSE
+                    motion::close_travel_seconds()
                 } else {
                     motion::OPEN
                 };
@@ -2567,6 +2591,10 @@ impl ReaderApp {
                     self.flight = None;
                 }
             }
+            // The outgoing reader paints last: at p=1 its bands cover the
+            // whole screen, so the close-out starts from the exact static
+            // reader frame and peels away to reveal what is underneath.
+            self.reader_exit_overlay(ui, full, now);
         }
         if let Some((text, at)) = &self.notice {
             let age = (now - *at) as f32;
@@ -3588,7 +3616,7 @@ fn library_thumbnails(
         let now = ui.ctx().input(|i| i.time);
         let reveal = self.flight.as_ref().map(|flight| {
             let duration = if flight.returning {
-                motion::CLOSE
+                motion::close_travel_seconds()
             } else {
                 motion::OPEN
             };
@@ -3603,6 +3631,9 @@ fn library_thumbnails(
         let detail_alpha = reveal
             .map(|reveal| motion::smooth(((reveal - 0.5) / 0.5).max(0.)))
             .unwrap_or(1.);
+        // While the reader peels away over this page, the text column
+        // waits under the bands and fades in past `under_alpha_start`.
+        let exit_alpha = self.exit_under_alpha(now);
         // 摊开 (R2 分工): the slanted staircase clip owns the cover
         // geometry — soft shadow, hairline border, and the cover art itself
         // are the `incoming` plane (archive_motion.dart incoming: slant clip
@@ -3669,6 +3700,9 @@ fn library_thumbnails(
                 ScrollArea::vertical()
                     .id_salt(("detail-body", id))
                     .show(ui, |ui| {
+                        if exit_alpha < 0.999 {
+                            ui.set_opacity(exit_alpha);
+                        }
                         ui.add(
                             Label::new(
                                 RichText::new(title)
@@ -3695,6 +3729,9 @@ fn library_thumbnails(
             ScrollArea::vertical()
                 .id_salt(("detail-body", id))
                 .show(ui, |ui| {
+                    if exit_alpha < 0.999 {
+                        ui.set_opacity(exit_alpha);
+                    }
                     ui.vertical_centered(|ui| {
                         let title_size = if area.width() >= 700. { 30. } else { 24. };
                         ui.add(
@@ -3824,6 +3861,160 @@ fn library_thumbnails(
         } else {
             self.next_page(id, if self.rtl { -step } else { step }, now, viewport_w);
         }
+    }
+    /// Reader -> target peel-exit overlay. The screen field is already the
+    /// return target (painted by the normal branch above); this repaints
+    /// the outgoing reader plane inside spread bands shrinking
+    /// `close_p` 1 -> 0, so the book looks closed rather than cut. The
+    /// `INFINITY` sentinel discharges on the first exit frame, exactly
+    /// like the entry clock.
+    fn reader_exit_overlay(&mut self, ui: &mut Ui, area: Rect, now: f64) {
+        let Some((armed, id)) = self.reader_exit.clone() else {
+            return;
+        };
+        let close = crate::params::params().close.clone();
+        let started = if armed.is_infinite() {
+            self.reader_exit = Some((now, id.clone()));
+            now
+        } else {
+            armed
+        };
+        let raw = ((now - started) / motion::close_seconds().max(0.001)).clamp(0., 1.) as f32;
+        let p = motion::close_p(raw);
+        if p <= 0.001 {
+            self.reader_exit = None;
+            return;
+        }
+        let Some(book) = self.reader_book(&id) else {
+            self.reader_exit = None;
+            return;
+        };
+        let page_viewport = area.shrink2(vec2(8., 0.));
+        let page_fit = area.shrink2(vec2(8., 64.));
+        let step: i32 = if self.spread && !self.vertical && area.width() > 700. {
+            if self.spread_offset && self.page == 0 { 1 } else { 2 }
+        } else { 1 };
+        let (base, partner) =
+            if step == 2 { spread_pair(self.page, self.spread_offset) } else { (self.page, None) };
+        let pair = step == 2;
+        let first_on_right = pair && self.rtl;
+        let available = if pair {
+            Rect::from_min_size(
+                page_fit.min + vec2(if first_on_right { page_fit.width() / 2. } else { 0. }, 0.),
+                vec2(page_fit.width() / 2., page_fit.height()),
+            )
+        } else { page_fit };
+        let (crop, pan, zoom) = (self.crop, self.pan, self.zoom);
+        let fit_single = self.fit_width && step == 1;
+        // Same slide state reader_ui paints with — live so a mid-turn back
+        // keeps continuity; tick only retires finished tweens.
+        let slide_x = if zoom > 1. { 0. } else { self.page_slide.current_offset(now) };
+        self.page_slide.tick(now);
+        let outgoing = (step == 1).then(|| self.page_slide.outgoing(now)).flatten();
+        let mut queue: Vec<(usize, Rect, bool)> = Vec::new();
+        for (page, offset_x, fit_w) in [
+            (base, slide_x, fit_single),
+            (partner.unwrap_or(usize::MAX),
+             slide_x + if first_on_right { -available.width() } else { available.width() }, false),
+            (outgoing.map(|(p, _)| p).unwrap_or(usize::MAX), slide_x - self.slide_turn_gap, fit_single),
+        ] {
+            if page > book.page_count.saturating_sub(1) { continue; }
+            if let Some(tex) = self.pages.get(&(id.clone(), page)) {
+                let size = tex.shown_size(crop);
+                let scale = if fit_w {
+                    available.width() / size.x
+                } else {
+                    (available.width() / size.x).min(available.height() / size.y)
+                };
+                let target =
+                    Rect::from_center_size(available.center() + vec2(offset_x, 0.) + pan, size * scale * zoom);
+                queue.push((page, target, (target.center().x - available.center().x) > 0.));
+            }
+        }
+        if queue.is_empty() {
+            if let Some(tex) = self.pages.get(&(id.clone(), self.page)) {
+                let size = tex.shown_size(crop);
+                let scale = (available.width() / size.x).min(available.height() / size.y);
+                queue.push((self.page,
+                            Rect::from_center_size(available.center() + pan, size * scale * zoom),
+                            false));
+            }
+        }
+        // Chrome leads out on its own fast fade while the bands close.
+        let chrome_t = self.controls_anim.map(|t| t.value(now))
+            .unwrap_or(if self.controls { 1. } else { 0. })
+            * (1. - ((now - started) / (close.chrome_ms as f64 / 1000.).max(0.001)).clamp(0., 1.) as f32);
+        let dir = motion::close_dir(self.rtl);
+        let (dx, dy) = motion::spread_offset(p);
+        let shift = vec2(dx * dir, dy);
+        // The peel ridge rides the retreating edge (1-p) and never drops
+        // below the live drag/turn phase, mirroring the entry's max().
+        let phase = (1. - p).max((slide_x.abs() / page_viewport.width().max(1.)).clamp(0., 1.));
+        let title = self.reading_title(&book);
+        let has_chapter = self.chapter(&id).is_some();
+        let page_label = format!(
+            "{} / {}{}", self.page + 1, book.page_count,
+            if self.private { " · 私密阅读" } else { "" });
+        let palette = crate::design::palette(true);
+        for band in shelf::spread_clip(area, p, dir) {
+            let clipped = ui.painter().with_clip_rect(band);
+            clipped.rect_filled(band, 0., Color32::from_rgb(18, 20, 22));
+            let pages_painter = clipped.with_clip_rect(page_viewport);
+            for (page, target, mirror) in &queue {
+                if let Some(tex) = self.pages.get(&(id.clone(), *page)) {
+                    tex.paint_flip(&pages_painter, target.translate(shift), crop, phase, *mirror);
+                }
+            }
+            if chrome_t <= 0.001 {
+                continue;
+            }
+            // Static ghost of the reader chrome (icons + labels, no slider /
+            // hover state) fading out ahead of the bands.
+            let mut ghost = clipped.clone();
+            ghost.multiply_opacity(chrome_t);
+            let top_shift = -56. * (1. - chrome_t);
+            let bottom_shift = 68. * (1. - chrome_t);
+            let top_bar = Rect::from_min_max(
+                area.min + vec2(0., top_shift),
+                pos2(area.right(), area.top() + 56. + top_shift),
+            );
+            let bottom_bar = Rect::from_min_max(
+                pos2(area.left(), area.bottom() - 68. + bottom_shift),
+                pos2(area.right(), area.bottom() + bottom_shift),
+            );
+            let bar_fill = palette.surface.gamma_multiply(chrome_t);
+            let hairline = Stroke::new(1., Color32::from_white_alpha((30. * chrome_t) as u8));
+            ghost.rect_filled(top_bar, 0., bar_fill);
+            ghost.line_segment([top_bar.left_bottom(), top_bar.right_bottom()], hairline);
+            ghost.rect_filled(bottom_bar, 0., bar_fill);
+            ghost.line_segment([bottom_bar.left_top(), bottom_bar.right_top()], hairline);
+            let icon = Color32::from_gray(232);
+            let di = crate::design::draw_icon;
+            di(&ghost, pos2(area.left() + 30., area.top() + 30. + top_shift), "back", icon, false);
+            if has_chapter {
+                di(&ghost, pos2(area.right() - 82., area.top() + 30. + top_shift), "chapters", icon, false);
+            }
+            di(&ghost, pos2(area.right() - 30., area.top() + 30. + top_shift), "settings", icon, false);
+            ghost.text(area.min + vec2(56., 20. + top_shift), Align2::LEFT_TOP,
+                       title.clone(), FontId::proportional(15.), palette.ink);
+            di(&ghost, pos2(area.left() + 32., bottom_bar.top() + 34.), "prev", icon, false);
+            di(&ghost, pos2(area.right() - 32., bottom_bar.top() + 34.), "next", icon, false);
+            ghost.text(pos2(area.center().x, bottom_bar.top() + 2.), Align2::CENTER_TOP,
+                       page_label.clone(), FontId::monospace(12.), palette.muted);
+        }
+    }
+    /// Under-screen content stays hidden until the band coverage drops
+    /// below `close.under_alpha_start`, then settles in smoothly.
+    fn exit_under_alpha(&self, now: f64) -> f32 {
+        let Some((armed, _)) = self.reader_exit else {
+            return 1.;
+        };
+        let close = crate::params::params().close.clone();
+        let started = if armed.is_infinite() { now } else { armed };
+        let raw = ((now - started) / motion::close_seconds().max(0.001)).clamp(0., 1.) as f32;
+        let p = motion::close_p(raw);
+        let uas = close.under_alpha_start.clamp(0.01, 1.);
+        motion::smooth(((uas - p) / uas).clamp(0., 1.))
     }
     fn reader_ui(&mut self, ui: &mut Ui, area: Rect, id: &str, now: f64) {
         let Some(book) = self.reader_book(id) else {
@@ -6416,6 +6607,10 @@ fn library_thumbnails(
     pub fn covers_loaded(&self) -> bool {
         self.cover_pending.is_empty()
     }
+    /// 合上动画进行中（outgoing 阅读器平面仍在收缩 bands 里绘制）。
+    pub fn reader_exit_active(&self) -> bool {
+        self.reader_exit.is_some()
+    }
 }
 
 impl eframe::App for ReaderApp {
@@ -6595,6 +6790,46 @@ mod tests {
         assert_eq!(app.screen_name(), "reader");
         app.request_back(4., area, true);
         assert_eq!(app.screen_name(), "detail");
+    }
+    #[test]
+    fn back_from_reader_arms_peel_exit_and_commits_to_the_target() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = Context::default();
+        crate::configure_fonts(&ctx);
+        let mut app = ReaderApp::new(root.path().into(), ctx.clone());
+        let area = Rect::from_min_size(Pos2::ZERO, vec2(390., 844.));
+        app.reader_return = Screen::Detail("book".into());
+        app.screen = Screen::Reader("book".into());
+        app.back(1., area);
+        // The screen field is already the return target; the exit clock
+        // overlays the closing reader plane until raw reaches 1.
+        assert!(matches!(app.screen, Screen::Detail(_)));
+        let (armed, id) = app.reader_exit.clone().unwrap();
+        assert!(armed.is_infinite() && id == "book");
+        // A repeated back acts on the now-visible target (no re-arm).
+        app.back(2., area);
+        assert!(matches!(app.screen, Screen::Library));
+        assert!(app.reader_exit.clone().unwrap().0.is_infinite(), "exit clock must not rebuild");
+        // Frames run the clock; p hits 0 inside exit_ms and clears.
+        for i in 0..40 {
+            ctx.run_ui(
+                RawInput {
+                    screen_rect: Some(area),
+                    time: Some(3. + i as f64 / 60.),
+                    ..Default::default()
+                },
+                |ui| app.draw(ui),
+            )
+            .drop_without_applying_deltas();
+        }
+        assert!(app.reader_exit.is_none());
+        // Reduced motion skips the peel entirely: plain screen swap.
+        let mut reduced = ReaderApp::new(root.path().into(), Context::default());
+        reduced.reduced = true;
+        reduced.reader_return = Screen::Detail("book".into());
+        reduced.screen = Screen::Reader("book".into());
+        reduced.back(1., area);
+        assert!(reduced.reader_exit.is_none() && matches!(reduced.screen, Screen::Detail(_)));
     }
     #[test]
     fn opening_another_book_releases_old_page_textures_and_requests() {

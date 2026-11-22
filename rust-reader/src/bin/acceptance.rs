@@ -209,6 +209,34 @@ impl Harness {
         output.textures_delta.clear();
         Ok(())
     }
+    /// 读取已落盘 PNG 的 RGBA 像素（宽 = h.size[0]）。
+    fn captured_pixels(&self, name: &str) -> Result<Vec<u8>> {
+        Ok(image::open(self.output.join(format!("{name}.png")))
+            .with_context(|| format!("missing capture {name}"))?
+            .to_rgba8()
+            .into_raw())
+    }
+    /// 两帧在 [skip_top, rows-exclude_bottom) 行带内逐字节比较；跳过交互
+    /// chrome（顶栏 hover、底栏滑块）——ghost 不复制这些。
+    fn captured_equal(&self, a: &str, b: &str, skip_top: usize, exclude_bottom: usize) -> Result<bool> {
+        let (pa, pb) = (self.captured_pixels(a)?, self.captured_pixels(b)?);
+        let stride = self.size[0] as usize * 4;
+        let from = (skip_top * stride).min(pa.len()).min(pb.len());
+        let to = self.size[1] as usize - exclude_bottom;
+        let to = (pa.len().min(pb.len()) / stride).min(to) * stride;
+        Ok(from <= to && pa[from..to] == pb[from..to])
+    }
+    /// 合上中点帧采样：页区下方边距行，bands 内阅读器黑（~19）、
+    /// bands 外详情页纸白（~248）。
+    fn close_mid_samples(&self, name: &str) -> Result<(u8, u8)> {
+        let px = self.captured_pixels(name)?;
+        let (w, y) = (self.size[0] as usize, self.size[1] as usize - 180);
+        let at = |x: usize| -> u8 {
+            let i = (y * w + x) * 4;
+            ((px[i] as u32 + px[i + 1] as u32 + px[i + 2] as u32) / 3) as u8
+        };
+        Ok((at(w / 12), at(w * 5 / 6)))
+    }
     fn frames(&mut self, n: usize) -> Result<()> {
         for _ in 0..n {
             self.frame(vec![], None)?;
@@ -1323,8 +1351,33 @@ fn ipad_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
             h.click("reader-options-close")?;
             h.frames(4)?;
         }
-        h.click("reader-back")?;
-        h.frames(24)?;
+        if name == "portrait" {
+            // 合上中点帧（p 首个 <=0.55 的 exit 帧）：半屏阅读器、半屏详情。
+            h.frame(vec![], Some("close-pre"))?;
+            let back_pos = h
+                .app
+                .hitboxes
+                .get("reader-back")
+                .with_context(|| "reader-back control missing")?
+                .center();
+            let btn = |pressed: bool| Event::PointerButton {
+                pos: back_pos,
+                button: PointerButton::Primary,
+                pressed,
+                modifiers: Modifiers::NONE,
+            };
+            h.frame(vec![Event::PointerMoved(back_pos), btn(true)], None)?;
+            h.frame(vec![btn(false)], Some("close-p1"))?;
+            let exit_s = yejian::motion_close_seconds();
+            let mut mid = false;
+            for i in 1..=24usize {
+                let p = yejian::motion_close_p(((i as f64) * h.dt / exit_s.max(0.001)).min(1.) as f32);
+                h.frame(vec![], (!mid && p <= 0.55).then(|| { mid = true; "close-mid" }))?;
+            }
+        } else {
+            h.click("reader-back")?;
+            h.frames(24)?;
+        }
         h.click("back")?;
         h.frames(45)?;
     }
@@ -2029,8 +2082,68 @@ fn main() -> Result<()> {
     )?;
     h.wait(ReaderApp::page_loaded)?;
     anyhow::ensure!(h.app.current_page() == 2, "swipe failed to turn a page");
-    h.click("reader-back")?;
-    h.frames(3)?;
+    // 阶段4「合上」：先等翻页补间走完拿到静态基线帧，再发 back。
+    // close-p1（release 帧=p=1 叠加层首帧）页区应逐字节等于基线；
+    // close-commit（exit 收尽的下一帧）应等于 close-end 直切帧；
+    // close-mid 采样 p 首个 <=0.55 的帧，bands 内黑、bands 外纸白。
+    for _ in 0..90 {
+        if !h.app.frame_is_animating { break; }
+        h.frames(1)?;
+    }
+    anyhow::ensure!(!h.app.frame_is_animating, "reader still animating at close baseline");
+    h.frame(vec![], Some("close-pre"))?;
+    // back() fires mid-frame on pointer release, so the release frame is
+    // the first overlay frame (p=1); name it by releasing manually.
+    let back_pos = h
+        .app
+        .hitboxes
+        .get("reader-back")
+        .with_context(|| "reader-back control missing")?
+        .center();
+    h.frame(
+        vec![
+            Event::PointerMoved(back_pos),
+            Event::PointerButton { pos: back_pos, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE },
+        ],
+        None,
+    )?;
+    h.frame(
+        vec![Event::PointerButton { pos: back_pos, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE }],
+        Some("close-p1"),
+    )?;
+    anyhow::ensure!(h.app.reader_exit_active(), "reader-back armed no close exit");
+    anyhow::ensure!(
+        h.captured_equal("close-p1", "close-pre", 56, 80)?,
+        "exit first frame differs from the static reader frame",
+    );
+    let exit_s = yejian::motion_close_seconds();
+    let (mut mid_done, mut commit_done) = (false, false);
+    for i in 1..=40usize {
+        let p = yejian::motion_close_p(((i as f64) * h.dt / exit_s.max(0.001)).min(1.) as f32);
+        let name = if !mid_done && p <= 0.55 {
+            mid_done = true;
+            Some("close-mid")
+        } else if !commit_done && p <= 0.002 {
+            commit_done = true;
+            Some("close-commit")
+        } else {
+            None
+        };
+        h.frame(vec![], name)?;
+        if commit_done && !h.app.reader_exit_active() { break; }
+    }
+    h.frame(vec![], Some("close-end"))?;
+    anyhow::ensure!(!h.app.reader_exit_active(), "close exit did not finish");
+    anyhow::ensure!(mid_done && commit_done, "close frames not captured");
+    anyhow::ensure!(
+        h.captured_equal("close-commit", "close-end", 0, 0)?,
+        "exit last frame differs from the direct-cut target frame",
+    );
+    let (dark_side, paper_side) = h.close_mid_samples("close-mid")?;
+    anyhow::ensure!(
+        dark_side < 90 && paper_side > 140,
+        "mid-exit frame lacks the two-screen split: dark={dark_side} paper={paper_side}",
+    );
     h.click("back")?;
     for i in 0..60 {
         h.frame(vec![], Some(&format!("motion/frame-{:03}", i + 100)))?;

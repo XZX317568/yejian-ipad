@@ -21,6 +21,7 @@ pub struct Params {
     pub shelf: Shelf,
     pub spread: Spread,
     pub flip: Flip,
+    pub close: Close,
 }
 
 impl Default for Params {
@@ -33,6 +34,7 @@ impl Default for Params {
             shelf: Shelf::default(),
             spread: Spread::default(),
             flip: Flip::default(),
+            close: Close::default(),
         }
     }
 }
@@ -310,6 +312,49 @@ impl Default for Flip {
             entry_ease_y1: 0.72,
             entry_ease_x2: 0.18,
             entry_ease_y2: 1.,
+        }
+    }
+}
+
+/// Close (合上): the reader -> detail peel-exit mirror of the entry, plus
+/// the detail -> shelf return duration lifted out of `motion::CLOSE`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Close {
+    /// Reader -> target screen peel-exit duration in milliseconds
+    /// (reference `NovelMotion.exit` = 320).
+    pub exit_ms: f32,
+    /// Cubic bezier control points of the exit easing (defaults mirror
+    /// `flip.entry_ease_*` so the exit replays the entry curve in reverse).
+    pub exit_ease_x1: f32,
+    pub exit_ease_y1: f32,
+    pub exit_ease_x2: f32,
+    pub exit_ease_y2: f32,
+    /// Exit band direction: 0 mirrors the entry sweep (rtl-aware),
+    /// non-zero forces the closing edge toward that side.
+    pub peel_dir: f32,
+    /// Under-screen content (detail text column) starts fading in once the
+    /// band progress `p` drops below this threshold.
+    pub under_alpha_start: f32,
+    /// Reader chrome lead-out fade in milliseconds.
+    pub chrome_ms: f32,
+    /// Detail -> shelf cover-return duration in milliseconds
+    /// (was `motion::CLOSE` = 0.580 s).
+    pub close_travel_ms: f32,
+}
+
+impl Default for Close {
+    fn default() -> Self {
+        Self {
+            exit_ms: 320.,
+            exit_ease_x1: 0.18,
+            exit_ease_y1: 0.72,
+            exit_ease_x2: 0.18,
+            exit_ease_y2: 1.,
+            peel_dir: 0.,
+            under_alpha_start: 0.5,
+            chrome_ms: 160.,
+            close_travel_ms: 580.,
         }
     }
 }
