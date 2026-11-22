@@ -1883,7 +1883,7 @@ fn daily_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// 裁决素材专用：iPad 竖屏下的「抽出 → 摊开」连续帧。
+/// 裁决素材专用：iPad 竖屏下的「抽出 → 摊开 → 合上」连续帧。
 /// 默认全量 pass 的 motion 帧是手机尺寸（390×844），对 iPad 打磨没有参考价值。
 fn record_pass(h: &mut Harness) -> Result<()> {
     h.size = [1024, 1366];
@@ -1892,30 +1892,109 @@ fn record_pass(h: &mut Harness) -> Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|n: &usize| *n >= 100)
-        .unwrap_or(240);
-    let scroll_n = motion_frames * 30 / 100;
-    let open_n = motion_frames - scroll_n;
+        .unwrap_or(280);
+    // 帧分配：书架滚动 ≤60 帧（60fps 实速）→ 摊开飞行（慢动作）→ 合上段
+    //（阅读器稳定 + reader-back 触发 peel 收缩 + 详情稳定，2 倍慢动作）。
+    // motion::OPEN ≈ 0.72s：1/180 推进 ×131 帧 ≈ 0.73s 恰好覆盖全程，且
+    // spread-mid 落在与 1/240 录制相同的 t≈0.70s 中点斜扫帧。
+    // 合上段至少要 52+30 帧（最长 exit_ms=420ms≈50.4 帧 + 稳定 30），总帧数
+    // 低于 ~275 时 hold 会缩到 0、长 exit 的断言会失败。
+    let scroll_n = (motion_frames / 4).min(60);
+    let open_n = ((motion_frames - scroll_n) * 6 / 10).max(131);
+    let close_n = motion_frames - scroll_n - open_n;
     std::fs::create_dir_all(h.output.join("motion"))?;
+    let at = |i: usize| format!("motion/frame-{i:03}");
     h.click("shelf-next")?;
     for i in 0..scroll_n {
-        h.frame(vec![], Some(&format!("motion/frame-{i:03}")))?;
+        h.frame(vec![], Some(&at(i)))?;
     }
     h.wait(ReaderApp::covers_loaded)?;
     h.click("shelf-center")?;
-    // 飞行只有 0.72s；按 1/240 推进，168 帧 ≈ 4 倍慢动作，裁决视频里才看得清。
-    h.dt = 1. / 240.;
+    h.dt = 1. / 180.;
     for i in 0..open_n {
-        // t = i·(1/240)/0.72: i=121 lands at t≈0.70, mid-slant-sweep — kept
-        // as a named proof frame next to the motion strip.
-        let name = if i == 121 {
-            "spread-mid".to_string()
-        } else {
-            format!("motion/frame-{:03}", i + scroll_n)
-        };
+        // 留一份命名证明帧，但必须另存——R3 直接把帧改名，motion 序号断在
+        // frame-193，ffmpeg 只编码到 192 帧。
+        let name = at(i + scroll_n);
         h.frame(vec![], Some(&name))?;
+        if i == 91 {
+            std::fs::copy(
+                h.output.join(format!("{name}.png")),
+                h.output.join("spread-mid.png"),
+            )?;
+        }
     }
     h.dt = 1. / 60.;
-    println!("RECORD: {motion_frames} frames at 1024x1366 (scroll {scroll_n} / open {open_n})");
+    // 摊开收尽后进阅读器（entry peel 不录——帧数留给稳定态）；等页面与
+    // 翻页补间全走完拿到合上基线，再录 ~30 帧阅读器稳定段。
+    h.wait(|a| a.screen_name() == "detail")?;
+    h.click("read")?;
+    h.dt = 1. / 120.;
+    h.wait(ReaderApp::page_loaded)?;
+    for _ in 0..90 {
+        if !h.app.frame_is_animating {
+            break;
+        }
+        h.frames(1)?;
+    }
+    anyhow::ensure!(
+        !h.app.frame_is_animating,
+        "record: reader still animating before close"
+    );
+    // ~30 帧稳定阅读器（2 倍慢放），让裁决能看清 entry 收尾后的静止页。
+    let hold_n = close_n.saturating_sub(52).min(30);
+    for i in 0..hold_n {
+        h.frame(vec![], Some(&at(scroll_n + open_n + i)))?;
+    }
+    // back() fires on pointer release: the release frame is the first
+    // peel-exit frame (p=1), so press goes unrecorded and release opens
+    // the close segment — same hand-off the full pass names close-p1.
+    let back_pos = h
+        .app
+        .hitboxes
+        .get("reader-back")
+        .with_context(|| "record: reader-back control missing")?
+        .center();
+    h.frame(
+        vec![
+            Event::PointerMoved(back_pos),
+            Event::PointerButton {
+                pos: back_pos,
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+        ],
+        None,
+    )?;
+    h.frame(
+        vec![Event::PointerButton {
+            pos: back_pos,
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }],
+        Some(&at(scroll_n + open_n + hold_n)),
+    )?;
+    anyhow::ensure!(
+        h.app.reader_exit_active(),
+        "record: reader-back armed no close exit"
+    );
+    // 剩余 ~57 帧 ×1/120 ≈ 0.48s，覆盖最长的 exit_ms(420) 加少量详情稳定。
+    for i in (hold_n + 1)..close_n {
+        h.frame(vec![], Some(&at(scroll_n + open_n + i)))?;
+    }
+    anyhow::ensure!(
+        !h.app.reader_exit_active(),
+        "record: close exit did not finish"
+    );
+    anyhow::ensure!(
+        h.app.screen_name() == "detail",
+        "record: close did not land back on detail"
+    );
+    h.dt = 1. / 60.;
+    println!(
+        "RECORD: {motion_frames} frames at 1024x1366 (scroll {scroll_n} / open {open_n} / close {close_n}, hold {hold_n})"
+    );
     Ok(())
 }
 
