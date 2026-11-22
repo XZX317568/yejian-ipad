@@ -782,13 +782,14 @@ impl ReaderApp {
                 page: 0,
                 cover: true,
                 generation: 0,
+                target: 0,
             });
         }
     }
     pub(super) fn trim_covers(&mut self) {
         let mut bytes: usize = self.covers.values().map(|texture| texture.size()[0] * texture.size()[1] * 4).sum();
         crate::perf::set_cover_bytes(bytes as u64);
-        while self.covers.len() > 48 || bytes > 64 * 1024 * 1024 {
+        while bytes > 64 * 1024 * 1024 {
             let candidate = self.covers.keys()
                 .filter(|id| !self.visible_covers.contains(*id)
                     && !self.flight.as_ref().is_some_and(|flight| &flight.id == *id))
@@ -799,6 +800,31 @@ impl ReaderApp {
                 bytes -= texture.size()[0] * texture.size()[1] * 4;
             }
             self.cover_usage.remove(&id);
+        }
+    }
+    /// Decode target width for page requests: the viewport's physical
+    /// width (halved for two-page spreads) with 25% headroom, clamped to
+    /// [1024, 3072]. Downscale only — smaller pages stay as-is.
+    pub(super) fn page_target_width(&self) -> u32 {
+        let factor = if self.spread && !self.vertical { 0.5 } else { 1. };
+        (self.page_target_px * factor * 1.25).clamp(1024., 3072.) as u32
+    }
+    /// Zoom past 1.5x asks for a 3072-wide decode of the current page; the
+    /// arriving texture swaps in through the normal image path.
+    pub(super) fn ask_hires(&mut self, id: &str) {
+        let key = (id.to_string(), self.page);
+        let already = self
+            .pages
+            .get(&key)
+            .is_some_and(|texture| texture.size.x >= 3072.);
+        if !already && self.hires_requested.insert(key) {
+            self.send(Command::Image {
+                id: id.into(),
+                page: self.page,
+                cover: false,
+                generation: self.page_generation,
+                target: 3072,
+            });
         }
     }
     pub(super) fn ask_page(&mut self, id: &str, page: usize) {
@@ -821,6 +847,7 @@ impl ReaderApp {
                 page,
                 cover: false,
                 generation: self.page_generation,
+                target: self.page_target_width(),
             });
         }
     }
@@ -828,12 +855,19 @@ impl ReaderApp {
         let (near, essential) = self.page_keep_sets();
         self.pages
             .retain(|key, _| near.contains(key) || essential.contains(key));
+        // Page textures also have a byte budget on top of the page window:
+        // 384 MB on iPad, 256 MB elsewhere. Essential pages never evict.
+        let budget: u64 = if cfg!(target_os = "ios") {
+            384 * 1024 * 1024
+        } else {
+            256 * 1024 * 1024
+        };
         while self
             .pages
             .values()
             .map(|page| page.size.x as u64 * page.size.y as u64 * 4)
             .sum::<u64>()
-            > 128 * 1024 * 1024
+            > budget
         {
             let Some(key) = self
                 .pages
@@ -1357,6 +1391,9 @@ impl ReaderApp {
         }
         if !matches!(&self.screen,Screen::Reader(current) if current==id) {
             return;
+        }
+        if !self.vertical && self.zoom > 1.5 {
+            self.ask_hires(id);
         }
         self.rendered_page_nodes = 0;
         if self.chapter_end {

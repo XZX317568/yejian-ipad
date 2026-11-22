@@ -127,6 +127,8 @@ pub struct ReaderApp {
     keep_awake_setting: bool,
     perf_overlay: bool,
     last_frame_at: Option<std::time::Instant>,
+    page_target_px: f32,
+    hires_requested: HashSet<(String, usize)>,
     awake: bool,
     /// Calls made to `set_keep_awake`, asserted by tests.
     #[cfg(test)]
@@ -340,6 +342,8 @@ impl ReaderApp {
             keep_awake_setting: true,
             perf_overlay: false,
             last_frame_at: None,
+            page_target_px: 2048.,
+            hires_requested: HashSet::new(),
             awake: false,
             #[cfg(test)]
             awake_log: Vec::new(),
@@ -749,6 +753,7 @@ impl ReaderApp {
                             continue;
                         }
                         self.page_pending.remove(&(id.clone(), page));
+                        self.hires_requested.remove(&(id.clone(), page));
                         if result.as_ref().is_err_and(|error| error == PAGE_NOT_READY) {
                             if let Some(stream) = self.stream_for_mut(&id) {
                                 stream.waiting.insert(page);
@@ -1322,6 +1327,7 @@ impl ReaderApp {
             }
             Err(_) => full,
         };
+        self.page_target_px = full.width() * ctx.pixels_per_point();
         let (background, ink, _) = self.colors();
         ui.painter().rect_filled(full, 0., background);
         let tablet = Self::side_navigation(full);
@@ -1555,6 +1561,7 @@ impl eframe::App for ReaderApp {
         self.report_snapshot_ready(ui.ctx());
     }
     fn on_exit(&mut self) {
+        self.worker.shutdown();
         self.keep_awake(false);
         self.flush_position();
         let epoch = crate::follows::now() as f64;
@@ -1641,18 +1648,19 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let ctx = Context::default();
         let mut app = ReaderApp::new(root.path().into(), ctx.clone());
-        for index in 0..80 {
+        // Covers evict on a byte LRU (64 MB cap); each of these is 4 MB.
+        for index in 0..18 {
             let id = format!("book-{index}");
             app.covers.insert(id.clone(), ctx.load_texture(
-                id.clone(), ColorImage::filled([2, 2], Color32::WHITE), TextureOptions::LINEAR,
+                id.clone(), ColorImage::filled([1024, 1024], Color32::WHITE), TextureOptions::LINEAR,
             ));
             app.cover_usage.insert(id, index);
         }
         app.visible_covers.insert("book-0".into());
         app.trim_covers();
-        assert_eq!(app.covers.len(), 48);
+        assert_eq!(app.covers.len(), 16);
         assert!(app.covers.contains_key("book-0"));
-        assert!(app.covers.contains_key("book-79"));
+        assert!(app.covers.contains_key("book-17"));
         assert!(!app.covers.contains_key("book-1"));
     }
     #[test]

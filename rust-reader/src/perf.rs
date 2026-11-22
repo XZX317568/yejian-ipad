@@ -142,7 +142,7 @@ fn percentile(slot: &Mutex<VecDeque<f64>>, p: f64) -> Option<f64> {
     }
     let mut values: Vec<f64> = ring.iter().copied().collect();
     values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let index = ((values.len() - 1) as f64 * p).round() as usize;
+    let index = ((values.len() - 1) as f64 * p) as usize;
     Some(values[index])
 }
 
@@ -215,6 +215,7 @@ mod tests {
         let ring = Mutex::new((1..=20).map(|v| v as f64).collect::<VecDeque<_>>());
         assert_eq!(percentile(&ring, 0.5), Some(10.));
         assert_eq!(percentile(&ring, 0.95), Some(19.));
+        assert_eq!(percentile(&ring, 1.0), Some(20.));
     }
 
     #[test]
