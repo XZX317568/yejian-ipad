@@ -123,7 +123,8 @@ pub fn geometry(area: Rect, count: usize, focus: f32, entrance: f32) -> Vec<Volu
     let focus = if count == 1 { 0. } else { focus };
     let scale = shelf_scale(area);
     let width = area.width();
-    let pitch = lane_pitch_for(area, count);
+    // 相邻书最多遮掉约 28%：pitch 至少要留出封面可见宽度，否则边缘书只剩一条细缝。
+    let pitch_base = lane_pitch_for(area, count);
     let spine = lane_pitch(area) - 11. * scale;
     let cover = (width / scale * 0.32).clamp(100., 190.) * scale;
     let height = (cover - 20. * scale) * 166. / 118. + 54. * scale;
@@ -139,6 +140,12 @@ pub fn geometry(area: Rect, count: usize, focus: f32, entrance: f32) -> Vec<Volu
     let cover = cover * fit;
     let height = height * fit;
     let base_y = base_y * fit;
+    // 相邻书最多遮掉约 28%：pitch 至少要留出封面可见宽度，否则边缘书只剩一条细缝。
+    let pitch = pitch_base.max(cover * 0.66 * 0.72);
+    // 垂直居中：书群的锚点原本从 area.top 往下挂，底部的展签区会被压住。
+    // 这里把剩余高度按 45% 放到上方，让整摞书居中而不是贴底。
+    let stacked_now = base_y + height;
+    let v_pad = ((area.height() - stacked_now) * 0.45).max(0.);
     let mut start_x = area.center().x - (spine + cover * 0.66) / 2. + cover * 0.84 * 0.66;
     let first = -(count as i32 / 2);
     let last = first + count as i32 - 1;
@@ -199,14 +206,15 @@ pub fn geometry(area: Rect, count: usize, focus: f32, entrance: f32) -> Vec<Volu
             let phase = entrance * motion::ENTRANCE as f32 / 1.7 - distance * 0.075;
             let crest = (1. + (phase * std::f32::consts::TAU).sin()) * 0.5;
             let load = -9. * crest * crest * (1. - ink) * scale;
-            let rail_y = (rail * shelf.rail_linear + rail * rail * shelf.rail_quad) * scale;
+            // 对称下沉：|rail| 项让两侧一起矮下去，避免整排"往右下坠"。
+            let rail_y = (rail.abs() * shelf.rail_linear * 0.8 + rail * rail * shelf.rail_quad) * scale;
             let floor = pos2(
                 start_x + distance * pitch,
-                area.top() + base_y + height + rail_y,
+                area.top() + v_pad + base_y + height + rail_y,
             );
             let origin = pos2(
                 start_x + distance * pitch - pull * 0.66,
-                area.top() + base_y + pull * 0.30 - height * 0.60 * lift + rail_y + load,
+                area.top() + v_pad + base_y + pull * 0.30 - height * 0.60 * lift + rail_y + load,
             );
             let front = Plane {
                 origin,

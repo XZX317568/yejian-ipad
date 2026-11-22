@@ -1987,7 +1987,8 @@ impl ReaderApp {
         // 书架是页面主体：宽屏（iPad）时舞台直接吃掉整屏高度。
         // 用 shelf_viewport 而不是 area.bottom()：area 可能是可滚动内容区。
         let height = if side_by_side {
-            (self.shelf_viewport.height() - top - 16.).clamp(220., 4000.)
+            // 再让出 88pt 给底部导航/安全区，避免展签按钮被底栏吃掉。
+            (self.shelf_viewport.height() - top - 104.).clamp(220., 4000.)
         } else if short_landscape {
             224. + (self.font_scale - 1.) * 16. + browse_extra + 28.
         } else {
