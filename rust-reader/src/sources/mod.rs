@@ -227,6 +227,12 @@ pub struct Sources {
     cover_missing_disk: HashSet<String>,
     cover_textures: std::collections::HashMap<String, TextureHandle>,
     cover_lru: VecDeque<String>,
+    /// egui-time stamps for freshly materialized cover textures, feeding
+    /// the 180 ms fade-in and the shell's keep-animating signal.
+    cover_loaded_at: std::collections::HashMap<String, f64>,
+    /// Reduced-motion flag mirrored from the shell; fades jump straight
+    /// to their final frame when set.
+    reduced: bool,
     /// Page already auto-loaded when its last grid row scrolled into view, so
 
     /// the marker cannot fire the same request again on the next frame.
@@ -964,6 +970,8 @@ impl Sources {
             cover_missing_disk: HashSet::new(),
             cover_textures: Default::default(),
             cover_lru: VecDeque::new(),
+            cover_loaded_at: Default::default(),
+            reduced: false,
             auto_next_page: None,
             chapter_progress: Default::default(),
             description_expanded: false,
@@ -1359,6 +1367,7 @@ impl Sources {
                     self.cover_failed.clear();
                     self.cover_ready.clear();
                     self.cover_missing_disk.clear();
+                    self.cover_loaded_at.clear();
                 }
                 StorageEvent::Failed(error) => self.status = error,
             }

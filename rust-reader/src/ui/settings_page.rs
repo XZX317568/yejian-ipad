@@ -418,25 +418,32 @@ impl ReaderApp {
                             ui.add_space(22.);
                             let mut percent = (self.font_scale * 100.).round();
                             ui.label(format!("文字大小 · {percent:.0}%"));
-                            ui.spacing_mut().slider_width = (ui.available_width() - 12.).max(80.);
-                            if ui
-                                .add(
-                                    Slider::new(&mut percent, 100. ..=200.)
-                                        .show_value(false)
-                                        .step_by(5.),
-                                )
-                                .changed()
-                            {
+                            let width = (ui.available_width() - 12.).max(80.);
+                            let out = crate::design::slider(
+                                ui,
+                                "font-scale-slider",
+                                &mut percent,
+                                100.0..=200.,
+                                width,
+                                false,
+                                self.dark,
+                            );
+                            self.hitboxes
+                                .insert("font-scale-slider".into(), out.rect);
+                            if out.changed {
+                                percent = (percent / 5.).round() * 5.;
                                 self.font_scale = percent / 100.;
                                 self.setting("font-scale", self.font_scale.to_string());
                                 self.mark_appearance_changed();
                             }
                             ui.add_space(12.);
-                            if crate::design::toggle(
+                            let reduced_now = self.reduced;
+                            if crate::design::toggle_animated(
                                 ui,
                                 &mut self.reduced,
                                 "减少动态效果",
                                 "切书和打开封面时，使用更轻的过渡",
+                                reduced_now,
                             ) {
                                 self.setting("reduce-motion", self.reduced.to_string());
                             }
@@ -485,11 +492,12 @@ impl ReaderApp {
                                 self.set_reading_mode(mode);
                             }
                             ui.add_space(14.);
-                            if crate::design::toggle(
+                            if crate::design::toggle_animated(
                                 ui,
                                 &mut self.rtl,
                                 "从右向左翻页",
                                 "适合日式漫画的阅读顺序",
+                                self.reduced,
                             ) {
                                 self.reader_globals.rtl = self.rtl;
                                 self.setting(
@@ -500,22 +508,24 @@ impl ReaderApp {
                             }
                             ui.separator();
                             ui.add_space(6.);
-                            if crate::design::toggle(
+                            if crate::design::toggle_animated(
                                 ui,
                                 &mut self.private,
                                 "私密阅读",
                                 "不保存新的阅读进度和历史",
+                                self.reduced,
                             ) {
                                 self.setting("private", self.private.to_string());
                                 self.sources.set_private(self.private);
                             }
                             ui.separator();
                             ui.add_space(6.);
-                            if crate::design::toggle(
+                            if crate::design::toggle_animated(
                                 ui,
                                 &mut self.keep_awake_setting,
                                 "阅读时屏幕常亮",
                                 "打开书籍时不让屏幕自动熄灭",
+                                self.reduced,
                             ) {
                                 self.setting(
                                     "keep-awake",
@@ -529,11 +539,12 @@ impl ReaderApp {
                             }
                             ui.separator();
                             ui.add_space(6.);
-                            if crate::design::toggle(
+                            if crate::design::toggle_animated(
                                 ui,
                                 &mut self.reader_status,
                                 "显示时间和电量",
                                 "阅读时右下角显示时间与电量",
+                                self.reduced,
                             ) {
                                 self.setting(
                                     "reader-status",
@@ -650,11 +661,12 @@ impl ReaderApp {
                             }
                             ui.add_space(10.);
                             let mut notify = self.notify_enabled;
-                            if crate::design::toggle(
+                            if crate::design::toggle_animated(
                                 ui,
                                 &mut notify,
                                 "新章节通知",
                                 "追更发现新章节时发送系统通知；iOS 后台刷新由系统调度，LiveContainer 安装时可能不会运行",
+                                self.reduced,
                             ) {
                                 if notify {
                                     self.notify_enabled = true;
@@ -676,11 +688,12 @@ impl ReaderApp {
                             ui.set_width(ui.available_width());
                             crate::design::section(ui, "进度跟踪（AniList / Kitsu / Bangumi）");
                             let mut sync = self.trackers.auto_sync();
-                            if crate::design::toggle(
+                            if crate::design::toggle_animated(
                                 ui,
                                 &mut sync,
                                 "自动同步章节进度",
                                 "读完一章就把远端进度推进到已读（私密阅读时不上传）",
+                                self.reduced,
                             ) {
                                 self.trackers
                                     .submit(crate::trackers::TrackCommand::SetAutoSync(sync));
@@ -731,11 +744,12 @@ impl ReaderApp {
                                 ui.set_width(ui.available_width());
                                 crate::design::section(ui, "隐私");
                                 let mut on = self.applock.enabled();
-                                if crate::design::toggle(
+                                if crate::design::toggle_animated(
                                     ui,
                                     &mut on,
                                     "应用锁（面容 ID / 触控 ID / 设备密码）",
                                     "回到应用时验证身份后再显示内容",
+                                    self.reduced,
                                 ) && self.applock.request_toggle(on)
                                 {
                                     self.start_auth("验证以更改应用锁");
@@ -791,11 +805,12 @@ impl ReaderApp {
                             ui.set_width(ui.available_width());
                             crate::design::section(ui, "云同步（WebDAV）");
                             let mut enabled = self.cloud.enabled;
-                            if crate::design::toggle(
+                            if crate::design::toggle_animated(
                                 ui,
                                 &mut enabled,
                                 "启用 WebDAV 云同步",
                                 "进度、追更、书签、统计等在两台设备间同步；密码只存在本机",
+                                self.reduced,
                             ) {
                                 self.cloud.enabled = enabled;
                                 self.cloud.config.enabled = enabled;
@@ -984,11 +999,12 @@ impl ReaderApp {
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             crate::design::section(ui, "关于");
-                            if crate::design::toggle(
+                            if crate::design::toggle_animated(
                                 ui,
                                 &mut self.perf_overlay,
                                 "性能信息",
                                 "在右上角显示解码、帧时间和纹理内存",
+                                self.reduced,
                             ) {
                                 self.setting(
                                     "perf-overlay",

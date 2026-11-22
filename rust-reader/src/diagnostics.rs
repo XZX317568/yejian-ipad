@@ -20,7 +20,7 @@ const LOG_FILE: &str = "yejian.log";
 const MARKER: &str = "running.marker";
 const CRASH_PREFIX: &str = "crash-";
 /// Mirrors the iOS/Android build number reported to stores.
-const BUILD: &str = "19";
+const BUILD: &str = "20";
 
 pub fn version_line() -> String {
     format!("yejian {} (build {BUILD})", env!("CARGO_PKG_VERSION"))

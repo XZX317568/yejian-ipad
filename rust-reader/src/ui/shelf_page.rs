@@ -540,13 +540,17 @@ impl ReaderApp {
         } else {
             palette.muted
         };
+        let visual = crate::design::press_rect(
+            rect,
+            response.is_pointer_button_down_on() && !self.reduced,
+        );
         let p = ui.painter();
         if !id.starts_with("nav-") && !is_reader {
             p.rect_filled(
-                rect,
+                visual,
                 12.,
-                if response.hovered() {
-                    palette.soft
+                if response.is_pointer_button_down_on() || response.hovered() {
+                    palette.accent_soft
                 } else {
                     // `soft` sits one step above the shelf stage so the pager
                     // buttons stay legible in dark mode without a heavy frame.
@@ -554,93 +558,13 @@ impl ReaderApp {
                 },
             );
             p.rect_stroke(
-                rect,
+                visual,
                 12.,
                 Stroke::new(1., palette.line),
                 StrokeKind::Inside,
             );
         }
-        let c = rect.center();
-        let stroke = Stroke::new(1.7, color);
-        match kind {
-            "search" => {
-                p.circle_stroke(c - vec2(2., 2.), 5.6, stroke);
-                p.line_segment([c + vec2(2., 2.), c + vec2(9., 9.)], stroke);
-            }
-            "plus" => {
-                p.line_segment([c - vec2(7., 0.), c + vec2(7., 0.)], stroke);
-                p.line_segment([c - vec2(0., 7.), c + vec2(0., 7.)], stroke);
-            }
-            "back" => {
-                p.line_segment([c + vec2(4., -7.), c + vec2(-4., 0.)], stroke);
-                p.line_segment([c + vec2(-4., 0.), c + vec2(4., 7.)], stroke);
-            }
-            "next" => {
-                p.line_segment([c + vec2(-3., -4.), c + vec2(2., 0.)], stroke);
-                p.line_segment([c + vec2(2., 0.), c + vec2(-3., 4.)], stroke);
-            }
-            "prev" => {
-                p.line_segment([c + vec2(3., -4.), c + vec2(-2., 0.)], stroke);
-                p.line_segment([c + vec2(-2., 0.), c + vec2(3., 4.)], stroke);
-            }
-            "open" => {
-                p.line_segment([c + vec2(-6., 6.), c + vec2(6., -6.)], stroke);
-                p.line_segment([c + vec2(-4., -6.), c + vec2(6., -6.)], stroke);
-                p.line_segment([c + vec2(6., -6.), c + vec2(6., 4.)], stroke);
-            }
-            "library" => {
-                p.rect_stroke(
-                    Rect::from_center_size(c, vec2(12., 16.)),
-                    1.,
-                    stroke,
-                    StrokeKind::Inside,
-                );
-                p.line_segment([c + vec2(1., -7.), c + vec2(1., -1.)], stroke);
-            }
-            "history" => {
-                p.circle_stroke(c, 7., stroke);
-                p.line_segment([c, c - vec2(0., 4.)], stroke);
-                p.line_segment([c, c + vec2(4., 2.)], stroke);
-            }
-            "settings" => {
-                p.circle_stroke(c, 7., stroke);
-                p.circle_stroke(c, 2., stroke);
-            }
-            "chapters" => {
-                for y in [-5., 0., 5.] {
-                    p.line_segment([c + vec2(-7., y), c + vec2(7., y)], stroke);
-                }
-            }
-            "bookmark" => {
-                p.line_segment([c + vec2(-5., -7.), c + vec2(-5., 7.)], stroke);
-                p.line_segment([c + vec2(5., -7.), c + vec2(5., 7.)], stroke);
-                p.line_segment([c + vec2(-5., -7.), c + vec2(5., -7.)], stroke);
-                p.line_segment([c + vec2(-5., 7.), c + vec2(0., 3.)], stroke);
-                p.line_segment([c + vec2(5., 7.), c + vec2(0., 3.)], stroke);
-            }
-            "bookmark-on" => {
-                let pts = vec![
-                    c + vec2(-5., -7.),
-                    c + vec2(5., -7.),
-                    c + vec2(5., 7.),
-                    c + vec2(0., 3.),
-                    c + vec2(-5., 7.),
-                ];
-                p.add(Shape::convex_polygon(pts, color, stroke));
-            }
-            "share" => {
-                // Open box with an arrow rising out of it.
-                p.line_segment([c + vec2(-7., -1.), c + vec2(-7., 7.)], stroke);
-                p.line_segment([c + vec2(-7., 7.), c + vec2(7., 7.)], stroke);
-                p.line_segment([c + vec2(7., 7.), c + vec2(7., -1.)], stroke);
-                p.line_segment([c + vec2(0., 4.), c + vec2(0., -7.)], stroke);
-                p.line_segment([c + vec2(0., -7.), c + vec2(-4., -3.)], stroke);
-                p.line_segment([c + vec2(0., -7.), c + vec2(4., -3.)], stroke);
-            }
-            _ => {
-                p.circle_stroke(c, 7., stroke);
-            }
-        }
+        crate::design::draw_icon(p, visual.center(), kind, color, active);
         response.clicked()
     }
     pub(super) fn shelf_area(&self, area: Rect) -> Rect {
@@ -680,6 +604,8 @@ impl ReaderApp {
         } else if side_by_side {
             374. + tall_extra + (self.font_scale - 1.) * 40.
         } else {
+            // A little extra headroom keeps the pager clear of the lifted
+            // cover corner on phone portrait.
             384. + (self.font_scale - 1.) * 112.
         };
         let stage = Rect::from_min_size(
@@ -692,7 +618,7 @@ impl ReaderApp {
                 vec2(width * 0.55 - 12., height - 24.),
             )
         } else {
-            Rect::from_min_size(stage.min + vec2(8., 6.), vec2(width - 16., 212.))
+            Rect::from_min_size(stage.min + vec2(8., 30.), vec2(width - 16., 212.))
         };
         let (stage, books, browse, arranged_side_by_side) = if self.library_grid {
             (
@@ -737,8 +663,8 @@ impl ReaderApp {
                 let stage_h = books_h + info_h;
                 let stage = Rect::from_min_size(stage.min, vec2(width, stage_h));
                 let books = Rect::from_min_size(
-                    stage.min + vec2(8., 6.),
-                    vec2(width - 16., books_h),
+                    stage.min + vec2(8., 30.),
+                    vec2(width - 16., books_h - 24.),
                 );
                 (stage, books)
             };
@@ -824,7 +750,7 @@ impl ReaderApp {
             pos2(area.center().x + width / 2., area.bottom() - bottom),
         )
     }
-    pub(super) fn navigation(&mut self, ui: &mut Ui, full: Rect, tablet: bool) {
+    pub(super) fn navigation(&mut self, ui: &mut Ui, full: Rect, tablet: bool, now: f64) {
         let palette = crate::design::palette(self.dark);
         let tabs = [
             (Tab::Library, "书架", "library"),
@@ -847,6 +773,9 @@ impl ReaderApp {
                 vec2((full.width() - 32.).min(480.), 64.),
             )
         };
+        if !tablet {
+            crate::design::soft_shadow(ui.painter(), rail, 23., 1.2, self.dark);
+        }
         ui.painter()
             .rect_filled(rail, if tablet { 0. } else { 23. }, palette.surface);
         if !tablet {
@@ -865,8 +794,9 @@ impl ReaderApp {
                 palette.ink,
             );
         }
-        for (i, (tab, label, kind)) in tabs.into_iter().enumerate() {
-            let rect = if tablet {
+        let mut slots = [Rect::NOTHING; 4];
+        for (i, _) in tabs.iter().enumerate() {
+            slots[i] = if tablet {
                 Rect::from_min_size(
                     pos2(
                         rail.left() + 10.,
@@ -885,18 +815,44 @@ impl ReaderApp {
                     vec2(rail.width() / 4., 64.),
                 )
             };
-            if tab == self.tab {
-                // Selected item keeps ink ink + a small accent indicator
-                // instead of a tinted pill.
-                ui.painter().rect_filled(
-                    Rect::from_center_size(
-                        pos2(rect.center().x, rect.bottom() - 4.),
-                        vec2(18., 2.5),
-                    ),
-                    1.2,
-                    palette.accent,
-                );
-            }
+        }
+        let tab_index = tabs
+            .iter()
+            .position(|(tab, _, _)| *tab == self.tab)
+            .unwrap_or(0);
+        if self.tab != self.last_nav_tab {
+            let from = tabs
+                .iter()
+                .position(|(tab, _, _)| *tab == self.last_nav_tab)
+                .unwrap_or(tab_index);
+            self.nav_pill = Some(motion::TimedTween::new(
+                now,
+                if self.reduced { 0. } else { 0.20 },
+                from as f32,
+                tab_index as f32,
+            ));
+            self.tab_enter = (!self.reduced).then_some(now);
+            self.last_nav_tab = self.tab;
+        }
+        let pill_pos = self
+            .nav_pill
+            .map(|t| t.value(now))
+            .unwrap_or(tab_index as f32);
+        if self.nav_pill.is_some_and(|t| t.done(now)) {
+            self.nav_pill = None;
+        }
+        let i0 = pill_pos.floor().clamp(0., 3.) as usize;
+        let i1 = (i0 + 1).min(3);
+        let frac = (pill_pos - i0 as f32).clamp(0., 1.);
+        let r0 = slots[i0].shrink2(vec2(5., 5.));
+        let r1 = slots[i1].shrink2(vec2(5., 5.));
+        let pill = Rect::from_min_max(
+            r0.min + (r1.min - r0.min) * frac,
+            r0.max + (r1.max - r0.max) * frac,
+        );
+        ui.painter().rect_filled(pill, 16., palette.accent_soft);
+        for (i, (tab, label, kind)) in tabs.into_iter().enumerate() {
+            let rect = slots[i];
             // The whole item is the tap target: the glyph alone is only
             // 32x29 pt, below the 44 pt Apple asks for.
             let row_clicked = ui
@@ -1471,6 +1427,31 @@ impl ReaderApp {
         }
         let index = (self.motion.focus.round() as i32).rem_euclid(books.len() as i32) as usize;
         let book = &books[index];
+        // Focus info: a new central book settles the title block in with a
+        // crisp 0.12s opacity fade while the progress bar tweens over. The
+        // `(id, started)` pair doubles as the "last focused" marker, so the
+        // fade arms exactly once per change and then stays finished.
+        let focus_changed = !matches!(
+            &self.focus_book_anim,
+            Some((anim_id, _)) if anim_id == &book.id
+        );
+        if focus_changed {
+            self.focus_book_anim = Some((
+                book.id.clone(),
+                if self.reduced { f64::MIN } else { now },
+            ));
+        }
+        let focus_new = focus_changed;
+        let focus_alpha = self
+            .focus_book_anim
+            .as_ref()
+            .map(|(_, started)| {
+                let k = ((now - *started) / 0.12).clamp(0., 1.) as f32;
+                0.4 + 0.6 * motion::smooth(k)
+            })
+            .unwrap_or(1.);
+        let mut info_painter = ui.painter().clone();
+        info_painter.multiply_opacity(focus_alpha);
         let info = layout.info.min;
         let info_right = layout.info.right();
         let title_width = layout.info.width();
@@ -1489,8 +1470,32 @@ impl ReaderApp {
         );
         title.wrap.max_rows = 1;
         let title = ui.painter().layout_job(title);
-        let progress_pos = info + vec2(0., title.size().y + 10.);
-        ui.painter().galley(info, title, ink);
+        info_painter.galley(info, title.clone(), ink);
+        let mut progress_pos = info + vec2(0., title.size().y + 10.);
+        // A quiet metadata pill rides under the title on wide layouts.
+        if layout.side_by_side && !layout.short_landscape && self.font_scale <= 1.3 {
+            let meta = if !book.category.is_empty() {
+                Some(book.category.clone())
+            } else {
+                let count = self.chapters_for(&book.id).len();
+                (count > 1).then(|| format!("共 {count} 话"))
+            };
+            if let Some(meta) = meta {
+                let galley = ui.painter().layout(
+                    meta,
+                    FontId::proportional(11.),
+                    palette.muted,
+                    title_width,
+                );
+                let pill = Rect::from_min_size(
+                    progress_pos - vec2(4., 1.),
+                    vec2(galley.size().x + 18., galley.size().y + 8.),
+                );
+                info_painter.rect_filled(pill, pill.height() / 2., palette.soft);
+                info_painter.galley(progress_pos + vec2(5., 3.), galley, palette.muted);
+                progress_pos.y += pill.height() + 6.;
+            }
+        }
         let has_progress = book.last_read_at.is_some();
         let progress = if let Some(follow) = self.online_follow(&book.id) {
             self.online_progress_label(follow)
@@ -1516,27 +1521,43 @@ impl ReaderApp {
         let progress = ui.painter().layout_job(progress);
         // Keep the action with the title and progress when the column scrolls.
         let action_y = progress_pos.y + progress.size().y + 25.;
-        let palette = crate::design::palette(self.dark);
+        let target_fraction = if has_progress {
+            (book.current_page + 1) as f32 / book.page_count.max(1) as f32
+        } else {
+            0.
+        };
+        if focus_new {
+            let from = self
+                .progress_tween
+                .map(|t| t.value(now))
+                .unwrap_or(target_fraction);
+            self.progress_tween = Some(motion::TimedTween::new(
+                now,
+                if self.reduced { 0. } else { 0.2 },
+                from,
+                target_fraction,
+            ));
+        }
+        let fill_fraction = self
+            .progress_tween
+            .map(|t| t.value(now))
+            .unwrap_or(target_fraction);
+        if self.progress_tween.is_some_and(|t| t.done(now)) {
+            self.progress_tween = None;
+        }
         let track = Rect::from_min_size(
             pos2(info.x, progress_pos.y + progress.size().y + 12.),
             vec2((info_right - info.x).min(360.), 3.),
         );
-        ui.painter().rect_filled(track, 2., palette.line);
+        info_painter.rect_filled(track, 2., palette.line);
         if has_progress {
-            ui.painter().rect_filled(
-                Rect::from_min_size(
-                    track.min,
-                    vec2(
-                        track.width() * (book.current_page + 1) as f32
-                            / book.page_count.max(1) as f32,
-                        3.,
-                    ),
-                ),
+            info_painter.rect_filled(
+                Rect::from_min_size(track.min, vec2(track.width() * fill_fraction, 3.)),
                 2.,
                 palette.accent,
             );
         }
-        ui.painter().galley(progress_pos, progress, muted);
+        info_painter.galley(progress_pos, progress, muted);
         let detail_width = 30. * self.font_scale + 24.;
         let action_width =
             (84. * self.font_scale + 68.).min(layout.info.width() - detail_width - 12.);
@@ -1581,17 +1602,41 @@ impl ReaderApp {
                 self.open_reader(book);
             }
         }
-        let pager_right = if layout.short_landscape {
-            layout.books.right() - 8.
-        } else {
-            layout.stage.right() - 16.
-        };
+        // On phone portrait the pager leaves the card's top corner — where it
+        // overlapped the lifted cover — and right-aligns on the thumbnails'
+        // title row just under the stage. Wide layouts keep it in the stage.
+        let phone_portrait = !layout.side_by_side && !layout.short_landscape;
         let tally = format!("{:02} / {:02}", index + 1, books.len());
         let tally = ui
             .painter()
             .layout_no_wrap(tally, FontId::monospace(11.), muted);
-        let pager_left = pager_right - 88. - tally.size().x - 4.;
-        let y = layout.stage.top() + 12.;
+        let tally_gap = if phone_portrait { 8. } else { 2. };
+        let pager_right = if layout.short_landscape {
+            layout.books.right() - 8.
+        } else if phone_portrait {
+            // Keep clear of the 展开/收起 + triangle block painted at the
+            // browse row's right edge.
+            let label = if self.library_grid { "收起" } else { "展开" };
+            let label_w = ui
+                .painter()
+                .layout_no_wrap(
+                    label.to_owned(),
+                    FontId::proportional(12. * self.font_scale),
+                    muted,
+                )
+                .size()
+                .x;
+            let right_block = label_w + 4. * self.font_scale + 8. * self.font_scale + 6.;
+            layout.browse.right() - right_block - 12.
+        } else {
+            layout.stage.right() - 16.
+        };
+        let pager_left = pager_right - 88. - tally.size().x - tally_gap * 2.;
+        let y = if phone_portrait {
+            layout.browse.top() - 12.
+        } else {
+            layout.stage.top() + 12.
+        };
         let prev_clicked = books.len() > 1
             && self.icon(
                 ui,
@@ -1606,7 +1651,7 @@ impl ReaderApp {
         }
         if books.len() > 1 {
             ui.painter().galley(
-                pos2(pager_left + 46., y + (44. - tally.size().y) / 2.),
+                pos2(pager_left + 44. + tally_gap, y + (44. - tally.size().y) / 2.),
                 tally,
                 muted,
             );
@@ -1623,7 +1668,11 @@ impl ReaderApp {
             self.motion
                 .select(self.motion.focus.round() + 1., now, self.reduced);
         }
-        self.library_thumbnails(ui, layout.browse, &books, index, now);
+        // The phone-portrait pager rides on the collapse row's right end;
+        // the row's click zone ends just left of the pager so neither
+        // swallows the other's presses.
+        let pager_edge = (phone_portrait && books.len() > 1).then_some(pager_left);
+        self.library_thumbnails(ui, layout.browse, pager_edge, &books, index, now);
         if !self.selected.is_empty() {
             let rect = Rect::from_min_size(
                 pos2(area.left() + 24., area.bottom() - 122.),
@@ -1670,6 +1719,7 @@ impl ReaderApp {
         &mut self,
         ui: &mut Ui,
         area: Rect,
+        pager_edge: Option<f32>,
         books: &[Book],
         selected: usize,
         now: f64,
@@ -1731,10 +1781,15 @@ impl ReaderApp {
             palette.muted,
             Stroke::NONE,
         ));
-        let row = Rect::from_min_size(
+        let mut row = Rect::from_min_size(
             area.min,
             vec2(area.width(), (34. * self.font_scale).max(44.)),
         );
+        // On phone portrait the pager icons ride on this row's right end;
+        // keep the press zone clear of them so both stay clickable.
+        if let Some(edge) = pager_edge {
+            row = row.with_max_x(edge - 6.);
+        }
         self.hitboxes.insert("shelf-grid-toggle".into(), row);
         let response = ui.interact(row, Id::unique("shelf-grid-toggle"), Sense::click());
         response.widget_info(|| {
@@ -1796,29 +1851,37 @@ impl ReaderApp {
                         );
                         response
                             .widget_info(|| WidgetInfo::labeled(Role::Button, true, &book.title));
-                        if ui.clip_rect().contains_rect(rect) {
-                            self.hitboxes
-                                .insert(format!("shelf-thumbnail-{}", book.id), rect);
+                        self.hitboxes
+                            .insert(format!("shelf-thumbnail-{}", book.id), rect);
+                        // Long shelves follow the active book once per change.
+                        if index == selected && self.last_thumb_selected != Some(selected) {
+                            ui.scroll_to_rect(rect, Some(Align::Center));
                         }
                         let cover = Rect::from_min_size(
                             rect.min + vec2(4., 3.),
                             vec2(cover_width, cover_height),
                         );
+                        let lifted_cover = if index == selected {
+                            cover.translate(vec2(0., -4.))
+                        } else {
+                            cover
+                        };
+                        crate::design::soft_shadow(
+                            ui.painter(),
+                            lifted_cover,
+                            6.,
+                            if index == selected { 1.3 } else { 0.6 },
+                            self.dark,
+                        );
+                        let cover = crate::design::press_rect(
+                            lifted_cover,
+                            response.is_pointer_button_down_on() && !self.reduced,
+                        );
                         if index == selected || response.hovered() {
-                            ui.painter()
-                                .rect_filled(cover.expand(5.), 10., palette.accent_soft);
-                            // Two hairlines — one flush with the art, one at
-                            // the halo — read as a single calm selection ring.
                             ui.painter().rect_stroke(
-                                cover.expand(5.),
-                                10.,
-                                Stroke::new(1., palette.accent),
-                                StrokeKind::Inside,
-                            );
-                            ui.painter().rect_stroke(
-                                cover.expand(1.5),
+                                cover,
                                 6.,
-                                Stroke::new(1., palette.accent.gamma_multiply(0.7)),
+                                Stroke::new(1.5, palette.accent),
                                 StrokeKind::Inside,
                             );
                         }
@@ -1890,6 +1953,7 @@ impl ReaderApp {
                     }
                 });
         });
+        self.last_thumb_selected = Some(selected);
     }
     pub(super) fn open_detail(
         &mut self,
@@ -1926,13 +1990,39 @@ impl ReaderApp {
         self.ask_cover(ui.ctx(), &cover_id);
         let cover = self.detail_cover_rect(area);
         let palette = crate::design::palette(self.dark);
-        ui.painter()
-            .rect_filled(cover.expand2(vec2(24., 24.)), 24., palette.soft);
-        ui.painter().rect_filled(
-            cover.translate(vec2(7., 9.)).expand(2.),
-            9.,
-            palette.ink.gamma_multiply(0.08),
-        );
+        let now = ui.ctx().input(|i| i.time);
+        let reveal = self.flight.as_ref().map(|flight| {
+            let duration = if flight.returning {
+                motion::CLOSE
+            } else {
+                motion::OPEN
+            };
+            let elapsed = ((now - flight.started) / duration).clamp(0., 1.) as f32;
+            if flight.returning {
+                1. - elapsed
+            } else {
+                elapsed
+            }
+        });
+        // The text column's reveal opacity; it also lifts 8pt into place.
+        let detail_alpha = reveal
+            .map(|reveal| motion::smooth(((reveal - 0.5) / 0.5).max(0.)))
+            .unwrap_or(1.);
+        // Soft paper shadow + a hairline border land only once the flying
+        // cover has nearly arrived — nothing may peek out from behind it.
+        if reveal.is_none_or(|reveal| reveal > 0.72) {
+            let mut cover_painter = ui.painter().clone();
+            if let Some(reveal) = reveal {
+                cover_painter.multiply_opacity(((reveal - 0.72) / 0.28).clamp(0., 1.));
+            }
+            crate::design::soft_shadow(&cover_painter, cover, 8., 2.2, self.dark);
+            cover_painter.rect_stroke(
+                cover,
+                9.,
+                Stroke::new(1., palette.line),
+                StrokeKind::Inside,
+            );
+        }
         if self.flight.is_none()
             && let Some(texture) = self.covers.get(&cover_id)
         {
@@ -1970,7 +2060,7 @@ impl ReaderApp {
             pos2(cover.right() + 72., cover.top() + cover.height() * 0.15)
         } else {
             pos2(area.left() + 24., cover.bottom() + 44.)
-        };
+        } - vec2(0., 8. * (1. - detail_alpha));
         if Self::detail_wide(area) {
             let body = Rect::from_min_size(
                 details_start,

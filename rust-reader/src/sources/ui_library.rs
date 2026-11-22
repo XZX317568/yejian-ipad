@@ -31,6 +31,7 @@ use super::repos::COMMUNITY_INDEX;
 use super::covers::CoverReq;
 use super::engine::Task;
 use super::covers::cover_key;
+use super::ui_browse::bordered_action;
 use super::ui_browse::disclosure;
 use super::downloads::manga_snapshot_key;
 use super::ui_browse::quiet_action;
@@ -157,6 +158,8 @@ impl Sources {
         if self.follows.is_empty() {
             return;
         }
+        let palette = design::palette(ui.visuals().dark_mode);
+        let now = ui.ctx().input(|i| i.time);
         design::section(ui, &format!("我的追更 · {}", self.follows.len()));
         let checking = self.checking > 0;
         if ui
@@ -223,7 +226,20 @@ impl Sources {
             };
             // Only covers without a texture are fetched; asking for loaded
             // ones re-downloads them after every completed request.
-            if texture.is_none()
+            let missing = texture.is_none();
+            let (texture, alpha) = match texture {
+                Some(texture) => {
+                    let alpha = cover_url
+                        .as_ref()
+                        .map_or(1., |url| self.cover_alpha(&cover_key(&source_id, url), now));
+                    (Some(texture), alpha)
+                }
+                None => (
+                    self.cover_texture(ui.ctx(), &snapshot),
+                    self.cover_alpha(&snapshot, now),
+                ),
+            };
+            if missing
                 && let Some(url) = cover_url
             {
                 want_covers.push(CoverReq {
@@ -232,18 +248,22 @@ impl Sources {
                     url,
                 });
             }
-            let texture = match texture {
-                Some(texture) => Some(texture),
-                None => self.cover_texture(ui.ctx(), &snapshot),
-            };
             if let Some(texture) = texture {
                 let cover =
                     Rect::from_center_size(pos2(left + 18., (top + bottom) / 2.), vec2(40., 54.));
-                ui.painter().image(
-                    texture.id(),
+                crate::shelf::paint_art_alpha(
+                    ui.painter(),
+                    crate::shelf::Plane::rect(cover),
+                    cover.size(),
+                    &texture,
+                    palette.accent_soft,
+                    alpha,
+                );
+                ui.painter().rect_stroke(
                     cover,
-                    Rect::from_min_max(pos2(0., 0.), pos2(1., 1.)),
-                    Color32::WHITE,
+                    8.,
+                    Stroke::new(1., palette.line),
+                    StrokeKind::Inside,
                 );
             }
         }
@@ -444,7 +464,10 @@ impl Sources {
                         .hint_text("粘贴书源仓库地址")
                         .desired_width(ui.available_width()),
                 );
-                if ui.add_enabled(!self.busy, quiet_action("读取")).clicked() {
+                if ui
+                    .add_enabled(!self.busy, bordered_action("读取", ui.visuals().dark_mode))
+                    .clicked()
+                {
                     self.submit(Task::Fetch(self.url.trim().into()));
                 }
             });

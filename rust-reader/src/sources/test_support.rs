@@ -324,6 +324,8 @@ pub(super) fn test_sources(root: &Path) -> Sources {
         cover_missing_disk: HashSet::new(),
         cover_textures: Default::default(),
         cover_lru: VecDeque::new(),
+        cover_loaded_at: Default::default(),
+        reduced: false,
         auto_next_page: None,
         chapter_progress: Default::default(),
         description_expanded: false,

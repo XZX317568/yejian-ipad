@@ -119,6 +119,21 @@ pub struct ReaderApp {
     zoom: f32,
     pan: Vec2,
     controls: bool,
+    controls_anim: Option<motion::TimedTween>,
+    page_slide: motion::PageSlide,
+    /// Strip gap between the incoming and outgoing page during a turn:
+    /// the eased outgoing offset is `current_offset - slide_turn_gap`.
+    slide_turn_gap: f32,
+    zoom_anim: motion::ZoomAnim,
+    nav_pill: Option<motion::TimedTween>,
+    last_nav_tab: Tab,
+    tab_enter: Option<f64>,
+    /// `(book id, start time)` driving the stage info's 0.12s opacity settle.
+    focus_book_anim: Option<(String, f64)>,
+    progress_tween: Option<motion::TimedTween>,
+    last_thumb_selected: Option<usize>,
+    /// Open timestamp driving the reader options panel's 0.16s fade/lift.
+    reader_options_at: Option<f64>,
     /// Showing the 本章完 end card past the last page.
     chapter_end: bool,
     /// "lr" | "next" | "off" — tap-zone behaviour (`tap-zones` setting).
@@ -343,6 +358,17 @@ impl ReaderApp {
             zoom: 1.,
             pan: Vec2::ZERO,
             controls: true,
+            controls_anim: None,
+            page_slide: motion::PageSlide::default(),
+            slide_turn_gap: 0.,
+            zoom_anim: motion::ZoomAnim::default(),
+            nav_pill: None,
+            last_nav_tab: Tab::Library,
+            tab_enter: None,
+            focus_book_anim: None,
+            progress_tween: None,
+            last_thumb_selected: None,
+            reader_options_at: None,
             chapter_end: false,
             tap_zones: "lr".into(),
             keep_awake_setting: true,
@@ -986,6 +1012,36 @@ impl ReaderApp {
             self.back(now, area);
         }
     }
+    /// True while any bounded animation still needs repaints. Every `Option`
+    /// it reads is cleared once the motion finishes, so an idle frame leaves
+    /// `frame_is_animating` false and the repaint delay long.
+    fn animating(&self, now: f64, entrance: f32) -> bool {
+        let reader_motion = matches!(self.screen, Screen::Reader(_))
+            && (self.page_slide.active(now)
+                || self.zoom_anim.active(now)
+                || self.controls_anim.is_some_and(|t| !t.done(now)));
+        self.motion.active()
+            || entrance < 1.
+            || self.flight.is_some()
+            || self.shelf_reorder.is_some()
+            || reader_motion
+            || (matches!(self.screen, Screen::Reader(_))
+                && self.vertical
+                && self.vertical_reader.active())
+            || self.nav_pill.is_some_and(|t| !t.done(now))
+            || self.tab_enter.is_some()
+            || self
+                .focus_book_anim
+                .as_ref()
+                .is_some_and(|(_, t0)| now - *t0 < 0.12)
+            || self.progress_tween.is_some_and(|t| !t.done(now))
+            || self
+                .reader_options_at
+                .is_some_and(|t0| now - t0 < 0.16)
+            || (matches!(self.screen, Screen::Library)
+                && self.tab == Tab::Sources
+                && self.sources.is_animating(now))
+    }
     fn colors(&self) -> (Color32, Color32, Color32) {
         let p = crate::design::palette(self.dark);
         (p.paper, p.ink, p.muted)
@@ -1004,12 +1060,18 @@ impl ReaderApp {
         let response = ui.interact(rect, Id::unique(id), Sense::click());
         response.widget_info(|| WidgetInfo::labeled(Role::Button, true, label));
         let palette = crate::design::palette(self.dark);
+        let pressed = response.is_pointer_button_down_on();
+        let rect = crate::design::press_rect(rect, pressed && !self.reduced);
         let fill = if primary {
-            if response.hovered() {
+            if pressed {
+                palette.primary.gamma_multiply(0.78)
+            } else if response.hovered() {
                 palette.primary.gamma_multiply(0.88)
             } else {
                 palette.primary
             }
+        } else if pressed {
+            palette.accent_soft
         } else if response.hovered() {
             palette.soft
         } else {
@@ -1092,6 +1154,7 @@ impl ReaderApp {
             }
         }
         self.sources.poll();
+        self.sources.set_reduced(self.reduced);
         if let Some(scope) = self.sources.take_scope_change() {
             self.setting("search-scope", scope);
         }
@@ -1377,10 +1440,36 @@ impl ReaderApp {
         if system_back || (!self.applock.locked() && ctx.input(|i| i.key_pressed(Key::Escape))) {
             self.request_back(now, content, system_back);
         }
+        // Clear every finished bounded tween so an idle frame reports
+        // `frame_is_animating == false` and the repaint delay stays long.
+        if self.nav_pill.is_some_and(|t| t.done(now)) {
+            self.nav_pill = None;
+        }
+        if self.tab_enter.is_some_and(|t0| now - t0 >= 0.14) {
+            self.tab_enter = None;
+        }
+        if self.progress_tween.is_some_and(|t| t.done(now)) {
+            self.progress_tween = None;
+        }
+        if self.controls_anim.is_some_and(|t| t.done(now)) {
+            self.controls_anim = None;
+        }
+        if !self.reader_options {
+            self.reader_options_at = None;
+        }
+        let tab_alpha = if let Some(t0) = self.tab_enter {
+            let k = ((now - t0) / 0.14).clamp(0., 1.) as f32;
+            if k >= 1. {
+                1.
+            } else {
+                0.45 + 0.55 * motion::smooth(k)
+            }
+        } else {
+            1.
+        };
         let is_reader = matches!(self.screen, Screen::Reader(_));
-        let animating = self.motion.tick(now);
-        self.frame_is_animating =
-            animating || entrance < 1. || self.flight.is_some() || self.shelf_reorder.is_some();
+        self.motion.tick(now);
+        self.frame_is_animating = self.animating(now, entrance);
         if self.frame_is_animating {
             ctx.request_repaint();
         }
@@ -1389,59 +1478,6 @@ impl ReaderApp {
                 self.reader_ui(ui, full, &id, now);
             }
         } else {
-            if !matches!(self.screen, Screen::Library) {
-                if self.icon(
-                    ui,
-                    "back",
-                    Rect::from_min_size(content.min + vec2(24., 14.), vec2(44., 44.)),
-                    "back",
-                    "返回书架",
-                ) {
-                    self.back(now, content);
-                }
-            } else {
-                let title = match self.tab {
-                    Tab::Library => "书架",
-                    Tab::Sources => "发现书源",
-                    Tab::History => "阅读足迹",
-                    Tab::Settings => "设置",
-                };
-                ui.painter().text(
-                    content.min + vec2(24., 37.),
-                    Align2::LEFT_CENTER,
-                    title,
-                    crate::typography::display(30. * self.font_scale.min(1.3)),
-                    ink,
-                );
-                if self.tab == Tab::Library
-                    && self.icon(
-                        ui,
-                        "search",
-                        Rect::from_min_size(
-                            pos2(content.right() - 68., content.top() + 16.),
-                            vec2(44., 44.),
-                        ),
-                        "search",
-                        "搜索书库",
-                    )
-                {
-                    self.search = !self.search;
-                }
-                if self.tab == Tab::Library
-                    && self.icon(
-                        ui,
-                        "import",
-                        Rect::from_min_size(
-                            pos2(content.right() - 120., content.top() + 16.),
-                            vec2(44., 44.),
-                        ),
-                        "plus",
-                        "导入漫画",
-                    )
-                {
-                    self.pick_import();
-                }
-            }
             let transition = self.flight.as_ref().map(|flight| {
                 let duration = if flight.returning {
                     motion::CLOSE
@@ -1456,6 +1492,92 @@ impl ReaderApp {
                 };
                 (flight.book_id.clone(), motion::travel(progress))
             });
+            let flight_reveal = transition.as_ref().map(|(_, reveal)| *reveal);
+            if !matches!(self.screen, Screen::Library) {
+                // The back affordance fades in late during the cover flight
+                // instead of snapping onto the detail page.
+                let back_alpha = flight_reveal
+                    .map(|reveal| motion::smooth(((reveal - 0.35) / 0.45).clamp(0., 1.)))
+                    .unwrap_or(1.);
+                if back_alpha > 0.001 {
+                    let mut go_back = false;
+                    ui.scope(|ui| {
+                        ui.set_opacity(back_alpha);
+                        go_back = self.icon(
+                            ui,
+                            "back",
+                            Rect::from_min_size(content.min + vec2(24., 14.), vec2(44., 44.)),
+                            "back",
+                            "返回书架",
+                        );
+                    });
+                    if go_back {
+                        self.back(now, content);
+                    }
+                }
+            } else {
+                // The library top bar crossfades in as the cover flies home.
+                let bar_alpha = flight_reveal
+                    .map(|reveal| 1. - motion::smooth((reveal / 0.42).min(1.)))
+                    .unwrap_or(1.);
+                if bar_alpha > 0.001 {
+                    let mut toggled = false;
+                    let mut import = false;
+                    ui.scope(|ui| {
+                        ui.set_opacity(bar_alpha);
+                        if flight_reveal.is_some() {
+                            ui.disable();
+                        }
+                        let title = match self.tab {
+                            Tab::Library => "书架",
+                            Tab::Sources => "发现书源",
+                            Tab::History => "阅读足迹",
+                            Tab::Settings => "设置",
+                        };
+                        ui.painter().text(
+                            content.min + vec2(24., 37.),
+                            Align2::LEFT_CENTER,
+                            title,
+                            crate::typography::display(30. * self.font_scale.min(1.3)),
+                            ink,
+                        );
+                        if self.tab == Tab::Library
+                            && self.icon(
+                                ui,
+                                "search",
+                                Rect::from_min_size(
+                                    pos2(content.right() - 68., content.top() + 16.),
+                                    vec2(44., 44.),
+                                ),
+                                "search",
+                                "搜索书库",
+                            )
+                        {
+                            toggled = true;
+                        }
+                        if self.tab == Tab::Library
+                            && self.icon(
+                                ui,
+                                "import",
+                                Rect::from_min_size(
+                                    pos2(content.right() - 120., content.top() + 16.),
+                                    vec2(44., 44.),
+                                ),
+                                "plus",
+                                "导入漫画",
+                            )
+                        {
+                            import = true;
+                        }
+                    });
+                    if toggled {
+                        self.search = !self.search;
+                    }
+                    if import {
+                        self.pick_import();
+                    }
+                }
+            }
             if let Some((id, reveal)) = transition {
                 ui.scope(|ui| {
                     ui.disable();
@@ -1474,22 +1596,25 @@ impl ReaderApp {
                         if self.tab != Tab::Settings {
                             self.storage_opened = false;
                         }
-                        match self.tab {
-                            Tab::Library => {
-                                self.library_viewport(ui, content, now, entrance);
-                                crate::perf::mark(crate::perf::Stage::FirstShelfFrame);
+                        ui.scope(|ui| {
+                            ui.set_opacity(tab_alpha);
+                            match self.tab {
+                                Tab::Library => {
+                                    self.library_viewport(ui, content, now, entrance);
+                                    crate::perf::mark(crate::perf::Stage::FirstShelfFrame);
+                                }
+                                Tab::History => self.history_ui(ui, content),
+                                Tab::Settings => self.settings_ui(ui, content),
+                                Tab::Sources => self.sources_ui(ui, content),
                             }
-                            Tab::History => self.history_ui(ui, content),
-                            Tab::Settings => self.settings_ui(ui, content),
-                            Tab::Sources => self.sources_ui(ui, content),
-                        }
+                        });
                     }
                     Screen::Detail(id) => self.detail_ui(ui, content, &id),
                     _ => {}
                 }
             }
             if tablet || matches!(self.screen, Screen::Library) {
-                self.navigation(ui, full, tablet);
+                self.navigation(ui, full, tablet, now);
             }
             if let Some(flight) = &self.flight {
                 let duration = if flight.returning {
@@ -1537,58 +1662,80 @@ impl ReaderApp {
             }
         }
         if let Some((text, at)) = self.notice.clone() {
-            if now - at < 5. {
-                let crash = matches!(
-                    self.exit_notice,
-                    Some(crate::diagnostics::ExitNotice::Crash)
-                ) && text.contains("意外退出");
-                let fg = self.colors().0;
-                let height = if crash { 54. } else { 42. };
-                let rect = Rect::from_center_size(
-                    pos2(full.center().x, full.bottom() - 100.),
-                    vec2((full.width() - 32.).min(560.), height),
-                );
-                ui.painter().rect_filled(rect, 10., ink);
-                let text_rect = if crash {
-                    rect.shrink2(vec2(16., 0.)).with_max_x(rect.max.x - 108.)
+            let age = (now - at) as f32;
+            if age < 5. {
+                // 0.18s slide/fade in, 0.22s fade out before the 5s expiry;
+                // repaints are requested only during those two windows.
+                let enter = if self.reduced {
+                    1.
                 } else {
-                    rect.shrink2(vec2(16., 0.))
+                    motion::smooth((age / 0.18).clamp(0., 1.))
                 };
-                let mut job = egui::text::LayoutJob::simple(
-                    text,
-                    FontId::proportional(12.5),
-                    fg,
-                    text_rect.width().max(40.),
-                );
-                job.wrap.max_rows = 1;
-                job.wrap.break_anywhere = true;
-                let galley = ui.painter().layout_job(job);
-                let text_pos = if crash {
-                    pos2(text_rect.min.x, rect.center().y - galley.size().y * 0.5)
+                let exit = if self.reduced {
+                    1.
                 } else {
-                    pos2(
-                        text_rect.center().x - galley.size().x * 0.5,
-                        rect.center().y - galley.size().y * 0.5,
-                    )
+                    (1. - (age - (5. - 0.22)) / 0.22).clamp(0., 1.)
                 };
-                ui.painter().galley(text_pos, galley, fg);
-                if crash {
-                    let btn_rect = Rect::from_center_size(
-                        pos2(rect.max.x - 54., rect.center().y),
-                        vec2(92., 44.),
+                let alpha = (enter * exit).clamp(0., 1.);
+                if alpha > 0.001 {
+                    let crash = matches!(
+                        self.exit_notice,
+                        Some(crate::diagnostics::ExitNotice::Crash)
+                    ) && text.contains("意外退出");
+                    let fg = self.colors().0;
+                    let height = if crash { 54. } else { 42. };
+                    let rect = Rect::from_center_size(
+                        pos2(full.center().x, full.bottom() - 100. + 14. * (1. - enter)),
+                        vec2((full.width() - 32.).min(560.), height),
                     );
-                    let button = ui.put(
-                        btn_rect,
-                        Button::new(RichText::new("导出日志").size(12.5).color(fg))
-                            .fill(fg.gamma_multiply(0.16))
-                            .stroke(Stroke::new(1., fg))
-                            .corner_radius(8.),
+                    let mut toast = ui.painter().clone();
+                    toast.multiply_opacity(alpha);
+                    crate::design::soft_shadow(&toast, rect, height / 2., 1., self.dark);
+                    toast.rect_filled(rect, height / 2., ink);
+                    let text_rect = if crash {
+                        rect.shrink2(vec2(16., 0.)).with_max_x(rect.max.x - 108.)
+                    } else {
+                        rect.shrink2(vec2(16., 0.))
+                    };
+                    let mut job = egui::text::LayoutJob::simple(
+                        text,
+                        FontId::proportional(12.5),
+                        fg,
+                        text_rect.width().max(40.),
                     );
-                    self.hitboxes.insert("crash-export".into(), button.rect);
-                    if button.clicked() {
-                        self.exit_notice = None;
-                        self.export_diagnostics();
+                    job.wrap.max_rows = 1;
+                    job.wrap.break_anywhere = true;
+                    let galley = ui.painter().layout_job(job);
+                    let text_pos = if crash {
+                        pos2(text_rect.min.x, rect.center().y - galley.size().y * 0.5)
+                    } else {
+                        pos2(
+                            text_rect.center().x - galley.size().x * 0.5,
+                            rect.center().y - galley.size().y * 0.5,
+                        )
+                    };
+                    toast.galley(text_pos, galley, fg);
+                    if crash {
+                        let btn_rect = Rect::from_center_size(
+                            pos2(rect.max.x - 54., rect.center().y),
+                            vec2(92., 44.),
+                        );
+                        let button = ui.put(
+                            btn_rect,
+                            Button::new(RichText::new("导出日志").size(12.5).color(fg))
+                                .fill(fg.gamma_multiply(0.16))
+                                .stroke(Stroke::new(1., fg))
+                                .corner_radius(8.),
+                        );
+                        self.hitboxes.insert("crash-export".into(), button.rect);
+                        if button.clicked() {
+                            self.exit_notice = None;
+                            self.export_diagnostics();
+                        }
                     }
+                }
+                if !self.reduced && (age < 0.18 || age > 5. - 0.22) {
+                    ctx.request_repaint();
                 }
             }
         }
@@ -1622,12 +1769,7 @@ impl ReaderApp {
             crate::perf::mark(crate::perf::Stage::CoversReady);
         }
         self.trim_covers();
-        self.frame_is_animating = self.motion.active()
-            || entrance < 1.
-            || self.flight.is_some()
-            || (matches!(self.screen, Screen::Reader(_))
-                && self.vertical
-                && self.vertical_reader.active());
+        self.frame_is_animating = self.animating(now, entrance);
         if self.frame_is_animating {
             ctx.request_repaint();
         }
@@ -1838,7 +1980,7 @@ mod tests {
         assert!(app.pages.is_empty());
         assert_eq!(app.page_pending, HashSet::from([("new".into(), 0)]));
         let generation = app.page_generation;
-        app.next_page("new", 10);
+        app.next_page("new", 10, 0., 800.);
         assert!(app.page_generation > generation);
         assert_eq!(app.page_pending, HashSet::from([("new".into(), 10)]));
     }
@@ -2552,31 +2694,31 @@ mod tests {
         app.open_reader(&target);
         // lr follows the reading direction.
         app.tap_zones = "lr".into();
-        app.reader_tap("one", 0.9, 1);
+        app.reader_tap("one", 0.9, 1, 0., 800.);
         assert_eq!(app.page, 6);
-        app.reader_tap("one", 0.1, 1);
+        app.reader_tap("one", 0.1, 1, 0., 800.);
         assert_eq!(app.page, 5);
         app.rtl = true;
-        app.reader_tap("one", 0.1, 1);
+        app.reader_tap("one", 0.1, 1, 0., 800.);
         assert_eq!(app.page, 6, "rtl left edge advances");
-        app.reader_tap("one", 0.9, 1);
+        app.reader_tap("one", 0.9, 1, 0., 800.);
         assert_eq!(app.page, 5, "rtl right edge retreats");
         app.rtl = false;
         // next: both outer zones advance.
         app.tap_zones = "next".into();
-        app.reader_tap("one", 0.1, 1);
+        app.reader_tap("one", 0.1, 1, 0., 800.);
         assert_eq!(app.page, 6);
-        app.reader_tap("one", 0.9, 1);
+        app.reader_tap("one", 0.9, 1, 0., 800.);
         assert_eq!(app.page, 7);
         // off: outer taps do nothing, the center still toggles controls.
         app.tap_zones = "off".into();
-        app.reader_tap("one", 0.1, 1);
-        app.reader_tap("one", 0.9, 1);
+        app.reader_tap("one", 0.1, 1, 0., 800.);
+        app.reader_tap("one", 0.9, 1, 0., 800.);
         assert_eq!(app.page, 7);
         let controls = app.controls;
-        app.reader_tap("one", 0.5, 1);
+        app.reader_tap("one", 0.5, 1, 0., 800.);
         assert_eq!(app.controls, !controls);
-        app.reader_tap("one", 0.5, 1);
+        app.reader_tap("one", 0.5, 1, 0., 800.);
         assert_eq!(app.controls, controls);
     }
 
@@ -2599,18 +2741,18 @@ mod tests {
         assert_eq!(app.page, 19);
         // The first advance past the last page shows the card instead of
         // moving — progress stays on the real last page.
-        app.next_page("one", 1);
+        app.next_page("one", 1, 0., 800.);
         assert!(app.chapter_end);
         assert_eq!(app.page, 19);
         assert_eq!(app.current_book_id(), Some("one"));
         // Back returns to the last page without a card.
-        app.next_page("one", -1);
+        app.next_page("one", -1, 0., 800.);
         assert!(!app.chapter_end);
         assert_eq!(app.page, 19);
         // Forward again, then continue into the next linked chapter.
-        app.next_page("one", 1);
+        app.next_page("one", 1, 0., 800.);
         assert!(app.chapter_end);
-        app.next_page("one", 1);
+        app.next_page("one", 1, 0., 800.);
         assert_eq!(app.current_book_id(), Some("two"));
         assert_eq!(app.page, 0);
         assert!(!app.chapter_end);
@@ -2618,9 +2760,9 @@ mod tests {
         let mut tail = book("two");
         tail.current_page = 19;
         app.open_reader(&tail);
-        app.next_page("two", 1);
+        app.next_page("two", 1, 0., 800.);
         assert!(app.chapter_end);
-        app.next_page("two", 1);
+        app.next_page("two", 1, 0., 800.);
         assert!(app.chapter_end && app.page == 19);
         assert_eq!(app.current_book_id(), Some("two"));
     }
@@ -2721,7 +2863,7 @@ mod tests {
             .unwrap()
             .clone();
         assert_eq!(app.bookmark_book(&mark).unwrap().id, "two");
-        app.bookmark_jump(mark, "one");
+        app.bookmark_jump(mark, "one", 0., 800.);
         assert!(matches!(&app.screen, Screen::Reader(id) if id == "two"));
         assert_eq!(app.page, 5);
         // Private mode disables bookmarks entirely.
@@ -2742,6 +2884,8 @@ mod tests {
                 created_at: 1,
             },
             "one",
+            0.,
+            800.,
         );
         assert!(app.error.is_some());
     }

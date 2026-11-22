@@ -40,14 +40,25 @@ pub(super) fn quiet_action(label: &str) -> Button<'_> {
         .wrap_mode(egui::TextWrapMode::Extend)
 }
 
+/// Secondary actions share the warm surface + hairline border of the rest
+/// of the design system instead of floating as bare text.
+pub(super) fn bordered_action(label: &str, dark: bool) -> Button<'_> {
+    design::secondary(label, dark).wrap_mode(egui::TextWrapMode::Extend)
+}
+
 pub(super) fn disclosure(ui: &mut Ui, label: &str, default_open: bool, body: impl FnOnce(&mut Ui)) {
     let mut state = collapsing_header::CollapsingState::load_with_default_open(
         ui.ctx(),
         ui.make_persistent_id(label),
         default_open,
     );
-    let mut response =
-        ui.add(quiet_action(label).right_text(if state.is_open() { "−" } else { "+" }));
+    let mut response = ui.add(
+        bordered_action(label, ui.visuals().dark_mode).right_text(if state.is_open() {
+            "−"
+        } else {
+            "+"
+        }),
+    );
     if response.clicked() {
         state.toggle(ui);
         response.mark_changed();
@@ -164,14 +175,17 @@ pub(super) fn paint_cover(
     title: &str,
     font: FontId,
     palette: &crate::design::Palette,
+    alpha: f32,
 ) {
     match texture {
         Some(texture) => {
-            painter.image(
-                texture.id(),
-                rect,
-                Rect::from_min_max(pos2(0., 0.), pos2(1., 1.)),
-                Color32::WHITE,
+            crate::shelf::paint_art_alpha(
+                painter,
+                crate::shelf::Plane::rect(rect),
+                rect.size(),
+                texture,
+                palette.accent_soft,
+                alpha,
             );
         }
         None => {
@@ -593,10 +607,10 @@ impl Sources {
                 leave = true;
                 self.start_search();
             }
-            if ui.add(quiet_action("重置")).clicked() {
+            if ui.add(design::secondary("重置", dark)).clicked() {
                 editor = FilterEditor::new(&self.filters, &[]);
             }
-            if ui.add(quiet_action("取消")).clicked() {
+            if ui.add(design::secondary("取消", dark)).clicked() {
                 leave = true;
             }
         });
@@ -606,11 +620,20 @@ impl Sources {
         ui.add_space(14.);
         ui.separator();
         ui.add_space(14.);
-        ScrollArea::vertical()
+        let output = ScrollArea::vertical()
             .id_salt("source-filter-editor")
             .show(ui, |ui| {
                 editor.ui(ui, &self.filters);
             });
+        // Long option lists clip mid-row at the viewport edge; a warm fade
+        // lets them dissolve into the paper instead of slicing hard.
+        design::paint_scroll_fade(
+            ui.painter(),
+            output.inner_rect,
+            design::palette(dark).paper,
+            false,
+            true,
+        );
         if !leave {
             self.filter_editor = Some(editor);
         }
@@ -638,7 +661,8 @@ impl Sources {
         false
     }
     pub(super)fn browser_header(&mut self, ui: &mut Ui) {
-        let palette = design::palette(ui.visuals().dark_mode);
+        let dark = ui.visuals().dark_mode;
+        let palette = design::palette(dark);
         ui.vertical(|ui| {
             ui.set_min_width(ui.available_width());
             ui.horizontal_wrapped(|ui| {
@@ -760,7 +784,7 @@ impl Sources {
                     if ui
                         .add_enabled(
                             self.metadata_loaded && !hidden && !self.filters.is_empty(),
-                            quiet_action(&label),
+                            bordered_action(&label, dark),
                         )
                         .clicked()
                     {
@@ -769,7 +793,7 @@ impl Sources {
                     }
                     if !self.applied_filters.is_empty()
                         && !hidden
-                        && ui.add(quiet_action("清除筛选")).clicked()
+                        && ui.add(bordered_action("清除筛选", dark)).clicked()
                     {
                         self.applied_filters.clear();
                         self.start_search();
@@ -881,6 +905,7 @@ impl Sources {
         let small_h = ui.text_style_height(&TextStyle::Small);
         let cell_h = cover_h + 6. + body_h * 2. + 2. + small_h + 6.;
         let expanded = ui.clip_rect().expand(cell_h + gap);
+        let now = ui.ctx().input(|i| i.time);
         let entries = self.results.entries.clone();
         let mut want = Vec::new();
         let mut last_row = None;
@@ -911,11 +936,12 @@ impl Sources {
                 }
                 let source = self.source_for(manga);
                 let url = manga.cover.clone().unwrap_or_default();
+                let key = cover_key(&source, &url);
                 let texture = if expanded.intersects(cell) {
                     let texture = self.cover_image(ui.ctx(), &source, &url);
                     if texture.is_none() && !url.is_empty() {
                         want.push(CoverReq {
-                            key: cover_key(&source, &url),
+                            key: key.clone(),
                             source,
                             url,
                         });
@@ -927,7 +953,10 @@ impl Sources {
                 if response.hovered() && !self.busy {
                     ui.painter().rect_filled(cell, 8., palette.soft);
                 }
-                let cover_rect = Rect::from_min_size(cell.min, vec2(cell_w, cover_h));
+                let cover_rect = design::press_rect(
+                    Rect::from_min_size(cell.min, vec2(cell_w, cover_h)),
+                    response.is_pointer_button_down_on(),
+                );
                 let painter = ui.painter().with_clip_rect(ui.clip_rect().intersect(cell));
                 paint_cover(
                     &painter,
@@ -936,6 +965,7 @@ impl Sources {
                     &manga.title,
                     TextStyle::Heading.resolve(ui.style()),
                     &palette,
+                    self.cover_alpha(&key, now),
                 );
                 let mut title_job = egui::text::LayoutJob::simple(
                     manga.title.clone(),
@@ -1019,11 +1049,12 @@ impl Sources {
             *open = Some(manga.clone());
         }
         let url = manga.cover.clone().unwrap_or_default();
+        let key = cover_key(&manga.source_key, &url);
         let texture = if ui.clip_rect().expand(cell.height() + 16.).intersects(cell) {
             let texture = self.cover_image(ui.ctx(), &manga.source_key, &url);
             if texture.is_none() && !url.is_empty() {
                 want.push(CoverReq {
-                    key: cover_key(&manga.source_key, &url),
+                    key: key.clone(),
                     source: manga.source_key.clone(),
                     url,
                 });
@@ -1035,6 +1066,7 @@ impl Sources {
         if response.hovered() && !self.busy {
             ui.painter().rect_filled(cell, 8., palette.soft);
         }
+        let now = ui.ctx().input(|i| i.time);
         let painter = ui.painter().with_clip_rect(ui.clip_rect().intersect(cell));
         paint_cover(
             &painter,
@@ -1043,6 +1075,7 @@ impl Sources {
             &manga.title,
             TextStyle::Heading.resolve(ui.style()),
             &palette,
+            self.cover_alpha(&key, now),
         );
         let body_h = ui.text_style_height(&TextStyle::Body);
         let mut title_job = egui::text::LayoutJob::simple(
@@ -1307,7 +1340,10 @@ impl Sources {
                 {
                     self.open_web(&origin, None);
                 }
-                if ui.add(quiet_action("忽略")).clicked() {
+                if ui
+                    .add(bordered_action("忽略", ui.visuals().dark_mode))
+                    .clicked()
+                {
                     self.challenge = None;
                 }
             });
@@ -1463,7 +1499,9 @@ impl Sources {
                     ui.add(Label::new(&self.status).wrap());
                 }
                 if let Some(task) = self.failed.clone()
-                    && ui.add(quiet_action("重试")).clicked()
+                    && ui
+                        .add(bordered_action("重试", ui.visuals().dark_mode))
+                        .clicked()
                 {
                     self.submit(task);
                 }

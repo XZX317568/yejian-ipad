@@ -228,6 +228,10 @@ impl Sources {
                 )
             });
         self.covers.insert(snapshot.to_string(), texture.clone());
+        if texture.is_some() {
+            self.cover_loaded_at
+                .insert(snapshot.to_string(), ctx.input(|i| i.time));
+        }
         texture
     }
     pub(super)fn cover_image(&mut self, ctx: &Context, source: &str, url: &str) -> Option<TextureHandle> {
@@ -265,16 +269,39 @@ impl Sources {
         let texture =
             ctx.load_texture(format!("source-cover-{key}"), image, TextureOptions::LINEAR);
         self.cover_textures.insert(key.clone(), texture.clone());
+        self.cover_loaded_at
+            .insert(key.clone(), ctx.input(|i| i.time));
         self.cover_lru.push_back(key);
         while self.cover_textures.len() > COVER_TEXTURE_CAP {
             match self.cover_lru.pop_front() {
                 Some(evicted) => {
                     self.cover_textures.remove(&evicted);
+                    self.cover_loaded_at.remove(&evicted);
                 }
                 None => break,
             }
         }
         Some(texture)
+    }
+    /// Mirrors the shell's reduced-motion setting; cover fades complete
+    /// instantly so nothing keeps animating.
+    pub(crate) fn set_reduced(&mut self, reduced: bool) {
+        self.reduced = reduced;
+    }
+    /// True only while a freshly decoded cover is still inside its 180 ms
+    /// fade-in window, so the host repaints until every tile settles.
+    pub(crate) fn is_animating(&self, now: f64) -> bool {
+        !self.reduced && self.cover_loaded_at.values().any(|&t0| now - t0 < 0.18)
+    }
+    /// Fade-in progress for the cover stored under `key`; textures that
+    /// predate the timestamp map (or finished fading) render fully opaque.
+    pub(super) fn cover_alpha(&self, key: &str, now: f64) -> f32 {
+        if self.reduced {
+            return 1.;
+        }
+        self.cover_loaded_at.get(key).map_or(1., |&t0| {
+            crate::motion::smooth(((now - t0) / 0.18).clamp(0., 1.) as f32)
+        })
     }
     pub(super)fn plan_covers(&mut self, want: Vec<CoverReq>) {
         let skip: HashSet<String> = self

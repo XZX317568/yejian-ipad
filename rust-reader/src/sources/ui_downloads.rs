@@ -29,6 +29,7 @@ use egui::*;
 use super::*;
 use super::downloads::DownloadStatus;
 use super::tasks::DownloadTask;
+use super::ui_browse::bordered_action;
 use super::ui_browse::quiet_action;
 
 impl Sources {
@@ -101,7 +102,10 @@ impl Sources {
                     }
                 }
                 DownloadStatus::Failed => {
-                    if ui.add(quiet_action("重试")).clicked() {
+                    if ui
+                        .add(bordered_action("重试", ui.visuals().dark_mode))
+                        .clicked()
+                    {
                         self.retry_task(task);
                     }
                     if ui.add(quiet_action("取消")).clicked() {

@@ -32,6 +32,7 @@ use super::covers::CoverReq;
 use super::downloads::DownloadStatus;
 use super::tasks::DownloadTask;
 use super::covers::cover_key;
+use super::ui_browse::bordered_action;
 use super::ui_browse::disclosure;
 use super::ui_browse::paint_cover;
 use super::ui_browse::quiet_action;
@@ -208,13 +209,14 @@ impl Sources {
         };
         let source = self.source_for(&manga);
         let width = ui.available_width();
+        let now = ui.ctx().input(|i| i.time);
 
         let back_label = if self.shelf_origin {
             "返回书架"
         } else {
             "返回搜索结果"
         };
-        let back = ui.add(quiet_action(back_label).min_size(vec2(88., 44.)));
+        let back = ui.add(bordered_action(back_label, dark).min_size(vec2(88., 44.)));
         self.hitboxes.insert("source-detail-back".into(), back.rect);
         if back.clicked() {
             self.selected_manga = None;
@@ -253,6 +255,7 @@ impl Sources {
 
         let cover_url = manga.cover.clone().unwrap_or_default();
         let texture = self.cover_image(ui.ctx(), &source, &cover_url);
+        let cover_alpha = self.cover_alpha(&cover_key(&source, &cover_url), now);
         let mut want = Vec::new();
         if texture.is_none() && !cover_url.is_empty() {
             want.push(CoverReq {
@@ -324,9 +327,9 @@ impl Sources {
                     read = true;
                 }
                 let button = if followed {
-                    ui.add(quiet_action("已在书架 · 移出").min_size(vec2(0., 48.)))
+                    ui.add(bordered_action("已在书架 · 移出", dark).min_size(vec2(0., 48.)))
                 } else {
-                    ui.add(quiet_action("加入书架").min_size(vec2(0., 48.)))
+                    ui.add(bordered_action("加入书架", dark).min_size(vec2(0., 48.)))
                 };
                 this.hitboxes
                     .insert("source-detail-follow".into(), button.rect);
@@ -335,7 +338,8 @@ impl Sources {
                 }
                 let button = ui.add_enabled(
                     missing > 0 && !this.busy,
-                    quiet_action(&format!("下载全部未下载（{missing}）")).min_size(vec2(0., 48.)),
+                    bordered_action(&format!("下载全部未下载（{missing}）"), dark)
+                        .min_size(vec2(0., 48.)),
                 );
                 this.hitboxes
                     .insert("source-detail-missing".into(), button.rect);
@@ -363,6 +367,7 @@ impl Sources {
         if wide {
             ui.horizontal(|ui| {
                 let (cover_rect, _) = ui.allocate_exact_size(cover_size, Sense::hover());
+                design::soft_shadow(ui.painter(), cover_rect, 8., 1.2, dark);
                 paint_cover(
                     ui.painter(),
                     cover_rect,
@@ -370,6 +375,7 @@ impl Sources {
                     &manga.title,
                     heading.clone(),
                     &palette,
+                    cover_alpha,
                 );
                 ui.add_space(16.);
                 ui.vertical(|ui| {
@@ -380,6 +386,7 @@ impl Sources {
         } else {
             ui.vertical_centered(|ui| {
                 let (cover_rect, _) = ui.allocate_exact_size(cover_size, Sense::hover());
+                design::soft_shadow(ui.painter(), cover_rect, 8., 1.2, dark);
                 paint_cover(
                     ui.painter(),
                     cover_rect,
@@ -387,6 +394,7 @@ impl Sources {
                     &manga.title,
                     heading.clone(),
                     &palette,
+                    cover_alpha,
                 );
             });
             ui.add_space(8.);
@@ -490,7 +498,8 @@ impl Sources {
         ui.horizontal_wrapped(|ui| {
             ui.selectable_value(&mut self.chapters_newest_first, false, "从头开始");
             ui.selectable_value(&mut self.chapters_newest_first, true, "最新在前");
-            if !self.chapter_query.is_empty() && ui.add(quiet_action("清除查找")).clicked() {
+            if !self.chapter_query.is_empty() && ui.add(bordered_action("清除查找", dark)).clicked()
+            {
                 self.chapter_query.clear();
             }
         });
@@ -530,6 +539,11 @@ impl Sources {
                 .chapter_progress
                 .get(&id)
                 .map(|&(page, count, _)| (page, count));
+            // Finished chapters drop to muted ink so unread ones stand out.
+            let read = progress.is_some_and(|(page, count)| count > 0 && page + 1 >= count)
+                || state.is_some_and(|state| {
+                    state.total > 0 && state.read_page.is_some_and(|page| page + 1 >= state.total)
+                });
             let lines = chapter_state_lines(
                 chapter.locked,
                 downloaded.is_some(),
@@ -554,7 +568,7 @@ impl Sources {
             let mut name_job = egui::text::LayoutJob::simple(
                 name.clone(),
                 body.clone(),
-                if chapter.locked {
+                if chapter.locked || read {
                     palette.muted
                 } else {
                     palette.ink
@@ -613,15 +627,21 @@ impl Sources {
             if response.clicked() {
                 open = Some(chapter.clone());
             }
-            if response.hovered() {
-                painter.rect_filled(row_rect, 6., palette.soft);
+            let is_resume = resume_key.as_deref() == Some(chapter.key.as_str());
+            if is_resume {
+                painter.rect_filled(row_rect, 6., palette.accent_soft.gamma_multiply(0.55));
+            } else if response.hovered() {
+                painter.rect_filled(row_rect, 6., palette.accent_soft);
             }
-            if resume_key.as_deref() == Some(chapter.key.as_str()) {
-                painter.rect_filled(
-                    Rect::from_min_size(row_rect.min, vec2(3., row_rect.height())),
-                    1.5,
-                    palette.accent,
+            if response.is_pointer_button_down_on() {
+                painter.rect_filled(row_rect, 6., palette.accent_soft);
+            }
+            if is_resume {
+                let bar = Rect::from_min_size(
+                    pos2(row_rect.left() + 1., row_rect.top() + 8.),
+                    vec2(3., (row_rect.height() - 16.).max(0.)),
                 );
+                painter.rect_filled(bar, 1.5, palette.accent);
             }
             let text_top = row_rect.top() + (row_h - text_h) / 2.;
             painter.galley(
@@ -641,16 +661,24 @@ impl Sources {
             }
             let lines_h = state_galleys.len() as f32 * (small_h + 2.) - 2.;
             for (row, galley) in state_galleys.iter().enumerate() {
-                painter.galley(
-                    pos2(
-                        row_rect.right() - button_w - 8. - galley.size().x,
-                        row_rect.top()
-                            + (row_h - lines_h.max(0.)) / 2.
-                            + row as f32 * (small_h + 2.),
-                    ),
-                    galley.clone(),
-                    palette.muted,
+                let galley_pos = pos2(
+                    row_rect.right() - button_w - 8. - galley.size().x,
+                    row_rect.top() + (row_h - lines_h.max(0.)) / 2. + row as f32 * (small_h + 2.),
                 );
+                painter.galley(galley_pos, galley.clone(), palette.muted);
+                // A crisp accent check makes linked chapters read as done at
+                // a glance without changing the state text itself.
+                if downloaded.is_some() && lines[row] == "已下载" {
+                    let c = pos2(galley_pos.x - 10., galley_pos.y + small_h / 2.);
+                    painter.line_segment(
+                        [c + vec2(-3.4, 0.2), c + vec2(-0.9, 2.6)],
+                        Stroke::new(1.6, palette.accent),
+                    );
+                    painter.line_segment(
+                        [c + vec2(-0.9, 2.6), c + vec2(3.6, -2.8)],
+                        Stroke::new(1.6, palette.accent),
+                    );
+                }
             }
             if show_download {
                 let button_rect = Rect::from_center_size(
@@ -660,7 +688,7 @@ impl Sources {
                 let label = if failed { "重试下载" } else { "仅下载" };
                 let button = ui.put(
                     button_rect,
-                    quiet_action(label).min_size(button_rect.size()),
+                    design::secondary(label, dark).min_size(button_rect.size()),
                 );
                 self.hitboxes
                     .insert(format!("source-chapter-dl-{index}"), button.rect);

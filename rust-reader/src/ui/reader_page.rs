@@ -115,14 +115,20 @@ impl ReaderApp {
                     .flatten()
             })
     }
-    pub(super) fn bookmark_jump(&mut self, mark: crate::bookmarks::Bookmark, current: &str) {
+    pub(super) fn bookmark_jump(
+        &mut self,
+        mark: crate::bookmarks::Bookmark,
+        current: &str,
+        now: f64,
+        viewport_w: f32,
+    ) {
         if let Some(book) = self.bookmark_book(&mark) {
             let id = book.id.clone();
             self.open_reader(&book);
             self.chapter_dialog = None;
             let delta = mark.page as i32 - self.page as i32;
             if delta != 0 {
-                self.next_page(&id, delta);
+                self.next_page(&id, delta, now, viewport_w);
             }
             return;
         }
@@ -177,6 +183,7 @@ impl ReaderApp {
             resume,
             waiting: HashSet::new(),
         });
+        self.page_slide = motion::PageSlide::default();
         self.open_reader(&book);
     }
     /// Follows the online chapter's download, and hands the reader over to
@@ -993,6 +1000,10 @@ impl ReaderApp {
         self.zoom = 1.;
         self.pan = Vec2::ZERO;
         self.controls = true;
+        self.controls_anim = None;
+        self.page_slide = motion::PageSlide::default();
+        self.page_slide.page = self.page;
+        self.zoom_anim.cancel();
         self.page_generation += 1;
         self.worker
             .generation
@@ -1005,8 +1016,9 @@ impl ReaderApp {
             self.record_page(&book.id, self.page);
         }
     }
-    pub(super) fn next_page(&mut self, id: &str, delta: i32) {
+    pub(super) fn next_page(&mut self, id: &str, delta: i32, now: f64, viewport_w: f32) {
         self.pending_reader_tap = None;
+        let old_page = self.page;
         let Some(book) = self.reader_book(id) else {
             return;
         };
@@ -1067,6 +1079,20 @@ impl ReaderApp {
         if self.pages.contains_key(&(id.to_string(), page)) {
             self.record_page(id, page);
         }
+        // Tap, button and keyboard turns ease the incoming page in from a
+        // small strip offset (instant under reduced motion); a committed
+        // finger drag re-arms the turn with the real drag offset instead.
+        if matches!(&self.screen, Screen::Reader(current) if current == id)
+            && !self.vertical
+            && self.zoom <= 1.
+        {
+            let dir_sign = if (delta > 0) ^ self.rtl { 1. } else { -1. };
+            let start_offset = dir_sign * viewport_w * 0.24;
+            self.page_slide.page = page;
+            self.slide_turn_gap = start_offset;
+            self.page_slide
+                .animate_turn(old_page, start_offset, now, self.reduced);
+        }
     }
     pub(super) fn reader_input_blocked(&self) -> bool {
         self.reader_options
@@ -1087,6 +1113,8 @@ impl ReaderApp {
         self.next_stream = None;
         self.zoom = 1.;
         self.pan = Vec2::ZERO;
+        self.page_slide.cancel();
+        self.zoom_anim.cancel();
         self.pending_reader_tap = None;
         if matches!(self.screen, Screen::Reader(_)) {
             self.save_reader_prefs();
@@ -1111,19 +1139,36 @@ impl ReaderApp {
         #[cfg(test)]
         self.awake_log.push(on);
     }
-    pub(super) fn reader_tap(&mut self, id: &str, relative: f32, step: i32) {
+    pub(super) fn reader_tap(
+        &mut self,
+        id: &str,
+        relative: f32,
+        step: i32,
+        now: f64,
+        viewport_w: f32,
+    ) {
         self.stats.activity(crate::follows::now() as f64);
         if self.vertical || self.zoom > 1. || (0.27..=0.73).contains(&relative) {
+            let current = self
+                .controls_anim
+                .map(|t| t.value(now))
+                .unwrap_or(if self.controls { 1. } else { 0. });
             self.controls = !self.controls;
+            self.controls_anim = Some(motion::TimedTween::new(
+                now,
+                if self.reduced { 0. } else { 0.18 },
+                current,
+                if self.controls { 1. } else { 0. },
+            ));
         } else {
             match self.tap_zones.as_str() {
-                "next" => self.next_page(id, step),
+                "next" => self.next_page(id, step, now, viewport_w),
                 "off" => {}
                 _ => {
                     if relative < 0.27 {
-                        self.next_page(id, if self.rtl { step } else { -step });
+                        self.next_page(id, if self.rtl { step } else { -step }, now, viewport_w);
                     } else {
-                        self.next_page(id, if self.rtl { -step } else { step });
+                        self.next_page(id, if self.rtl { -step } else { step }, now, viewport_w);
                     }
                 }
             }
@@ -1218,7 +1263,12 @@ impl ReaderApp {
                     palette.on_primary,
                 );
                 if response.clicked() {
-                    self.next_page(id, 1);
+                    self.next_page(
+                        id,
+                        1,
+                        ui.ctx().input(|i| i.time),
+                        content.width(),
+                    );
                 }
             }
             None => {
@@ -1240,7 +1290,7 @@ impl ReaderApp {
         ui.painter()
             .rect_filled(area, 0., Color32::from_rgb(18, 17, 16));
         self.ask_page(id, self.page);
-        let step = if self.spread && !self.vertical && area.width() > 700. {
+        let step: i32 = if self.spread && !self.vertical && area.width() > 700. {
             if self.spread_offset && self.page == 0 {
                 1
             } else {
@@ -1256,10 +1306,17 @@ impl ReaderApp {
         if pair_base != self.page {
             self.ask_page(id, pair_base);
         }
-        let content = area.shrink2(vec2(8., if self.controls { 64. } else { 0. }));
+        // `page_viewport` never moves when the chrome toggles — all page
+        // scaling, centering, panning and the dim overlay use it, so showing
+        // or hiding the bars never resizes the comic. `canvas_hit` is the
+        // gesture surface only, and still yields to the visible chrome.
+        let page_viewport = area.shrink2(vec2(8., 0.));
+        // The page always fits inside the band between the chrome bars.
+        let page_fit = area.shrink2(vec2(8., 64.));
+        let canvas_hit = area.shrink2(vec2(8., if self.controls { 64. } else { 0. }));
         let input_blocked = self.reader_input_blocked();
         let gesture = ui.interact(
-            content,
+            canvas_hit,
             Id::unique("reader-canvas"),
             if input_blocked {
                 Sense::hover()
@@ -1267,33 +1324,64 @@ impl ReaderApp {
                 Sense::click_and_drag()
             },
         );
-        self.hitboxes.insert("reader-canvas".into(), content);
+        self.hitboxes.insert("reader-canvas".into(), canvas_hit);
+        let fit_single = self.fit_width && !self.vertical && step == 1;
+        let page_swipe = !self.vertical && self.zoom <= 1. && !fit_single;
         let zoom = if input_blocked {
             1.
         } else {
             ui.input(|i| i.zoom_delta())
         };
         if zoom != 1. {
+            self.zoom_anim.cancel();
+            self.page_slide.cancel();
             self.zoom = (self.zoom * zoom).clamp(1., 5.);
             self.pending_reader_tap = None;
             if self.zoom == 1. {
                 self.pan = Vec2::ZERO;
             }
         }
+        if let Some((zoom, [px, py])) = self.zoom_anim.sample(now) {
+            self.zoom = zoom;
+            self.pan = vec2(px, py);
+        }
         if gesture.drag_started() {
             self.reader_drag = 0.;
             self.reader_drag_y = 0.;
             self.vertical_reader.stop();
             self.pending_reader_tap = None;
+            if page_swipe {
+                self.page_slide.begin_drag();
+                // Warm the neighbours so a committed swipe lands on a
+                // decoded page instead of a placeholder.
+                if self.page + (step as usize) < book.page_count {
+                    self.ask_page(id, self.page + step as usize);
+                }
+                if self.page >= step as usize {
+                    self.ask_page(id, self.page - step as usize);
+                }
+            }
         }
         if gesture.dragged() {
             let delta = ui.input(|i| i.pointer.delta());
             self.reader_drag += delta.x;
             self.reader_drag_y += delta.y;
+            if page_swipe {
+                let can_prev = self.page > 0 || self.has_neighbor(id, -1);
+                let can_next = self.page + (step as usize) < book.page_count
+                    || self.has_neighbor(id, 1);
+                self.page_slide.drag(
+                    delta.x,
+                    can_prev,
+                    can_next,
+                    self.rtl,
+                    page_viewport.width(),
+                );
+            }
         }
-        let fit_single = self.fit_width && !self.vertical && step == 1;
         if gesture.dragged() && (self.zoom > 1. || fit_single) {
             let delta = ui.input(|i| i.pointer.delta());
+            self.zoom_anim.cancel();
             self.pan += if self.vertical {
                 vec2(delta.x, 0.)
             } else if self.zoom > 1. {
@@ -1307,7 +1395,44 @@ impl ReaderApp {
             let distance_y = self.reader_drag_y;
             self.reader_drag = 0.;
             self.reader_drag_y = 0.;
-            if distance.abs() > 45. {
+            if page_swipe {
+                if distance.abs() > 45. {
+                    let old_page = self.page;
+                    let old_book = id.to_owned();
+                    let drag_off = self.page_slide.current_offset(now);
+                    self.next_page(
+                        id,
+                        if (distance < 0.) ^ self.rtl {
+                            step
+                        } else {
+                            -step
+                        },
+                        now,
+                        page_viewport.width(),
+                    );
+                    if self.page != old_page
+                        && matches!(&self.screen, Screen::Reader(current) if current == &old_book)
+                    {
+                        // The neighbour followed the finger one strip width
+                        // away; it now settles from where the drag left it.
+                        let sign = if (distance < 0.) ^ self.rtl { 1. } else { -1. };
+                        let start_offset = drag_off
+                            + if drag_off < 0. {
+                                page_viewport.width()
+                            } else {
+                                -page_viewport.width()
+                            };
+                        self.page_slide.page = self.page;
+                        self.slide_turn_gap = sign * page_viewport.width();
+                        self.page_slide
+                            .animate_turn(old_page, start_offset, now, self.reduced);
+                    } else {
+                        self.page_slide.rebound(now, self.reduced);
+                    }
+                } else {
+                    self.page_slide.rebound(now, self.reduced);
+                }
+            } else if distance.abs() > 45. {
                 self.next_page(
                     id,
                     if (distance < 0.) ^ self.rtl {
@@ -1315,14 +1440,16 @@ impl ReaderApp {
                     } else {
                         -step
                     },
+                    now,
+                    page_viewport.width(),
                 );
             } else if fit_single && distance_y.abs() > 45. {
                 // Once the fitted page cannot pan any further, a vertical
                 // swipe turns like the usual next/previous controls.
                 if distance_y < 0. && self.pan.y <= -self.reader_fit_limit + 1. {
-                    self.next_page(id, step);
+                    self.next_page(id, step, now, page_viewport.width());
                 } else if distance_y > 0. && self.pan.y >= self.reader_fit_limit - 1. {
-                    self.next_page(id, -step);
+                    self.next_page(id, -step, now, page_viewport.width());
                 }
             }
         }
@@ -1344,14 +1471,56 @@ impl ReaderApp {
                 })
             });
             if double_tap {
-                self.zoom = if self.zoom > 1. { 1. } else { 2. };
-                self.pan = Vec2::ZERO;
                 self.pending_reader_tap = None;
+                if let Some(pos) = tapped {
+                    if self.zoom <= 1.01 {
+                        // Focal zoom: the tapped point stays put as the page
+                        // doubles, then the target pan is clamped to the 2x
+                        // travel limits so nothing lands off-canvas.
+                        let target_zoom = 2.0_f32;
+                        let mut target_pan =
+                            (page_viewport.center() - pos) * (target_zoom - 1.);
+                        if let Some(texture) = self.pages.get(&(id.into(), self.page)) {
+                            let size = texture.shown_size(self.crop);
+                            let scale = (page_viewport.width() / size.x)
+                                .min(page_viewport.height() / size.y);
+                            let limit_2x = ((size * scale * target_zoom
+                                - page_viewport.size())
+                                * 0.5)
+                                .max(Vec2::ZERO);
+                            target_pan.x = target_pan.x.clamp(-limit_2x.x, limit_2x.x);
+                            target_pan.y = target_pan.y.clamp(-limit_2x.y, limit_2x.y);
+                        }
+                        self.zoom_anim.start(
+                            self.zoom,
+                            target_zoom,
+                            [self.pan.x, self.pan.y],
+                            [target_pan.x, target_pan.y],
+                            now,
+                            self.reduced,
+                        );
+                    } else {
+                        self.zoom_anim.start(
+                            self.zoom,
+                            1.0,
+                            [self.pan.x, self.pan.y],
+                            [0., 0.],
+                            now,
+                            self.reduced,
+                        );
+                    }
+                }
             }
             if let Some((deadline, pos)) = self.pending_reader_tap {
                 if now >= deadline && !ctx.input(|i| i.pointer.primary_down()) {
                     self.pending_reader_tap = None;
-                    self.reader_tap(id, (pos.x - content.left()) / content.width(), step);
+                    self.reader_tap(
+                        id,
+                        (pos.x - canvas_hit.left()) / canvas_hit.width(),
+                        step,
+                        now,
+                        page_viewport.width(),
+                    );
                 } else {
                     ctx.request_repaint_after(std::time::Duration::from_secs_f64(
                         (deadline - now).max(0.01),
@@ -1360,7 +1529,13 @@ impl ReaderApp {
             }
             if !double_tap && let Some(pos) = tapped {
                 if let Some((_, first)) = self.pending_reader_tap.take() {
-                    self.reader_tap(id, (first.x - content.left()) / content.width(), step);
+                    self.reader_tap(
+                        id,
+                        (first.x - canvas_hit.left()) / canvas_hit.width(),
+                        step,
+                        now,
+                        page_viewport.width(),
+                    );
                 }
                 let delay = ctx.options(|options| options.input_options.max_double_click_delay);
                 self.pending_reader_tap = Some((now + delay, pos));
@@ -1382,7 +1557,7 @@ impl ReaderApp {
                 }
             });
             if delta != 0 {
-                self.next_page(id, delta);
+                self.next_page(id, delta, now, page_viewport.width());
             }
         }
         if !matches!(&self.screen,Screen::Reader(current) if current==id) {
@@ -1392,13 +1567,22 @@ impl ReaderApp {
             self.ask_hires(id);
         }
         self.rendered_page_nodes = 0;
+        let slide_x = if self.vertical || self.zoom > 1. {
+            0.
+        } else {
+            self.page_slide.current_offset(now)
+        };
+        self.page_slide.tick(now);
         if self.chapter_end {
-            self.chapter_end_card(ui, content, id);
+            self.chapter_end_card(ui, page_fit, id);
         } else if self.vertical {
-            self.vertical_ui(ui, content, id, book.page_count, now, &gesture);
+            self.vertical_ui(ui, page_viewport, id, book.page_count, now, &gesture);
         } else if let Some(error) = self.page_errors.get(&(id.into(), self.page)).cloned() {
             ui.put(
-                Rect::from_center_size(content.center(), vec2(content.width() - 40., 120.)),
+                Rect::from_center_size(
+                    page_viewport.center(),
+                    vec2(page_viewport.width() - 40., 120.),
+                ),
                 Label::new(
                     RichText::new(format!("这一页暂时无法打开\n{error}")).color(Color32::WHITE),
                 )
@@ -1407,7 +1591,7 @@ impl ReaderApp {
             if self.button(
                 ui,
                 "retry-page",
-                Rect::from_center_size(content.center() + vec2(0., 90.), vec2(144., 44.)),
+                Rect::from_center_size(page_viewport.center() + vec2(0., 90.), vec2(144., 44.)),
                 "重试这一页",
                 false,
             ) {
@@ -1424,21 +1608,21 @@ impl ReaderApp {
             let first_on_right = pair && self.rtl;
             let available = if pair {
                 Rect::from_min_size(
-                    content.min
+                    page_fit.min
                         + vec2(
                             if first_on_right {
-                                content.width() / 2.
+                                page_fit.width() / 2.
                             } else {
                                 0.
                             },
                             0.,
                         ),
-                    vec2(content.width() / 2., content.height()),
+                    vec2(page_fit.width() / 2., page_fit.height()),
                 )
             } else {
-                content
+                page_fit
             };
-            let painter = ui.painter().with_clip_rect(content);
+            let painter = ui.painter().with_clip_rect(page_viewport);
             let crop = self.crop;
             let slot = |texture: &PageTexture, center: Pos2, pan: Vec2, zoom: f32| {
                 let size = texture.shown_size(crop);
@@ -1459,14 +1643,22 @@ impl ReaderApp {
                 self.reader_fit_limit = if pair { 0. } else { limit.y };
                 self.pan.x = self.pan.x.clamp(-limit.x, limit.x);
                 self.pan.y = self.pan.y.clamp(-limit.y, limit.y);
-                let image_rect = Rect::from_center_size(available.center() + self.pan, size);
+                let image_rect = Rect::from_center_size(
+                    available.center() + self.pan + vec2(slide_x, 0.),
+                    size,
+                );
                 self.hitboxes.insert("reader-image".into(), image_rect);
                 texture.paint(&painter, image_rect, self.crop);
                 self.rendered_page_nodes += 1;
             } else {
                 self.reader_fit_limit = 0.;
                 if let Some(first) = self.pages.get(&(id.into(), base)) {
-                    slot(first, available.center(), self.pan, self.zoom);
+                    slot(
+                        first,
+                        available.center() + vec2(slide_x, 0.),
+                        self.pan,
+                        self.zoom,
+                    );
                     self.rendered_page_nodes += 1;
                 } else {
                     painter.text(
@@ -1487,7 +1679,8 @@ impl ReaderApp {
                             available.width()
                         },
                         0.,
-                    );
+                    )
+                    + vec2(slide_x, 0.);
                 if let Some(texture) = self.pages.get(&(id.into(), partner)) {
                     let target = slot(texture, second_center, self.pan, self.zoom);
                     if partner == self.page {
@@ -1533,18 +1726,111 @@ impl ReaderApp {
                     }
                 }
             }
+            // A committed turn slides the outgoing page away one strip gap
+            // behind the incoming one (single-page turns only).
+            if step == 1
+                && let Some((from_page, _)) = self.page_slide.outgoing(now)
+                && let Some(outgoing) = self.pages.get(&(id.into(), from_page))
+            {
+                slot(
+                    outgoing,
+                    available.center() + vec2(slide_x - self.slide_turn_gap, 0.),
+                    self.pan,
+                    self.zoom,
+                );
+                self.rendered_page_nodes += 1;
+            }
+            // While the finger holds, the page the drag reveals follows at
+            // exactly one strip width away.
+            if step == 1 && gesture.dragged() && slide_x.abs() > 2. {
+                let reveals_prev = if self.rtl { slide_x < 0. } else { slide_x > 0. };
+                let neighbor = if reveals_prev {
+                    self.page.checked_sub(1)
+                } else {
+                    (self.page + 1 < book.page_count).then_some(self.page + 1)
+                };
+                let neighbor_side = if slide_x > 0. { -1. } else { 1. };
+                if let Some(neighbor) = neighbor
+                    && let Some(texture) = self.pages.get(&(id.into(), neighbor))
+                {
+                    slot(
+                        texture,
+                        available.center()
+                            + vec2(slide_x + neighbor_side * page_viewport.width(), 0.),
+                        self.pan,
+                        self.zoom,
+                    );
+                    self.rendered_page_nodes += 1;
+                }
+            }
         } else {
             let text = self
                 .stream_waiting_text(id, self.page)
                 .unwrap_or_else(|| "正在打开这一页…".into());
             ui.put(
-                Rect::from_center_size(content.center(), vec2(content.width() - 40., 120.)),
+                Rect::from_center_size(
+                    page_viewport.center(),
+                    vec2(page_viewport.width() - 40., 120.),
+                ),
                 Label::new(RichText::new(text).size(15.).color(Color32::LIGHT_GRAY)).wrap(),
             );
         }
+        // Dragging past the chapter's first or last page surfaces a quiet
+        // boundary hint at the edge being pulled open.
+        if !self.vertical
+            && step == 1
+            && gesture.dragged()
+            && slide_x.abs() > 28.
+        {
+            let reveals_prev = if self.rtl { slide_x < 0. } else { slide_x > 0. };
+            let past_edge = if reveals_prev {
+                self.page == 0
+            } else {
+                self.page + 1 >= book.page_count
+            };
+            if past_edge {
+                let hint = if self.has_neighbor(id, if reveals_prev { -1 } else { 1 }) {
+                    if reveals_prev {
+                        "松手进入上一章"
+                    } else {
+                        "松手进入下一章"
+                    }
+                } else if reveals_prev {
+                    "已是第一页"
+                } else {
+                    "已是最后一页"
+                };
+                let galley = ui.painter().layout(
+                    hint.into(),
+                    FontId::proportional(13.),
+                    Color32::WHITE,
+                    page_viewport.width() - 40.,
+                );
+                let pill_size = vec2(galley.size().x + 30., galley.size().y + 18.);
+                let pill = Rect::from_center_size(
+                    pos2(
+                        if slide_x > 0. {
+                            page_viewport.left() + pill_size.x / 2. + 10.
+                        } else {
+                            page_viewport.right() - pill_size.x / 2. - 10.
+                        },
+                        page_viewport.center().y,
+                    ),
+                    pill_size,
+                );
+                crate::design::soft_shadow(ui.painter(), pill, pill_size.y / 2., 1., true);
+                ui.painter()
+                    .rect_filled(pill, pill_size.y / 2., Color32::from_black_alpha(215));
+                ui.painter().galley(
+                    pos2(pill.left() + 15., pill.center().y - galley.size().y / 2.),
+                    galley,
+                    Color32::WHITE,
+                );
+            }
+        }
         if self.brightness < 1. {
             ui.painter().rect_filled(
-                content,
+                page_viewport,
                 0.,
                 Color32::from_black_alpha(((1. - self.brightness) * 255.).round() as u8),
             );
@@ -1559,8 +1845,8 @@ impl ReaderApp {
             .and_then(|stream| stream.stopped.clone().map(|reason| (stream.task.clone(), reason)))
         {
             let banner = Rect::from_center_size(
-                pos2(content.center().x, content.bottom() - 60.),
-                vec2((content.width() - 24.).min(420.), 96.),
+                pos2(page_viewport.center().x, page_viewport.bottom() - 60.),
+                vec2((page_viewport.width() - 24.).min(420.), 96.),
             );
             ui.painter().rect_filled(banner, 12., Color32::from_black_alpha(200));
             ui.put(
@@ -1577,159 +1863,298 @@ impl ReaderApp {
                 self.sources.resume_stream(&task);
             }
         }
-        if self.controls {
+        // The chrome fades and slides over a fixed page viewport, so it can
+        // never make the comic jump. Interactive controls only register
+        // while `controls` is on; a fading ghost carries them out.
+        let chrome_t = self
+            .controls_anim
+            .map(|t| t.value(now))
+            .unwrap_or(if self.controls { 1. } else { 0. });
+        if self.controls_anim.is_some_and(|t| t.done(now)) {
+            self.controls_anim = None;
+        }
+        if chrome_t > 0.001 {
             let palette = crate::design::palette(true);
-            let (bar, ink, muted) = (palette.surface, palette.ink, palette.muted);
+            let (ink, muted) = (palette.ink, palette.muted);
             ui.style_mut().visuals = crate::design::visuals(true);
-            ui.painter().rect_filled(
-                Rect::from_min_size(area.min, vec2(area.width(), 56.)),
-                0.,
-                bar,
+            let bar_fill = palette.surface.gamma_multiply(chrome_t);
+            let hairline = Stroke::new(1., Color32::from_white_alpha((30. * chrome_t) as u8));
+            let top_shift = -56. * (1. - chrome_t);
+            let bottom_shift = 68. * (1. - chrome_t);
+            let top_bar = Rect::from_min_max(
+                area.min + vec2(0., top_shift),
+                pos2(area.right(), area.top() + 56. + top_shift),
             );
-            ui.painter().rect_filled(
-                Rect::from_min_size(
-                    pos2(area.left(), area.bottom() - 62.),
-                    vec2(area.width(), 62.),
-                ),
-                0.,
-                bar,
+            let bottom_bar = Rect::from_min_max(
+                pos2(area.left(), area.bottom() - 68. + bottom_shift),
+                pos2(area.right(), area.bottom() + bottom_shift),
             );
-            if self.icon(
-                ui,
-                "reader-back",
-                Rect::from_min_size(area.min + vec2(8., 8.), vec2(44., 44.)),
-                "back",
-                match (&self.reader_return, self.tab) {
-                    (Screen::Library, Tab::History) => "返回阅读足迹",
-                    (Screen::Library, Tab::Sources) => "返回书源",
-                    (Screen::Library, _) => "返回书架",
-                    _ => "返回详情",
-                },
-            ) {
-                self.back(now, area);
-            }
-            let title_width = (area.width() - 56. - 216.).max(0.);
-            let mut job = egui::text::LayoutJob::simple(
-                self.reading_title(&book),
-                FontId::proportional(15.),
-                ink,
-                title_width,
-            );
-            job.wrap.max_rows = 1;
-            let galley = ui.painter().layout_job(job);
+            ui.painter().rect_filled(top_bar, 0., bar_fill);
             ui.painter()
-                .with_clip_rect(Rect::from_min_max(
-                    area.min + vec2(56., 0.),
-                    pos2(area.right() - 216., area.top() + 56.),
-                ))
-                .galley(area.min + vec2(56., 20.), galley, ink);
-            if self.icon(
-                ui,
-                "reader-chapters",
-                Rect::from_min_size(pos2(area.right() - 104., area.top() + 8.), vec2(44., 44.)),
-                "chapters",
-                if self.chapter(id).is_some() {
-                    "章节与书签"
+                .line_segment([top_bar.left_bottom(), top_bar.right_bottom()], hairline);
+            ui.painter().rect_filled(bottom_bar, 0., bar_fill);
+            ui.painter()
+                .line_segment([bottom_bar.left_top(), bottom_bar.right_top()], hairline);
+            if self.controls {
+                if self.icon(
+                    ui,
+                    "reader-back",
+                    Rect::from_min_size(area.min + vec2(8., 8. + top_shift), vec2(44., 44.)),
+                    "back",
+                    match (&self.reader_return, self.tab) {
+                        (Screen::Library, Tab::History) => "返回阅读足迹",
+                        (Screen::Library, Tab::Sources) => "返回书源",
+                        (Screen::Library, _) => "返回书架",
+                        _ => "返回详情",
+                    },
+                ) {
+                    self.back(now, area);
+                }
+                let title_width = (area.width() - 56. - 216.).max(0.);
+                let mut job = egui::text::LayoutJob::simple(
+                    self.reading_title(&book),
+                    FontId::proportional(15.),
+                    ink,
+                    title_width,
+                );
+                job.wrap.max_rows = 1;
+                let galley = ui.painter().layout_job(job);
+                ui.painter()
+                    .with_clip_rect(Rect::from_min_max(
+                        area.min + vec2(56., top_shift),
+                        pos2(area.right() - 216., area.top() + 56. + top_shift),
+                    ))
+                    .galley(area.min + vec2(56., 20. + top_shift), galley, ink);
+                if self.icon(
+                    ui,
+                    "reader-chapters",
+                    Rect::from_min_size(
+                        pos2(area.right() - 104., area.top() + 8. + top_shift),
+                        vec2(44., 44.),
+                    ),
+                    "chapters",
+                    if self.chapter(id).is_some() {
+                        "章节与书签"
+                    } else {
+                        "书签"
+                    },
+                ) {
+                    self.dialog_bookmarks = self.chapter(id).is_none();
+                    self.chapter_dialog = Some(id.to_string());
+                }
+                let bookmarked = self.bookmarked(id);
+                if self.icon(
+                    ui,
+                    "reader-bookmark",
+                    Rect::from_min_size(
+                        pos2(area.right() - 156., area.top() + 8. + top_shift),
+                        vec2(44., 44.),
+                    ),
+                    if bookmarked { "bookmark-on" } else { "bookmark" },
+                    if bookmarked { "取消书签" } else { "加书签" },
+                ) {
+                    self.bookmark_toggle(id);
+                }
+                let share_rect = Rect::from_min_size(
+                    pos2(area.right() - 208., area.top() + 8. + top_shift),
+                    vec2(44., 44.),
+                );
+                if self.share_enabled(id) {
+                    if self.icon(ui, "reader-share", share_rect, "share", "分享本页") {
+                        self.send(Command::SharePage {
+                            id: id.to_string(),
+                            page: self.page,
+                        });
+                    }
                 } else {
-                    "书签"
-                },
-            ) {
-                self.dialog_bookmarks = self.chapter(id).is_none();
-                self.chapter_dialog = Some(id.to_string());
-            }
-            let bookmarked = self.bookmarked(id);
-            if self.icon(
-                ui,
-                "reader-bookmark",
-                Rect::from_min_size(pos2(area.right() - 156., area.top() + 8.), vec2(44., 44.)),
-                if bookmarked { "bookmark-on" } else { "bookmark" },
-                if bookmarked { "取消书签" } else { "加书签" },
-            ) {
-                self.bookmark_toggle(id);
-            }
-            let share_rect =
-                Rect::from_min_size(pos2(area.right() - 208., area.top() + 8.), vec2(44., 44.));
-            if self.share_enabled(id) {
-                if self.icon(ui, "reader-share", share_rect, "share", "分享本页") {
-                    self.send(Command::SharePage {
-                        id: id.to_string(),
-                        page: self.page,
-                    });
+                    self.hitboxes.insert("reader-share".into(), share_rect);
+                    // Disabled until the page's original bytes exist.
+                    let p = ui.painter();
+                    let c = share_rect.center();
+                    let stroke = Stroke::new(1.7, Color32::from_gray(140));
+                    p.line_segment([c + vec2(-7., -1.), c + vec2(-7., 7.)], stroke);
+                    p.line_segment([c + vec2(-7., 7.), c + vec2(7., 7.)], stroke);
+                    p.line_segment([c + vec2(7., 7.), c + vec2(7., -1.)], stroke);
+                    p.line_segment([c + vec2(0., 4.), c + vec2(0., -7.)], stroke);
+                    p.line_segment([c + vec2(0., -7.), c + vec2(-4., -3.)], stroke);
+                    p.line_segment([c + vec2(0., -7.), c + vec2(4., -3.)], stroke);
+                }
+                if self.icon(
+                    ui,
+                    "reader-settings",
+                    Rect::from_min_size(
+                        pos2(area.right() - 52., area.top() + 8. + top_shift),
+                        vec2(44., 44.),
+                    ),
+                    "settings",
+                    "阅读设置",
+                ) {
+                    self.reader_options = true;
+                    self.reader_options_at = Some(now);
+                    self.vertical_reader.stop();
+                    self.pending_reader_tap = None;
+                }
+                if self.icon(
+                    ui,
+                    "reader-prev",
+                    Rect::from_min_size(
+                        pos2(area.left() + 10., bottom_bar.top() + 12.),
+                        vec2(44., 44.),
+                    ),
+                    "prev",
+                    "上一页",
+                ) {
+                    self.next_page(id, -step, now, page_viewport.width());
+                }
+                if self.icon(
+                    ui,
+                    "reader-next",
+                    Rect::from_min_size(
+                        pos2(area.right() - 54., bottom_bar.top() + 12.),
+                        vec2(44., 44.),
+                    ),
+                    "next",
+                    "下一页",
+                ) {
+                    self.next_page(id, step, now, page_viewport.width());
+                }
+                ui.painter().text(
+                    pos2(area.center().x, bottom_bar.top() + 2.),
+                    Align2::CENTER_TOP,
+                    format!(
+                        "{} / {}{}",
+                        self.page + 1,
+                        book.page_count,
+                        if self.private { " · 私密阅读" } else { "" }
+                    ),
+                    FontId::monospace(12.),
+                    muted,
+                );
+                let mut page_f32 = self.page as f32 + 1.;
+                let slider_rect = Rect::from_min_size(
+                    pos2(area.left() + 62., bottom_bar.top() + 18.),
+                    vec2((area.width() - 124.).max(80.), 44.),
+                );
+                let out = ui
+                    .scope_builder(UiBuilder::new().max_rect(slider_rect), |ui| {
+                        crate::design::slider(
+                            ui,
+                            "reader-page-slider",
+                            &mut page_f32,
+                            1.0..=(book.page_count.max(1) as f32),
+                            slider_rect.width(),
+                            self.rtl,
+                            true,
+                        )
+                    })
+                    .inner;
+                self.hitboxes.insert("reader-page-slider".into(), out.rect);
+                if out.changed {
+                    let target = (page_f32.round() as usize).saturating_sub(1);
+                    self.next_page(
+                        id,
+                        target as i32 - self.page as i32,
+                        now,
+                        page_viewport.width(),
+                    );
+                    self.page_slide.cancel();
+                }
+                if out.dragging {
+                    let text =
+                        format!("第 {} / {} 页", page_f32.round() as usize, book.page_count);
+                    let galley =
+                        ui.painter().layout_no_wrap(text, FontId::proportional(13.), ink);
+                    let bubble_size = vec2(galley.size().x + 26., galley.size().y + 14.);
+                    let thumb_x = out.thumb_x.clamp(
+                        area.left() + bubble_size.x / 2. + 6.,
+                        area.right() - bubble_size.x / 2. - 6.,
+                    );
+                    let bubble = Rect::from_center_size(
+                        pos2(thumb_x, bottom_bar.top() - 24.),
+                        bubble_size,
+                    );
+                    crate::design::soft_shadow(ui.painter(), bubble, bubble_size.y / 2., 1.4, true);
+                    ui.painter()
+                        .rect_filled(bubble, bubble_size.y / 2., palette.surface);
+                    ui.painter().rect_stroke(
+                        bubble,
+                        bubble_size.y / 2.,
+                        Stroke::new(1., palette.line),
+                        StrokeKind::Inside,
+                    );
+                    ui.painter()
+                        .galley(bubble.center() - galley.size() / 2., galley, ink);
                 }
             } else {
-                self.hitboxes.insert("reader-share".into(), share_rect);
-                // Disabled until the page's original bytes exist.
-                let p = ui.painter();
-                let c = share_rect.center();
-                let stroke = Stroke::new(1.7, Color32::from_gray(140));
-                p.line_segment([c + vec2(-7., -1.), c + vec2(-7., 7.)], stroke);
-                p.line_segment([c + vec2(-7., 7.), c + vec2(7., 7.)], stroke);
-                p.line_segment([c + vec2(7., 7.), c + vec2(7., -1.)], stroke);
-                p.line_segment([c + vec2(0., 4.), c + vec2(0., -7.)], stroke);
-                p.line_segment([c + vec2(0., -7.), c + vec2(-4., -3.)], stroke);
-                p.line_segment([c + vec2(0., -7.), c + vec2(4., -3.)], stroke);
+                // A fading ghost keeps the outgoing chrome sliding away;
+                // nothing here is interactive any more.
+                let mut ghost = ui.painter().clone();
+                ghost.multiply_opacity(chrome_t);
+                let icon_color = Color32::from_gray(232);
+                crate::design::draw_icon(
+                    &ghost,
+                    pos2(area.left() + 30., area.top() + 30. + top_shift),
+                    "back",
+                    icon_color,
+                    false,
+                );
+                crate::design::draw_icon(
+                    &ghost,
+                    pos2(area.right() - 82., area.top() + 30. + top_shift),
+                    "chapters",
+                    icon_color,
+                    false,
+                );
+                crate::design::draw_icon(
+                    &ghost,
+                    pos2(area.right() - 134., area.top() + 30. + top_shift),
+                    "bookmark",
+                    icon_color,
+                    false,
+                );
+                crate::design::draw_icon(
+                    &ghost,
+                    pos2(area.right() - 186., area.top() + 30. + top_shift),
+                    "share",
+                    icon_color,
+                    false,
+                );
+                crate::design::draw_icon(
+                    &ghost,
+                    pos2(area.right() - 30., area.top() + 30. + top_shift),
+                    "settings",
+                    icon_color,
+                    false,
+                );
+                ghost.text(
+                    area.min + vec2(56., 20. + top_shift),
+                    Align2::LEFT_TOP,
+                    self.reading_title(&book),
+                    FontId::proportional(15.),
+                    ink,
+                );
+                crate::design::draw_icon(
+                    &ghost,
+                    pos2(area.left() + 32., bottom_bar.top() + 34.),
+                    "prev",
+                    icon_color,
+                    false,
+                );
+                crate::design::draw_icon(
+                    &ghost,
+                    pos2(area.right() - 32., bottom_bar.top() + 34.),
+                    "next",
+                    icon_color,
+                    false,
+                );
+                ghost.text(
+                    pos2(area.center().x, bottom_bar.top() + 2.),
+                    Align2::CENTER_TOP,
+                    format!("{} / {}", self.page + 1, book.page_count),
+                    FontId::monospace(12.),
+                    muted,
+                );
             }
-            if self.icon(
-                ui,
-                "reader-settings",
-                Rect::from_min_size(pos2(area.right() - 52., area.top() + 8.), vec2(44., 44.)),
-                "settings",
-                "阅读设置",
-            ) {
-                self.reader_options = true;
-                self.vertical_reader.stop();
-                self.pending_reader_tap = None;
-            }
-            if self.icon(
-                ui,
-                "reader-prev",
-                Rect::from_min_size(pos2(area.left() + 10., area.bottom() - 55.), vec2(44., 44.)),
-                "prev",
-                "上一页",
-            ) {
-                self.next_page(id, -step);
-            }
-            if self.icon(
-                ui,
-                "reader-next",
-                Rect::from_min_size(
-                    pos2(area.right() - 50., area.bottom() - 55.),
-                    vec2(44., 44.),
-                ),
-                "next",
-                "下一页",
-            ) {
-                self.next_page(id, step);
-            }
-            let mut page = self.page + 1;
-            let rect = Rect::from_min_size(
-                pos2(area.left() + 62., area.bottom() - 49.),
-                vec2(area.width() - 124., 24.),
-            );
-            let old_width = ui.spacing().slider_width;
-            ui.spacing_mut().slider_width = rect.width();
-            if ui
-                .put(
-                    rect,
-                    Slider::new(&mut page, 1..=book.page_count.max(1)).show_value(false),
-                )
-                .changed()
-            {
-                self.next_page(id, page as i32 - 1 - self.page as i32);
-            }
-            ui.spacing_mut().slider_width = old_width;
-            ui.painter().text(
-                pos2(area.center().x, area.bottom() - 15.),
-                Align2::CENTER_CENTER,
-                format!(
-                    "{} / {}{}",
-                    self.page + 1,
-                    book.page_count,
-                    if self.private { " · 私密阅读" } else { "" }
-                ),
-                FontId::monospace(10.),
-                muted,
-            );
         } else if self.reader_status {
             // Bottom-right 时间 · 电量 pill while the controls are hidden;
             // repaint once at each minute boundary, battery polled ≤1/min.

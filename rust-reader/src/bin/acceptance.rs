@@ -684,11 +684,16 @@ fn scroll_until_row_visible(h: &mut Harness, id: &str, label: &str) -> Result<()
 }
 
 fn design_touch(h: &Harness, id: &str, label: Option<&str>) -> Result<()> {
-    let rect = *h
-        .app
-        .hitboxes
-        .get(id)
-        .with_context(|| format!("design: missing {id}"))?;
+    let rect = *h.app.hitboxes.get(id).with_context(|| {
+        let similar: Vec<String> = h
+            .app
+            .hitboxes
+            .keys()
+            .filter(|k| k.starts_with("shelf") || k.starts_with("nav"))
+            .map(|k| format!("{k}@{:?}", h.app.hitboxes[k]))
+            .collect();
+        format!("design: missing {id}; nearby: {similar:?}")
+    })?;
     anyhow::ensure!(
         rect.width() >= 43.5 && rect.height() >= 43.5,
         "design: {id} touch target is only {rect:?}"

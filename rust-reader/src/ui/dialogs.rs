@@ -25,6 +25,14 @@ use super::*;
 impl ReaderApp {
     pub(super) fn dialogs(&mut self, ctx: &Context) {
         if self.reader_options {
+            if self.reader_options_at.is_none() {
+                self.reader_options_at = (!self.reduced).then(|| ctx.input(|i| i.time));
+            }
+            let now = ctx.input(|i| i.time);
+            let open_t = self
+                .reader_options_at
+                .map(|t0| motion::smooth(((now - t0) / 0.16).clamp(0., 1.) as f32))
+                .unwrap_or(1.);
             let response = Modal::new(Id::unique("reader-options"))
                 .frame(
                     Frame::popup(&ctx.style_of(Theme::Dark))
@@ -36,154 +44,467 @@ impl ReaderApp {
                     ui.set_width((ctx.content_rect().width() - 56.).clamp(200., 440.));
                     ui.set_max_width((ctx.content_rect().width() - 56.).clamp(200., 440.));
                     ui.style_mut().visuals = crate::design::visuals(true);
-                    ui.horizontal(|ui| {
-                        ui.heading("阅读设置");
-                    });
-                    let mut safe = ctx.content_rect();
-                    if let Ok(insets) = yejian_platform::safe_insets() {
-                        let scale = ctx.pixels_per_point();
-                        safe = safe.intersect(Rect::from_min_max(
-                            safe.min
-                                + vec2(
-                                    insets.left as f32 / scale,
-                                    insets.top as f32 / scale,
-                                ),
-                            safe.max
-                                - vec2(
-                                    insets.right as f32 / scale,
-                                    insets.bottom as f32 / scale,
-                                ),
-                        ));
-                    }
-                    let height = (safe.height() - 180.).max(120.);
-                    ScrollArea::vertical().max_height(height).show(ui, |ui| {
-                        ui.label("阅读方式");
-                        let mode = if self.vertical {
-                            "vertical"
-                        } else if self.spread {
-                            "spread"
-                        } else {
-                            "paged"
-                        };
-                        for (key, name) in [
-                            ("paged", "单页"),
-                            ("spread", "平板双页"),
-                            ("vertical", "上下滚动"),
-                        ] {
-                            let response = ui.add_sized(
-                                [ui.available_width(), 48.],
-                                Button::new(name).selected(mode == key).wrap(),
-                            );
-                            self.hitboxes
-                                .insert(format!("reader-mode-{key}"), response.rect);
-                            if response.clicked() {
-                                self.set_reading_mode(key);
-                            }
+                    ui.scope(|ui| {
+                        ui.set_opacity(open_t);
+                        ui.add_space(8. * (1. - open_t));
+                        ui.horizontal(|ui| {
+                            ui.heading("阅读设置");
+                        });
+                        let mut safe = ctx.content_rect();
+                        if let Ok(insets) = yejian_platform::safe_insets() {
+                            let scale = ctx.pixels_per_point();
+                            safe = safe.intersect(Rect::from_min_max(
+                                safe.min
+                                    + vec2(
+                                        insets.left as f32 / scale,
+                                        insets.top as f32 / scale,
+                                    ),
+                                safe.max
+                                    - vec2(
+                                        insets.right as f32 / scale,
+                                        insets.bottom as f32 / scale,
+                                    ),
+                            ));
                         }
-                        ui.add_space(8.);
-                        let direction = ui.add_sized(
-                            [ui.available_width(), 48.],
-                            Button::new(if self.rtl {
-                                "翻页方向：从右向左"
+                        let height = (safe.height() - 180.).max(120.);
+                        let p = crate::design::palette(true);
+                        let size = 14. * self.font_scale.min(1.5);
+                        ScrollArea::vertical().max_height(height).show(ui, |ui| {
+                            let avail_w = ui.available_width();
+                            ui.label(RichText::new("阅读方式").color(p.muted).small());
+                            let mode = if self.vertical {
+                                "vertical"
+                            } else if self.spread {
+                                "spread"
                             } else {
-                                "翻页方向：从左向右"
-                            })
-                            .wrap(),
-                        );
-                        self.hitboxes
-                            .insert("reader-direction".into(), direction.rect);
-                        if direction.clicked() {
-                            self.rtl = !self.rtl;
-                            self.save_reader_prefs();
-                        }
-                        for (name, hitbox, on) in [
-                            ("裁剪白边", "reader-crop", self.crop),
-                            ("适应宽度", "reader-fit", self.fit_width),
-                            ("双页首页单独", "reader-spread-offset", self.spread_offset),
-                        ] {
-                            let toggle = ui.add_sized(
-                                [ui.available_width(), 48.],
-                                Button::new(format!(
-                                    "{name}：{}",
-                                    if on { "开" } else { "关" }
-                                ))
-                                .wrap(),
-                            );
-                            self.hitboxes.insert(hitbox.into(), toggle.rect);
-                            if toggle.clicked() {
-                                match hitbox {
-                                    "reader-crop" => self.crop = !self.crop,
-                                    "reader-fit" => self.fit_width = !self.fit_width,
-                                    _ => self.spread_offset = !self.spread_offset,
+                                "paged"
+                            };
+                            // 3-up segmented control when labels fit; the 2+1
+                            // wrap keeps every cell unclipped at 200% type.
+                            let cols = if avail_w >= 330. && self.font_scale <= 1.35 {
+                                3.
+                            } else {
+                                2.
+                            };
+                            let col_w = ((avail_w - (cols - 1.) * 8.) / cols).floor();
+                            let item_spacing = ui.spacing().item_spacing;
+                            ui.spacing_mut().item_spacing = vec2(8., 8.);
+                            ui.horizontal_wrapped(|ui| {
+                                for (key, name, icon) in [
+                                    ("paged", "单页", "paged"),
+                                    ("spread", "平板双页", "spread"),
+                                    ("vertical", "上下滚动", "vertical"),
+                                ] {
+                                    let (rect, response) = ui.allocate_exact_size(
+                                        vec2(col_w, 48.),
+                                        Sense::click(),
+                                    );
+                                    response.widget_info(|| {
+                                        WidgetInfo::labeled(Role::Button, true, name)
+                                    });
+                                    let selected = mode == key;
+                                    let draw = crate::design::press_rect(
+                                        rect,
+                                        response.is_pointer_button_down_on()
+                                            && !self.reduced,
+                                    );
+                                    let fill = if selected || response.hovered() {
+                                        p.accent_soft
+                                    } else {
+                                        p.soft
+                                    };
+                                    let stroke = if selected {
+                                        Stroke::new(1.5, p.accent)
+                                    } else {
+                                        Stroke::new(1., p.line)
+                                    };
+                                    ui.painter().rect_filled(draw, 12., fill);
+                                    ui.painter().rect_stroke(
+                                        draw,
+                                        12.,
+                                        stroke,
+                                        StrokeKind::Inside,
+                                    );
+                                    let label_color =
+                                        if selected { p.accent } else { p.ink };
+                                    let galley = ui.painter().layout_no_wrap(
+                                        name.to_owned(),
+                                        FontId::proportional(size),
+                                        label_color,
+                                    );
+                                    let show_icon =
+                                        col_w >= 112. && self.font_scale <= 1.2;
+                                    let icon_w = if show_icon { 24. } else { 0. };
+                                    let text_x =
+                                        rect.center().x + icon_w / 2. - galley.size().x / 2.;
+                                    if show_icon {
+                                        crate::design::draw_icon(
+                                            ui.painter(),
+                                            pos2(text_x - 12., rect.center().y),
+                                            icon,
+                                            label_color,
+                                            selected,
+                                        );
+                                    }
+                                    ui.painter().galley(
+                                        pos2(text_x, rect.center().y - galley.size().y / 2.),
+                                        galley,
+                                        label_color,
+                                    );
+                                    self.hitboxes
+                                        .insert(format!("reader-mode-{key}"), rect);
+                                    if response.clicked() {
+                                        self.set_reading_mode(key);
+                                    }
                                 }
+                            });
+                            ui.spacing_mut().item_spacing = item_spacing;
+                            ui.add_space(10.);
+                            // Full-width direction row: label left, RTL/LTR
+                            // badge right. The painted "翻页方向" stays inside
+                            // the registered hitbox for the acceptance text
+                            // bounds check.
+                            let (dir_rect, direction) =
+                                ui.allocate_exact_size(vec2(avail_w, 46.), Sense::click());
+                            direction.widget_info(|| {
+                                WidgetInfo::labeled(Role::Button, true, "翻页方向")
+                            });
+                            let draw = crate::design::press_rect(
+                                dir_rect,
+                                direction.is_pointer_button_down_on() && !self.reduced,
+                            );
+                            ui.painter().rect_filled(
+                                draw,
+                                12.,
+                                if direction.hovered() {
+                                    p.accent_soft
+                                } else {
+                                    p.soft
+                                },
+                            );
+                            ui.painter().rect_stroke(
+                                draw,
+                                12.,
+                                Stroke::new(1., p.line),
+                                StrokeKind::Inside,
+                            );
+                            ui.painter().text(
+                                pos2(draw.left() + 14., draw.center().y),
+                                Align2::LEFT_CENTER,
+                                "翻页方向",
+                                FontId::proportional(size),
+                                p.ink,
+                            );
+                            let value = if self.rtl { "从右向左" } else { "从左向右" };
+                            let badge_text = ui.painter().layout_no_wrap(
+                                value.to_owned(),
+                                FontId::proportional((size - 1.).max(11.)),
+                                p.accent,
+                            );
+                            let badge = Rect::from_center_size(
+                                pos2(
+                                    draw.right() - 12. - (badge_text.size().x + 22.) / 2.,
+                                    draw.center().y,
+                                ),
+                                vec2(badge_text.size().x + 22., 26.),
+                            );
+                            ui.painter().rect_filled(badge, 13., p.accent_soft);
+                            ui.painter().rect_stroke(
+                                badge,
+                                13.,
+                                Stroke::new(1., p.accent.gamma_multiply(0.55)),
+                                StrokeKind::Inside,
+                            );
+                            ui.painter().galley(
+                                pos2(
+                                    badge.left() + 11.,
+                                    badge.center().y - badge_text.size().y / 2.,
+                                ),
+                                badge_text,
+                                p.accent,
+                            );
+                            self.hitboxes.insert("reader-direction".into(), dir_rect);
+                            if direction.clicked() {
+                                self.rtl = !self.rtl;
                                 self.save_reader_prefs();
                             }
-                        }
-                        // `Slider` places its rail, drag value and text in a
-                        // horizontal row that is laid out at its desired width
-                        // even inside `add_sized`, so the rail must be shrunk
-                        // to the space that actually remains or the whole modal
-                        // grows past the viewport at large font scales.
-                        let brightness = ui.scope_builder(
-                            UiBuilder::new()
-                                .max_rect(Rect::from_min_size(
-                                    ui.cursor().min,
-                                    vec2(ui.available_width(), 48.),
-                                ))
-                                .layout(Layout::left_to_right(Align::Center)),
-                            |ui| {
-                                ui.label("亮度");
-                                // The default rail is transparent on the dark
-                                // dialog surface; give it a visible neutral
-                                // and accent the filled portion.
-                                let palette = crate::design::palette(true);
-                                let visuals = ui.visuals_mut();
-                                visuals.widgets.inactive.weak_bg_fill = palette.soft;
-                                visuals.widgets.inactive.bg_fill = palette.accent;
-                                ui.spacing_mut().slider_width =
-                                    (ui.available_width() - 120.).max(40.);
-                                ui.add(
-                                    Slider::new(&mut self.brightness, 0.3..=1.)
-                                        .fixed_decimals(2)
-                                        .trailing_fill(true),
+                            ui.add_space(10.);
+                            // Grouped toggle rows with animated pill switches.
+                            let toggles = [
+                                ("裁剪白边", "reader-crop", self.crop),
+                                ("适应宽度", "reader-fit", self.fit_width),
+                                ("双页首页单独", "reader-spread-offset", self.spread_offset),
+                            ];
+                            let (group, _) = ui.allocate_exact_size(
+                                vec2(avail_w, 46. * toggles.len() as f32),
+                                Sense::hover(),
+                            );
+                            ui.painter().rect_filled(group, 12., p.soft);
+                            ui.painter().rect_stroke(
+                                group,
+                                12.,
+                                Stroke::new(1., p.line),
+                                StrokeKind::Inside,
+                            );
+                            let mut toggled = None;
+                            for (row, (name, hitbox, on)) in toggles.into_iter().enumerate()
+                            {
+                                let rect = Rect::from_min_size(
+                                    group.min + vec2(0., 46. * row as f32),
+                                    vec2(avail_w, 46.),
+                                );
+                                if row > 0 {
+                                    ui.painter().line_segment(
+                                        [
+                                            pos2(rect.left() + 12., rect.top()),
+                                            pos2(rect.right() - 12., rect.top()),
+                                        ],
+                                        Stroke::new(1., p.line),
+                                    );
+                                }
+                                let response = ui.interact(
+                                    rect,
+                                    ui.make_persistent_id(hitbox),
+                                    Sense::click(),
+                                );
+                                response.widget_info(|| {
+                                    WidgetInfo::labeled(Role::Button, true, name)
+                                });
+                                if response.hovered()
+                                    || response.is_pointer_button_down_on()
+                                {
+                                    ui.painter().rect_filled(
+                                        rect.shrink2(vec2(0., 2.)),
+                                        8.,
+                                        p.accent_soft.linear_multiply(0.5),
+                                    );
+                                }
+                                ui.painter().text(
+                                    pos2(rect.left() + 14., rect.center().y),
+                                    Align2::LEFT_CENTER,
+                                    name,
+                                    FontId::proportional(size),
+                                    p.ink,
+                                );
+                                let t = ctx.animate_bool_with_time(
+                                    Id::unique(hitbox),
+                                    on,
+                                    if self.reduced { 0. } else { 0.14 },
+                                );
+                                let track = Rect::from_center_size(
+                                    pos2(rect.right() - 14. - 22., rect.center().y),
+                                    vec2(44., 26.),
+                                );
+                                let track_color = egui::lerp(
+                                    Rgba::from(p.muted.gamma_multiply(0.45))
+                                        ..=Rgba::from(p.accent),
+                                    t,
+                                );
+                                ui.painter().rect_filled(track, 13., track_color);
+                                let knob = pos2(
+                                    track.left() + 13. + (track.width() - 26.) * t,
+                                    track.center().y,
+                                );
+                                ui.painter()
+                                    .circle_filled(knob + vec2(0., 1.), 10., p.line);
+                                ui.painter().circle_filled(knob, 10., p.surface);
+                                self.hitboxes.insert(hitbox.into(), rect);
+                                if response.clicked() {
+                                    toggled = Some(hitbox);
+                                }
+                            }
+                            match toggled {
+                                Some("reader-crop") => self.crop = !self.crop,
+                                Some("reader-fit") => self.fit_width = !self.fit_width,
+                                Some(_) => self.spread_offset = !self.spread_offset,
+                                None => {}
+                            }
+                            if toggled.is_some() {
+                                self.save_reader_prefs();
+                            }
+                            ui.add_space(10.);
+                            // Brightness row: sun icon, label, custom slider,
+                            // percent readout. The row rect is the hitbox; the
+                            // slider's own id stays separate.
+                            let (bright_rect, _) =
+                                ui.allocate_exact_size(vec2(avail_w, 46.), Sense::hover());
+                            ui.painter().rect_filled(bright_rect, 12., p.soft);
+                            ui.painter().rect_stroke(
+                                bright_rect,
+                                12.,
+                                Stroke::new(1., p.line),
+                                StrokeKind::Inside,
+                            );
+                            crate::design::draw_icon(
+                                ui.painter(),
+                                pos2(bright_rect.left() + 20., bright_rect.center().y),
+                                "sun",
+                                p.muted,
+                                false,
+                            );
+                            ui.painter().text(
+                                pos2(bright_rect.left() + 36., bright_rect.center().y),
+                                Align2::LEFT_CENTER,
+                                "亮度",
+                                FontId::proportional(size),
+                                p.ink,
+                            );
+                            let readout = format!("{:.0}%", self.brightness * 100.);
+                            let readout_text = ui.painter().layout_no_wrap(
+                                readout,
+                                FontId::proportional(13. * self.font_scale.min(1.3)),
+                                p.muted,
+                            );
+                            ui.painter().galley(
+                                pos2(
+                                    bright_rect.right() - 14. - readout_text.size().x,
+                                    bright_rect.center().y - readout_text.size().y / 2.,
+                                ),
+                                readout_text.clone(),
+                                p.muted,
+                            );
+                            let slider_zone = Rect::from_min_max(
+                                pos2(bright_rect.left() + 78., bright_rect.top() + 1.),
+                                pos2(
+                                    (bright_rect.right() - 22. - readout_text.size().x)
+                                        .max(bright_rect.left() + 160.),
+                                    bright_rect.bottom() - 1.,
+                                ),
+                            );
+                            let out = ui
+                                .scope_builder(
+                                    UiBuilder::new().max_rect(slider_zone).layout(
+                                        Layout::left_to_right(Align::Center),
+                                    ),
+                                    |ui| {
+                                        crate::design::slider(
+                                            ui,
+                                            "reader-brightness-slider",
+                                            &mut self.brightness,
+                                            0.3..=1.0,
+                                            slider_zone.width(),
+                                            false,
+                                            true,
+                                        )
+                                    },
                                 )
-                            },
+                                .inner;
+                            self.hitboxes
+                                .insert("reader-brightness".into(), bright_rect);
+                            if out.changed {
+                                self.brightness = self.brightness.clamp(0.3, 1.);
+                                self.save_reader_prefs();
+                            }
+                            ui.add_space(10.);
+                            // Secondary actions share a row when they fit.
+                            let two_col = avail_w >= 360. && self.font_scale <= 1.3;
+                            let act_w = if two_col {
+                                ((avail_w - 8.) / 2.).floor()
+                            } else {
+                                avail_w
+                            };
+                            let mut secondary =
+                                |ui: &mut Ui, rect: Rect, name: &str, hitbox: &str| {
+                                    let response = ui.interact(
+                                        rect,
+                                        ui.make_persistent_id(hitbox),
+                                        Sense::click(),
+                                    );
+                                    response.widget_info(|| {
+                                        WidgetInfo::labeled(Role::Button, true, name)
+                                    });
+                                    let draw = crate::design::press_rect(
+                                        rect,
+                                        response.is_pointer_button_down_on()
+                                            && !self.reduced,
+                                    );
+                                    ui.painter().rect_filled(
+                                        draw,
+                                        12.,
+                                        if response.hovered()
+                                            || response.is_pointer_button_down_on()
+                                        {
+                                            p.accent_soft
+                                        } else {
+                                            p.soft
+                                        },
+                                    );
+                                    ui.painter().rect_stroke(
+                                        draw,
+                                        12.,
+                                        Stroke::new(1., p.line),
+                                        StrokeKind::Inside,
+                                    );
+                                    let text = ui.painter().layout(
+                                        name.to_owned(),
+                                        FontId::proportional(size),
+                                        p.ink,
+                                        (rect.width() - 16.).max(40.),
+                                    );
+                                    ui.painter().galley(
+                                        rect.center() - text.size() / 2.,
+                                        text,
+                                        p.ink,
+                                    );
+                                    self.hitboxes.insert(hitbox.into(), rect);
+                                    response.clicked()
+                                };
+                            let [save_rect, reset_rect] = if two_col {
+                                let (row, _) = ui.allocate_exact_size(
+                                    vec2(avail_w, 46.),
+                                    Sense::hover(),
+                                );
+                                [
+                                    Rect::from_min_size(row.min, vec2(act_w, 46.)),
+                                    Rect::from_min_size(
+                                        pos2(row.right() - act_w, row.top()),
+                                        vec2(act_w, 46.),
+                                    ),
+                                ]
+                            } else {
+                                let (r1, _) = ui.allocate_exact_size(
+                                    vec2(avail_w, 46.),
+                                    Sense::hover(),
+                                );
+                                ui.add_space(8.);
+                                let (r2, _) = ui.allocate_exact_size(
+                                    vec2(avail_w, 46.),
+                                    Sense::hover(),
+                                );
+                                [r1, r2]
+                            };
+                            let save = secondary(
+                                ui,
+                                save_rect,
+                                "设为所有作品的默认",
+                                "reader-save-default",
+                            );
+                            let reset = secondary(
+                                ui,
+                                reset_rect,
+                                "恢复原始大小",
+                                "reader-reset-zoom",
+                            );
+                            if save {
+                                self.save_reader_globals();
+                            }
+                            if reset {
+                                self.zoom = 1.;
+                                self.pan = Vec2::ZERO;
+                                self.zoom_anim.cancel();
+                            }
+                        });
+                        ui.add_space(8.);
+                        let close = ui.add_sized(
+                            [ui.available_width(), 48.],
+                            crate::design::primary("继续阅读", true),
                         );
                         self.hitboxes
-                            .insert("reader-brightness".into(), brightness.response.rect);
-                        if brightness.inner.changed() {
-                            self.brightness = self.brightness.clamp(0.3, 1.);
-                            self.save_reader_prefs();
-                        }
-                        let defaults = ui.add_sized(
-                            [ui.available_width(), 48.],
-                            Button::new("设为所有作品的默认").wrap(),
-                        );
-                        self.hitboxes
-                            .insert("reader-save-default".into(), defaults.rect);
-                        if defaults.clicked() {
-                            self.save_reader_globals();
-                        }
-                        let reset = ui.add_sized(
-                            [ui.available_width(), 48.],
-                            Button::new("恢复原始大小").wrap(),
-                        );
-                        self.hitboxes.insert("reader-reset-zoom".into(), reset.rect);
-                        if reset.clicked() {
-                            self.zoom = 1.;
-                            self.pan = Vec2::ZERO;
+                            .insert("reader-options-close".into(), close.rect);
+                        if close.clicked() {
+                            self.reader_options = false;
                         }
                     });
-                    ui.add_space(8.);
-                    let close = ui.add_sized(
-                        [ui.available_width(), 48.],
-                        crate::design::primary("继续阅读", true),
-                    );
-                    self.hitboxes
-                        .insert("reader-options-close".into(), close.rect);
-                    if close.clicked() {
-                        self.reader_options = false;
-                    }
                 });
             if response.should_close() {
                 self.reader_options = false;
@@ -289,7 +610,12 @@ impl ReaderApp {
                                             jump.rect,
                                         );
                                         if jump.clicked() {
-                                            self.bookmark_jump(mark.clone(), &id);
+                                            self.bookmark_jump(
+                                                mark.clone(),
+                                                &id,
+                                                ctx.input(|i| i.time),
+                                                ctx.content_rect().width(),
+                                            );
                                         }
                                     },
                                 );

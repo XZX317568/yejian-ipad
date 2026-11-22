@@ -379,8 +379,16 @@ pub(crate) fn visuals(dark: bool) -> Visuals {
     }
     v.widgets.hovered.bg_fill = p.soft;
     v.widgets.hovered.weak_bg_fill = p.soft;
-    v.widgets.active.bg_fill = p.soft;
-    v.widgets.active.weak_bg_fill = p.soft;
+    // Gentle press distinction: a shade deeper than the hover wash.
+    let pressed = if dark {
+        p.accent_soft.gamma_multiply(1.2)
+    } else {
+        p.accent_soft.gamma_multiply(0.88)
+    };
+    v.widgets.active.bg_fill = pressed;
+    v.widgets.active.weak_bg_fill = pressed;
+    v.widgets.active.bg_stroke = Stroke::new(1., p.accent.linear_multiply(0.6));
+    v.widgets.active.fg_stroke.color = p.accent;
     v
 }
 
@@ -608,10 +616,17 @@ pub(crate) fn danger(label: &str, dark: bool) -> Button<'_> {
         .wrap()
 }
 
-pub(crate) fn toggle(ui: &mut Ui, value: &mut bool, title: &str, description: &str) -> bool {
+/// Toggle with a 140ms knob and track transition (instant when `reduced`).
+pub(crate) fn toggle_animated(
+    ui: &mut Ui,
+    value: &mut bool,
+    title: &str,
+    description: &str,
+    reduced: bool,
+) -> bool {
     let p = palette(ui.visuals().dark_mode);
     let text_width = (ui.available_width() - 68.).max(80.);
-    let title = ui.painter().layout(
+    let title_galley = ui.painter().layout(
         title.to_owned(),
         TextStyle::Body.resolve(ui.style()),
         p.ink,
@@ -623,30 +638,448 @@ pub(crate) fn toggle(ui: &mut Ui, value: &mut bool, title: &str, description: &s
         p.muted,
         text_width,
     );
-    let height = (title.size().y + description.size().y + 10.).max(56.);
+    let height = (title_galley.size().y + description.size().y + 10.).max(56.);
     let (rect, response) =
         ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click());
-    response.widget_info(|| WidgetInfo::selected(Role::CheckBox, true, *value, title.text()));
+    response.widget_info(|| {
+        WidgetInfo::selected(Role::CheckBox, true, *value, title_galley.text())
+    });
     if response.clicked() {
         *value = !*value;
     }
-    ui.painter().galley(rect.min, title.clone(), p.ink);
+    ui.painter().galley(rect.min, title_galley.clone(), p.ink);
     ui.painter().galley(
-        rect.min + vec2(0., title.size().y + 4.),
+        rect.min + vec2(0., title_galley.size().y + 4.),
         description,
         p.muted,
     );
+    let anim = ui.ctx().animate_bool_with_time(
+        ui.make_persistent_id(("yejian-toggle", title)),
+        *value,
+        if reduced { 0. } else { 0.14 },
+    );
     let track = Rect::from_center_size(pos2(rect.right() - 24., rect.center().y), vec2(46., 28.));
     ui.painter()
-        .rect_filled(track, 14., if *value { p.accent } else { p.line });
-    let x = if *value {
-        track.right() - 14.
-    } else {
-        track.left() + 14.
-    };
+        .rect_filled(track, 14., mix(p.line, p.accent, anim));
+    let x = track.left() + 14. + (track.width() - 28.) * anim;
     ui.painter()
-        .circle_filled(pos2(x, track.center().y), 10., p.surface);
+        .circle_filled(pos2(x, track.center().y), 10., mix(p.surface, p.on_accent, anim));
     response.clicked()
+}
+
+fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0., 1.);
+    let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color32::from_rgba_premultiplied(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()), l(a.a(), b.a()))
+}
+
+/// Warm paper ambient + directional drop shadow: three translucent rounded
+/// rects scaled by `elevation` (1.0 cards/nav, 2.0 modals/cover). No shaders.
+pub(crate) fn soft_shadow(p: &Painter, rect: Rect, radius: f32, elevation: f32, dark: bool) {
+    let elevation = elevation.max(0.);
+    if elevation <= 0. {
+        return;
+    }
+    // (spread, drop, alpha) — all per unit of elevation.
+    for (spread, drop, alpha) in [
+        (3.2, 0.6, if dark { 0.10 } else { 0.07 }),
+        (1.8, 1.4, if dark { 0.18 } else { 0.10 }),
+        (0.9, 2.4, if dark { 0.30 } else { 0.16 }),
+    ] {
+        let grow = spread * elevation;
+        let layer = rect
+            .expand2(vec2(grow, grow))
+            .translate(vec2(0., drop * elevation));
+        let color = if dark {
+            Color32::from_black_alpha((alpha * 255.) as u8)
+        } else {
+            Color32::from_rgba_unmultiplied(92, 76, 58, (alpha * 255.) as u8)
+        };
+        p.rect_filled(layer, radius + grow, color);
+    }
+}
+
+/// Unified light-bordered secondary action button.
+pub(crate) fn secondary<'a>(label: &'a str, dark: bool) -> Button<'a> {
+    let p = palette(dark);
+    Button::new(RichText::new(label).color(p.ink))
+        .fill(p.soft)
+        .stroke(Stroke::new(1., p.line))
+        .corner_radius(10)
+        .min_size(vec2(44., 44.))
+        .wrap()
+}
+
+/// Gentle 0.97 shrink around center for touch press feedback
+/// (at most 2pt inset per side).
+pub(crate) fn press_rect(rect: Rect, pressed: bool) -> Rect {
+    if !pressed {
+        return rect;
+    }
+    let inset = vec2(
+        (rect.width() * 0.015).min(2.),
+        (rect.height() * 0.015).min(2.),
+    );
+    Rect::from_min_max(rect.min + inset, rect.max - inset)
+}
+
+/// 20pt alpha-to-solid gradient strips fading scrolled content into `bg`.
+pub(crate) fn paint_scroll_fade(
+    p: &Painter,
+    rect: Rect,
+    bg: Color32,
+    fade_top: bool,
+    fade_bottom: bool,
+) {
+    const FADE: f32 = 20.;
+    let strip = |top: f32, bottom: f32, top_color: Color32, bottom_color: Color32| {
+        let strip = Rect::from_min_max(pos2(rect.left(), top), pos2(rect.right(), bottom));
+        if strip.is_positive() {
+            let mut mesh = Mesh::default();
+            mesh.colored_vertex(strip.left_top(), top_color);
+            mesh.colored_vertex(strip.right_top(), top_color);
+            mesh.colored_vertex(strip.right_bottom(), bottom_color);
+            mesh.colored_vertex(strip.left_bottom(), bottom_color);
+            mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+            p.add(Shape::mesh(mesh));
+        }
+    };
+    if fade_top {
+        strip(
+            rect.top(),
+            (rect.top() + FADE).min(rect.bottom()),
+            bg.linear_multiply(0.),
+            bg,
+        );
+    }
+    if fade_bottom {
+        strip(
+            (rect.bottom() - FADE).max(rect.top()),
+            rect.bottom(),
+            bg,
+            bg.linear_multiply(0.),
+        );
+    }
+}
+
+pub(crate) struct SliderOutcome {
+    pub changed: bool,
+    pub dragging: bool,
+    pub rect: Rect,
+    pub thumb_x: f32,
+}
+
+/// Touch-sized custom slider: 44pt hit area, 4pt rounded track, accent fill
+/// (from the left in LTR, the right in RTL), press/drag anywhere to set.
+pub(crate) fn slider(
+    ui: &mut Ui,
+    id: impl AsIdSalt,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    width: f32,
+    rtl: bool,
+    dark: bool,
+) -> SliderOutcome {
+    let p = palette(dark);
+    let (rect, _allocated) = ui.allocate_exact_size(vec2(width.max(80.), 44.), Sense::hover());
+    let response = ui.interact(rect, ui.make_persistent_id(id), Sense::click_and_drag());
+    response.widget_info(|| WidgetInfo::slider(true, *value as f64, ""));
+
+    let (min, max) = (*range.start(), *range.end());
+    let span = (max - min).max(f32::EPSILON);
+    let track = Rect::from_center_size(rect.center(), vec2((rect.width() - 28.).max(4.), 4.));
+
+    let mut changed = false;
+    if (response.dragged() || response.is_pointer_button_down_on())
+        && let Some(pointer) = response.interact_pointer_pos()
+    {
+        let raw = if rtl {
+            track.right() - pointer.x
+        } else {
+            pointer.x - track.left()
+        };
+        let next = (min + (raw / track.width()).clamp(0., 1.) * (max - min))
+            .clamp(min.min(max), min.max(max));
+        if next != *value {
+            *value = next;
+            changed = true;
+        }
+    }
+
+    let t = ((*value - min) / span).clamp(0., 1.);
+    let t_visual = if rtl { 1. - t } else { t };
+    let thumb_x = track.left() + track.width() * t_visual;
+    let cy = rect.center().y;
+
+    let track_fill = if dark {
+        Color32::from_gray(72)
+    } else {
+        p.line
+    };
+    ui.painter().rect_filled(track, 2., track_fill);
+    let active = if rtl {
+        Rect::from_min_max(pos2(thumb_x, track.top()), track.max)
+    } else {
+        Rect::from_min_max(track.min, pos2(thumb_x, track.bottom()))
+    };
+    if active.width() > 0.5 {
+        ui.painter().rect_filled(active, 2., p.accent);
+    }
+    let engaged =
+        response.hovered() || response.dragged() || response.is_pointer_button_down_on();
+    let r = if engaged { 11. } else { 9. };
+    let thumb = pos2(thumb_x, cy);
+    ui.painter().circle_filled(
+        thumb + vec2(0., 1.2),
+        r + 0.8,
+        Color32::from_black_alpha(if dark { 80 } else { 28 }),
+    );
+    ui.painter().circle_filled(thumb, r, p.surface);
+    ui.painter()
+        .circle_stroke(thumb, r - 0.7, Stroke::new(2., p.accent));
+    if engaged {
+        ui.painter().circle_filled(thumb, 3., p.accent);
+    }
+    SliderOutcome {
+        changed,
+        dragging: response.dragged(),
+        rect,
+        thumb_x,
+    }
+}
+
+/// Small geometric glyphs drawn centered on `center` at ~17pt.
+pub(crate) fn draw_icon(p: &Painter, center: Pos2, kind: &str, color: Color32, active: bool) {
+    let c = center;
+    let stroke = Stroke::new(if active { 1.8 } else { 1.5 }, color);
+    let tint = color.linear_multiply(0.16);
+    match kind {
+        "library" => {
+            let book = Rect::from_center_size(c, vec2(13., 16.));
+            if active {
+                p.rect_filled(book, 2., tint);
+            }
+            p.rect_stroke(book, 2., stroke, StrokeKind::Inside);
+            let spine_x = book.left() + 3.6;
+            p.line_segment(
+                [
+                    pos2(spine_x, book.top() + 0.8),
+                    pos2(spine_x, book.bottom() - 0.8),
+                ],
+                Stroke::new(1.2, color),
+            );
+            let r_top = book.top() + 0.6;
+            let r_right = book.right() - 2.4;
+            p.add(Shape::convex_polygon(
+                vec![
+                    pos2(r_right - 2.8, r_top),
+                    pos2(r_right, r_top),
+                    pos2(r_right, r_top + 5.4),
+                    pos2(r_right - 1.4, r_top + 4.),
+                    pos2(r_right - 2.8, r_top + 5.4),
+                ],
+                color,
+                Stroke::NONE,
+            ));
+        }
+        "search" => {
+            let ring = c + vec2(-1.4, -1.4);
+            let r = 5.2;
+            p.circle_stroke(ring, r, stroke);
+            let d = vec2(1., 1.).normalized();
+            p.line_segment(
+                [ring + d * (r + 0.4), ring + d * (r + 4.)],
+                Stroke::new(if active { 2.2 } else { 1.8 }, color),
+            );
+        }
+        "history" => {
+            if active {
+                p.circle_filled(c, 7., tint);
+            }
+            p.circle_stroke(c, 7., stroke);
+            let pts: Vec<Pos2> = (0..=5)
+                .map(|i| {
+                    let a = (140. + i as f32 * 22.).to_radians();
+                    c + vec2(a.cos(), a.sin()) * 8.8
+                })
+                .collect();
+            p.add(Shape::line(pts, Stroke::new(1.1, color.linear_multiply(0.6))));
+            p.line_segment([c, c + vec2(0., -3.8)], Stroke::new(1.6, color));
+            p.line_segment([c, c + vec2(2.8, 1.2)], Stroke::new(1.6, color));
+            p.circle_filled(c, 1.1, color);
+        }
+        "settings" => {
+            // Three horizontal sliders — unmistakable at 16-20pt.
+            for (i, dy) in [-4.6, 0., 4.6].into_iter().enumerate() {
+                let y = c.y + dy;
+                p.line_segment(
+                    [pos2(c.x - 7., y), pos2(c.x + 7., y)],
+                    Stroke::new(1.4, color.linear_multiply(0.85)),
+                );
+                let knob = pos2(c.x + [-2.6, 2.4, -0.6][i], y);
+                if active {
+                    p.circle_filled(knob, 2.4, color);
+                } else {
+                    p.circle_stroke(knob, 2.4, Stroke::new(1.5, color));
+                }
+            }
+        }
+        "plus" => {
+            p.line_segment(
+                [c + vec2(-6., 0.), c + vec2(6., 0.)],
+                Stroke::new(1.8, color),
+            );
+            p.line_segment(
+                [c + vec2(0., -6.), c + vec2(0., 6.)],
+                Stroke::new(1.8, color),
+            );
+        }
+        "back" => {
+            p.line_segment(
+                [c + vec2(5., 0.), c + vec2(-5.5, 0.)],
+                Stroke::new(1.8, color),
+            );
+            p.add(Shape::line(
+                vec![c + vec2(-1., -4.2), c + vec2(-5.5, 0.), c + vec2(-1., 4.2)],
+                Stroke::new(1.8, color),
+            ));
+        }
+        "prev" => {
+            p.add(Shape::line(
+                vec![c + vec2(3.2, -5.4), c + vec2(-3.2, 0.), c + vec2(3.2, 5.4)],
+                stroke,
+            ));
+        }
+        "next" => {
+            p.add(Shape::line(
+                vec![c + vec2(-3.2, -5.4), c + vec2(3.2, 0.), c + vec2(-3.2, 5.4)],
+                stroke,
+            ));
+        }
+        "open" => {
+            // Open book: two pages leaning on a shared spine.
+            let spine_top = c + vec2(0., -3.4);
+            let spine_bottom = c + vec2(0., 4.6);
+            for s in [-1., 1.] {
+                p.add(Shape::line(
+                    vec![
+                        spine_top,
+                        c + vec2(6.6 * s, -5.8),
+                        c + vec2(6.6 * s, 2.4),
+                        spine_bottom,
+                    ],
+                    stroke,
+                ));
+            }
+        }
+        "chapters" => {
+            for i in 0..3 {
+                let y = c.y - 4.6 + i as f32 * 4.6;
+                p.circle_filled(pos2(c.x - 5.6, y), 1.1, color);
+                p.line_segment(
+                    [pos2(c.x - 3., y), pos2(c.x + 6., y)],
+                    Stroke::new(1.5, color),
+                );
+            }
+        }
+        "sun" => {
+            if active {
+                p.circle_filled(c, 4.2, tint);
+            }
+            p.circle_stroke(c, 4.2, stroke);
+            for i in 0..8 {
+                let a = i as f32 * std::f32::consts::FRAC_PI_4;
+                let d = vec2(a.cos(), a.sin());
+                p.line_segment([c + d * 6.2, c + d * 8.2], Stroke::new(1.5, color));
+            }
+        }
+        "paged" => {
+            let page = Rect::from_center_size(c, vec2(11., 15.));
+            if active {
+                p.rect_filled(page, 1.5, tint);
+            }
+            p.rect_stroke(page, 1.5, stroke, StrokeKind::Inside);
+        }
+        "spread" => {
+            for s in [-1., 1.] {
+                let page = Rect::from_center_size(c + vec2(3.6 * s, 0.), vec2(6.4, 15.));
+                if active {
+                    p.rect_filled(page, 1.2, tint);
+                }
+                p.rect_stroke(page, 1.2, stroke, StrokeKind::Inside);
+            }
+        }
+        "vertical" => {
+            let page = Rect::from_center_size(c, vec2(11., 15.));
+            if active {
+                p.rect_filled(page, 1.5, tint);
+            }
+            p.rect_stroke(page, 1.5, stroke, StrokeKind::Inside);
+            p.add(Shape::line(
+                vec![
+                    pos2(c.x - 2.4, c.y - 0.6),
+                    pos2(c.x, c.y - 3.8),
+                    pos2(c.x + 2.4, c.y - 0.6),
+                ],
+                Stroke::new(1.5, color),
+            ));
+            p.add(Shape::line(
+                vec![
+                    pos2(c.x - 2.4, c.y + 0.6),
+                    pos2(c.x, c.y + 3.8),
+                    pos2(c.x + 2.4, c.y + 0.6),
+                ],
+                Stroke::new(1.5, color),
+            ));
+        }
+        "download" => {
+            p.line_segment(
+                [c + vec2(0., -6.), c + vec2(0., 2.2)],
+                Stroke::new(1.8, color),
+            );
+            p.add(Shape::line(
+                vec![c + vec2(-3.6, -1.), c + vec2(0., 2.6), c + vec2(3.6, -1.)],
+                Stroke::new(1.8, color),
+            ));
+            p.line_segment(
+                [pos2(c.x - 5.6, c.y + 6.), pos2(c.x + 5.6, c.y + 6.)],
+                Stroke::new(1.8, color),
+            );
+        }
+        "check" => {
+            p.add(Shape::line(
+                vec![c + vec2(-5.6, 0.6), c + vec2(-1.6, 4.4), c + vec2(6., -4.2)],
+                Stroke::new(2., color),
+            ));
+        }
+        "bookmark" => {
+            p.line_segment([c + vec2(-5., -7.), c + vec2(-5., 7.)], stroke);
+            p.line_segment([c + vec2(5., -7.), c + vec2(5., 7.)], stroke);
+            p.line_segment([c + vec2(-5., -7.), c + vec2(5., -7.)], stroke);
+            p.line_segment([c + vec2(-5., 7.), c + vec2(0., 3.)], stroke);
+            p.line_segment([c + vec2(5., 7.), c + vec2(0., 3.)], stroke);
+        }
+        "bookmark-on" => {
+            let pts = vec![
+                c + vec2(-5., -7.),
+                c + vec2(5., -7.),
+                c + vec2(5., 7.),
+                c + vec2(0., 3.),
+                c + vec2(-5., 7.),
+            ];
+            p.add(Shape::convex_polygon(pts, color, stroke));
+        }
+        "share" => {
+            // Open box with an arrow rising out of it.
+            p.line_segment([c + vec2(-7., -1.), c + vec2(-7., 7.)], stroke);
+            p.line_segment([c + vec2(-7., 7.), c + vec2(7., 7.)], stroke);
+            p.line_segment([c + vec2(7., 7.), c + vec2(7., -1.)], stroke);
+            p.line_segment([c + vec2(0., 4.), c + vec2(0., -7.)], stroke);
+            p.line_segment([c + vec2(0., -7.), c + vec2(-4., -3.)], stroke);
+            p.line_segment([c + vec2(0., -7.), c + vec2(4., -3.)], stroke);
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]

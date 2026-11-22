@@ -278,7 +278,14 @@ impl ReaderApp {
                             );
                             self.hitboxes
                                 .insert(format!("history-{}", row.key), rect);
+                            crate::design::soft_shadow(ui.painter(), rect, 18., 0.8, self.dark);
                             ui.painter().rect_filled(rect, 18., palette.surface);
+                            ui.painter().rect_stroke(
+                                rect,
+                                18.,
+                                Stroke::new(1., palette.line.gamma_multiply(0.5)),
+                                StrokeKind::Inside,
+                            );
                             let cover_rect =
                                 Rect::from_min_size(rect.min + vec2(14., 14.), vec2(58., 82.));
                             let mut covered = false;
