@@ -1989,9 +1989,10 @@ impl ReaderApp {
             vec2(width, height),
         );
         let books = if side_by_side {
+            // 右侧信息栏曾经占掉近一半宽度；书架是主体，把它压到 22%。
             Rect::from_min_size(
                 stage.min + vec2(12., 12.),
-                vec2(width * 0.55 - 12., height - 24.),
+                vec2(width * 0.74 - 12., height - 24.),
             )
         } else {
             Rect::from_min_size(stage.min + vec2(8., 30.), vec2(width - 16., 212.))
@@ -1999,10 +2000,10 @@ impl ReaderApp {
         let info = if side_by_side {
             Rect::from_min_max(
                 pos2(
-                    books.right() + 28.,
+                    books.right() + 20.,
                     stage.top() + if short_landscape { 14. } else { 76. },
                 ),
-                stage.max - vec2(28., 26.),
+                stage.max - vec2(20., 26.),
             )
         } else {
             Rect::from_min_max(
@@ -2847,8 +2848,8 @@ impl ReaderApp {
         if layout.side_by_side {
             ui.painter().line_segment(
                 [
-                    pos2(layout.info.left() - 20., layout.stage.top() + 40.),
-                    pos2(layout.info.left() - 20., layout.stage.bottom() - 40.),
+                    pos2(layout.info.left() - 10., layout.stage.top() + 40.),
+                    pos2(layout.info.left() - 10., layout.stage.bottom() - 40.),
                 ],
                 Stroke::new(1., palette.ink.gamma_multiply(0.08)),
             );
@@ -3087,8 +3088,9 @@ impl ReaderApp {
         }
         info_painter.galley(progress_pos, progress, muted);
         let detail_width = 30. * self.font_scale + 24.;
+        // 触控热区不得小于 44pt；右侧信息栏收窄后按钮也要保底 88pt 才不会压线。
         let action_width =
-            (84. * self.font_scale + 68.).min(layout.info.width() - detail_width - 12.);
+            (84. * self.font_scale + 68.).min(layout.info.width() - detail_width - 12.).max(88.);
         let open_rect = Rect::from_min_size(
             pos2(info.x + action_width + 12., action_y),
             vec2(detail_width, 50.),
