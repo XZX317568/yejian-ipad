@@ -96,6 +96,7 @@
 - 2026-11-22 ffmpeg 管线可用：`artifacts/rust/stage0/body.mp4`（160 帧 / 121KB）
 - 2026-11-22 kill test 先 FAILED（纸全平仍 PASS），补断言后 **PASSED**：broken EXIT=1 / good EXIT=0，日志 `.tools/loop-baseline/stage0-killtest5.log`
 - 2026-11-23 **iPad 模拟器真机链路打通**：macOS 盒跑通 CI 同款 build-rust-ios.sh --sim → xcodebuild → capture-ipad-simulator.sh → IPadRotationTests **4/4 PASS**；shelf.png 证实竖屏底部标签栏+全屏书架在真模拟器生效（截图拉回到 artifacts/rust/sim-pulled/，经 devin forward + python http.server）。verify-ipad-snapshots.py 崩在缺 relocated-library.json（覆盖率缺口，非 bug）
+- 2026-11-23 **模拟器第二轮全链 PASS**（含摊开）：ipad-sim2 出 8 画面（shelf/detail/detail-landscape/reader/history/browse/community/filters/filters-landscape），IPadRotationTests 4/4，TEST EXECUTE SUCCEEDED；detail 完成态布局全居中正确。截图路径 artifacts/rust/ipad-sim2（盒子）/ sim-pulled/detail-sim2.png（本地）
 - 2026-11-23 **摊开语义纠正**（.tools/stage2-spread-spec.md）：参考 `slant=min(180,w·0.46)` 是**裁剪路径斜扫边**不是面片剪切；incoming/outgoing 在参考里是死代码，唯一活用法是底部 sheet。摊开 = 斜边扫入 clip 揭示，接在 flight 的 contact 段（t≥0.58）后
 - 2026-11-23 书本尺寸实测：`cover = clamp(w/scale*0.32,100,190)*scale`，iPad 竖屏约 **328pt 宽 / 528pt 高**（不是以为的 460）；`base_y+height ≈ 974`，画布 1202，所以垂直并未被裁
 - 2026-11-23 景深压暗已生效：每退一槽 13%（`shelf.rs` paint_volume），两侧书不再和焦点书抢视线
