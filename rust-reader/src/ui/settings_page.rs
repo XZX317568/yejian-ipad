@@ -1106,36 +1106,12 @@ impl ReaderApp {
             ),
         };
         let screen = ctx.content_rect();
-        // Dim everything under the card and swallow the tap so it can only
-        // close the dialog — nothing beneath is clickable.
-        let scrim = Area::new(Id::unique("storage-confirm-scrim"))
-            .order(Order::Foreground)
-            .fade_in(false)
-            .interactable(true)
-            .fixed_pos(screen.min)
-            .show(ctx, |ui| {
-                ui.painter()
-                    .rect_filled(screen, 0., Color32::from_black_alpha(96));
-                ui.allocate_rect(screen, Sense::click())
-            });
-        if scrim.inner.clicked() {
-            self.storage_confirm = None;
-            return;
-        }
         // fade_in(false) + surface fill: the card is opaque from the first
         // frame, nothing behind it can bleed through.
-        let mut card_rect = Rect::NOTHING;
-        Area::new(Id::unique("storage-confirm"))
-            .order(Order::Foreground)
-            .fade_in(false)
-            .interactable(true)
-            .movable(false)
-            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
-            .show(ctx, |ui| {
-                let frame = crate::design::surface(ui).show(ui, |ui| {
-                    ui.set_width(
-                        (screen.width() - 56.).clamp(220., 420.),
-                    );
+        let modal = crate::design::modal(ctx, "storage-confirm", |ui| {
+            ui.set_width(
+                (screen.width() - 56.).clamp(220., 420.),
+            );
                     ui.heading(title);
                     ui.label(copy);
                     ui.add_space(6.);
@@ -1175,11 +1151,13 @@ impl ReaderApp {
                             self.storage_confirm = None;
                         }
                     });
-                });
-                card_rect = frame.response.rect;
-            });
+        });
+        if modal.scrim_clicked {
+            self.storage_confirm = None;
+            return;
+        }
         self.hitboxes
-            .insert("storage-confirm-card".into(), card_rect);
+            .insert("storage-confirm-card".into(), modal.card_rect);
     }
     /// Categories shown in the manage panel / pick list: stored user order
     /// plus categories found on books that are not stored yet. Fixed entries
@@ -1192,36 +1170,16 @@ impl ReaderApp {
         body: impl FnOnce(&mut Self, &mut Ui) -> R,
     ) -> Option<R> {
         let screen = ctx.content_rect();
-        let scrim = Area::new(Id::unique(format!("{id}-scrim")))
-            .order(Order::Foreground)
-            .fade_in(false)
-            .interactable(true)
-            .fixed_pos(screen.min)
-            .show(ctx, |ui| {
-                ui.painter()
-                    .rect_filled(screen, 0., Color32::from_black_alpha(96));
-                ui.allocate_rect(screen, Sense::click())
-            });
-        if scrim.inner.clicked() {
+        let mut out: Option<R> = None;
+        let modal = crate::design::modal(ctx, id, |ui| {
+            ui.set_width((screen.width() - 56.).clamp(240., 440.));
+            out = Some(body(self, ui));
+        });
+        if modal.scrim_clicked {
             *open = false;
             return None;
         }
-        let mut card_rect = Rect::NOTHING;
-        let mut out: Option<R> = None;
-        Area::new(Id::unique(id))
-            .order(Order::Foreground)
-            .fade_in(false)
-            .interactable(true)
-            .movable(false)
-            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
-            .show(ctx, |ui| {
-                let frame = crate::design::surface(ui).show(ui, |ui| {
-                    ui.set_width((screen.width() - 56.).clamp(240., 440.));
-                    out = Some(body(self, ui));
-                });
-                card_rect = frame.response.rect;
-            });
-        self.hitboxes.insert(format!("{id}-card"), card_rect);
+        self.hitboxes.insert(format!("{id}-card"), modal.card_rect);
         out
     }
     /// 分类管理 panel and the multi-select 分类 picker.

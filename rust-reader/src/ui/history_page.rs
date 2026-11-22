@@ -438,30 +438,8 @@ impl ReaderApp {
             return;
         }
         let screen = ctx.content_rect();
-        let scrim = Area::new(Id::unique("footprint-clear-scrim"))
-            .order(Order::Foreground)
-            .fade_in(false)
-            .interactable(true)
-            .fixed_pos(screen.min)
-            .show(ctx, |ui| {
-                ui.painter()
-                    .rect_filled(screen, 0., Color32::from_black_alpha(96));
-                ui.allocate_rect(screen, Sense::click())
-            });
-        if scrim.inner.clicked() {
-            self.history_clear = false;
-            return;
-        }
-        let mut card_rect = Rect::NOTHING;
-        Area::new(Id::unique("footprint-clear"))
-            .order(Order::Foreground)
-            .fade_in(false)
-            .interactable(true)
-            .movable(false)
-            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
-            .show(ctx, |ui| {
-                let frame = crate::design::surface(ui).show(ui, |ui| {
-                    ui.set_width((screen.width() - 56.).clamp(220., 420.));
+        let modal = crate::design::modal(ctx, "footprint-clear", |ui| {
+            ui.set_width((screen.width() - 56.).clamp(220., 420.));
                     ui.heading("清空阅读足迹");
                     ui.label("从足迹移除全部记录，阅读进度不受影响，再次阅读会重新出现。");
                     ui.add_space(6.);
@@ -491,10 +469,12 @@ impl ReaderApp {
                             self.history_clear = false;
                         }
                     });
-                });
-                card_rect = frame.response.rect;
-            });
+        });
+        if modal.scrim_clicked {
+            self.history_clear = false;
+            return;
+        }
         self.hitboxes
-            .insert("footprint-clear-card".into(), card_rect);
+            .insert("footprint-clear-card".into(), modal.card_rect);
     }
 }

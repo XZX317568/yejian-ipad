@@ -381,30 +381,8 @@ impl Sources {
             return;
         };
         let screen = ctx.content_rect();
-        let scrim = Area::new(egui::Id::unique("uninstall-scrim"))
-            .order(Order::Foreground)
-            .fade_in(false)
-            .interactable(true)
-            .fixed_pos(screen.min)
-            .show(ctx, |ui| {
-                ui.painter()
-                    .rect_filled(screen, 0., Color32::from_black_alpha(96));
-                ui.allocate_rect(screen, Sense::click())
-            });
-        if scrim.inner.clicked() {
-            self.uninstall = None;
-            return;
-        }
-        let mut card_rect = Rect::NOTHING;
-        Area::new(egui::Id::unique("uninstall-card"))
-            .order(Order::Foreground)
-            .fade_in(false)
-            .interactable(true)
-            .movable(false)
-            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
-            .show(ctx, |ui| {
-                let frame = crate::design::surface(ui).show(ui, |ui| {
-                    ui.set_width((screen.width() - 56.).clamp(220., 440.));
+        let modal = design::modal(ctx, "uninstall", |ui| {
+            ui.set_width((screen.width() - 56.).clamp(220., 440.));
                     ui.heading(format!("卸载 {}", source.manifest.name));
                     ui.label("已下载的章节保留；这个书源上的追更会停止更新，并标为「书源已卸载」。");
                     ui.add_space(6.);
@@ -420,10 +398,12 @@ impl Sources {
                             self.confirm_uninstall();
                         }
                     });
-                });
-                card_rect = frame.response.rect;
-            });
-        self.hitboxes.insert("source-uninstall-card".into(), card_rect);
+        });
+        if modal.scrim_clicked {
+            self.uninstall = None;
+            return;
+        }
+        self.hitboxes.insert("source-uninstall-card".into(), modal.card_rect);
     }
     pub(super)fn repository_entry_ui(&mut self, ui: &mut Ui) {
         let palette = design::palette(ui.visuals().dark_mode);
@@ -663,30 +643,8 @@ impl Sources {
             return;
         }
         let screen = ctx.content_rect();
-        let scrim = Area::new(egui::Id::unique("history-clear-scrim"))
-            .order(Order::Foreground)
-            .fade_in(false)
-            .interactable(true)
-            .fixed_pos(screen.min)
-            .show(ctx, |ui| {
-                ui.painter()
-                    .rect_filled(screen, 0., Color32::from_black_alpha(96));
-                ui.allocate_rect(screen, Sense::click())
-            });
-        if scrim.inner.clicked() {
-            self.history_confirm = false;
-            return;
-        }
-        let mut card_rect = Rect::NOTHING;
-        Area::new(egui::Id::unique("history-clear"))
-            .order(Order::Foreground)
-            .fade_in(false)
-            .interactable(true)
-            .movable(false)
-            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
-            .show(ctx, |ui| {
-                let frame = crate::design::surface(ui).show(ui, |ui| {
-                    ui.set_width((screen.width() - 56.).clamp(220., 420.));
+        let modal = design::modal(ctx, "history-clear", |ui| {
+            ui.set_width((screen.width() - 56.).clamp(220., 420.));
                     ui.heading("清空搜索历史");
                     ui.label("删除全部搜索记录，书架和阅读进度不受影响。");
                     ui.add_space(6.);
@@ -707,11 +665,13 @@ impl Sources {
                             self.history_confirm = false;
                         }
                     });
-                });
-                card_rect = frame.response.rect;
-            });
+        });
+        if modal.scrim_clicked {
+            self.history_confirm = false;
+            return;
+        }
         self.hitboxes
-            .insert("history-clear-card".into(), card_rect);
+            .insert("history-clear-card".into(), modal.card_rect);
     }
 }
 

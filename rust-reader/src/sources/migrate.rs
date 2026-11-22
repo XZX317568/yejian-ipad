@@ -352,36 +352,16 @@ impl Sources {
         };
         let _ = state;
         let screen = ctx.content_rect();
-        let scrim = Area::new(egui::Id::unique("migrate-scrim"))
-            .order(Order::Foreground)
-            .fade_in(false)
-            .interactable(true)
-            .fixed_pos(screen.min)
-            .show(ctx, |ui| {
-                ui.painter()
-                    .rect_filled(screen, 0., Color32::from_black_alpha(96));
-                ui.allocate_rect(screen, Sense::click())
-            });
-        if scrim.inner.clicked() {
+        let modal = design::modal(ctx, "migrate", |ui| {
+            ui.set_width((screen.width() - 56.).clamp(280., 560.));
+            ui.set_max_height((screen.height() - 80.).clamp(240., 640.));
+            self.migrate_card(ui);
+        });
+        if modal.scrim_clicked {
             self.close_migrate();
             return;
         }
-        let mut card_rect = Rect::NOTHING;
-        Area::new(egui::Id::unique("migrate"))
-            .order(Order::Foreground)
-            .fade_in(false)
-            .interactable(true)
-            .movable(false)
-            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
-            .show(ctx, |ui| {
-                let frame = crate::design::surface(ui).show(ui, |ui| {
-                    ui.set_width((screen.width() - 56.).clamp(280., 560.));
-                    ui.set_max_height((screen.height() - 80.).clamp(240., 640.));
-                    self.migrate_card(ui);
-                });
-                card_rect = frame.response.rect;
-            });
-        self.hitboxes.insert("migrate-card".into(), card_rect);
+        self.hitboxes.insert("migrate-card".into(), modal.card_rect);
     }
     /// Card body: header, candidate groups or the confirm stage.
     pub(super)fn migrate_card(&mut self, ui: &mut Ui) {
