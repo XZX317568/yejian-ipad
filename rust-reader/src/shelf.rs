@@ -134,6 +134,14 @@ fn slot_shrink(distance: f32) -> f32 {
     }
 }
 
+/// 反透视深度压缩：斜轴测投影下厚度方向（书脊 spine 宽 + 封面 depth 向量）
+/// 不随距离衰减会显得远端书一样厚。按 1/(1+0.22·|d|) 连续压缩：
+/// d=0 → 1.00，±1 → 0.82，±2 → 0.69，±3 → 0.60（渐近但永不归零）。
+/// 只压"厚度轴"，书高与书宽(封面面内)不动，远处书更扁、焦点书更立体。
+fn depth_squeeze(distance: f32) -> f32 {
+    1. / (1. + 0.22 * distance.abs())
+}
+
 /// 书靠近 shelf_area 左右边缘 0..band 时按 smoothstep 渐隐，
 /// 取代之前被 painter clip 硬裁的生硬边缘。band = min(48, 宽度 5%)。
 /// 以书"靠内"的边衡量：从左侧滑入的书在左缘离开左 band 后即全亮。
@@ -265,14 +273,15 @@ pub fn geometry(area: Rect, count: usize, focus: f32, entrance: f32) -> Vec<Volu
                 center_x - footprint_b / 2. - pull * 0.66,
                 area.top() + v_pad + base_y + pull * 0.30 - height_b * 0.60 * lift + rail_y + load,
             );
+            let squeeze = depth_squeeze(distance);
             let front = Plane {
                 origin,
-                horizontal: vec2(spine_b, spine_b * 0.10),
+                horizontal: vec2(spine_b, spine_b * 0.10) * squeeze,
                 vertical: vec2(0., height_b),
             };
             let face = Plane {
                 origin: front.point(1., 0.),
-                horizontal: vec2(cover_b * 0.66, cover_b * -0.30),
+                horizontal: vec2(cover_b * 0.66, cover_b * -0.30) * squeeze,
                 vertical: vec2(0., height_b),
             };
             let volume = Volume {
@@ -326,20 +335,6 @@ fn flat(p: &Painter, plane: Plane, color: Color32) {
         Stroke::NONE,
     );
 }
-fn flat_stroked(p: &Painter, plane: Plane, color: Color32, stroke: Stroke) {
-    polygon(
-        p,
-        vec![
-            plane.point(0., 0.),
-            plane.point(1., 0.),
-            plane.point(1., 1.),
-            plane.point(0., 1.),
-        ],
-        color,
-        stroke,
-    );
-}
-
 fn ellipse(p: &Painter, center: Pos2, radius: Vec2, fill: Color32) {
     let points: Vec<Pos2> = (0..24)
         .map(|i| {
@@ -371,29 +366,58 @@ pub fn paint_floor(p: &Painter, volumes: &[Volume], dark: bool) {
     } else {
         Color32::from_rgb(138, 128, 107)
     };
+    let fade_dir = vec2(-1., 1.).normalized();
     for volume in volumes {
         let lift = volume.lift;
         let origin = volume.floor + vec2(-4., 5.) * lift * volume.scale;
         let front = volume.front.horizontal;
         let depth = volume.face.horizontal;
         let tail = vec2(-10., 10.) * volume.scale * (1. + 0.55 * lift);
-        gradient(
-            p,
-            &[
-                origin,
-                origin + front,
-                origin + front + depth,
-                origin + depth,
-                origin + depth + tail,
-                origin + tail,
-            ],
-            vec2(-1., 1.),
-            ink.gamma_multiply((0.12 - 0.065 * lift) * volume.opacity * volume.fade),
-            Color32::TRANSPARENT,
-        );
-        // 已排除：用 ellipse 画"接触阴影"在这套斜轴测几何上会变成一排圆形色块，
-        // 看起来像石头而不是影子（2026-11-23 实测，见 STATE 已验证事实）。
-        // 正确做法是把接触阴影并进上面那张地面梯度多边形，而不是另画椭圆。
+        let ambient = (0.12 - 0.065 * lift) * volume.opacity * volume.fade;
+        // 接触阴影并进同一个 mesh（不是独立 Shape，更不是 ellipse——独立椭圆
+        // 在斜轴测下会渲染成一排圆点，2026-11-23 实测已回退）。
+        // 贴地前缘 = 书底 footprint 的 viewer 侧两条边 p0→p1(书脊底)→p2(封面底)，
+        // 沿 fade_dir 扩一条 ≤6pt 的窄带：近边 alpha=1.5×环境（<1.6×上限），
+        // 远边回落到环境值，形成"重量锚点"而不是飘着的书。
+        let contact = ambient * 1.58;
+        let band = 5.5_f32;
+        let p0 = origin;
+        let p1 = origin + front;
+        let p2 = origin + front + depth;
+        let p3 = origin + depth;
+        let p4 = origin + depth + tail;
+        let p5 = origin + tail;
+        let b0 = p0 + fade_dir * band;
+        let b1 = p1 + fade_dir * band;
+        let b2 = p2 + fade_dir * band;
+        let mut mesh = Mesh::default();
+        // row 0：贴地前缘，最深
+        for pos in [p0, p1, p2] {
+            mesh.colored_vertex(pos, ink.gamma_multiply(contact));
+        }
+        // row 1：窄带外缘 + 原多边形尾端，沿用原 (-1,1) 方向的环境梯度
+        let far = [b0, b1, b2, p3, p4, p5];
+        let bounds = Rect::from_points(&far);
+        let half = bounds.size() * vec2(-1., 1.) * 0.5;
+        for &pos in &far {
+            let factor = ((pos - (bounds.center() - half)).dot(half)
+                / (2. * half.length_sq()))
+            .clamp(0., 1.);
+            mesh.colored_vertex(
+                pos,
+                ink.gamma_multiply(ambient).lerp_to_gamma(Color32::TRANSPARENT, factor),
+            );
+        }
+        // 窄带：p0p1b0 + p1p2b2 两个四边形
+        mesh.add_triangle(0, 1, 4);
+        mesh.add_triangle(0, 4, 3);
+        mesh.add_triangle(1, 2, 5);
+        mesh.add_triangle(1, 5, 4);
+        // 远处区域：b0b1b2p3p4p5 扇形（沿用原多边形扇形逻辑）
+        for i in 4..8u32 {
+            mesh.add_triangle(3, i, i + 1);
+        }
+        p.add(Shape::mesh(mesh));
     }
 }
 
@@ -545,14 +569,17 @@ pub fn paint_volume(
     faded.multiply_opacity(volume.opacity * volume.fade);
     let p = &faded;
     let scale = volume.scale;
+    // 深度压缩同步到排版基准面：文字与装饰按 unit 向量映射到面上，
+    // 不乘 squeeze 会随距离漂出压扁后的轮廓。
+    let squeeze = depth_squeeze(volume.distance);
     let face_unit = Plane {
         origin: volume.face.origin,
-        horizontal: vec2(0.66, -0.30) * scale,
+        horizontal: vec2(0.66, -0.30) * scale * squeeze,
         vertical: Vec2::Y * scale,
     };
     let spine_unit = Plane {
         origin: volume.front.origin,
-        horizontal: vec2(1., 0.10) * scale,
+        horizontal: vec2(1., 0.10) * scale * squeeze,
         vertical: Vec2::Y * scale,
     };
     let ink = if dark {
@@ -588,7 +615,24 @@ pub fn paint_volume(
     let paper = paper.gamma_multiply(dim);
     let spine = spine.gamma_multiply(dim);
     let edge_line = edge_line.gamma_multiply(dim);
-    flat_stroked(p, volume.face, paper, Stroke::new(0.8, edge_line));
+    // 受光棱线：取代整圈 0.8px 闭合描边（闭合描边让书像贴纸）。
+    // 光源在右上（depth 向量指向右上）：只描各面的"上缘 + 靠外一侧"——
+    // 封面是上缘+右缘，书脊是上缘+外侧左缘；书脊右缘是封面沟槽暗线。
+    let ridge_paper = paper.lerp_to_gamma(Color32::WHITE, 0.5);
+    let ridge_spine = spine.lerp_to_gamma(Color32::WHITE, 0.5);
+    let lit_edges = |p: &Painter, plane: Plane, right: bool, color: Color32| {
+        p.line_segment(
+            [plane.point(0., 0.), plane.point(1., 0.)],
+            Stroke::new(0.9, color),
+        );
+        let u = if right { 1. } else { 0. };
+        p.line_segment(
+            [plane.point(u, 0.), plane.point(u, 1.)],
+            Stroke::new(0.9, color),
+        );
+    };
+    flat(p, volume.face, paper);
+    lit_edges(p, volume.face, true, ridge_paper);
     let mut print = p.clone();
     print.multiply_opacity(volume.ink);
     if !hide_cover {
@@ -675,7 +719,8 @@ pub fn paint_volume(
             p.line_segment([a + depth * 0.07, a + depth * 0.93], Stroke::new(0.4, striation));
         }
     }
-    flat_stroked(p, volume.front, spine, Stroke::new(0.8, edge_line));
+    flat(p, volume.front, spine);
+    lit_edges(p, volume.front, false, ridge_spine);
     // A whisper of a gutter line where the cover board meets the spine gives
     // each volume its own silhouette against the neighbour's white edge.
     p.line_segment(
