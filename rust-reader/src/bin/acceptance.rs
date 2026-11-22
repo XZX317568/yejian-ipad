@@ -1268,6 +1268,41 @@ fn ipad_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
         h.frames(6)?;
         h.frame(vec![], Some(&format!("ipad-pro-129-{name}-reader")))?;
         if name == "portrait" {
+            // 阶段 3 flip evidence: hold a 0.5-width drag so the turn-edge
+            // depth ridge is visible, then release into the committed turn.
+            let grab = pos2(size[0] as f32 - 80., size[1] as f32 / 2.);
+            h.frame(
+                vec![
+                    Event::PointerMoved(grab),
+                    Event::PointerButton {
+                        pos: grab,
+                        button: PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Modifiers::NONE,
+                    },
+                ],
+                None,
+            )?;
+            let mut held = grab;
+            for _ in 0..8 {
+                held.x -= 56.;
+                h.frame(vec![Event::PointerMoved(held)], None)?;
+            }
+            h.frame(
+                vec![Event::PointerMoved(held - vec2(56., 0.))],
+                Some("ipad-pro-129-portrait-flip-mid"),
+            )?;
+            h.frame(
+                vec![Event::PointerButton {
+                    pos: held - vec2(56., 0.),
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Modifiers::NONE,
+                }],
+                None,
+            )?;
+            h.wait(ReaderApp::page_loaded)?;
+            h.frames(4)?;
             h.click("reader-settings")?;
             h.frames(6)?;
             h.frame(vec![], Some("ipad-pro-129-portrait-reader-settings"))?;
@@ -1977,7 +2012,11 @@ fn main() -> Result<()> {
         None,
     )?;
     for x in [265., 235., 205., 175., 145., 115.] {
-        h.frame(vec![Event::PointerMoved(pos2(x, 420.))], None)?;
+        let name = x > 144.5 && x < 145.5;
+        h.frame(
+            vec![Event::PointerMoved(pos2(x, 420.))],
+            name.then_some("reader-flip-mid"),
+        )?;
     }
     h.frame(
         vec![Event::PointerButton {

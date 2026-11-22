@@ -93,6 +93,81 @@ impl PageTexture {
             }
         }
     }
+    /// Paints the page as a textured mesh instead of a flat image: each
+    /// column lifts by [`motion::flip_depth`] and scales like the cover
+    /// paper (`300/(300-depth)`), with finite-difference shading.
+    /// `phase` is `|offset|/W`; `mirror` flips the ridge to the `u = 0`
+    /// edge for pages whose reveal seam is on the left. When `phase`
+    /// is 0 the vertices land on the flat rect, matching `paint`.
+    fn paint_flip(&self, painter: &Painter, rect: Rect, crop: bool, phase: f32, mirror: bool) {
+        const COLUMNS: u32 = 17;
+        let content = if crop {
+            self.content
+        } else {
+            Rect::from_min_max(Pos2::ZERO, pos2(1., 1.))
+        };
+        let f = crate::params::params().flip.clone();
+        let mut top = 0.;
+        for tile in &self.tiles {
+            let tile_height = tile.size()[1] as f32 / self.size.y;
+            let (tile_top, tile_bottom) = (top, top + tile_height);
+            top = tile_bottom;
+            let (visible_top, visible_bottom) = (
+                tile_top.max(content.top()),
+                tile_bottom.min(content.bottom()),
+            );
+            if visible_bottom <= visible_top {
+                continue;
+            }
+            let uv = Rect::from_min_max(
+                pos2(content.left(), (visible_top - tile_top) / tile_height),
+                pos2(content.right(), (visible_bottom - tile_top) / tile_height),
+            );
+            let target = Rect::from_min_size(
+                pos2(
+                    rect.left(),
+                    rect.top()
+                        + (visible_top - content.top()) / content.height() * rect.height(),
+                ),
+                vec2(
+                    rect.width(),
+                    (visible_bottom - visible_top) / content.height() * rect.height(),
+                ),
+            );
+            if !target.intersects(painter.clip_rect()) {
+                continue;
+            }
+            let mut mesh = Mesh::with_texture(tile.id());
+            mesh.vertices.reserve((COLUMNS * 2) as usize);
+            for row in 0..2 {
+                let v = row as f32;
+                for col in 0..COLUMNS {
+                    let u = col as f32 / (COLUMNS - 1) as f32;
+                    let um = if mirror { 1. - u } else { u };
+                    let depth = motion::flip_depth(um, phase, f.depth_px);
+                    let scale = 300. / (300. - depth.min(200.));
+                    let flat = target.lerp_inside(vec2(u, v));
+                    let pos = target.center() + (flat - target.center()) * scale;
+                    let fd = motion::flip_depth((um + 0.03).min(1.), phase, f.depth_px) - depth;
+                    let brightness =
+                        (1. - fd * f.edge_shade * 2. - depth / 28. * f.edge_shade)
+                            .clamp(0.72, 1.06);
+                    let channel = (brightness * 255.).round().clamp(0., 255.) as u8;
+                    mesh.vertices.push(egui::epaint::Vertex {
+                        pos,
+                        uv: uv.lerp_inside(vec2(u, v)),
+                        color: Color32::from_rgb(channel, channel, channel),
+                    });
+                }
+            }
+            for col in 0..COLUMNS - 1 {
+                let a = col;
+                let b = col + COLUMNS;
+                mesh.indices.extend([a, b, a + 1, a + 1, b, b + 1]);
+            }
+            painter.add(Shape::mesh(mesh));
+        }
+    }
 }
 
 /// What follows the current chapter in the vertical strip.
@@ -201,6 +276,10 @@ pub struct ReaderApp {
     /// Strip gap between the incoming and outgoing page during a turn:
     /// the eased outgoing offset is `current_offset - slide_turn_gap`.
     slide_turn_gap: f32,
+    /// Detail -> reader peel-entry clock: `INFINITY` means armed (starts
+    /// on the first reader frame with a decoded page), then the start
+    /// timestamp, cleared when the entry finishes.
+    reader_entry: Option<f64>,
     zoom_anim: motion::ZoomAnim,
     nav_pill: Option<motion::TimedTween>,
     last_nav_tab: Tab,
@@ -318,6 +397,7 @@ impl ReaderApp {
             controls_anim: None,
             page_slide: motion::PageSlide::default(),
             slide_turn_gap: 0.,
+            reader_entry: None,
             zoom_anim: motion::ZoomAnim::default(),
             nav_pill: None,
             last_nav_tab: Tab::Library,
@@ -1632,6 +1712,12 @@ impl ReaderApp {
         self.apply_reader_prefs(book);
         if !matches!(self.screen, Screen::Reader(_)) {
             self.reader_return = self.screen.clone();
+            // Arm the peel-in entry; it starts on the first reader frame
+            // so a chapter-to-chapter handoff inside the reader skips it.
+            // Vertical and reduced-motion readers get no peel to show.
+            self.reader_entry = (!self.reduced && !self.vertical).then_some(f64::INFINITY);
+        } else {
+            self.reader_entry = None;
         }
         self.page = book.current_page.min(book.page_count.saturating_sub(1));
         self.screen = Screen::Reader(book.id.clone());
@@ -1711,7 +1797,8 @@ impl ReaderApp {
             && self.zoom <= 1.
         {
             let dir_sign = if (delta > 0) ^ self.rtl { 1. } else { -1. };
-            let start_offset = dir_sign * viewport_w * 0.24;
+            let start_offset =
+                dir_sign * viewport_w * crate::params::params().flip.tap_strip_pct;
             self.page_slide.page = page;
             self.slide_turn_gap = start_offset;
             self.page_slide
@@ -1722,10 +1809,15 @@ impl ReaderApp {
     /// it reads is cleared once the motion finishes, so an idle frame leaves
     /// `frame_is_animating` false and the repaint delay long.
     fn animating(&self, now: f64, entrance: f32) -> bool {
+        let entry_active = self.reader_entry.is_some_and(|t| {
+            t.is_infinite()
+                || now - t < crate::params::params().flip.entry_ms.max(0.) as f64 / 1000.
+        });
         let reader_motion = matches!(self.screen, Screen::Reader(_))
             && (self.page_slide.active(now)
                 || self.zoom_anim.active(now)
-                || self.controls_anim.is_some_and(|t| !t.done(now)));
+                || self.controls_anim.is_some_and(|t| !t.done(now))
+                || entry_active);
         self.motion.active()
             || entrance < 1.
             || self.flight.is_some()
@@ -3850,7 +3942,17 @@ fn library_thumbnails(
             self.reader_drag = 0.;
             self.reader_drag_y = 0.;
             if page_swipe {
-                if distance.abs() > 45. {
+                let flip = crate::params::params().flip.clone();
+                let release_vx = ui.input(|i| i.pointer.velocity().x);
+                let committed = distance.abs() > flip.commit_px
+                    || (release_vx.abs() >= flip.commit_vx
+                        && release_vx.signum() == distance.signum());
+                let distance = if distance.abs() > flip.commit_px {
+                    distance
+                } else {
+                    release_vx
+                };
+                if committed {
                     let old_page = self.page;
                     let old_book = id.to_owned();
                     let drag_off = self.page_slide.current_offset(now);
@@ -4024,6 +4126,28 @@ fn library_thumbnails(
             self.page_slide.current_offset(now)
         };
         self.page_slide.tick(now);
+        // Detail -> reader peel-entry progress. The armed sentinel discharges
+        // here — outside the textured-page branch — so vertical or
+        // not-yet-decoded readers still finish the entry and stop painting.
+        let flip = crate::params::params().flip.clone();
+        let entry_p = if let Some(start) = self.reader_entry {
+            let started = if start.is_infinite() {
+                self.reader_entry = Some(now);
+                now
+            } else {
+                start
+            };
+            let p = motion::flip_entry_ease(
+                ((now - started) / (flip.entry_ms as f64 / 1000.).max(0.001)).clamp(0., 1.)
+                    as f32,
+            );
+            if p >= 1. {
+                self.reader_entry = None;
+            }
+            p
+        } else {
+            1.
+        };
         if self.vertical {
             self.vertical_ui(ui, page_viewport, id, book.page_count, now, &gesture);
         } else if let Some(error) = self.page_errors.get(&(id.into(), self.page)).cloned() {
@@ -4073,13 +4197,32 @@ fn library_thumbnails(
             };
             let painter = ui.painter().with_clip_rect(page_viewport);
             let crop = self.crop;
-            let slot = |texture: &PageTexture, center: Pos2, pan: Vec2, zoom: f32| {
+            // Page paints are queued so the detail->reader entry can replay
+            // them behind peel clip bands; `phase` drives the flip-depth
+            // ridge (|offset|/page width), `mirror` puts it on the left.
+            let w = page_viewport.width().max(1.);
+            let phase = (slide_x.abs() / w).clamp(0., 1.);
+            // Page paints are queued as page indices (re-resolved at flush)
+            // so nothing here borrows `self.pages` across the mutable
+            // `ask_page`/button calls below.
+            let mut queue: Vec<(usize, Rect, bool)> = Vec::new();
+            fn slot(
+                page: usize,
+                texture: &PageTexture,
+                available: Rect,
+                crop: bool,
+                center: Pos2,
+                pan: Vec2,
+                zoom: f32,
+                queue: &mut Vec<(usize, Rect, bool)>,
+            ) -> Rect {
                 let size = texture.shown_size(crop);
                 let scale = (available.width() / size.x).min(available.height() / size.y);
                 let target = Rect::from_center_size(center + pan, size * scale * zoom);
-                texture.paint(&painter, target, crop);
+                let mirror = (target.center().x - available.center().x) > 0.;
+                queue.push((page, target, mirror));
                 target
-            };
+            }
             if base == self.page {
                 let size = texture.shown_size(self.crop);
                 let scale = if fit_single {
@@ -4097,16 +4240,21 @@ fn library_thumbnails(
                     size,
                 );
                 self.hitboxes.insert("reader-image".into(), image_rect);
-                texture.paint(&painter, image_rect, self.crop);
+                let mirror = (image_rect.center().x - available.center().x) > 0.;
+                queue.push((self.page, image_rect, mirror));
                 self.rendered_page_nodes += 1;
             } else {
                 self.reader_fit_limit = 0.;
                 if let Some(first) = self.pages.get(&(id.into(), base)) {
                     slot(
+                        base,
                         first,
+                        available,
+                        crop,
                         available.center() + vec2(slide_x, 0.),
                         self.pan,
                         self.zoom,
+                        &mut queue,
                     );
                     self.rendered_page_nodes += 1;
                 } else {
@@ -4131,7 +4279,16 @@ fn library_thumbnails(
                     )
                     + vec2(slide_x, 0.);
                 if let Some(texture) = self.pages.get(&(id.into(), partner)) {
-                    let target = slot(texture, second_center, self.pan, self.zoom);
+                    let target = slot(
+                        partner,
+                        texture,
+                        available,
+                        crop,
+                        second_center,
+                        self.pan,
+                        self.zoom,
+                        &mut queue,
+                    );
                     if partner == self.page {
                         self.hitboxes.insert("reader-image".into(), target);
                     }
@@ -4182,10 +4339,14 @@ fn library_thumbnails(
                 && let Some(outgoing) = self.pages.get(&(id.into(), from_page))
             {
                 slot(
+                    from_page,
                     outgoing,
+                    available,
+                    crop,
                     available.center() + vec2(slide_x - self.slide_turn_gap, 0.),
                     self.pan,
                     self.zoom,
+                    &mut queue,
                 );
                 self.rendered_page_nodes += 1;
             }
@@ -4203,13 +4364,47 @@ fn library_thumbnails(
                     && let Some(texture) = self.pages.get(&(id.into(), neighbor))
                 {
                     slot(
+                        neighbor,
                         texture,
+                        available,
+                        crop,
                         available.center()
                             + vec2(slide_x + neighbor_side * page_viewport.width(), 0.),
                         self.pan,
                         self.zoom,
+                        &mut queue,
                     );
                     self.rendered_page_nodes += 1;
+                }
+            }
+            // Flush the queued pages. During the detail->reader entry the
+            // reader is treated as one incoming plane: the eased peel front
+            // reveals it through clip bands (the R3 widget-tree fallback),
+            // while the depth ridge hugs the sweeping reveal edge. After
+            // the entry the same paints run flat and unbanded.
+            if entry_p >= 1. {
+                for (page, target, mirror) in &queue {
+                    if let Some(tex) = self.pages.get(&(id.into(), *page)) {
+                        tex.paint_flip(&painter, *target, crop, phase, *mirror);
+                    }
+                }
+            } else {
+                let dir = if self.rtl { -1. } else { 1. };
+                let (dx, dy) = motion::spread_offset(entry_p);
+                let shift = vec2(dx * dir, dy);
+                for band in shelf::spread_clip(page_viewport, entry_p, dir) {
+                    let clipped = painter.with_clip_rect(band);
+                    for (page, target, mirror) in &queue {
+                        if let Some(tex) = self.pages.get(&(id.into(), *page)) {
+                            tex.paint_flip(
+                                &clipped,
+                                target.translate(shift),
+                                crop,
+                                (1. - entry_p).max(phase),
+                                *mirror,
+                            );
+                        }
+                    }
                 }
             }
         } else {

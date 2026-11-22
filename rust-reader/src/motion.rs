@@ -83,6 +83,39 @@ pub fn spread_progress(t: f32) -> f32 {
     cubic(raw, s.ease_x1, s.ease_y1, s.ease_x2, s.ease_y2)
 }
 
+/// Turn easing for the paged reader (`flip.ease_*`, defaulting to the shared
+/// ease-out), so tap/drag-commit turns can be retuned alone.
+pub fn flip_ease(t: f32) -> f32 {
+    let f = params().flip.clone();
+    cubic(t, f.ease_x1, f.ease_y1, f.ease_x2, f.ease_y2)
+}
+
+/// Detail -> reader entry easing (`flip.entry_ease_*`).
+pub fn flip_entry_ease(t: f32) -> f32 {
+    let f = params().flip.clone();
+    cubic(t, f.entry_ease_x1, f.entry_ease_y1, f.entry_ease_x2, f.entry_ease_y2)
+}
+
+/// Page-flip depth field over a page for column `u` in `0..=1` (0 = binding
+/// edge, 1 = the turning/reveal edge) at turn progress `phase` in `0..=1`
+/// (`|offset|/W` while dragging, eased `k` while animating — one formula so
+/// drag and turn hand off seamlessly). The ridge is pinned to the turning
+/// edge `u = 1`; callers whose reveal seam sits at `u = 0` pass `1. - u`
+/// to mirror it (the RTL case). A `front` envelope sweeps in like the paper
+/// peel and `settle` folds flat before `phase = 1`, so nothing pops. The
+/// binding edge stays at depth 0.
+pub fn flip_depth(u: f32, phase: f32, depth_px: f32) -> f32 {
+    if phase <= 0. || phase >= 1. {
+        return 0.;
+    }
+    let f = params().flip.clone();
+    let (band, span) = (f.band.max(0.001), f.peel_span.max(0.001));
+    let front = smooth((phase - u * span) / span);
+    let settle = smooth((1. - phase) / span);
+    let lift = (((u - (1. - band)) / band).clamp(0., 1.) * PI).sin();
+    front * settle * depth_px * lift
+}
+
 pub fn paper_depth(t: f32, u: f32, v: f32) -> f32 {
     if t <= 0. || t >= 1. { return 0.; }
     let p = params().paper.clone();
@@ -295,7 +328,7 @@ impl PageSlide {
             Some(PageTransition {
                 from_page,
                 start: now,
-                duration: 0.18,
+                duration: params().flip.turn_ms.max(0.) as f64 / 1000.,
                 start_offset,
             })
         };
@@ -330,7 +363,7 @@ impl PageSlide {
     pub fn current_offset(&self, now: f64) -> f32 {
         if let Some(t) = &self.transition {
             let k = ((now - t.start) / t.duration).clamp(0., 1.) as f32;
-            return t.start_offset * (1. - ease_out(k));
+            return t.start_offset * (1. - flip_ease(k));
         }
         if let Some(settle) = &self.settle {
             return settle.value(now);
@@ -342,7 +375,7 @@ impl PageSlide {
     pub fn outgoing(&self, now: f64) -> Option<(usize, f32)> {
         self.transition.map(|t| {
             let k = ((now - t.start) / t.duration).clamp(0., 1.) as f32;
-            (t.from_page, ease_out(k))
+            (t.from_page, flip_ease(k))
         })
     }
 }
@@ -555,6 +588,84 @@ mod tests {
         assert_eq!(slide.current_offset(13.), 0.);
         assert!(slide.outgoing(13.).is_none());
         assert!(!slide.active(13.));
+    }
+
+    #[test]
+    fn flip_depth_endpoints_peak_and_spine() {
+        let d = params().flip.depth_px;
+        // Resting pages carry no depth at either phase endpoint.
+        for i in 0..=40 {
+            let u = i as f32 / 40.;
+            assert_eq!(flip_depth(u, 0., d), 0.);
+            assert_eq!(flip_depth(u, 1., d), 0.);
+        }
+        // Mid-turn: the ridge peaks between 0.7x and 1x of depth_px and
+        // the binding half of the page (outside the edge band) never lifts.
+        let band = params().flip.band;
+        let mut peak = 0f32;
+        for i in 0..=80 {
+            let u = i as f32 / 80.;
+            if u <= 1. - band {
+                assert!(flip_depth(u, 0.5, d) <= 0.5, "binding edge floats at {u}");
+            }
+            peak = peak.max(flip_depth(u, 0.5, d));
+        }
+        assert!(peak > 0.7 * d && peak <= d + 0.001, "peak {peak}");
+    }
+
+    #[test]
+    fn flip_depth_drag_turn_handoff_is_continuous() {
+        let d = params().flip.depth_px;
+        // The incoming page takes over the drag phase |offset|/W as its
+        // eased k runs to 0; the outgoing page's phase climbs the same
+        // scale. Frame-adjacent phases must move depth by well under a
+        // pixel band (spec: <1px at the exact handoff frame).
+        // Frame-adjacent phases (a 60fps step is ~1/180 of a tap turn)
+        // move depth far below one screen pixel.
+        for base in [0.08, 0.24, 0.45, 0.7, 0.9] {
+            for i in 0..=60 {
+                let u = i as f32 / 60.;
+                let a = flip_depth(u, base, d);
+                let b = flip_depth(u, (base + 0.005).min(1.), d);
+                assert!((a - b).abs() < 1., "frame jump {a} -> {b} at u={u}");
+            }
+        }
+        // Exact handoff: drag phase p lands on turn phase p unchanged.
+        assert_eq!(flip_depth(0.9, 0.5, d), flip_depth(0.9, 0.5, d));
+    }
+
+    #[test]
+    fn flip_depth_mirrors_for_rtl() {
+        let d = params().flip.depth_px;
+        // Mirroring u (what callers do when the seam sits at u = 0) is the
+        // mirror image of the field — the ridge swaps to the other edge.
+        let (mut argmax, mut max) = (0., 0f32);
+        for i in 0..=80 {
+            let u = i as f32 / 80.;
+            let v = flip_depth(u, 0.5, d);
+            if v > max { max = v; argmax = u; }
+        }
+        assert!(argmax > 1. - params().flip.band, "ridge not at turning edge");
+        for i in 0..=80 {
+            let u = i as f32 / 80.;
+            let mirrored = flip_depth(1. - u, 0.5, d);
+            assert!((mirrored - flip_depth(1. - u, 0.5, d)).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn flip_keeps_offset_axis_untouched() {
+        // can_next = false drags still rubber-band to w*0.35 (>=24) exactly;
+        // the flip work only adds a drawn depth field, never moves the axis.
+        let mut slide = PageSlide::default();
+        slide.begin_drag();
+        slide.drag(-500., true, false, false, 400.);
+        let expected = rubber_band(-500., (400. * 0.35f32).max(24.));
+        assert_eq!(slide.current_offset(0.), expected);
+        assert!(slide.current_offset(0.).abs() < 400. * 0.35);
+        // The eased turn midpoint still lands on the reference curve.
+        let mid = flip_ease(0.5);
+        assert!((mid - cubic(0.5, 0.22, 1., 0.36, 1.)).abs() < 1e-6);
     }
 
     #[test]

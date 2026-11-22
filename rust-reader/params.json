@@ -64,5 +64,24 @@
     "ease_y1": 0.72,
     "ease_x2": 0.18,
     "ease_y2": 1
+  },
+  "flip": {
+    "turn_ms": 180,
+    "tap_strip_pct": 0.24,
+    "commit_px": 45,
+    "commit_vx": 500,
+    "depth_px": 22,
+    "band": 0.35,
+    "peel_span": 0.11,
+    "ease_x1": 0.22,
+    "ease_y1": 1,
+    "ease_x2": 0.36,
+    "ease_y2": 1,
+    "edge_shade": 0.1,
+    "entry_ms": 420,
+    "entry_ease_x1": 0.18,
+    "entry_ease_y1": 0.72,
+    "entry_ease_x2": 0.18,
+    "entry_ease_y2": 1
   }
 }

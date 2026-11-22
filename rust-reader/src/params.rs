@@ -20,6 +20,7 @@ pub struct Params {
     pub ease: Ease,
     pub shelf: Shelf,
     pub spread: Spread,
+    pub flip: Flip,
 }
 
 impl Default for Params {
@@ -31,6 +32,7 @@ impl Default for Params {
             ease: Ease::default(),
             shelf: Shelf::default(),
             spread: Spread::default(),
+            flip: Flip::default(),
         }
     }
 }
@@ -248,6 +250,66 @@ impl Default for Spread {
             ease_y1: 0.72,
             ease_x2: 0.18,
             ease_y2: 1.,
+        }
+    }
+}
+
+/// Page flip (翻页): the depth ridge riding the turning edge plus the turn
+/// commit and entry timings. Only shapes motion — the PageSlide offset axis
+/// keeps its existing rubber-band behaviour.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Flip {
+    /// Tap/committed turn duration in milliseconds.
+    pub turn_ms: f32,
+    /// Tap turn starting offset as a fraction of the page width.
+    pub tap_strip_pct: f32,
+    /// Drag commit displacement threshold in points.
+    pub commit_px: f32,
+    /// Drag commit velocity threshold in points per second.
+    pub commit_vx: f32,
+    /// Peak lift of the turning-edge depth ridge in points.
+    pub depth_px: f32,
+    /// Ridge band width as a fraction of the page width.
+    pub band: f32,
+    /// Per-column peel delay of the depth envelope.
+    pub peel_span: f32,
+    /// Cubic bezier control points of the turn easing.
+    pub ease_x1: f32,
+    pub ease_y1: f32,
+    pub ease_x2: f32,
+    pub ease_y2: f32,
+    /// Crease shading strength at the turning edge (0 disables).
+    pub edge_shade: f32,
+    /// Detail -> reader peel-entry duration in milliseconds.
+    pub entry_ms: f32,
+    /// Cubic bezier control points of the entry easing.
+    pub entry_ease_x1: f32,
+    pub entry_ease_y1: f32,
+    pub entry_ease_x2: f32,
+    pub entry_ease_y2: f32,
+}
+
+impl Default for Flip {
+    fn default() -> Self {
+        Self {
+            turn_ms: 180.,
+            tap_strip_pct: 0.24,
+            commit_px: 45.,
+            commit_vx: 500.,
+            depth_px: 22.,
+            band: 0.35,
+            peel_span: 0.11,
+            ease_x1: 0.22,
+            ease_y1: 1.,
+            ease_x2: 0.36,
+            ease_y2: 1.,
+            edge_shade: 0.10,
+            entry_ms: 420.,
+            entry_ease_x1: 0.18,
+            entry_ease_y1: 0.72,
+            entry_ease_x2: 0.18,
+            entry_ease_y2: 1.,
         }
     }
 }
