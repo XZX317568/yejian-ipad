@@ -661,8 +661,8 @@ impl CloudSync {
         let (reply_tx, rx) = mpsc::channel::<CloudReply>();
         crate::diagnostics::spawn_supervised(
             "yejian-cloud",
+            "云同步",
             true,
-            || crate::diagnostics::report_recovery("云同步"),
             move || {
                 while let Ok(command) = cmd_rx.recv() {
                     match command {

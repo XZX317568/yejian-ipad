@@ -149,8 +149,8 @@ impl Worker {
         let archive_access = Arc::new(RwLock::new(()));
         crate::diagnostics::spawn_supervised(
             "yejian-library",
+            "书库",
             false,
-            || crate::diagnostics::report_fatal("书库"),
             move || {
                 let notify = |event| {
                     let _ = event_tx.send(event);
@@ -184,8 +184,8 @@ impl Worker {
                     let shared = page_queue_for_threads.clone();
                     crate::diagnostics::spawn_supervised(
                         &format!("yejian-images-{worker_index}"),
+                        "图片解码",
                         true,
-                        || crate::diagnostics::report_recovery("图片解码"),
                         move || {
                             let image_library = match Library::open(&worker_root) {
                                 Ok(library) => library,
@@ -216,8 +216,8 @@ impl Worker {
                     let cover_rx = cover_rx.clone();
                     crate::diagnostics::spawn_supervised(
                         "yejian-covers",
+                        "封面",
                         true,
-                        || crate::diagnostics::report_recovery("封面"),
                         move || {
                             let cover_library = match Library::open(&cover_root) {
                                 Ok(library) => library,
@@ -238,7 +238,7 @@ impl Worker {
                 }
                 let position_events=event_tx.clone();let position_ctx=ctx.clone();
                 let position_rx=position_rx.clone();
-                crate::diagnostics::spawn_supervised("yejian-progress",true,||crate::diagnostics::report_recovery("阅读进度"),move||{
+                crate::diagnostics::spawn_supervised("yejian-progress","阅读进度",true,move||{
                     let mut last_error:Option<String>=None;
                     while let Ok(command)=position_rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).recv() {
                         match command {
@@ -789,7 +789,7 @@ fn read_covers(
     }
 }
 
-fn read_settings(library: &Library) -> anyhow::Result<Vec<(String, String)>> {
+pub(crate) fn read_settings(library: &Library) -> anyhow::Result<Vec<(String, String)>> {
     let mut settings = Vec::new();
     for key in [
         "theme",

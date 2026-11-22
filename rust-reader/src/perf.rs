@@ -111,6 +111,35 @@ fn peak() {
     PEAK_BYTES.fetch_max(total, Ordering::Relaxed);
 }
 
+/// Default page-texture byte budget; the bench can override it to
+/// compare eviction pressure.
+const PAGE_BUDGET: u64 = 128 * 1024 * 1024;
+static PAGE_BUDGET_OVERRIDE: AtomicU64 = AtomicU64::new(0);
+
+/// Effective page-texture budget in bytes (0 override = default).
+pub fn page_budget() -> u64 {
+    match PAGE_BUDGET_OVERRIDE.load(Ordering::Relaxed) {
+        0 => PAGE_BUDGET,
+        bytes => bytes,
+    }
+}
+
+/// Bench-only page budget override; `None` restores the default.
+#[cfg(any(test, debug_assertions))]
+pub fn set_page_budget(bytes: Option<u64>) {
+    PAGE_BUDGET_OVERRIDE.store(bytes.unwrap_or(0), Ordering::Relaxed);
+}
+
+/// Bench-only: restart peak tracking at the currently live bytes so each
+/// measured phase reports its own peak.
+#[cfg(any(test, debug_assertions))]
+pub fn reset_peak_to_live() {
+    PEAK_BYTES.store(
+        PAGE_BYTES.load(Ordering::Relaxed) + COVER_BYTES.load(Ordering::Relaxed),
+        Ordering::Relaxed,
+    );
+}
+
 /// Clears all rings and peaks — used by the bench between iterations.
 #[cfg(any(test, debug_assertions))]
 pub fn reset() {

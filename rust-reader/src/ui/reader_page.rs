@@ -855,13 +855,9 @@ impl ReaderApp {
         let (near, essential) = self.page_keep_sets();
         self.pages
             .retain(|key, _| near.contains(key) || essential.contains(key));
-        // Page textures also have a byte budget on top of the page window:
-        // 384 MB on iPad, 256 MB elsewhere. Essential pages never evict.
-        let budget: u64 = if cfg!(target_os = "ios") {
-            384 * 1024 * 1024
-        } else {
-            256 * 1024 * 1024
-        };
+        // Page textures also have a byte budget on top of the page window;
+        // essential pages never evict.
+        let budget: u64 = crate::perf::page_budget();
         while self
             .pages
             .values()

@@ -22,6 +22,15 @@ required-features = ["acceptance"]
 members = ["crates/reader-core", "crates/source-engine", "platform"]
 resolver = "3"
 
+# Release-optimised build that keeps the debug-assertions acceptance
+# seams for the perf bench (`cargo run --profile perf --bin acceptance`).
+[profile.perf]
+inherits = "release"
+debug-assertions = true
+overflow-checks = false
+lto = false
+codegen-units = 16
+
 [patch.crates-io]
 eframe = { path = "vendor/eframe-0.37.0" }
 egui-wgpu = { path = "vendor/egui-wgpu-0.37.0" }

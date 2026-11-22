@@ -348,8 +348,8 @@ impl Sources {
         let worker_stale = stale_engines.clone();
         crate::diagnostics::spawn_supervised(
                 "yejian-sources",
+                "书源引擎",
                 true,
-                || crate::diagnostics::report_recovery("书源引擎"),
                 move || {
                 let catalog = SourceCatalog::new(meta_root.join("sources"));
                 let mut engines = std::collections::HashMap::<String, SourceEngine>::new();
@@ -570,8 +570,8 @@ impl Sources {
         let up_ctx = ctx.clone();
         crate::diagnostics::spawn_supervised(
                 "yejian-updates",
+                "追更检查",
                 true,
-                || crate::diagnostics::report_recovery("追更检查"),
                 move || {
                 let catalog = SourceCatalog::new(up_root.join("sources"));
                 while let Ok(batch) = up_cmd_rx.recv() {
@@ -645,8 +645,8 @@ impl Sources {
             let stale = stale_engines.clone();
             crate::diagnostics::spawn_supervised(
                 "yejian-covers",
+                "封面",
                 true,
-                || crate::diagnostics::report_recovery("封面"),
                 move || {
                     let catalog = SourceCatalog::new(cover_root.join("sources"));
                     let mut engines = std::collections::HashMap::<String, SourceEngine>::new();
@@ -705,8 +705,8 @@ impl Sources {
             let ctx = ctx.clone();
             crate::diagnostics::spawn_supervised(
                 "yejian-cover-http",
+                "封面",
                 true,
-                || crate::diagnostics::report_recovery("封面"),
                 move || {
                     let (lock, cvar) = &*queue;
                     loop {
@@ -753,8 +753,8 @@ impl Sources {
             let stop = dl_stop.clone();
             crate::diagnostics::spawn_supervised(
                 "yejian-downloads",
+                "下载",
                 true,
-                || crate::diagnostics::report_recovery("下载"),
                 move || {
                     let catalog = SourceCatalog::new(root.join("sources"));
                     let mut engines = std::collections::HashMap::<String, SourceEngine>::new();
@@ -837,8 +837,8 @@ impl Sources {
                 (root.clone(), stale_engines.clone(), ctx.clone());
             crate::diagnostics::spawn_supervised(
                 "yejian-global-search",
+                "跨书源搜索",
                 true,
-                || crate::diagnostics::report_recovery("跨书源搜索"),
                 move || {
                     let catalog = SourceCatalog::new(catalog_root.join("sources"));
                     global_search_run(
@@ -867,8 +867,8 @@ impl Sources {
             let (root, ctx) = (root.clone(), ctx.clone());
             crate::diagnostics::spawn_supervised(
                 "yejian-source-storage",
+                "存储统计",
                 true,
-                || crate::diagnostics::report_recovery("存储统计"),
                 move || {
                     storage_worker_run(&storage_cmd_rx, &storage_event_tx, &root, &ctx)
                 },
@@ -1039,6 +1039,10 @@ impl Sources {
     /// The followed works, in follow order (newest first).
     pub(crate) fn follows(&self) -> &[Follow] {
         &self.follows
+    }
+    /// Download/queue entries, for the diagnostics summary.
+    pub(crate) fn task_count(&self) -> usize {
+        self.tasks.len()
     }
     /// Setting writes the host persists (`source-repos`, `-checked-at`).
     pub(crate) fn take_setting_writes(&mut self) -> Vec<(String, String)> {

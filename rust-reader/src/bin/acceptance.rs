@@ -37,8 +37,15 @@ impl Harness {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter =
             pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))?;
+        // Request the adapter's full limits so decoded pages wider than the
+        // 2048 downlevel default fit (real devices expose 8192+).
+        let required_limits = adapter.limits();
+        let (device, queue) = pollster::block_on(adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                required_limits,
+                ..Default::default()
+            },
+        ))?;
         println!("Offscreen adapter: {}", adapter.get_info().name);
         let renderer = Renderer::new(
             &device,
@@ -72,6 +79,7 @@ impl Harness {
             )),
             time: Some(self.now),
             events,
+            max_texture_side: Some(self.device.limits().max_texture_dimension_2d as usize),
             ..Default::default()
         };
         let mut output = self.ctx.run_ui(input, |ui| self.app.draw(ui));
@@ -1704,8 +1712,12 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
         .map(|i| zip.by_index(i).unwrap().name().to_string())
         .collect();
     anyhow::ensure!(
-        entries.iter().any(|n| n == "device.txt"),
-        "diagnostics zip lacks device.txt: {entries:?}"
+        entries.iter().any(|n| n == "device.txt") && entries.iter().any(|n| n == "summary.txt"),
+        "diagnostics zip lacks device/summary: {entries:?}"
+    );
+    anyhow::ensure!(
+        !entries.iter().any(|n| n.ends_with(".json")),
+        "diagnostics zip ships a raw state file: {entries:?}"
     );
     for secret in ["trackers.json", "webdav.json", "web-cookies.json"] {
         anyhow::ensure!(
@@ -3868,7 +3880,9 @@ fn percentile_of(values: &mut Vec<f64>, p: f64) -> f64 {
     if values.is_empty() {
         return 0.;
     }
-    values[((values.len() - 1) as f64 * p).round() as usize]
+    // Ceil so small samples (5 spread turns) still pick the tail, not a
+    // mid-range value.
+    values[(((values.len() - 1) as f64 * p).ceil() as usize).min(values.len() - 1)]
 }
 
 fn median(values: &[f64]) -> f64 {
@@ -3876,43 +3890,64 @@ fn median(values: &[f64]) -> f64 {
     percentile_of(&mut v, 0.5)
 }
 
-/// One bench iteration: fresh app+library so caches do not leak across runs.
-/// `fixtures` holds pre-generated CBZ files; `size` is the simulated viewport
-/// in points at 2x (iPad-class density).
-fn bench_iteration(
-    fixtures: &Path,
-    library: &Path,
-    output: &Path,
-    size: [u32; 2],
-) -> Result<serde_json::Value> {
-    std::fs::create_dir_all(library)?;
-    let process_start = Instant::now();
+/// Book ids discovered during the import phase.
+struct BenchBooks {
+    paged: String,
+    strip: String,
+    hires: String,
+}
+
+/// Imports `cbz` and returns the id of the book that appeared.
+fn bench_import(h: &mut Harness, known: &mut Vec<String>, cbz: PathBuf) -> Result<String> {
+    let before = h.app.shelf_book_count();
+    h.app.import_files(vec![cbz]);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while h.app.shelf_book_count() == before {
+        anyhow::ensure!(Instant::now() < deadline, "bench import stalled");
+        h.frames(2)?;
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    let id = (0..h.app.shelf_book_count())
+        .filter_map(|i| h.app.shelf_book_id(i))
+        .find(|id| !known.contains(id))
+        .context("bench import produced no new book")?;
+    known.push(id.clone());
+    Ok(id)
+}
+
+/// Imports the three fixtures on a throwaway harness, then drops it so the
+/// measured cold start begins from an already-populated library.
+fn bench_prepare(fixtures: &Path, library: &Path, output: &Path) -> Result<BenchBooks> {
     let mut h = Harness::new(library.to_path_buf(), output.to_path_buf())?;
     h.ctx.set_pixels_per_point(2.);
-    h.size = size;
-    yejian::perf::reset();
-    // cold_start_to_shelf_ms: from app/worker spawn to the first frame where
-    // the shelf shows its books with covers fully decoded.
-    h.app.import_files(vec![fixtures.join("bench-paged.cbz")]);
-    eprintln!("bench: waiting for shelf");
-    h.wait(|a| a.shelf_book_count() >= 1 && a.covers_loaded())?;
-    h.frame(vec![], None)?;
-    let cold_start_to_shelf_ms = process_start.elapsed().as_secs_f64() * 1000.;
+    let mut known = Vec::new();
+    let books = BenchBooks {
+        paged: bench_import(&mut h, &mut known, fixtures.join("bench-paged.cbz"))?,
+        strip: bench_import(&mut h, &mut known, fixtures.join("bench-strip.cbz"))?,
+        hires: bench_import(&mut h, &mut known, fixtures.join("bench-hires.cbz"))?,
+    };
+    h.wait(|a| a.covers_loaded())?;
+    h.frames(3)?;
+    Ok(books)
+}
 
-    let paged = h.app.shelf_book_id(0).context("paged book missing")?;
-    // open_to_first_page_ms: reader-open to the first frame painting the
-    // current page's texture.
+/// open_to_first_page_ms: wall clock from issuing the open command to the
+/// first painted frame where the current page's texture is loaded.
+/// page_turn_wait_ms: wall clock from issuing a turn to the first painted
+/// frame where the new page's texture is loaded; `turns` sequential turns
+/// are issued 400 ms apart and reported as mean/p95 by the caller.
+fn bench_open_and_turns(
+    h: &mut Harness,
+    book: &str,
+    turns: usize,
+) -> Result<(f64, Vec<f64>)> {
     let open_began = Instant::now();
-    eprintln!("bench: open_book {paged}");
-    h.app.open_book(&paged);
+    h.app.open_book(book);
     h.wait(ReaderApp::page_loaded)?;
     h.frame(vec![], None)?;
-    let open_to_first_page_ms = open_began.elapsed().as_secs_f64() * 1000.;
-
-    // page_turn_wait_ms: 20 sequential turns issued every 400 ms wall clock;
-    // each wait ends when the new page's texture is painted.
+    let open_ms = open_began.elapsed().as_secs_f64() * 1000.;
     let mut waits = Vec::new();
-    for turn in 1..=20usize {
+    for turn in 1..=turns {
         let slot = Instant::now();
         let before = h.app.current_page();
         h.click("reader-next")?;
@@ -3928,48 +3963,33 @@ fn bench_iteration(
             std::thread::sleep(Duration::from_millis(15));
         }
         waits.push(slot.elapsed().as_secs_f64() * 1000.);
-        if turn < 20 {
+        if turn < turns {
             let elapsed = slot.elapsed();
             if elapsed < Duration::from_millis(400) {
                 std::thread::sleep(Duration::from_millis(400) - elapsed);
             }
         }
     }
-    let page_turn_wait_ms_mean = waits.iter().sum::<f64>() / waits.len() as f64;
-    let page_turn_wait_ms_p95 = percentile_of(&mut waits.clone(), 0.95);
+    Ok((open_ms, waits))
+}
 
-    // strip_blank_frames: frames during a scripted fast scroll (fixed
-    // pt/frame over the whole strip) where any visible page region has no
-    // texture.
-    h.app.leave_reader();
-    h.frames(3)?;
-    h.app.set_mode("vertical");
-    h.app.import_files(vec![fixtures.join("bench-strip.cbz")]);
-    h.wait(|a| a.shelf_book_count() >= 2)?;
-    let strip = (0..h.app.shelf_book_count())
-        .filter_map(|i| h.app.shelf_book_id(i))
-        .find(|id| *id != paged)
-        .context("strip book missing")?;
-    h.app.open_book(&strip);
-    {
-        let deadline = Instant::now() + Duration::from_secs(180);
-        while !(h.app.is_vertical() && h.app.page_loaded()) {
-            anyhow::ensure!(Instant::now() < deadline, "bench strip open timed out");
-            h.frame(vec![], None)?;
-            std::thread::sleep(Duration::from_millis(15));
-        }
-    }
-    h.frames(3)?;
-    let mut strip_blank_frames = 0usize;
-    let scroll = -(h.size[1] as f32) * 0.8;
+/// strip_blank_frames: frames during a scripted fast scroll — 50 pt of
+/// wheel delta per frame paced to one frame every 16.7 ms of wall clock
+/// (≈3000 pt/s) across the whole strip — in which any visible page region
+/// painted without a texture. Bounded by a 180 s limit.
+fn bench_strip_scroll(h: &mut Harness) -> Result<usize> {
     let center = pos2(h.size[0] as f32 / 2., h.size[1] as f32 / 2.);
-    for _ in 0..200 {
+    let frame_pace = Duration::from_secs_f64(1. / 60.);
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let mut blanks = 0usize;
+    loop {
+        let slot = Instant::now();
         h.frame(
             vec![
                 Event::PointerMoved(center),
                 Event::MouseWheel {
                     unit: MouseWheelUnit::Point,
-                    delta: vec2(0., scroll),
+                    delta: vec2(0., -50.),
                     source: MouseWheelSource::Wheel,
                     modifiers: Modifiers::NONE,
                     phase: TouchPhase::Move,
@@ -3978,73 +3998,199 @@ fn bench_iteration(
             None,
         )?;
         if yejian::perf::take_blank_frame() {
-            strip_blank_frames += 1;
+            blanks += 1;
         }
         if h.app.current_fraction() >= 0.999 {
-            break;
+            return Ok(blanks);
+        }
+        anyhow::ensure!(Instant::now() < deadline, "bench strip scroll timed out");
+        if let Some(rest) = frame_pace.checked_sub(slot.elapsed()) {
+            std::thread::sleep(rest);
         }
     }
-    // peak_texture_bytes: max resident page+cover texture bytes seen during
-    // the run (sum of live tile w*h*4).
+}
+
+/// Metrics for one fixture phase. peak_texture_bytes is the maximum
+/// resident page+cover texture bytes during the phase (sum of live tile
+/// w*h*4), with the peak reset to live bytes when the phase starts.
+fn bench_phase(peak: u64, open_ms: f64, waits: &mut Vec<f64>) -> serde_json::Value {
+    serde_json::json!({
+        "open_to_first_page_ms": open_ms,
+        "page_turn_wait_ms_mean": waits.iter().sum::<f64>() / waits.len() as f64,
+        "page_turn_wait_ms_p95": percentile_of(waits, 0.95),
+        "peak_texture_bytes": peak,
+    })
+}
+
+/// One bench iteration: cold start on a prepared library, then the paged,
+/// hires and strip phases (hires only, in spread mode, when `spread_only`).
+fn bench_iteration(
+    fixtures: &Path,
+    library: &Path,
+    output: &Path,
+    size: [u32; 2],
+    spread_only: bool,
+) -> Result<serde_json::Value> {
+    let books = bench_prepare(fixtures, library, output)?;
+    yejian::perf::reset();
+    // cold_start_to_shelf_ms: harness construction (process-level app +
+    // worker startup) to the first painted frame where the shelf shows its
+    // books with covers loaded.
+    let start = Instant::now();
+    let mut h = Harness::new(library.to_path_buf(), output.to_path_buf())?;
+    h.ctx.set_pixels_per_point(2.);
+    h.size = size;
+    h.wait(|a| a.shelf_book_count() >= 3 && a.covers_loaded())?;
+    h.frame(vec![], None)?;
+    let cold_start_to_shelf_ms = start.elapsed().as_secs_f64() * 1000.;
+
+    let mut phases = serde_json::Map::new();
+    if !spread_only {
+        yejian::perf::reset_peak_to_live();
+        let (open_ms, mut waits) = bench_open_and_turns(&mut h, &books.paged, 20)?;
+        phases.insert(
+            "paged".into(),
+            bench_phase(yejian::perf::snapshot().peak_bytes, open_ms, &mut waits),
+        );
+        h.app.leave_reader();
+        h.frames(3)?;
+    }
+
+    yejian::perf::reset_peak_to_live();
+    if spread_only {
+        h.app.set_mode("spread");
+    }
+    // 12-page fixture: 8 paged turns fit; spread advances two pages per
+    // turn, so 5 turns reach the last spread without overshooting.
+    let (open_ms, mut waits) = bench_open_and_turns(&mut h, &books.hires, if spread_only { 5 } else { 8 })?;
+    phases.insert(
+        "hires".into(),
+        bench_phase(yejian::perf::snapshot().peak_bytes, open_ms, &mut waits),
+    );
+    h.app.leave_reader();
+    h.frames(3)?;
+
+    if !spread_only {
+        h.app.set_mode("vertical");
+        yejian::perf::reset_peak_to_live();
+        h.app.open_book(&books.strip);
+        {
+            let deadline = Instant::now() + Duration::from_secs(180);
+            while !(h.app.is_vertical() && h.app.page_loaded()) {
+                anyhow::ensure!(Instant::now() < deadline, "bench strip open timed out");
+                h.frame(vec![], None)?;
+                std::thread::sleep(Duration::from_millis(15));
+            }
+        }
+        h.frames(3)?;
+        yejian::perf::reset_peak_to_live();
+        let strip_blank_frames = bench_strip_scroll(&mut h)?;
+        phases.insert(
+            "strip".into(),
+            serde_json::json!({
+                "strip_blank_frames": strip_blank_frames,
+                "peak_texture_bytes": yejian::perf::snapshot().peak_bytes,
+            }),
+        );
+        h.app.leave_reader();
+        h.app.set_mode("paged");
+    }
+
     let snapshot = yejian::perf::snapshot();
-    Ok(serde_json::json!({
-        "viewport": format!("{}x{}", size[0], size[1]),
-        "open_to_first_page_ms": open_to_first_page_ms,
-        "page_turn_wait_ms_mean": page_turn_wait_ms_mean,
-        "page_turn_wait_ms_p95": page_turn_wait_ms_p95,
-        "strip_blank_frames": strip_blank_frames,
-        "peak_texture_bytes": snapshot.peak_bytes,
+    let mut run = serde_json::json!({
         "cold_start_to_shelf_ms": cold_start_to_shelf_ms,
         "decode_p50_ms": snapshot.decode_p50_ms,
         "decode_p95_ms": snapshot.decode_p95_ms,
         "queue_p95_ms": snapshot.queue_p95_ms,
         "frame_p95_ms": snapshot.frame_p95_ms,
-    }))
+    });
+    for (key, value) in phases {
+        run[key] = value;
+    }
+    Ok(run)
+}
+
+/// Median of `key` across `runs` (missing keys are skipped).
+fn bench_median(runs: &[serde_json::Value], key: &str) -> f64 {
+    let values: Vec<f64> = runs
+        .iter()
+        .filter_map(|run| run[key].as_f64())
+        .collect();
+    median(&values)
 }
 
 /// `YEJIAN_BENCH=1`: runs the perf bench 3x per viewport and writes
 /// `bench.json` (median per metric) into the output dir.
+/// `YEJIAN_BENCH_PAGE_BUDGET` (bytes) overrides the page-texture budget.
 fn bench_pass(output: &Path) -> Result<()> {
     let fixtures = output.join("bench-fixtures");
     std::fs::create_dir_all(&fixtures)?;
-    // (a) 40-page 1500x2200 JPEG manga; (b) 20-page 800x12000 vertical strip.
+    // (a) 40-page 1500x2200 manga; (b) 20-page 800x12000 vertical strip;
+    // (c) 12-page 2480x3508 high-res scan (triggers display-sized decode).
     if !fixtures.join("bench-paged.cbz").exists() {
         println!("bench: generating paged fixture (this takes a moment)");
         bench_cbz(&fixtures, "bench-paged", 1500, 2200, 40)?;
+    }
+    if !fixtures.join("bench-strip.cbz").exists() {
         println!("bench: generating strip fixture");
         bench_cbz(&fixtures, "bench-strip", 800, 12000, 20)?;
     }
+    if !fixtures.join("bench-hires.cbz").exists() {
+        println!("bench: generating hires fixture");
+        bench_cbz(&fixtures, "bench-hires", 2480, 3508, 12)?;
+    }
+    if let Ok(bytes) = std::env::var("YEJIAN_BENCH_PAGE_BUDGET") {
+        let bytes: u64 = bytes.parse().context("YEJIAN_BENCH_PAGE_BUDGET")?;
+        yejian::perf::set_page_budget(Some(bytes));
+        println!("bench: page budget override {bytes} bytes");
+    }
+    const TOP_KEYS: &[&str] = &[
+        "cold_start_to_shelf_ms",
+        "decode_p50_ms",
+        "decode_p95_ms",
+        "queue_p95_ms",
+        "frame_p95_ms",
+    ];
+    const PHASE_KEYS: &[&str] = &[
+        "open_to_first_page_ms",
+        "page_turn_wait_ms_mean",
+        "page_turn_wait_ms_p95",
+        "peak_texture_bytes",
+    ];
+    const STRIP_KEYS: &[&str] = &["strip_blank_frames", "peak_texture_bytes"];
     let mut report = serde_json::Map::new();
-    for (label, size) in [("ipad-11", [834, 1194]), ("ipad-pro-129", [1024, 1366])] {
+    for (label, size, spread_only) in [
+        ("ipad-11", [834, 1194], false),
+        ("ipad-pro-129", [1024, 1366], false),
+        ("ipad-pro-129-landscape-spread", [1366, 1024], true),
+    ] {
         let mut runs = Vec::new();
         for iteration in 0..3 {
             let library = output.join(format!("bench-lib-{label}-{iteration}"));
             let _ = std::fs::remove_dir_all(&library);
-            let run = bench_iteration(&fixtures, &library, output, size)?;
+            let run = bench_iteration(&fixtures, &library, output, size, spread_only)?;
             println!("bench {label} run {iteration}: {run}");
             runs.push(run);
         }
-        // Median per metric across the 3 runs.
-        let keys = [
-            "open_to_first_page_ms",
-   
-            "page_turn_wait_ms_mean",
-            "page_turn_wait_ms_p95",
-            "strip_blank_frames",
-            "peak_texture_bytes",
-            "cold_start_to_shelf_ms",
-            "decode_p50_ms",
-            "decode_p95_ms",
-            "queue_p95_ms",
-            "frame_p95_ms",
-        ];
         let mut med = serde_json::Map::new();
-        for key in keys {
-            let values: Vec<f64> = runs
-                .iter()
-                .map(|run| run[key].as_f64().unwrap_or(0.))
-                .collect();
-            med.insert(key.into(), serde_json::json!(median(&values)));
+        for key in TOP_KEYS {
+            med.insert((*key).into(), serde_json::json!(bench_median(&runs, key)));
+        }
+        for (phase, keys) in [
+            ("paged", PHASE_KEYS),
+            ("hires", PHASE_KEYS),
+            ("strip", STRIP_KEYS),
+        ] {
+            if runs.iter().all(|run| run.get(phase).is_some()) {
+                let phase_runs: Vec<serde_json::Value> =
+                    runs.iter().map(|run| run[phase].clone()).collect();
+                let mut phase_med = serde_json::Map::new();
+                for key in keys {
+                    phase_med
+                        .insert((*key).into(), serde_json::json!(bench_median(&phase_runs, key)));
+                }
+                med.insert(phase.into(), serde_json::Value::Object(phase_med));
+            }
         }
         report.insert(label.into(), serde_json::Value::Object(med));
     }

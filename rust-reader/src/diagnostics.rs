@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock, RwLock},
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 /// In-memory log lines kept for crash dumps and diagnostics.
@@ -333,18 +333,20 @@ fn write_crash(name: &str, message: &str, location: &str, backtrace: &str) {
     let _ = fs::write(&path, body);
 }
 
-/// Files that never leave the device inside a diagnostics zip.
-fn excluded(name: &str) -> bool {
-    let name = name.to_lowercase();
-    ["trackers.json", "webdav.json", "web-cookies.json"].contains(&name.as_str())
-        || ["token", "cookie", "secret", "password", "credential"]
-            .iter()
-            .any(|needle| name.contains(needle))
+/// Keys whose values never leave the device inside summary.txt.
+pub(crate) fn sensitive_key(key: &str) -> bool {
+    let key = key.to_lowercase();
+    ["token", "cookie", "secret", "password", "credential", "key", "auth"]
+        .iter()
+        .any(|needle| key.contains(needle))
 }
 
-/// Zips logs, crash files, version/device info and non-secret settings
-/// into `share/diagnostics-<millis>.zip` for the system share sheet.
-pub fn export_diagnostics(root: &Path) -> io::Result<PathBuf> {
+/// Zips an allowlist — device.txt, the logs directory (logs + crash
+/// files) and a caller-built summary.txt — into
+/// `share/diagnostics-<millis>.zip`. No raw JSON state file is exported:
+/// source-settings.json, device-identity.json and token stores stay on
+/// the device.
+pub fn export_diagnostics(root: &Path, summary: &str) -> io::Result<PathBuf> {
     init();
     let share = root.join("share");
     fs::create_dir_all(&share)?;
@@ -376,21 +378,9 @@ pub fn export_diagnostics(root: &Path) -> io::Result<PathBuf> {
             }
         }
     }
-    // Plain settings/state JSON files at the root, minus every secret file.
-    if let Ok(entries) = fs::read_dir(root) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if p.is_file() && name.ends_with(".json") && !excluded(name) {
-                let bytes = fs::read(&p)?;
-                zip.start_file(format!("settings/{name}"), options)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-                zip.write_all(&bytes)?;
-            }
-        }
-    }
+    zip.start_file("summary.txt", options)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    zip.write_all(summary.as_bytes())?;
     zip.finish()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
     Ok(path)
@@ -411,30 +401,49 @@ pub fn clear_logs(root: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// How many panics inside [`GIVE_UP_WINDOW`] stop a restartable worker.
+const GIVE_UP_PANICS: usize = 3;
+/// Panics older than this no longer count towards giving up.
+const GIVE_UP_WINDOW: Duration = Duration::from_secs(300);
+
 /// Runs `f` on a named thread; a panic is caught, logged and written to a
-/// crash file, then `on_recover` fires. Restartable workers respawn after
-/// a short pause; others stop and rely on the notice to reach the user.
-pub fn spawn_supervised<F, R>(name: &str, restartable: bool, on_recover: R, f: F)
+/// crash file. Restartable workers respawn with exponential backoff
+/// (200 ms doubling, capped at 30 s); three panics inside five minutes
+/// stop the worker and report a fatal notice. Non-restartable workers
+/// stop on the first panic and report a fatal notice.
+pub fn spawn_supervised<F>(name: &str, module: &str, restartable: bool, f: F)
 where
     F: Fn() + Send + 'static,
-    R: Fn() + Send + 'static,
 {
     init();
     let name = name.to_string();
+    let module = module.to_string();
     let _ = thread::Builder::new()
         .name(name.clone())
-        .spawn(move || loop {
-            let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| f()));
-            match outcome {
-                Ok(()) => return,
-                Err(_) => {
-                    log::error!("supervised thread {name} panicked; restartable={restartable}");
-                    log::logger().flush();
-                    on_recover();
-                    if !restartable {
-                        return;
+        .spawn(move || {
+            let mut failures: Vec<Instant> = Vec::new();
+            let mut backoff = Duration::from_millis(200);
+            loop {
+                let outcome = std::panic::catch_unwind(AssertUnwindSafe(&f));
+                match outcome {
+                    Ok(()) => return,
+                    Err(_) => {
+                        log::error!("supervised thread {name} panicked; restartable={restartable}");
+                        log::logger().flush();
+                        if !restartable {
+                            report_fatal(&module);
+                            return;
+                        }
+                        failures.retain(|t| t.elapsed() < GIVE_UP_WINDOW);
+                        failures.push(Instant::now());
+                        if failures.len() >= GIVE_UP_PANICS {
+                            report_stopped(&module);
+                            return;
+                        }
+                        report_recovery(&module);
+                        thread::sleep(backoff);
+                        backoff = (backoff * 2).min(Duration::from_secs(30));
                     }
-                    thread::sleep(Duration::from_millis(200));
                 }
             }
         });
@@ -453,6 +462,12 @@ pub fn report_recovery(module: &str) {
 pub fn report_fatal(module: &str) {
     if let Ok(mut guard) = RECOVERIES.lock() {
         guard.push(format!("{module}模块出错，请重启应用"));
+    }
+}
+/// A restartable worker panicked too often and was stopped.
+fn report_stopped(module: &str) {
+    if let Ok(mut guard) = RECOVERIES.lock() {
+        guard.push(format!("{module}模块多次出错，已停止；请重启应用"));
     }
 }
 pub fn take_recoveries() -> Vec<String> {
@@ -556,62 +571,71 @@ mod tests {
     }
 
     #[test]
-    fn diagnostics_zip_excludes_every_secret_file() {
+    fn diagnostics_zip_keeps_secrets_on_device() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         fs::create_dir_all(root.join("logs")).unwrap();
         fs::write(root.join("logs").join(LOG_FILE), "log line\n").unwrap();
-        fs::write(root.join("settings.json"), "{}").unwrap();
+        // Sentinel payloads: TLS private key material and source logins
+        // must never appear anywhere inside the exported archive.
+        fs::write(
+            root.join("device-identity.json"),
+            r#"{"key":"TLS_PRIVATE_SENTINEL_7F3"}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("source-settings.json"),
+            r#"{"login":"SOURCE_LOGIN_SENTINEL_9A2"}"#,
+        )
+        .unwrap();
         for name in [
             "trackers.json",
             "webdav.json",
             "web-cookies.json",
             "oauth-token.json",
+            "settings.json",
         ] {
             fs::write(root.join(name), "secret").unwrap();
         }
-        let path = export_diagnostics(root).unwrap();
+        let path = export_diagnostics(root, "books: 3\n").unwrap();
+        let bytes = fs::read(&path).unwrap();
         let mut zip = zip::ZipArchive::new(File::open(&path).unwrap()).unwrap();
         let names: Vec<String> = (0..zip.len())
             .map(|i| zip.by_index(i).unwrap().name().to_string())
             .collect();
         assert!(names.iter().any(|n| n == "device.txt"));
-        assert!(names.iter().any(|n| n == "settings/settings.json"));
+        assert!(names.iter().any(|n| n == "summary.txt"));
         assert!(names.iter().any(|n| n == &format!("logs/{LOG_FILE}")));
-        for name in [
+        // Allowlist: no raw state JSON file is ever archived.
+        assert!(
+            !names.iter().any(|n| n.ends_with(".json")),
+            "state file leaked: {names:?}"
+        );
+        for sentinel in [
+            "TLS_PRIVATE_SENTINEL_7F3",
+            "SOURCE_LOGIN_SENTINEL_9A2",
             "trackers.json",
             "webdav.json",
             "web-cookies.json",
-            "oauth-token.json",
         ] {
-            assert!(!names.iter().any(|n| n.contains(name)), "{name} leaked");
+            assert!(
+                !bytes.windows(sentinel.len()).any(|w| w == sentinel.as_bytes()),
+                "{sentinel} appears in the archive"
+            );
         }
     }
 
     #[test]
     fn supervised_thread_restarts_and_reports() {
         let runs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (tx, rx) = std::sync::mpsc::channel();
         {
             let runs = runs.clone();
-            let tx = tx.clone();
-            spawn_supervised(
-                "yejian-test-supervised",
-                true,
-                move || {
-                    let _ = tx.send("recovered");
-                },
-                move || {
-                    if runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-                        panic!("first run dies");
-                    }
-                },
-            );
+            spawn_supervised("yejian-test-supervised", "测试", true, move || {
+                if runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    panic!("first run dies");
+                }
+            });
         }
-        assert_eq!(
-            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
-            "recovered"
-        );
         // Second run exits cleanly; total invocations = 2.
         for _ in 0..50 {
             if runs.load(std::sync::atomic::Ordering::SeqCst) >= 2 {
@@ -620,5 +644,31 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         panic!("supervised thread did not restart");
+    }
+
+    #[test]
+    fn supervised_thread_gives_up_after_repeated_panics() {
+        let runs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runs2 = runs.clone();
+        spawn_supervised("yejian-test-giveup", "测试模块", true, move || {
+            runs2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            panic!("always dies");
+        });
+        // 200 ms + 400 ms backoffs, then the third panic stops it.
+        thread::sleep(Duration::from_secs(3));
+        assert_eq!(
+            runs.load(std::sync::atomic::Ordering::SeqCst),
+            GIVE_UP_PANICS
+        );
+        let notices = take_recoveries();
+        assert!(
+            notices
+                .iter()
+                .any(|n| n.contains("测试模块模块多次出错，已停止")
+                    || n.contains("测试模块多次出错，已停止")),
+            "no give-up notice: {notices:?}"
+        );
+        thread::sleep(Duration::from_secs(1));
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), GIVE_UP_PANICS);
     }
 }

@@ -1711,10 +1711,37 @@ impl ReaderApp {
             });
     }
 
+    /// Counts, installed source ids+versions and whitelisted settings —
+    /// the only structured state the diagnostics zip carries. Keys that
+    /// look secret (`token`, `cookie`, …) are filtered anyway.
+    fn diagnostics_summary(&self) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        let _ = writeln!(out, "books: {}", self.books.len());
+        let _ = writeln!(out, "follows: {}", self.sources.follows().len());
+        let _ = writeln!(out, "download-tasks: {}", self.sources.task_count());
+        let _ = writeln!(out, "installed-sources:");
+        for (id, version) in self.sources.installed_source_meta() {
+            let _ = writeln!(out, "  {id} v{version}");
+        }
+        let _ = writeln!(out, "settings:");
+        if let Ok(library) = yejian_core::Library::open(&self.root)
+            && let Ok(settings) = crate::worker::read_settings(&library)
+        {
+            for (key, value) in settings {
+                if !crate::diagnostics::sensitive_key(&key) {
+                    let _ = writeln!(out, "  {key}={value}");
+                }
+            }
+        }
+        out
+    }
+
     /// 导出诊断日志: zip staged under share/ then handed to the system
     /// share sheet (desktop keeps the staged file).
     pub(super) fn export_diagnostics(&mut self) {
-        match crate::diagnostics::export_diagnostics(&self.root) {
+        let summary = self.diagnostics_summary();
+        match crate::diagnostics::export_diagnostics(&self.root, &summary) {
             Ok(path) => {
                 self.last_shared = Some(path.clone());
                 match yejian_platform::share_file(&path) {

@@ -1163,8 +1163,8 @@ impl Trackers {
         let worker_root = root.clone();
         crate::diagnostics::spawn_supervised(
             "yejian-trackers",
+            "跟踪服务",
             true,
-            || crate::diagnostics::report_recovery("跟踪服务"),
             move || {
                 while let Ok((id, command)) = cmd_rx.recv() {
                     if id != worker_request.load(std::sync::atomic::Ordering::Relaxed)
