@@ -38,7 +38,9 @@
 ### iPad 版面体检结论（详见 `.tools/ui-audit-20261123.md`）
 
 > ✅ 已修完并推送：展签居中+横屏让位（2ca30f0）、竖屏底部标签栏+width>height 侧栏判定+横屏窄栏（f546d2e）。用户反馈的"没适配 iPad"核心根因是 `side_navigation()` 的 `width>=1000` 把 1024 竖屏误判成横屏桌面布局。
-> ⚠️ 目标曾因 6 轮上限 blocked，已放宽到 24 轮并 resume（2026-11-23 02:50）。
+> ⚠️ 目标曾因 6 轮上限 blocked → 放宽 24 轮 → **用户要求 10000 轮**（2026-11-23 03:01）。
+> ✅ 2026-11-23 03:05 构建与验收迁往云 macOS 盒（12 核 arm64）：`acceptance` 全量 1m03s 编译、iPad 8 档矩阵 PASS（Metal 离屏，工件在盒子 `~/repos/yejian/artifacts/rust/mac-check1`）。iOS 模拟器链路齐备：`tools/build-rust-ios.sh --sim` + xcodebuild + `tools/capture-ipad-simulator.sh`（CI 同款），6 台 iPad 模拟器可用；真机 IPA 走 `--device --ipa` → LiveContainer。
+> ⚠️ zsh 注意：`===`/未引号变量会被展开；`PID=\$!` 不会展开（用 pgrep 确认）。
 
 两个独立 agent（ui-critic / nav-spec）给出的顺序：①展签内部左偏 ②竖屏该改底部标签栏（1024 竖屏仍走桌面侧栏，且 `side_navigation()` 用 width≥1000 判断会误判）③横屏 books rect 未扣展签带导致压字 ④边缘书柔边渐隐。本轮已修：书群垂直居中、舞台再让 104pt、pitch 下限、rail 对称下沉。
 
