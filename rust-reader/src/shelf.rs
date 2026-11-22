@@ -135,9 +135,10 @@ pub fn geometry(area: Rect, count: usize, focus: f32, entrance: f32) -> Vec<Volu
         let mut left = f32::INFINITY;
         let mut right = f32::NEG_INFINITY;
         for lane in first..=last {
+            let shelf = crate::params::params().shelf.clone();
             let weight = motion::weight(lane as f32);
             let x = start_x + lane as f32 * pitch
-                - cover * 0.84 * weight * (1.24 - 0.24 * weight) * 0.66;
+                - cover * shelf.pull_base * weight * (shelf.pull_linear - shelf.pull_quad * weight) * 0.66;
             left = left.min(x);
             right = right.max(x + spine + cover * 0.66);
         }
@@ -169,8 +170,9 @@ pub fn geometry(area: Rect, count: usize, focus: f32, entrance: f32) -> Vec<Volu
             if opacity <= 0.00001 {
                 return None;
             }
+            let shelf = crate::params::params().shelf.clone();
             let weight = motion::weight(distance);
-            let pull = cover * 0.84 * weight * (1.24 - 0.24 * weight);
+            let pull = cover * shelf.pull_base * weight * (shelf.pull_linear - shelf.pull_quad * weight);
             let lift = motion::smooth(weight);
             let rail = distance.clamp(-7., 7.);
             let start = ((distance + 8.) / 24.).clamp(0., 0.65);
@@ -184,7 +186,7 @@ pub fn geometry(area: Rect, count: usize, focus: f32, entrance: f32) -> Vec<Volu
             let phase = entrance * motion::ENTRANCE as f32 / 1.7 - distance * 0.075;
             let crest = (1. + (phase * std::f32::consts::TAU).sin()) * 0.5;
             let load = -9. * crest * crest * (1. - ink) * scale;
-            let rail_y = (rail * 2.5 + rail * rail * 0.45) * scale;
+            let rail_y = (rail * shelf.rail_linear + rail * rail * shelf.rail_quad) * scale;
             let floor = pos2(
                 start_x + distance * pitch,
                 area.top() + base_y + height + rail_y,
@@ -672,10 +674,11 @@ pub fn paint_flight(
     let depart = motion::cubic((t - 0.02) / 0.32, 0.645, 0.045, 0.355, 1.);
     let contact = motion::cubic((t - 0.58) / 0.42, 0.645, 0.045, 0.355, 1.);
     let envelope = 1. - motion::smooth((t - 0.42) / 0.16);
-    let lift = 18. * motion::smooth(t / 0.18) * envelope;
-    let roll = -0.045 * (t * std::f32::consts::PI).sin() * envelope;
+    let shelf = crate::params::params().shelf.clone();
+    let lift = shelf.lift_px * motion::smooth(t / 0.18) * envelope;
+    let roll = -shelf.roll_rad * (t * std::f32::consts::PI).sin() * envelope;
     let (sin, cos) = roll.sin_cos();
-    let arc = (12. + start.center().distance(end.center()) * 0.075).min(32.)
+    let arc = (shelf.arc_base + start.center().distance(end.center()) * shelf.arc_pct).min(shelf.arc_max)
         * (travel * std::f32::consts::PI).sin();
     let center = start.center().lerp(end.center(), travel) - vec2(0., arc + lift);
     let bounds = start.size() + (end.size() - start.size()) * travel;
@@ -700,7 +703,7 @@ pub fn paint_flight(
             Color32::from_black_alpha((elevation * 42. * gain).round() as u8),
         );
     }
-    let columns = 17;
+    let columns = shelf.columns.max(3) as u32;
     let rows = cover_rows(face);
     let mut mesh = cover_mesh(texture, face, &rows, columns, |u, v| {
         let scale = 300. / (300. - motion::paper_depth(t, u, v));
@@ -720,7 +723,7 @@ pub fn paint_flight(
         let u = inset + (1. - 2. * inset) * (i % columns as usize) as f32 / (columns - 1) as f32;
         let depth = motion::paper_depth(t, u, v);
         let shade = motion::paper_depth(t, u + 0.03, v + 0.03) - depth + depth / 28.;
-        let brightness = (1. - shade * 0.012).clamp(0.91, 1.04);
+        let brightness = (1. - shade * shelf.shade_gain).clamp(0.91, 1.04);
         let channel = (brightness * 255.).round().clamp(0., 255.) as u8;
         vertex.color = Color32::from_rgb(channel, channel, channel);
     }

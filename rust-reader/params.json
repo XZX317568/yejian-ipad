@@ -37,5 +37,19 @@
     "select_y2": 1,
     "travel_start": 0.12,
     "travel_span": 0.46
+  },
+  "shelf": {
+    "pull_base": 0.84,
+    "pull_linear": 1.24,
+    "pull_quad": 0.24,
+    "rail_linear": 2.5,
+    "rail_quad": 0.45,
+    "lift_px": 18,
+    "roll_rad": 0.045,
+    "arc_base": 12,
+    "arc_pct": 0.075,
+    "arc_max": 32,
+    "columns": 17,
+    "shade_gain": 0.012
   }
 }

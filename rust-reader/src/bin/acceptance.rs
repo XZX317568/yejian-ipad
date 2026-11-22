@@ -1787,6 +1787,32 @@ fn daily_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// 裁决素材专用：iPad 竖屏下的「抽出 → 摊开」连续帧。
+/// 默认全量 pass 的 motion 帧是手机尺寸（390×844），对 iPad 打磨没有参考价值。
+fn record_pass(h: &mut Harness) -> Result<()> {
+    h.size = [1024, 1366];
+    h.frames(8)?;
+    let motion_frames: usize = std::env::var("YEJIAN_MOTION_FRAMES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n: &usize| *n >= 100)
+        .unwrap_or(240);
+    let scroll_n = motion_frames * 30 / 100;
+    let open_n = motion_frames - scroll_n;
+    std::fs::create_dir_all(h.output.join("motion"))?;
+    h.click("shelf-next")?;
+    for i in 0..scroll_n {
+        h.frame(vec![], Some(&format!("motion/frame-{i:03}")))?;
+    }
+    h.wait(ReaderApp::covers_loaded)?;
+    h.click("shelf-center")?;
+    for i in 0..open_n {
+        h.frame(vec![], Some(&format!("motion/frame-{:03}", i + scroll_n)))?;
+    }
+    println!("RECORD: {motion_frames} frames at 1024x1366 (scroll {scroll_n} / open {open_n})");
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let output = std::env::args_os()
         .nth(1)
@@ -1876,6 +1902,9 @@ fn main() -> Result<()> {
     }
     if std::env::var_os("YEJIAN_DAILY_ONLY").is_some() {
         return daily_pass(&mut h, &data.join("library"));
+    }
+    if std::env::var_os("YEJIAN_RECORD_ONLY").is_some() {
+        return record_pass(&mut h);
     }
     h.frame(vec![], Some("phone-shelf"))?;
     anyhow::ensure!(h.app.rendered_book_nodes < 45);

@@ -18,11 +18,18 @@ pub struct Params {
     pub snap: Snap,
     pub weight: Weight,
     pub ease: Ease,
+    pub shelf: Shelf,
 }
 
 impl Default for Params {
     fn default() -> Self {
-        Self { paper: Paper::default(), snap: Snap::default(), weight: Weight::default(), ease: Ease::default() }
+        Self {
+            paper: Paper::default(),
+            snap: Snap::default(),
+            weight: Weight::default(),
+            ease: Ease::default(),
+            shelf: Shelf::default(),
+        }
     }
 }
 
@@ -144,6 +151,55 @@ impl Default for Ease {
             select_y2: 1.,
             travel_start: 0.12,
             travel_span: 0.46,
+        }
+    }
+}
+
+/// Shelf extraction (抽出) and cover flight (摊开) shape.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Shelf {
+    /// Base pull distance as a fraction of the cover width.
+    pub pull_base: f32,
+    /// Linear term of the pull falloff `w * (a - b * w)`.
+    pub pull_linear: f32,
+    /// Quadratic term of the pull falloff.
+    pub pull_quad: f32,
+    /// Rail sag per lane.
+    pub rail_linear: f32,
+    /// Rail sag per lane squared.
+    pub rail_quad: f32,
+    /// Peak lift of the flying cover in points.
+    pub lift_px: f32,
+    /// Peak roll of the flying cover in radians.
+    pub roll_rad: f32,
+    /// Arc height base in points.
+    pub arc_base: f32,
+    /// Arc height per point of travel distance.
+    pub arc_pct: f32,
+    /// Arc height cap.
+    pub arc_max: f32,
+    /// Cover mesh columns (rows are derived from the aspect ratio).
+    pub columns: usize,
+    /// Strength of the finite-difference paper shading.
+    pub shade_gain: f32,
+}
+
+impl Default for Shelf {
+    fn default() -> Self {
+        Self {
+            pull_base: 0.84,
+            pull_linear: 1.24,
+            pull_quad: 0.24,
+            rail_linear: 2.5,
+            rail_quad: 0.45,
+            lift_px: 18.,
+            roll_rad: 0.045,
+            arc_base: 12.,
+            arc_pct: 0.075,
+            arc_max: 32.,
+            columns: 17,
+            shade_gain: 0.012,
         }
     }
 }

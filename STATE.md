@@ -13,7 +13,10 @@
   - ✅ **纸张几何断言已补**：单测 `paper_curve_peak_stays_in_band`（峰值 12–30，默认实测 26.21）+ `paper_curve_is_not_rigid`（剖面跨度 >1.5，实测 4.52）；acceptance 启动闸门同带（`paper lift peak ... outside 12..=30`）
   - ✅ **kill test PASSED**：坏参数（纸全平）→ `Error: paper lift peak 0.00 outside 12..=30`，EXIT=1；正常参数 EXIT=0。日志 `.tools/loop-baseline/stage0-killtest5.log`
   - [done] **阶段 0 收口** → 可进阶段 1
-- [ ] 阶段 1 · 抽出　- [ ] 阶段 2 · 摊开　- [ ] 阶段 3 · 翻页　- [ ] 阶段 4 · 合上　- [ ] 阶段 5 · 常量对齐 + 边缘
+- [~] **阶段 1 · 抽出**：新增 `shelf` 参数段（`pull_base / pull_linear / pull_quad / rail_linear / rail_quad / lift_px / roll_rad / arc_base / arc_pct / arc_max / columns / shade_gain`），已接进 `shelf.rs` 的抽出与飞行绘制。
+  - 三个变体：**A 基线**（pull 0.84 / lift 18 / roll 0.045 / arc 12）｜**B 更拔**（1.00 / 22 / 0.06 / 16）｜**C 更克制**（0.70 / 14 / 0.03 / 9）
+  - 待用户裁决（A/B/C）→ 写回裁决表后本段才算完成
+- [ ] 阶段 2 · 摊开　- [ ] 阶段 3 · 翻页　- [ ] 阶段 4 · 合上　- [ ] 阶段 5 · 常量对齐 + 边缘
 
 每段完成 = 可机查证据 + 用户裁决编号，两者缺一不算。
 
