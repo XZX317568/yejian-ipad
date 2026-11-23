@@ -3755,7 +3755,6 @@ fn library_thumbnails(
         let cover_id = self.cover_id(id);
         self.ask_cover(&cover_id);
         let cover = self.detail_cover_rect(area);
-        let palette = crate::design::palette(self.dark);
         let now = ui.ctx().input(|i| i.time);
         let reveal = self.flight.as_ref().map(|flight| {
             let duration = if flight.returning {
@@ -3799,21 +3798,28 @@ fn library_thumbnails(
             let mips = self.cover_mips.get(&cover_id);
             let ppp = ui.ctx().pixels_per_point();
             let dark = self.dark;
-            let line = palette.line;
+            // P1-6: the detail cover is the same solid book as on the shelf
+            // — shelf::detail_volume interpolates Volume geometry from the
+            // flat landing card (morph 0) to a ~12 deg oblique book (morph 1)
+            // along the same spread_progress, so thickness, spine and page
+            // cap grow during the sweep instead of popping in at p=1.
+            // Shelf furniture (lane index / NO.xxx / selection dot) is off,
+            // the spine title stays. morph smooths the endpoints so the last
+            // stretch eases into place rather than snapping.
+            let morph = motion::smooth(spread);
+            let title_str = book.title.clone();
             shelf::paint_spread(ui.painter(), area, spread, dir, |p, shift| {
                 let card = cover.translate(shift);
-                crate::design::soft_shadow(p, card, 8., 2.2, dark);
-                p.rect_stroke(
-                    card,
-                    9.,
-                    Stroke::new(1., line),
-                    StrokeKind::Inside,
+                let volume = shelf::detail_volume(card, morph);
+                crate::shelf::paint_floor_one(p, &volume, dark);
+                let texture = shelf::cover_pick(
+                    mips,
+                    texture,
+                    volume.cover,
+                    shelf::detail_face(volume.cover),
+                    ppp,
                 );
-                if let Some(texture) =
-                    shelf::cover_pick(mips, texture, Plane::rect(card), card.size(), ppp)
-                {
-                    shelf::paint_art(p, Plane::rect(card), card.size(), texture, self.colors().0);
-                }
+                shelf::paint_detail_volume(p, &volume, &title_str, texture, dark);
             });
         }
         let (_, ink, muted) = self.colors();

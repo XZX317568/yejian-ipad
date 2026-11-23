@@ -92,6 +92,76 @@ impl Volume {
     }
 }
 
+/// 详情页斜轴测的封面"深度"方向：与书架 (0.66, −0.30) 同向——封面向
+/// 右上收去、页口朝上——但回正到 (0.58, −0.13)，斜率 ≈12.6°（P1-6
+/// 目标 10–15°）：书脊/页口看得见，封面仍然几乎正对。
+pub const DETAIL_DEPTH_X: f32 = 0.58;
+pub const DETAIL_DEPTH_Y: f32 = -0.13;
+/// 详情封面的"未投影"封面尺寸（cover_uv 中心裁切按它的宽高比取样）：
+/// 同 shelf_face 的角色，只是 depth X 是 DETAIL_DEPTH_X 而不是 0.66。
+pub fn detail_face(plane: Plane) -> Vec2 {
+    vec2(plane.horizontal.x / DETAIL_DEPTH_X, plane.vertical.y)
+}
+
+/// P1-6 详情页立体封面：与书架同一套 Volume 几何 / paint_volume 链路
+/// （正面 face + 左侧书脊 front + 顶部页口 cap + 地面阴影），回正到
+/// ~13° 微斜，书脊厚度、页口、收分都在，封面仍接近正面。
+/// `card` 是飞行落位时的正面平铺 rect（detail_cover_rect）：每一档
+/// morph 上 footprint 都钉死在 card 的左右缘、书底钉在 card 底边——
+/// morph 是几何插值：书脊与页口随斜扫进度"鼓"出来，而不是 p=1 瞬间
+/// 弹出。动画时序不变——morph 直接吃 spread_progress。
+/// 0 → 正面平面（与扫过处的平铺一致）；1 → 完整斜轴测书。
+pub fn detail_volume(card: Rect, morph: f32) -> Volume {
+    let morph = morph.clamp(0., 1.);
+    // cover_b = 真实书宽（未投影）：书脊投影 + 封面斜投恰占满 card 宽，
+    // footprint 任何 morph 下都与 card 同宽、左右缘对齐。
+    let cover_b = card.width() / (0.04 + DETAIL_DEPTH_X);
+    // 封面顶缘上移 |DETAIL_DEPTH_Y|·cover_b 后视觉高度仍为 card 高：
+    // 完整书的包围盒与落位卡完全重合，上下不越界。
+    let rise = cover_b * -DETAIL_DEPTH_Y;
+    let spine = cover_b * 0.04 * morph;
+    let height = card.height() - rise * morph;
+    // face_x(m) + spine(m) = card.width 恒成立 → 书宽钉死不变；
+    // cap[3].y = card.top 恒成立 → 页口顶缘钉在 card 顶缘。
+    let face_x = card.width() - spine;
+    let origin = pos2(card.left(), card.bottom() - height);
+    let front = Plane {
+        origin,
+        horizontal: vec2(spine, spine * 0.10),
+        vertical: vec2(0., height),
+    };
+    let face = Plane {
+        origin: front.point(1., 0.),
+        horizontal: vec2(face_x, cover_b * DETAIL_DEPTH_Y * morph),
+        vertical: vec2(0., height),
+    };
+    Volume {
+        lane: 0,
+        index: 0,
+        front,
+        face,
+        // 与 geometry_wide 同款封面框内边距，换成相对比例：封面框略缩进
+        // 封面面片，露出纸边。
+        cover: face.sub(0.042, 0.048, 0.916, 0.894),
+        cap: [
+            origin,
+            front.point(1., 0.),
+            face.point(1., 0.),
+            origin + face.horizontal,
+        ],
+        thickness: spine,
+        height,
+        // 书脊文字排版基准：scale·14 ≈ 完整书脊宽（同书架排版公式）。
+        scale: (cover_b * 0.04 / 14.).max(0.5),
+        ink: 1.,
+        opacity: 1.,
+        fade: 1.,
+        lift: 0.,
+        distance: 0.,
+        floor: pos2(origin.x, card.bottom()),
+    }
+}
+
 /// 抽书期间需要在飞行封面上方重绘的邻书（P2-4）：
 /// 不只右侧前景，左侧被遮的书也收进来——飞行 mesh 会把它们的剪影裁成
 /// 碎块，带 alpha 淡出重绘让被遮书保持完整轮廓。
@@ -400,13 +470,22 @@ fn gradient(p: &Painter, points: &[Pos2], direction: Vec2, first: Color32, last:
 }
 
 pub fn paint_floor(p: &Painter, volumes: &[Volume], dark: bool) {
+    for volume in volumes {
+        paint_floor_one(p, volume, dark);
+    }
+}
+
+/// 单本书的接触阴影 + 环境投影（paint_floor 的循环体；详情页立体封面
+/// 复用同一条阴影链路）。
+pub fn paint_floor_one(p: &Painter, volume: &Volume, dark: bool) {
     let ink = if dark {
         Color32::from_rgb(254, 253, 248)
     } else {
         Color32::from_rgb(138, 128, 107)
     };
     let fade_dir = vec2(-1., 1.).normalized();
-    for volume in volumes {
+    {
+        let volume = volume;
         let lift = volume.lift;
         let origin = volume.floor + vec2(-4., 5.) * lift * volume.scale;
         let front = volume.front.horizontal;
@@ -727,7 +806,59 @@ pub fn paint_volume(
 ) {
     let mut faded = p.clone();
     faded.multiply_opacity(volume.opacity * volume.fade);
-    let p = &faded;
+    paint_body(
+        &faded,
+        volume,
+        title,
+        shelf_face(volume.cover),
+        cover,
+        dark,
+        hide_cover,
+        selected,
+        true,
+    );
+}
+
+/// P1-6: detail-page cover paints the same solid book. Shelf furniture
+/// (NO.xxx index, spine number, selection dot, distance dimming) is
+/// omitted; the vertical spine title stays so the book reads as the same
+/// volume pulled off the shelf.
+pub fn paint_detail_volume(
+    p: &Painter,
+    volume: &Volume,
+    title: &str,
+    cover: Option<&TextureHandle>,
+    dark: bool,
+) {
+    paint_body(
+        p,
+        volume,
+        title,
+        detail_face(volume.cover),
+        cover,
+        dark,
+        false,
+        false,
+        false,
+    );
+}
+
+/// face (paper frame + cover art / ink fallback), cap top (gradient +
+/// page striations), front spine (lit ridge, gutter line, vertical title)
+/// — one shared draw path for the shelf and the detail page.
+/// shelf_furniture enables shelf-only furniture: lane index, NO.xxx,
+/// selection dot, distance dimming.
+fn paint_body(
+    p: &Painter,
+    volume: &Volume,
+    title: &str,
+    face: Vec2,
+    cover: Option<&TextureHandle>,
+    dark: bool,
+    hide_cover: bool,
+    selected: bool,
+    shelf_furniture: bool,
+) {
     let scale = volume.scale;
     // 深度压缩同步到排版基准面：文字与装饰按 unit 向量映射到面上，
     // 不乘 squeeze 会随距离漂出压扁后的轮廓。
@@ -797,13 +928,7 @@ pub fn paint_volume(
     print.multiply_opacity(volume.ink);
     if !hide_cover {
         if let Some(texture) = cover {
-            paint_art(
-                &print,
-                volume.cover,
-                shelf_face(volume.cover),
-                texture,
-                paper,
-            );
+            paint_art(&print, volume.cover, face, texture, paper);
             // The cover art ends flush with the face; a soft frame keeps the
             // printed edge crisp against the paper underneath.
             let frame = volume.cover;
@@ -820,29 +945,31 @@ pub fn paint_volume(
             );
         } else {
             flat(&print, volume.cover, ink);
-            let letters: String = title.chars().take(6).collect();
-            affine_text(
-                &print,
-                Plane {
-                    origin: volume.cover.point(0.08, 0.36),
-                    ..face_unit
-                },
-                Pos2::ZERO,
-                &letters,
-                10.,
-                paper,
-                false,
-            );
+            if shelf_furniture {
+                let letters: String = title.chars().take(6).collect();
+                affine_text(
+                    &print,
+                    Plane {
+                        origin: volume.cover.point(0.08, 0.36),
+                        ..face_unit
+                    },
+                    Pos2::ZERO,
+                    &letters,
+                    10.,
+                    paper,
+                    false,
+                );
+            }
         }
     }
     // Below ~0.72 the engraved index would render as ≈4px noise, so tiny
     // shelves swap both numbers for one quiet tick instead.
     let tiny = scale < 0.72;
-    if tiny {
+    if tiny && shelf_furniture {
         let a = face_unit.point(0.08, 0.07);
         let b = face_unit.point(0.30, 0.07);
         p.line_segment([a, b], Stroke::new(1., muted.gamma_multiply(0.6)));
-    } else {
+    } else if shelf_furniture {
         affine_text(
             &print,
             face_unit,
@@ -869,7 +996,10 @@ pub fn paint_volume(
         volume.cap.to_vec(),
         Stroke::new(0.4, muted.gamma_multiply(0.24)),
     ));
-    if !tiny {
+    // Page-edge striations only while thickness is visible: morph < 1
+    // leaves the cap degenerate and the lines would smear over the cover's
+    // top edge; < 1.5px of spine is noise anyway.
+    if !tiny && volume.thickness > 1.5 {
         // Ultra-fine page-edge striations inside the top cap suggest the
         // stacked paper leaves instead of a blank extruded box.
         let striation = muted.gamma_multiply(if dark { 0.16 } else { 0.18 });
@@ -887,7 +1017,7 @@ pub fn paint_volume(
         [volume.front.point(1., 0.), volume.front.point(1., 1.)],
         Stroke::new(0.9, muted.gamma_multiply(if dark { 0.30 } else { 0.42 })),
     );
-    if !tiny {
+    if !tiny && shelf_furniture {
         affine_text(
             &print,
             spine_unit,
@@ -898,19 +1028,23 @@ pub fn paint_volume(
             true,
         );
     }
-    let chars: Vec<char> = title.chars().take(9).collect();
-    // Keep the vertical title clear of the bottom ring on tight heights.
-    let top = (volume.height / scale - chars.len() as f32 * 11. - 14.) / 2.;
-    for (i, ch) in chars.iter().enumerate() {
-        affine_text(
-            &print,
-            spine_unit,
-            pos2((volume.thickness / scale - 9.) / 2., top + i as f32 * 11.),
-            &ch.to_string(),
-            9.,
-            ink,
-            false,
-        );
+    // 书脊竖排书名：书脊厚到能容纳一行字再画（morph 中途的窄脊上字
+    // 会挤出轮廓）。
+    if volume.thickness > 7. {
+        let chars: Vec<char> = title.chars().take(9).collect();
+        // Keep the vertical title clear of the bottom ring on tight heights.
+        let top = (volume.height / scale - chars.len() as f32 * 11. - 14.) / 2.;
+        for (i, ch) in chars.iter().enumerate() {
+            affine_text(
+                &print,
+                spine_unit,
+                pos2((volume.thickness / scale - 9.) / 2., top + i as f32 * 11.),
+                &ch.to_string(),
+                9.,
+                ink,
+                false,
+            );
+        }
     }
     // Neighbor contact AO: a narrow dark-to-transparent strip along the
     // gutter edge of the cover face gives the board joint natural depth.
@@ -931,14 +1065,20 @@ pub fn paint_volume(
     // recede, scaled by how far the lane sits from the focus. P2-4 叠加一项
     // 未抬升系数：被焦点书遮住大半的邻书沉得更深，露出的一角不再读成
     // 漂浮的色块。
-    let dim = ((volume.distance.abs().min(1.5) / 1.5) * 0.055 + (1. - volume.lift) * 0.055)
-        * if dark { 1.45 } else { 1. };
+    let dim = if shelf_furniture {
+        ((volume.distance.abs().min(1.5) / 1.5) * 0.055 + (1. - volume.lift) * 0.055)
+            * if dark { 1.45 } else { 1. }
+    } else {
+        0.
+    };
     if dim > 0.005 {
         let shade = Color32::from_black_alpha((dim * 255.).round() as u8);
         flat(p, volume.face, shade);
         flat(p, volume.front, shade);
     }
-    p.circle_stroke(volume.front.point(0.5, 0.94), 2.2, Stroke::new(0.6, muted));
+    if shelf_furniture {
+        p.circle_stroke(volume.front.point(0.5, 0.94), 2.2, Stroke::new(0.6, muted));
+    }
     if selected {
         p.circle_filled(
             volume.front.point(0.5, 0.94),
@@ -1111,6 +1251,33 @@ pub fn paint_spread(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn detail_volume_grows_from_flat_card_to_solid_book() {
+        let card = Rect::from_min_size(pos2(100., 100.), vec2(300., 422.));
+        for m in [0., 0.25, 0.5, 0.75, 1.] {
+            let v = detail_volume(card, m);
+            // Footprint stays pinned to the card at every morph step: same
+            // left/right edges, spine-side bottom on card.bottom, and the
+            // cap's back edge on card.top. The far bottom corner rides up
+            // with the slant — same as the shelf's oblique bottom edge.
+            assert!((v.front.origin.x - card.left()).abs() < 0.5);
+            assert!((v.face.point(1., 0.).x - card.right()).abs() < 0.5);
+            assert!((v.front.point(0., 1.).y - card.bottom()).abs() < 0.5);
+            assert!((v.cap[3].y - card.top()).abs() < 0.5, "m={m}");
+        }
+        let flat = detail_volume(card, 0.);
+        assert!(flat.front.horizontal.length() < 0.01);
+        assert!(flat.face.horizontal.y.abs() < 0.01);
+        let solid = detail_volume(card, 1.);
+        // morph 1: spine on the left, face slanting up-right at ~13°.
+        assert!(solid.front.horizontal.x > 10., "{:?}", solid.front);
+        let slope = -solid.face.horizontal.y / solid.face.horizontal.x;
+        assert!(slope > 0.17 && slope < 0.31, "slope {slope}");
+        // Mid morph interpolates the spine thickness linearly.
+        let mid = detail_volume(card, 0.5);
+        assert!((mid.thickness - solid.thickness * 0.5).abs() < 0.5);
+        assert!(mid.front.horizontal.x > 5.);
+    }
     #[test]
     fn cover_mip_tiers_halve_until_sixty_four() {
         let image = ColorImage::filled([520, 700], Color32::WHITE);
