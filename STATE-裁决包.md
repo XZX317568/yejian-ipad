@@ -2,6 +2,9 @@
 
 三段都实现了、验收全过（iPad 矩阵 EXIT=0）。现在欠的就是每个段一个编号——**回 r2=r3=r4 各选 A/B/C 中的一个**（例：`A B A`）。
 
+![三段裁决总览](artifacts/rust/record/overview.png)
+上=摊开完成态 / 中=翻页隆起带 / 下=合上撕口中帧。动画差异看视频更明显。
+
 每段证据：`artifacts/rust/record/r{2,3,4}/compare.mp4`（三宫格全链 310 帧：滚动→抽出摊开→进阅读器→拖翻→合上→详情）。也可以手跑 `preview\试-r{2,3,4}-A/B/C.cmd` 自己拖。
 
 ---
