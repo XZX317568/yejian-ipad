@@ -100,6 +100,7 @@
 - 2026-11-22 kill test 先 FAILED（纸全平仍 PASS），补断言后 **PASSED**：broken EXIT=1 / good EXIT=0，日志 `.tools/loop-baseline/stage0-killtest5.log`
 - 2026-11-23 **iPad 模拟器真机链路打通**：macOS 盒跑通 CI 同款 build-rust-ios.sh --sim → xcodebuild → capture-ipad-simulator.sh → IPadRotationTests **4/4 PASS**；shelf.png 证实竖屏底部标签栏+全屏书架在真模拟器生效（截图拉回到 artifacts/rust/sim-pulled/，经 devin forward + python http.server）。verify-ipad-snapshots.py 崩在缺 relocated-library.json（覆盖率缺口，非 bug）
 - 2026-11-23 **模拟器第三轮全链 PASS**（含 flip+verify 修复）：ipad-sim3 capture 完整跑完 CAPTURE_EXIT=0、legacy-library.json 就位、verify-ipad-snapshots.py PASS（上一轮 pipe2 的"缺 JSON 崩"已修复+根因是 capture 中断非 verify 错）。IPadRotationTests 4/4
+- 2026-11-23 **P1-6 详情封面立体化**（4213bd2）：复用 Volume 几何+morph 跟 spread_progress；详情页书脊/页口/收分全回——评审 R2 **15 条全部清零**
 - 2026-11-23 **P0-1 横屏书群**（7477920）：焦点书+28%、群宽×1.9、群心右移6%w；评审 R2 全部消化（P0×3 全修、P1×6 修5、P2×6 全修，剩 P1-6 详情封面立体化待裁决）
 - 2026-11-23 **P2四项**（6fdbdf5）：空状态居中、token 框露底、舞台加深4%、遮挡剪影保完整；评审队列清零（P0-1/P1-1/P1-6 三个大改留裁决后）
 - 2026-11-23 **P1一致性四项**（00d4e30）：分屏舞台改满幅直角带、辅助页统一 page_column 左缘、激活态统一胶囊、分页器统一锚舞台右上；剩 P1-1 展签对齐+P1-6 详情封面平面化两个大改待裁决
