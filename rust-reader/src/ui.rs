@@ -2148,9 +2148,11 @@ impl ReaderApp {
                 vec2(viewport.width(), (viewport.height() - top - 8.).max(220.)),
             )
         } else {
+            // 分屏/竖屏窄档与宽档统一成无边框满幅舞台：横向上不再把书
+            // 圈进 16pt 圆角卡片（P1-2），纵向仍按内容需要的高度，可滚动。
             Rect::from_min_size(
-                pos2(area.center().x - width / 2., area.top() + top),
-                vec2(width, height),
+                pos2(viewport.left(), area.top() + top),
+                vec2(viewport.width(), height),
             )
         };
         let books = if side_by_side {
@@ -2792,7 +2794,10 @@ impl ReaderApp {
         }
         let pill = Self::nav_pill_rect(&slots, pill_pos);
         self.hitboxes.insert("nav-pill".into(), pill);
-        ui.painter().rect_filled(pill, 16., palette.accent_soft);
+        // 侧栏与底栏激活态统一为同一种几何：同绿、同内边距、同「胶囊」
+        // 圆角（短边全圆），不再一处圆角矩形一处胶囊（P1-4）。
+        ui.painter()
+            .rect_filled(pill, pill.height() / 2., palette.accent_soft);
         for (i, (tab, label, kind)) in tabs.into_iter().enumerate() {
             let rect = slots[i];
             // The whole item is the tap target: the glyph alone is only
@@ -3067,9 +3072,9 @@ impl ReaderApp {
         } else {
             Color32::from_rgb(235, 233, 223)
         };
-        // 宽屏（iPad）用满屏底色，不套圆角卡片——否则像桌面小部件而不是一个 app。
+        // 窄档舞台与宽档同语义：满幅直边纸面带，不再画 22pt 圆角卡片（P1-2）。
         if !layout.side_by_side {
-            ui.painter().rect_filled(layout.stage, 22., stage_color);
+            ui.painter().rect_filled(layout.stage, 0., stage_color);
         }
         // 右侧栏与竖分隔线已下线：书架占满，信息改到底部展签。
         let volumes = shelf::geometry(shelf_area, books.len(), self.motion.focus, entrance);
@@ -3384,35 +3389,16 @@ impl ReaderApp {
         {
             self.open_reader(book);
         }
-        // On phone portrait the pager leaves the card's top corner — where it
-        // overlapped the lifted cover — and right-aligns on the thumbnails'
-        // title row just under the stage. Wide layouts keep it in the stage.
-        let phone_portrait = !layout.side_by_side && !layout.short_landscape;
+        // 分页器只留一种语义：所有档位都锚在舞台右上角（P1-5）。
+        // 此前窄屏把它挪到卡片右下，切档时同一控件满屏漂移。
         let tally = format!("{:02} / {:02}", index + 1, books.len());
         let tally = ui
             .painter()
             .layout_no_wrap(tally, FontId::monospace(11.), muted);
-        let tally_gap = if phone_portrait { 8. } else { 2. };
-        let pager_right = if layout.short_landscape {
-            layout.books.right() - 8.
-        } else if phone_portrait {
-            // Keep clear of the "N 本" count painted at the row's right edge.
-            let count = format!("{} 本", books.len());
-            let count_w = ui
-                .painter()
-                .layout_no_wrap(count, FontId::proportional(12. * self.font_scale), muted)
-                .size()
-                .x;
-            layout.browse.right() - count_w - 12.
-        } else {
-            layout.stage.right() - 16.
-        };
+        let tally_gap = 8.;
+        let pager_right = layout.stage.right() - 16.;
         let pager_left = pager_right - 88. - tally.size().x - tally_gap * 2.;
-        let y = if phone_portrait {
-            layout.stage.bottom() - 56.
-        } else {
-            layout.stage.top() + 12.
-        };
+        let y = layout.stage.top() + 12.;
         if books.len() > 1
             && self.icon(
                 ui,
@@ -5975,10 +5961,8 @@ fn library_thumbnails(
         }
     }
     fn sources_ui(&mut self, ui: &mut Ui, area: Rect) {
-        let mut column = Self::page_column(area, 88., 88.);
-        let width = (area.width() - 48.).min(1040.);
-        column.min.x = area.center().x - width / 2.;
-        column.max.x = area.center().x + width / 2.;
+        // 与设置/历史同一条列基线（P1-3）：横屏切 tab 时内容柱左缘不再横跳。
+        let column = Self::page_column(area, 88., 88.);
         // Feed library reading progress into the source detail page so
         // 继续阅读 picks the freshest chapter and rows show 已读/读到状态.
         let mut progress = std::collections::HashMap::new();

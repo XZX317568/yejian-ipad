@@ -799,7 +799,7 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
     h.size = [834, 1194];
     h.frames(5)?;
     h.click("nav-history")?;
-    h.frames(4)?;
+    h.frames(14)?;
     let resume = format!("history-{read_id}");
     design_touch(h, &resume, None)?;
     design_capture(h, "design-history", &mut captures)?;
@@ -817,7 +817,7 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
         "design: history reading did not return directly to its history entry"
     );
     h.click("nav-settings")?;
-    h.frames(5)?;
+    h.frames(14)?;
     for label in ["跟随系统", "浅色", "深色"] {
         anyhow::ensure!(
             design_label_visible(h, label),
@@ -916,7 +916,7 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
         "design: direct reading lost its shelf return"
     );
     h.click("nav-history")?;
-    h.frames(5)?;
+    h.frames(14)?;
     design_capture(h, "design-large-text-history", &mut captures)?;
     anyhow::ensure!(
         design_label_visible(h, "最近读过的故事，都在这里。"),
@@ -955,7 +955,7 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
         "design: large-text history reading did not return directly to history"
     );
     h.click("nav-settings")?;
-    h.frames(5)?;
+    h.frames(14)?;
     for label in ["跟随系统", "浅色", "深色"] {
         anyhow::ensure!(
             design_label_visible(h, label),
@@ -1374,7 +1374,9 @@ fn ipad_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
             ("history", "history"),
         ] {
             h.click(&format!("nav-{tab}"))?;
-            h.frames(4)?;
+            // 14 frames let the nav pill's 0.2s tween settle, so captures
+            // never show the highlight straddling two tabs (P1-4).
+            h.frames(14)?;
             h.frame(vec![], Some(&format!("{name}-{label}")))?;
             if tab == "search" {
                 for control in ["读取", "社区源"] {
@@ -1520,7 +1522,7 @@ fn ipad_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
         h.frames(5)?;
         for (tab, label) in [("search", "sources"), ("settings", "settings")] {
             h.click(&format!("nav-{tab}"))?;
-            h.frames(4)?;
+            h.frames(14)?;
             h.frame(
                 vec![],
                 Some(&format!("ipad-split-{name}-{label}-large-text")),
@@ -2479,21 +2481,21 @@ fn main() -> Result<()> {
     h.size = [1024, 768];
     h.frames(4)?;
     h.click("nav-history")?;
-    h.frames(3)?;
+    h.frames(14)?;
     h.frame(vec![], Some("history"))?;
     h.click("nav-settings")?;
-    h.frames(3)?;
+    h.frames(14)?;
     h.frame(vec![], Some("settings"))?;
     h.size = [1366, 1024];
     h.frames(6)?;
     h.click("nav-search")?;
-    h.frames(4)?;
+    h.frames(14)?;
     h.frame(vec![], Some("ipad-landscape-sources"))?;
     h.click("nav-history")?;
-    h.frames(4)?;
+    h.frames(14)?;
     h.frame(vec![], Some("ipad-landscape-history"))?;
     h.click("nav-settings")?;
-    h.frames(4)?;
+    h.frames(14)?;
     h.frame(vec![], Some("ipad-landscape-settings"))?;
     h.click("nav-library")?;
     h.frames(4)?;
