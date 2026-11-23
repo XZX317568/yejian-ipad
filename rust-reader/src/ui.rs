@@ -3237,7 +3237,12 @@ impl ReaderApp {
         let palette = crate::design::palette(self.dark);
         let mut progress_y = info.y + title.size().y + 10.;
         // A quiet metadata pill rides under the title on wide layouts.
-        if layout.side_by_side && !layout.short_landscape && self.font_scale <= 1.3 {
+        // 展签太矮时先让位：iPad-11 横屏 pill 会顶掉分隔线与按钮的空档。
+        if layout.side_by_side
+            && !layout.short_landscape
+            && layout.info.height() > 185.
+            && self.font_scale <= 1.3
+        {
             let meta = if !book.category.is_empty() {
                 Some(book.category.clone())
             } else {
@@ -3281,7 +3286,8 @@ impl ReaderApp {
         let progress = ui.painter().layout_job(progress);
         // Keep the action with the title and progress when the column scrolls.
         // 展签式布局：按钮必须留在舞台内，不允许被挤到屏幕外。
-        let action_y = (progress_y + progress.size().y + 18.)
+        // +30 而不是 +18：给下方 3pt 分隔线留 12pt 空档，线始终锚在文本与按钮之间。
+        let action_y = (progress_y + progress.size().y + 30.)
             .min(layout.info.bottom() - 56.)
             .max(layout.info.top() + 40.);
         let target_fraction = if has_progress {
@@ -3308,20 +3314,26 @@ impl ReaderApp {
         if self.progress_tween.is_some_and(|t| t.done(now)) {
             self.progress_tween = None;
         }
-        let track = Rect::from_min_size(
-            pos2(
-                info_cx - (info_right - info.x).min(360.) / 2.,
-                progress_y + progress.size().y + 12.,
-            ),
-            vec2((info_right - info.x).min(360.), 3.),
-        );
-        info_painter.rect_filled(track, 2., palette.line);
-        if has_progress {
-            info_painter.rect_filled(
-                Rect::from_min_size(track.min, vec2(track.width() * fill_fraction, 3.)),
-                2.,
-                palette.accent,
+        // 分隔线锚到按钮行上方 15pt：action_y 已被夹进展签底 56pt 内，
+        // 短展签（iPad-11 横屏）里锚文本块会让线横切按钮中线。
+        // 若线会压到进度文本（极短展签），则整条线不画。
+        let track_y = action_y - 15.;
+        if track_y > progress_y + progress.size().y {
+            let track = Rect::from_min_size(
+                pos2(
+                    info_cx - (info_right - info.x).min(360.) / 2.,
+                    track_y,
+                ),
+                vec2((info_right - info.x).min(360.), 3.),
             );
+            info_painter.rect_filled(track, 2., palette.line);
+            if has_progress {
+                info_painter.rect_filled(
+                    Rect::from_min_size(track.min, vec2(track.width() * fill_fraction, 3.)),
+                    2.,
+                    palette.accent,
+                );
+            }
         }
         info_painter.galley(
             pos2(info_cx - progress.size().x / 2., progress_y),
@@ -3329,12 +3341,20 @@ impl ReaderApp {
             muted,
         );
         let detail_width = 30. * self.font_scale + 24.;
+        // 展签内边距：按钮组左右都不许越过 info±8pt（320pt 分屏左缘出血修复）。
+        let inner_left = info.x + 8.;
+        let inner_right = info_right - 8.;
         // 触控热区不得小于 44pt；右侧信息栏收窄后按钮也要保底 88pt 才不会压线。
-        let action_width =
-            (84. * self.font_scale + 68.).min(layout.info.width() - detail_width - 12.).max(88.);
-        // 两个按钮作为一组居中于展签，间距 12pt，热区仍 ≥44pt。
+        let action_width = (84. * self.font_scale + 68.)
+            .min(inner_right - inner_left - detail_width - 12.)
+            .max(88.);
+        // 两个按钮按「整组」居中并夹进展签内边距——旧代码按组间缝隙居中，
+        // 不等宽按钮在 320pt 分屏会把「开始阅读」左缘推到屏幕边。
+        let group_w = action_width + 12. + detail_width;
+        let group_left = (info_cx - group_w / 2.)
+            .clamp(inner_left, (inner_right - group_w).max(inner_left));
         let open_rect = Rect::from_min_size(
-            pos2(info_cx + 6., action_y),
+            pos2(group_left + action_width + 12., action_y),
             vec2(detail_width, 50.),
         );
         if self.selected.is_empty() && self.button(ui, "open-book", open_rect, "详情", false) {
@@ -3346,7 +3366,7 @@ impl ReaderApp {
             }
         }
         let action = Rect::from_min_size(
-            pos2(info_cx - 6. - action_width, action_y),
+            pos2(group_left, action_y),
             vec2(action_width, 50.),
         );
         if self.selected.is_empty()
