@@ -65,6 +65,7 @@ pub struct Volume {
     opacity: f32,
     /// 屏幕边缘柔边渐隐系数（0..=1），在 paint 层乘到 opacity 上。
     /// 与 opacity 分开存：contains()/环绕交叉淡入淡出都只看 opacity。
+    /// 只作用于非焦点、非飞行书：焦点槽位与 detail/fly 形态固定为 1。
     fade: f32,
     lift: f32,
     distance: f32,
@@ -227,10 +228,15 @@ fn depth_squeeze(distance: f32) -> f32 {
 }
 
 /// 书靠近 shelf_area 左右边缘 0..band 时按 smoothstep 渐隐，
-/// 取代之前被 painter clip 硬裁的生硬边缘。band = min(48, 宽度 5%)。
-/// 以书"靠内"的边衡量：从左侧滑入的书在左缘离开左 band 后即全亮。
+/// 取代之前被 painter clip 硬裁的生硬边缘。band = min(48, 宽度 5%, 书宽/2)。
+/// 以书"靠内"的边衡量：从左侧滑入的书在左缘离开左 band 后即全亮——
+/// fade 起点是书的一半以上宽出屏，而不是刚碰到屏幕边缘就减 alpha；
+/// 书宽/2 上限保证窄书（书宽 < 2·band）也满足同一约束。
 fn edge_fade(bounds: Rect, area: Rect) -> f32 {
-    let band = 48.0_f32.min(area.width() * 0.05).max(1.);
+    let band = 48.0_f32
+        .min(area.width() * 0.05)
+        .min(bounds.width() * 0.5)
+        .max(1.);
     let left = motion::smooth((bounds.max.x - area.left()) / band);
     let right = motion::smooth((area.right() - bounds.min.x) / band);
     left.min(right)
@@ -420,8 +426,16 @@ pub fn geometry_wide(
                 distance,
                 floor,
             };
+            // 焦点槽位不渐隐（|distance|<=0.5）：书群居中时焦点书永远在
+            // 带内，但拖飞/归位途中 focus 未取整时仍按"焦点书"对待，且
+            // 抽出的飞行书 lane==focus，其飞行 mesh 由 paint_flight 走，
+            // 不吃本系数——这里一并锁死为 1。
             Some(Volume {
-                fade: edge_fade(volume.bounds(), area),
+                fade: if distance.abs() <= 0.5 {
+                    1.
+                } else {
+                    edge_fade(volume.bounds(), area)
+                },
                 ..volume
             })
         })
@@ -1530,5 +1544,55 @@ mod tests {
                 assert!((a.right() - m.right()).abs() < 0.01, "right edge at p={p}");
             }
         }
+    }
+
+    #[test]
+    fn edge_fade_softens_only_the_edge_bands() {
+        let area = Rect::from_min_size(Pos2::ZERO, vec2(1000., 400.));
+        // Fully interior book: fade 1.
+        let mid = Rect::from_min_size(pos2(400., 0.), vec2(200., 300.));
+        assert_eq!(edge_fade(mid, area), 1.);
+        // Book half-fading on the left: inner (right) edge 24pt inside
+        // the 48pt band -> smooth(0.5) = 0.5.
+        let left = Rect::from_min_size(pos2(-76., 0.), vec2(100., 300.));
+        assert!((edge_fade(left, area) - 0.5).abs() < 0.01, "left edge");
+        // Mirror on the right edge.
+        let right = Rect::from_min_size(pos2(976., 0.), vec2(100., 300.));
+        assert!((edge_fade(right, area) - 0.5).abs() < 0.01, "right edge");
+        // Fully off-screen left: fade 0.
+        let gone = Rect::from_min_size(pos2(-120., 0.), vec2(100., 300.));
+        assert_eq!(edge_fade(gone, area), 0.);
+        // Narrow book (w=40 < 2*band): band clamps to half the book width,
+        // so alpha only starts dropping once half the book is off-screen —
+        // inner edge at 21pt is outside the 20pt band -> still 1.
+        let narrow = Rect::from_min_size(pos2(-19., 0.), vec2(40., 300.));
+        assert_eq!(edge_fade(narrow, area), 1., "half width in = no fade");
+        // Exactly half out touches the band boundary; strictly more than
+        // half out must already dim.
+        let narrow_half = Rect::from_min_size(pos2(-21., 0.), vec2(40., 300.));
+        assert!(
+            edge_fade(narrow_half, area) < 1.,
+            "more than half out = fading"
+        );
+    }
+
+    #[test]
+    fn edge_fade_skips_the_focus_lane() {
+        // Narrow stage pushes lanes ±1 near the screen edge; the focus
+        // volume itself must keep fade 1 while a neighbour may soften.
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(300., 400.));
+        let volumes = geometry_wide(rect, 20, 0., 1., false);
+        for v in &volumes {
+            if v.distance.abs() <= 0.5 {
+                assert_eq!(v.fade, 1., "focus lane {} never fades", v.lane);
+            }
+            assert!((0. ..=1.).contains(&v.fade));
+        }
+        // The two outermost lanes straddle the screen edges and must be
+        // strictly softer than the centre.
+        assert!(
+            volumes.iter().any(|v| v.fade < 1.),
+            "edge lanes expected to soften on a 300pt stage"
+        );
     }
 }
