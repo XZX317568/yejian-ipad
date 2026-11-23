@@ -220,11 +220,19 @@ fn slot_shrink(distance: f32) -> f32 {
 }
 
 /// 反透视深度压缩：斜轴测投影下厚度方向（书脊 spine 宽 + 封面 depth 向量）
-/// 不随距离衰减会显得远端书一样厚。按 1/(1+0.22·|d|) 连续压缩：
-/// d=0 → 1.00，±1 → 0.82，±2 → 0.69，±3 → 0.60（渐近但永不归零）。
-/// 只压"厚度轴"，书高与书宽(封面面内)不动，远处书更扁、焦点书更立体。
+/// 不随距离衰减会显得远端书一样厚。分段线性插值、基线 0.65：
+/// d=0 → 1.00，±1 ≈ 0.82，±2 → 0.70，±3 及以外 → 0.65（真实厚度的 0.6–0.7）。
+/// 只压"厚度轴"的模长不改方向，书高与书宽(封面面内)不动，
+/// 远处书更扁、焦点书更立体；distance 连续，拖动中途不跳变。
 fn depth_squeeze(distance: f32) -> f32 {
-    1. / (1. + 0.22 * distance.abs())
+    let d = distance.abs();
+    if d <= 1. {
+        1. - 0.18 * d
+    } else if d <= 2. {
+        0.82 - 0.12 * (d - 1.)
+    } else {
+        (0.70 - 0.05 * (d - 2.)).max(0.65)
+    }
 }
 
 /// 书靠近 shelf_area 左右边缘 0..band 时按 smoothstep 渐隐，
@@ -1637,5 +1645,23 @@ mod tests {
             volumes.iter().any(|v| v.fade < 1.),
             "edge lanes expected to soften on a 300pt stage"
         );
+    }
+
+    #[test]
+    fn depth_squeeze_hits_the_spec_anchors() {
+        // STATE.md 规格第 3 条：焦点槽 1.0，±1 ≈ 0.82，±2 ≈ 0.70，
+        // ±3 及以外压在基线 0.65（真实厚度的 0.6–0.7，永不更薄）。
+        assert_eq!(depth_squeeze(0.), 1.);
+        assert!((depth_squeeze(1.) - 0.82).abs() < 1e-6);
+        assert!((depth_squeeze(-2.) - 0.70).abs() < 1e-6);
+        assert!((depth_squeeze(3.) - 0.65).abs() < 1e-6);
+        assert_eq!(depth_squeeze(7.), 0.65, "far lanes floor at baseline");
+        // 连续性：相邻采样单调递减且无跳变。
+        let mut prev = depth_squeeze(0.);
+        for i in 1..=400 {
+            let s = depth_squeeze(i as f32 * 0.02);
+            assert!(s <= prev && s >= 0.65, "monotone, floored at {i}");
+            prev = s;
+        }
     }
 }
