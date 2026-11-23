@@ -2929,6 +2929,15 @@ impl ReaderApp {
     }
     fn library_viewport(&mut self, ui: &mut Ui, area: Rect, now: f64, entrance: f32) {
         self.shelf_viewport = area;
+        // 空态、加载与启动错误都不画书架，内容只有一屏高。仍走滚动容器
+        // 会用虚拟总高做居中基准，把「清除搜索」按钮压出视口（hitbox 照
+        // 常登记但 ui.interact 被裁剪，点击落空）——回归
+        // 「clear search did not restore the shelf」的根因。
+        if self.startup_error.is_some() || !self.ready || self.visible_books().is_empty() {
+            self.shelf_shift = 0.;
+            self.library_ui(ui, area, now, entrance);
+            return;
+        }
         let height = self.shelf_layout(area).browse.bottom() - area.top() + 24.;
         let bottom = if Self::side_navigation(ui.ctx().content_rect()) {
             16.
