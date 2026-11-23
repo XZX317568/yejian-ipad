@@ -123,6 +123,17 @@ pub fn lane_pitch_for(area: Rect, count: usize) -> f32 {
     }
 }
 
+/// P0-1 横屏大档扇形槽距：上限从 2× 放宽到 4×，小书架（≤9 本）
+/// 在宽舞台上摊得更开，焦点书左右不再各挂一段空廊道。
+pub fn lane_pitch_wide(area: Rect, count: usize) -> f32 {
+    let base = lane_pitch(area);
+    if (2..=9).contains(&count) {
+        (area.width() / (count as f32 + 3.5)).clamp(base, base * 4.)
+    } else {
+        base
+    }
+}
+
 /// 按距焦点的槽位数缩小整本书：±1 槽 0.90x、±2 槽 0.82x，
 /// 之后每退一槽再乘 0.92（下限 0.55）。边缘书"退到背景"而不只是变暗。
 /// 用连续 distance 而不是取整槽号，拖动中途形变保持平滑。
@@ -155,7 +166,19 @@ fn edge_fade(bounds: Rect, area: Rect) -> f32 {
     left.min(right)
 }
 
-pub fn geometry(area: Rect, count: usize, focus: f32, entrance: f32) -> Vec<Volume> {
+/// P0-1 横屏大档（侧栏导航 + 非矮视口）：同一可用高度里把书放大一档。
+/// 竖屏与窄档保持原样（wide=false 时与 geometry 完全一致）。
+/// - 抬升余量 0.60→0.32：书底仍贴地板线，整摞高度占比 ~53%→~64%；
+///   焦点书顶允许探出 shelf_area 上缘（上层 clip 放宽到视口顶）。
+/// - 槽距上限 2×→4×：小书架（≤9 本）扇形放开铺满舞台，消除左廊道。
+/// - 群心右移 6%：展签同轴，侧栏不再吸走视觉重心。
+pub fn geometry_wide(
+    area: Rect,
+    count: usize,
+    focus: f32,
+    entrance: f32,
+    wide: bool,
+) -> Vec<Volume> {
     if count == 0 {
         return Vec::new();
     }
@@ -163,11 +186,17 @@ pub fn geometry(area: Rect, count: usize, focus: f32, entrance: f32) -> Vec<Volu
     let scale = shelf_scale(area);
     let width = area.width();
     // 相邻书最多遮掉约 28%：pitch 至少要留出封面可见宽度，否则边缘书只剩一条细缝。
-    let pitch_base = lane_pitch_for(area, count);
+    let pitch_base = if wide {
+        lane_pitch_wide(area, count)
+    } else {
+        lane_pitch_for(area, count)
+    };
     let spine = lane_pitch(area) - 11. * scale;
     let cover = (width / scale * 0.32).clamp(100., 190.) * scale;
     let height = (cover - 20. * scale) * 166. / 118. + 54. * scale;
-    let base_y = -cover * -0.30 + height * 0.60 + 12. * scale;
+    // base_y = 焦点书抬升余量 + 封面后缘抬高 + 槽距余量。横屏把抬升余量
+    // 0.60 压到 0.32，省下的高度全部变成书的实高（fit 仍按地板线 0.98 收）。
+    let base_y = -cover * -0.30 + height * (if wide { 0.32 } else { 0.60 }) + 12. * scale;
     // 按可用高度收口：书放大后（cover 190 * scale 2.6）整摞高度会超过画布，
     // 表现为书的底部被裁掉、上方留白过大。这里等比缩到能完整放下的尺寸。
     let stacked = base_y + height;
@@ -185,7 +214,10 @@ pub fn geometry(area: Rect, count: usize, focus: f32, entrance: f32) -> Vec<Volu
     // 这里把剩余高度按 45% 放到上方，让整摞书居中而不是贴底。
     let stacked_now = base_y + height;
     let v_pad = ((area.height() - stacked_now) * 0.45).max(0.);
-    let mut start_x = area.center().x - (spine + cover * 0.66) / 2. + cover * 0.84 * 0.66;
+    // 群心横轴：横屏右移 6% 内容宽，补偿侧栏造成的视觉左偏，展签同轴。
+    let axis = area.center().x
+        + if wide { area.width() * 0.06 } else { 0. };
+    let mut start_x = axis - (spine + cover * 0.66) / 2. + cover * 0.84 * 0.66;
     let first = -(count as i32 / 2);
     let last = first + count as i32 - 1;
     if count <= 9 {
@@ -208,7 +240,7 @@ pub fn geometry(area: Rect, count: usize, focus: f32, entrance: f32) -> Vec<Volu
             left = left.min(cx - footprint / 2.);
             right = right.max(cx + footprint / 2.);
         }
-        start_x += area.center().x - (left + right) / 2.;
+        start_x += axis - (left + right) / 2.;
     }
     let edge =
         ((width / 2. + spine + cover * 0.66 + cover * 0.84 * 0.66) / pitch).ceil() as i32 + 2;
@@ -1132,7 +1164,7 @@ mod tests {
     fn thousand_books_have_bounded_geometry_and_exact_hit_planes() {
         let rect = Rect::from_min_size(Pos2::ZERO, vec2(520., 450.));
         for f in [0., 999.9, 1000., -0.1, -1000.] {
-            let volumes = geometry(rect, 1000, f, 1.);
+            let volumes = geometry_wide(rect, 1000, f, 1., false);
             assert!(volumes.len() < 45);
             let selected = volumes.iter().find(|v| v.lane == f.round() as i32).unwrap();
             assert_eq!(selected.index, (f.round() as i32).rem_euclid(1000) as usize);
@@ -1144,7 +1176,7 @@ mod tests {
         let rect = Rect::from_min_size(Pos2::ZERO, vec2(740., 560.));
         for count in 2..=9 {
             for focus in [-3., -1., 0., 1., count as f32 + 1.] {
-                let volumes = geometry(rect, count, focus, 1.);
+                let volumes = geometry_wide(rect, count, focus, 1., false);
                 assert_eq!(volumes.len(), count);
                 let identities: std::collections::HashSet<_> =
                     volumes.iter().map(|v| v.index).collect();
@@ -1152,7 +1184,7 @@ mod tests {
                 assert!(volumes.iter().all(|v| v.opacity == 1.));
             }
             for focus in [-2.8, -0.6, 0.1, 0.8, count as f32 + 0.7] {
-                let volumes = geometry(rect, count, focus, 1.);
+                let volumes = geometry_wide(rect, count, focus, 1., false);
                 assert_eq!(volumes.len(), count + 1);
                 for index in 0..count {
                     let opacity: f32 = volumes
@@ -1179,8 +1211,8 @@ mod tests {
         let rect = Rect::from_min_size(Pos2::ZERO, vec2(740., 560.));
         for count in 2..=9 {
             for seam in [-1., -0.5, 0., 0.5, 1., count as f32] {
-                let before = geometry(rect, count, seam - 0.0001, 1.);
-                let after = geometry(rect, count, seam + 0.0001, 1.);
+                let before = geometry_wide(rect, count, seam - 0.0001, 1., false);
+                let after = geometry_wide(rect, count, seam + 0.0001, 1., false);
                 for old in &before {
                     if let Some(new) = after.iter().find(|v| v.lane == old.lane) {
                         assert_eq!(old.index, new.index);
@@ -1210,7 +1242,7 @@ mod tests {
     #[test]
     fn volumes_expose_lift_distance_and_cover_corners_stay_inside_the_crop() {
         let rect = Rect::from_min_size(Pos2::ZERO, vec2(740., 560.));
-        let volumes = geometry(rect, 9, 2., 1.);
+        let volumes = geometry_wide(rect, 9, 2., 1., false);
         for volume in &volumes {
             assert!((0. ..=1.).contains(&volume.lift));
             assert!((volume.distance - (volume.lane as f32 - 2.)).abs() < 0.0001);

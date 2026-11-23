@@ -217,6 +217,8 @@ struct ShelfLayout {
     browse: Rect,
     side_by_side: bool,
     short_landscape: bool,
+    /// P0-1 横屏大档（左栏导航 + 非矮视口）：书群放大、扇形放开、群心右移。
+    wide: bool,
 }
 
 pub struct ReaderApp {
@@ -1909,11 +1911,19 @@ impl ReaderApp {
             Screen::Detail(id) => {
                 let books = self.visible_books();
                 self.shelf_viewport = area;
-                let shelf_area = self.shelf_area(area.translate(vec2(0., self.shelf_shift)));
+                let shifted = area.translate(vec2(0., self.shelf_shift));
+                let layout = self.shelf_layout(shifted);
+                let shelf_area = self.shelf_paint_area(shifted);
                 if let Some(index) = books.iter().position(|b| self.same_series(&b.id, &id)) {
                     self.motion.select(index as f32, now, true);
                 }
-                let volumes = shelf::geometry(shelf_area, books.len(), self.motion.focus, 1.);
+                let volumes = shelf::geometry_wide(
+                    shelf_area,
+                    books.len(),
+                    self.motion.focus,
+                    1.,
+                    layout.wide,
+                );
                 if self.tab == Tab::Library
                     && let Some(volume) = volumes.iter().find(|v| {
                         v.lane == self.motion.focus.round() as i32
@@ -2093,6 +2103,21 @@ impl ReaderApp {
     fn shelf_area(&self, area: Rect) -> Rect {
         self.shelf_layout(area).books
     }
+    /// 书群实际绘制的区域：宽屏要扣掉底部展签带（+24pt 间距），
+    /// 否则横屏书脚压字。与 library_ui 里 shelf_area 的计算同源。
+    fn shelf_paint_area(&self, area: Rect) -> Rect {
+        let layout = self.shelf_layout(area);
+        if layout.side_by_side {
+            // 书群可绘制区底部必须在展签顶再让 24pt。
+            // 展签顶 = stage.bottom - band - 16 ⇒ 等价于扣 band + 40。
+            Rect::from_min_max(
+                pos2(layout.books.left(), layout.books.top() + 12.),
+                pos2(layout.books.right(), layout.info.top() - 24.),
+            )
+        } else {
+            layout.books
+        }
+    }
     fn shelf_layout(&self, area: Rect) -> ShelfLayout {
         // iPad 是整屏应用：宽屏时不再留桌面式两侧边距，也不套 1200pt 上限。
         let side_by_side = area.width() >= 660.;
@@ -2102,6 +2127,11 @@ impl ReaderApp {
             (area.width() - 32.).min(1200.)
         };
         let short_landscape = side_by_side && self.shelf_viewport.height() < 600.;
+        // 只有横屏大档走"放大+右移"：竖屏（底栏）与矮视口（手机横屏）
+        // 一律维持原布局（P0-1 只点名 ipad-11 / ipad-pro-12.9 两档）。
+        let wide = side_by_side
+            && Self::side_navigation(self.shelf_viewport)
+            && !short_landscape;
         let stacked_header = self.font_scale > 1.4 && area.width() < 520.;
         // 宽屏头部压缩：书架是主体，不该让桌面式大标题区占掉一大块。
         let top = if side_by_side {
@@ -2173,9 +2203,12 @@ impl ReaderApp {
             // 高度随舞台自适应，短视口（手机横屏 390pt）也不会被挤出屏幕。
             let info_w = (width * 0.52).clamp(300., 620.);
             let band = (height * 0.30).clamp(110., 200.);
+            // 展签中心轴跟着书群右移（geometry 里 +6%），保持同轴。
+            let axis =
+                stage.center().x + if wide { width * 0.06 } else { 0. };
             Rect::from_min_max(
-                pos2(stage.center().x - info_w / 2., stage.bottom() - band - 16.),
-                pos2(stage.center().x + info_w / 2., stage.bottom() - 16.),
+                pos2(axis - info_w / 2., stage.bottom() - band - 16.),
+                pos2(axis + info_w / 2., stage.bottom() - 16.),
             )
         } else {
             Rect::from_min_max(
@@ -2201,6 +2234,7 @@ impl ReaderApp {
             browse,
             side_by_side,
             short_landscape,
+            wide,
         }
     }
     fn detail_cover_rect(&self, area: Rect) -> Rect {
@@ -3080,16 +3114,7 @@ impl ReaderApp {
         let layout = self.shelf_layout(area);
         // 宽屏：把底部展签让出来，让扇形在"上方可用区域"里垂直居中，
         // 避免书全都压在屏幕底部（2026-11-23 用 analyze-layout.ps1 量出来的问题）。
-        let shelf_area = if layout.side_by_side {
-            // 书群可绘制区底部必须在展签顶再让 24pt，否则横屏书脚压字。
-            // 展签顶 = stage.bottom - band - 16 ⇒ 等价于扣 band + 40。
-            Rect::from_min_max(
-                pos2(layout.books.left(), layout.books.top() + 12.),
-                pos2(layout.books.right(), layout.info.top() - 24.),
-            )
-        } else {
-            layout.books
-        };
+        let shelf_area = self.shelf_paint_area(area);
         // P2-3：舞台底色比纸面深约 4%，弱光下边界也能读出来。
         let stage_color = if self.dark {
             Color32::from_rgb(35, 38, 34)
@@ -3101,7 +3126,8 @@ impl ReaderApp {
             ui.painter().rect_filled(layout.stage, 0., stage_color);
         }
         // 右侧栏与竖分隔线已下线：书架占满，信息改到底部展签。
-        let volumes = shelf::geometry(shelf_area, books.len(), self.motion.focus, entrance);
+        let volumes =
+            shelf::geometry_wide(shelf_area, books.len(), self.motion.focus, entrance, layout.wide);
         self.rendered_book_nodes = volumes.len();
         let mut keep = HashSet::new();
         for volume in &volumes {
@@ -3115,7 +3141,18 @@ impl ReaderApp {
             self.covers.retain(|id, _| keep.contains(id));
             self.cover_mips.retain(|id, _| keep.contains(id));
         }
-        let p = ui.painter().with_clip_rect(shelf_area);
+        // P0-1：横屏大档书放大后焦点书探出 shelf_area 上缘（抬升余量
+        // 0.60→0.32 换实高），clip 放宽到视口顶让它完整画出来——
+        // 顶部留白只有页头标题/分页器，不与书群列相交。
+        let clip_top = if layout.wide {
+            self.shelf_viewport.top()
+        } else {
+            shelf_area.top()
+        };
+        let p = ui.painter().with_clip_rect(Rect::from_min_max(
+            pos2(shelf_area.left(), clip_top),
+            shelf_area.max,
+        ));
         shelf::paint_floor(&p, &volumes, self.dark);
         for volume in &volumes {
             let book = &books[volume.index];
@@ -3175,7 +3212,11 @@ impl ReaderApp {
             Id::unique("shelf-gesture"),
             Sense::click_and_drag(),
         );
-        let pitch = shelf::lane_pitch_for(shelf_area, books.len());
+        let pitch = if layout.wide {
+            shelf::lane_pitch_wide(shelf_area, books.len())
+        } else {
+            shelf::lane_pitch_for(shelf_area, books.len())
+        };
         if gesture.dragged() && books.len() > 1 {
             self.motion.drag(-ui.input(|i| i.pointer.delta().x) / pitch);
         }
