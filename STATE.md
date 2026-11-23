@@ -97,6 +97,7 @@
 
 ## 已验证事实（一行一条，附证据路径）
 
+- 2026-11-23 **最新 IPA（工程清单 0.2）**：Actions run 45126414677（ipad.yml，ref work/ipad-polish-sync @7ae8705，代码同 6273962）成功 7m42s → `artifacts/rust/ipad-20261123-run45126414677/Yejian-iPad/Yejian-0.1.1-7-ipad-unsigned.ipa`（28,826,778 字节，SHA256 e536cc24…fcefc3）；Info.plist 实查 app.yejian.reader.rust / 0.1.1 / build 7——**与 11-20 的 build 7 同号**，新旧只能靠画面区分。云 Mac `devin ssh` 本次报未登录，改走 Actions
 - 2026-11-22 参数外置生效且无需重编译：`paper.base` 17→0 后 frame-045/060/075 哈希全变，日志 `.tools/loop-baseline/stage0-params-live.log`
 - 2026-11-22 ffmpeg 管线可用：`artifacts/rust/stage0/body.mp4`（160 帧 / 121KB）
 - 2026-11-22 kill test 先 FAILED（纸全平仍 PASS），补断言后 **PASSED**：broken EXIT=1 / good EXIT=0，日志 `.tools/loop-baseline/stage0-killtest5.log`
