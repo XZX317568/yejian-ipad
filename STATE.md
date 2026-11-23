@@ -6,14 +6,14 @@
 
 ## 阶段计划（外部评审后修订：先基建，再动形变）
 
-- [~] **阶段 0 · 调参基建**
+- ✅ **阶段 0 · 调参基建**
   - ✅ **参数外置**：`rust-reader/src/params.rs` + `rust-reader/params.json`（`YEJIAN_PARAMS` 可覆盖路径，含 `paper` / `snap` / `weight` / `ease` 四组）。**证据**：同一份已编译产物，改 `paper.base` 17→0 后 `motion/frame-045/060/075.png` 三帧 SHA256 全部不同，且无需重新编译。日志 `.tools/loop-baseline/stage0-params-live.log`
   - ✅ **录制管线**：`tools/record.ps1`（多变体 → 各自 mp4 → `hstack` 并排 `compare.mp4`）。ffmpeg 已验证可用：160 帧 → `artifacts/rust/stage0/body.mp4`（30fps，2.7s @60fps）
   - ✅ **帧数可调**：`YEJIAN_MOTION_FRAMES`（默认 100，录制用 240 → 30fps 播放约 8 秒）
   - ✅ **纸张几何断言已补**：单测 `paper_curve_peak_stays_in_band`（峰值 12–30，默认实测 26.21）+ `paper_curve_is_not_rigid`（剖面跨度 >1.5，实测 4.52）；acceptance 启动闸门同带（`paper lift peak ... outside 12..=30`）
   - ✅ **kill test PASSED**：坏参数（纸全平）→ `Error: paper lift peak 0.00 outside 12..=30`，EXIT=1；正常参数 EXIT=0。日志 `.tools/loop-baseline/stage0-killtest5.log`
   - [done] **阶段 0 收口** → 可进阶段 1
-- [~] **阶段 1 · 抽出**：新增 `shelf` 参数段（`pull_base / pull_linear / pull_quad / rail_linear / rail_quad / lift_px / roll_rad / arc_base / arc_pct / arc_max / columns / shade_gain`），已接进 `shelf.rs` 的抽出与飞行绘制。
+- ✅ **阶段 1 · 抽出**：新增 `shelf` 参数段（`pull_base / pull_linear / pull_quad / rail_linear / rail_quad / lift_px / roll_rad / arc_base / arc_pct / arc_max / columns / shade_gain`），已接进 `shelf.rs` 的抽出与飞行绘制。
   - 三个变体：**A 基线**（pull 0.84 / lift 18 / roll 0.045 / arc 12）｜**B 更拔**（1.00 / 22 / 0.06 / 16）｜**C 更克制**（0.70 / 14 / 0.03 / 9）
   - ⚠️ 第一版录制**看不见飞行段**：`h.frame()` 每帧固定推进 1/60s，而飞行只 0.72s ⇒ 只有 ~43 帧，剩下全是静止的详情页。已加 `Harness.dt`，录制时开放段按 1/240 推进（4 倍慢动作）。
   - 裁决素材（2026-11-23 三次重录=P1-6立体化后，310 帧全链）：r2/r3/r4 各有 compare.mp4 与 {A,B,C}/variant-*.mp4；摊开段书保持立体 morph（非平面卡片）
