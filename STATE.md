@@ -17,13 +17,15 @@
   - 三个变体：**A 基线**（pull 0.84 / lift 18 / roll 0.045 / arc 12）｜**B 更拔**（1.00 / 22 / 0.06 / 16）｜**C 更克制**（0.70 / 14 / 0.03 / 9）
   - ⚠️ 第一版录制**看不见飞行段**：`h.frame()` 每帧固定推进 1/60s，而飞行只 0.72s ⇒ 只有 ~43 帧，剩下全是静止的详情页。已加 `Harness.dt`，录制时开放段按 1/240 推进（4 倍慢动作）。
   - 裁决素材（2026-11-23 三次重录=P1-6立体化后，310 帧全链）：r2/r3/r4 各有 compare.mp4 与 {A,B,C}/variant-*.mp4；摊开段书保持立体 morph（非平面卡片）
+- **2026-11-23 裁决结果：r2=r3=r4=B（纸感全套）**——常量已落进 params.rs：spread slant_pct .46→.30 / start .45→.35 / shift_x 24→40；flip turn_ms 180→240 / commit_vx 500→350 / depth 22→34 / band .35→.50 / edge_shade .10→.16；close exit_ms 320→420 / under_alpha .5→.3 / travel 580→680。完整 acceptance EXIT=0 不回归
+  - **2026-11-23 裁决结果：r2=r3=r4=B（纸感全套）**。常量已落进 params.rs（B 值替换默认值）：spread slant_pct .46→.30 / start .45→.35 / shift_x 24→40；flip turn_ms 180→240 / commit_vx 500→350 / depth 22→34 / band .35→.50 / edge_shade .10→.16；close exit_ms 320→420 / under_alpha .5→.3 / travel 580→680。完整 acceptance EXIT=0 不回归
   - 裁决素材：`artifacts/rust/record/r1/compare.mp4`（三宫格 8s）与 `contact.png`（3 行 × 4 关键时刻拼图，`tools/contact-sheet.ps1` 生成）
   - ✅ **裁决：A**（2026-11-23，用户在 `preview/` 里用 A/B/C 三个启动器亲手试过后选定）→ 阶段 1 完成
-- [~] **阶段 2 · 摊开**：核心链路已入库（`0f43700`，斜扫 clip 揭示 + spread 参数组）；三变体已录 `artifacts/rust/record/r2/compare.mp4`；preview 已加 试-r2-A/B/C 启动器 → **待用户裁决编号**
-- [~] **阶段 4 · 合上**：实现已入库（reader_exit 镜像 entry，Option F）；三变体 r4-a-mirror / r4-b-bookish / r4-c-snappy 待录 → **待用户裁决编号**
-- [~] **阶段 3 · 翻页**：核心链路已入库（`64381e0`，页图 mesh 化 + 列向 depth 隆起 + 详情→阅读器 entry）；三变体已录 `artifacts/rust/record/r3/compare.mp4` + 中点帧 `record/r3-flip/{A,B,C}/flip-*.png`；preview 已加 试-r3-A/B/C 启动器 → **待用户裁决编号**
+- ✅ **阶段 2 · 摊开**：核心链路已入库（`0f43700`，斜扫 clip 揭示 + spread 参数组）；三变体已录 `artifacts/rust/record/r2/compare.mp4`；preview 已加 试-r2-A/B/C 启动器 → **2026-11-23 用户裁决：B（翻页感纸面）**
+- ✅ **阶段 4 · 合上**：实现已入库（reader_exit 镜像 entry，Option F）；三变体已录 `artifacts/rust/record/r4/compare.mp4` → **2026-11-23 用户裁决：B（书感）**
+- ✅ **阶段 3 · 翻页**：核心链路已入库（`64381e0`，页图 mesh 化 + 列向 depth 隆起 + 详情→阅读器 entry）；三变体已录 `artifacts/rust/record/r3/compare.mp4` + 中点帧 `record/r3-flip/{A,B,C}/flip-*.png`；preview 已加 试-r3-A/B/C 启动器 → **2026-11-23 用户裁决：B（纸感）**
   - 用户同时给出产品决定：**下线「藏书一览」网格，立体书架即主体**（已实现：`ui.rs` 不再绘制网格，网格高度并入 stage；`shelf_focus_book_id()` 补位验收链路）
-- [ ] 阶段 2 · 摊开　- [ ] 阶段 3 · 翻页　- [ ] 阶段 4 · 合上　- [ ] 阶段 5 · 常量对齐 + 边缘
+- ✅ 阶段 2 · 摊开（B）　- ✅ 阶段 3 · 翻页（B）　- ✅ 阶段 4 · 合上（B）　- ✅ 阶段 5 · 常量对齐（B 参数已入库）
 
 每段完成 = 可机查证据 + 用户裁决编号，两者缺一不算。
 

@@ -242,10 +242,12 @@ impl Default for Spread {
     fn default() -> Self {
         Self {
             slant_px: 180.,
-            slant_pct: 0.46,
-            shift_x: 24.,
+            // r2=B 裁决（2026-11-23 用户回字母）：翻页感纸面——
+            // 斜口占比收敛 .46→.30、起点提前 .45→.35、水平位移 24→40。
+            slant_pct: 0.30,
+            shift_x: 40.,
             shift_y: 12.,
-            start: 0.45,
+            start: 0.35,
             span: 0.55,
             dir: 1.,
             ease_x1: 0.18,
@@ -295,18 +297,19 @@ pub struct Flip {
 impl Default for Flip {
     fn default() -> Self {
         Self {
-            turn_ms: 180.,
+            // r3=B 裁决（2026-11-23）：纸感翻页——更慢更深更浓。
+            turn_ms: 240.,
             tap_strip_pct: 0.24,
             commit_px: 45.,
-            commit_vx: 500.,
-            depth_px: 22.,
-            band: 0.35,
+            commit_vx: 350.,
+            depth_px: 34.,
+            band: 0.5,
             peel_span: 0.11,
             ease_x1: 0.22,
             ease_y1: 1.,
             ease_x2: 0.36,
             ease_y2: 1.,
-            edge_shade: 0.10,
+            edge_shade: 0.16,
             entry_ms: 420.,
             entry_ease_x1: 0.18,
             entry_ease_y1: 0.72,
@@ -346,15 +349,16 @@ pub struct Close {
 impl Default for Close {
     fn default() -> Self {
         Self {
-            exit_ms: 320.,
+            // r4=B 裁决（2026-11-23）：书感合上——退出更从容。
+            exit_ms: 420.,
             exit_ease_x1: 0.18,
             exit_ease_y1: 0.72,
             exit_ease_x2: 0.18,
             exit_ease_y2: 1.,
             peel_dir: 0.,
-            under_alpha_start: 0.5,
+            under_alpha_start: 0.3,
             chrome_ms: 160.,
-            close_travel_ms: 580.,
+            close_travel_ms: 680.,
         }
     }
 }
