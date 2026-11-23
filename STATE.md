@@ -100,6 +100,7 @@
 - 2026-11-22 kill test 先 FAILED（纸全平仍 PASS），补断言后 **PASSED**：broken EXIT=1 / good EXIT=0，日志 `.tools/loop-baseline/stage0-killtest5.log`
 - 2026-11-23 **iPad 模拟器真机链路打通**：macOS 盒跑通 CI 同款 build-rust-ios.sh --sim → xcodebuild → capture-ipad-simulator.sh → IPadRotationTests **4/4 PASS**；shelf.png 证实竖屏底部标签栏+全屏书架在真模拟器生效（截图拉回到 artifacts/rust/sim-pulled/，经 devin forward + python http.server）。verify-ipad-snapshots.py 崩在缺 relocated-library.json（覆盖率缺口，非 bug）
 - 2026-11-23 **模拟器第三轮全链 PASS**（含 flip+verify 修复）：ipad-sim3 capture 完整跑完 CAPTURE_EXIT=0、legacy-library.json 就位、verify-ipad-snapshots.py PASS（上一轮 pipe2 的"缺 JSON 崩"已修复+根因是 capture 中断非 verify 错）。IPadRotationTests 4/4
+- 2026-11-23 **P1一致性四项**（00d4e30）：分屏舞台改满幅直角带、辅助页统一 page_column 左缘、激活态统一胶囊、分页器统一锚舞台右上；剩 P1-1 展签对齐+P1-6 详情封面平面化两个大改待裁决
 - 2026-11-23 **设计评审R2**（.tools/design-review-round2.md）：P0×3/P1×6/P2×6；P0-2线穿按钮+P0-3按钮出血已修（366443d，agent-p0fix 截图验证）；P0-1 横屏书群权重不足属布局改动待裁决后动
 - 2026-11-23 **摊开真bug修复** 943b0cb：斜扫之前被 flight mesh 压在底下从未可见（draw() 扫描期隐藏 mesh）；文字列在未揭示纸面鬼影（detail_text_alpha 改前沿联动）；spec§7 像素断言落地（斜率 0.139 vs 理论 0.1366 ±15%）
 - 2026-11-23 **边缘余项**：fd11ce0 斜扫带 8→自适应 23 段（撕口台阶细化见 agent-bands/close-mid-compare.png）+ 320pt 导航 pill 左右边距 ≥8pt
