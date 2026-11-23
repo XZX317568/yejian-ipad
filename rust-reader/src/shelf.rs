@@ -92,10 +92,13 @@ impl Volume {
     }
 }
 
+/// 抽书期间需要在飞行封面上方重绘的邻书（P2-4）：
+/// 不只右侧前景，左侧被遮的书也收进来——飞行 mesh 会把它们的剪影裁成
+/// 碎块，带 alpha 淡出重绘让被遮书保持完整轮廓。
 pub fn foreground(volumes: &[Volume], lane: i32, cover: Plane) -> Vec<Volume> {
     volumes
         .iter()
-        .filter(|v| v.lane > lane && v.bounds().intersects(cover.bounds()))
+        .filter(|v| v.lane != lane && v.bounds().intersects(cover.bounds()))
         .cloned()
         .collect()
 }
@@ -242,6 +245,10 @@ pub fn geometry(area: Rect, count: usize, focus: f32, entrance: f32) -> Vec<Volu
                 * (shelf.pull_linear - shelf.pull_quad * weight)
                 * shrink;
             let lift = motion::smooth(weight);
+            // P2-4：半抬的邻书再补一程抬升（焦点书 lift=1 不受影响）。
+            // 被焦点书遮住大半的书只露出下缘一角，读成"漂浮色块"；
+            // 抬高一点让被遮的书脊下缘和封面角连贯起来。
+            let lift = lift + (1. - lift) * weight * 0.8;
             let rail = distance.clamp(-7., 7.);
             let start = ((distance + 8.) / 24.).clamp(0., 0.65);
             let ink = motion::cubic(
@@ -889,8 +896,11 @@ pub fn paint_volume(
         Color32::TRANSPARENT,
     );
     // Gentle focus dimming keeps the centered book crisp while neighbors
-    // recede, scaled by how far the lane sits from the focus.
-    let dim = (volume.distance.abs().min(1.5) / 1.5) * if dark { 0.08 } else { 0.055 };
+    // recede, scaled by how far the lane sits from the focus. P2-4 叠加一项
+    // 未抬升系数：被焦点书遮住大半的邻书沉得更深，露出的一角不再读成
+    // 漂浮的色块。
+    let dim = ((volume.distance.abs().min(1.5) / 1.5) * 0.055 + (1. - volume.lift) * 0.055)
+        * if dark { 1.45 } else { 1. };
     if dim > 0.005 {
         let shade = Color32::from_black_alpha((dim * 255.).round() as u8);
         flat(p, volume.face, shade);

@@ -33,6 +33,9 @@ struct Flight {
     from: Plane,
     to: Plane,
     foreground: Vec<shelf::Volume>,
+    /// 起点书所在 lane：foreground 里 lane 更小的是"被遮挡的后景书"，
+    /// 重绘时给半透明，让剪影完整但仍在飞行封面之下（P2-4）。
+    origin_lane: i32,
     clip: Rect,
 }
 struct PageTexture {
@@ -1936,6 +1939,7 @@ impl ReaderApp {
                             from: source,
                             to: Plane::rect(self.detail_cover_rect(area)),
                             foreground: shelf::foreground(&volumes, volume.lane, source),
+                            origin_lane: volume.lane,
                             clip: shelf_area,
                         });
                     }
@@ -2606,14 +2610,20 @@ impl ReaderApp {
                         self.dark,
                     );
                     if progress < 0.12 {
-                        let mut mask = ui.painter().with_clip_rect(flight.clip);
-                        mask.multiply_opacity(
-                            1. - motion::cubic(progress / 0.12, 0.42, 0., 0.58, 1.),
-                        );
+                        let clip = ui.painter().with_clip_rect(flight.clip);
+                        let base_alpha =
+                            1. - motion::cubic(progress / 0.12, 0.42, 0., 0.58, 1.);
                         let books = self.visible_books();
                         for volume in &flight.foreground {
                             if let Some(book) = books.get(volume.index) {
                                 let cover = self.cover_id(&book.id);
+                                let mut mask = clip.clone();
+                                // P2-4：被抽书挡住的后景书（lane 更小）以半透明
+                                // 重绘——剪影保持完整不被飞行 mesh 切碎，又不会
+                                // 盖住飞出来的封面；前景书照旧全透明淡出。
+                                mask.multiply_opacity(
+                                    base_alpha * if volume.lane < flight.origin_lane { 0.6 } else { 1. },
+                                );
                                 shelf::paint_volume(
                                     &mask,
                                     volume,
@@ -3013,9 +3023,22 @@ impl ReaderApp {
             self.motion.select(0., now, true);
         }
         if books.is_empty() {
-            let y = area.top() + area.height() * 0.32;
-            let empty = Rect::from_min_max(pos2(area.left() + 32., y), area.max - vec2(32., 76.));
+            // P2-1：空状态块在页头与底栏之间整体纵向居中，而不是挂在 32% 处，
+            // 底部不再剩 2/3 死白。
+            let bottom_gap = if Self::side_navigation(area) {
+                56.
+            } else {
+                Self::TAB_BAR_HEIGHT + 16.
+            };
+            let empty = Rect::from_min_max(
+                pos2(area.left() + 32., area.top() + 96.),
+                pos2(area.right() - 32., area.bottom() - bottom_gap),
+            );
             ui.scope_builder(UiBuilder::new().max_rect(empty), |ui| {
+                // 块高约 24·1.4fs + 12 + 13·1.4fs + 24 + 44 ≈ 52fs + 80；
+                // 居中 = (可用高 - 块高) / 2，留少许偏上更自然。
+                let block = 52. * self.font_scale + 80.;
+                ui.add_space(((empty.height() - block) * 0.5 - 8.).max(0.));
                 ui.add(
                     Label::new(
                         RichText::new(if self.query.is_empty() {
@@ -3067,10 +3090,11 @@ impl ReaderApp {
         } else {
             layout.books
         };
+        // P2-3：舞台底色比纸面深约 4%，弱光下边界也能读出来。
         let stage_color = if self.dark {
-            Color32::from_rgb(40, 43, 39)
+            Color32::from_rgb(35, 38, 34)
         } else {
-            Color32::from_rgb(235, 233, 223)
+            Color32::from_rgb(226, 224, 213)
         };
         // 窄档舞台与宽档同语义：满幅直边纸面带，不再画 22pt 圆角卡片（P1-2）。
         if !layout.side_by_side {
@@ -3120,7 +3144,14 @@ impl ReaderApp {
         // The row is an endless shelf, so spines must dissolve into the page
         // instead of ending on a hard clip line.
         {
-            let background = stage_color;
+            // P2-3：渐隐带溶解到"舞台实际所在的那层底色"——窄档舞台已填色
+            // 用舞台色，宽档舞台不填色则溶进纸面，不然左右两条 30pt 米色带
+            // 会像描边一样突兀（分屏档右缘硬边同理）。
+            let background = if layout.side_by_side {
+                self.colors().0
+            } else {
+                stage_color
+            };
             let clear =
                 Color32::from_rgba_unmultiplied(background.r(), background.g(), background.b(), 0);
             let fade = 30.;
@@ -3671,6 +3702,7 @@ fn library_thumbnails(
                 from: volume.cover,
                 to: Plane::rect(self.detail_cover_rect(self.shelf_viewport)),
                 foreground: shelf::foreground(volumes, volume.lane, volume.cover),
+                origin_lane: volume.lane,
                 clip: self.shelf_area(area),
             });
         }
@@ -5270,6 +5302,9 @@ fn library_thumbnails(
                 .id_salt("reading-history")
                 .show(ui, |ui| {
                     if books.is_empty() {
+                        // P2-1：空卡放到可视区约 40% 处——视觉居中略偏上，
+                        // 不再贴顶、下面也不留整屏死白。卡高约 160pt。
+                        ui.add_space(((ui.available_height() - 190.) * 0.4).max(0.));
                         crate::design::surface(ui).show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             ui.add_space(24.);
@@ -5392,7 +5427,14 @@ fn library_thumbnails(
     }
     fn settings_ui(&mut self, ui: &mut Ui, area: Rect) {
         let palette = crate::design::palette(self.dark);
-        let column = Self::page_column(area, 92., 88.);
+        // P2-2：竖屏底部标签栏盖内容区——滚动视口下缘收到栏顶 6pt 之上，
+        // 内容再上移 8pt，让 AniList token 输入框首屏完整露出。
+        let bottom_bar = if Self::side_navigation(area) {
+            88.
+        } else {
+            Self::TAB_BAR_HEIGHT + 8.
+        };
+        let column = Self::page_column(area, if bottom_bar == 88. { 92. } else { 84. }, bottom_bar);
         ui.scope_builder(UiBuilder::new().max_rect(column), |ui| {
             ScrollArea::vertical()
                 .id_salt("reader-settings")
@@ -5703,6 +5745,8 @@ fn library_thumbnails(
                             ));
                         }
                     });
+                    // 末行也要能滚出底栏覆盖区（P2-2 安全区内边距）。
+                    ui.add_space(Self::TAB_BAR_HEIGHT + 8.);
                 });
         });
     }
