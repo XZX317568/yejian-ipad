@@ -125,7 +125,8 @@ def verify(directory):
                 f"{name}: inconsistent safe area")
         navigation = report["navigation"]
         if screen in ("shelf", "history", "sources", "settings", "community","browse","filters","filtered"):
-            require(set(navigation) == {"nav-library", "nav-search", "nav-history", "nav-settings"},
+            # nav-pill 是激活态指示器（P1-4 新增），不是缺失。
+            require(set(navigation) - {"nav-pill"} == {"nav-library", "nav-search", "nav-history", "nav-settings"},
                     f"{name}: incomplete navigation")
         for control, rect in navigation.items():
             x1, y1, x2, y2 = rect
