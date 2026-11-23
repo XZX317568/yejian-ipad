@@ -399,6 +399,7 @@ pub fn params() -> Arc<Params> {
     slot().read().map(|guard| Arc::clone(&guard)).unwrap_or_else(|_| Arc::new(Params::default()))
 }
 
+#[allow(dead_code)] // 保留：热加载钩子，未接线
 /// Re-read the parameter file, replacing the live values.
 /// Returns the path and whether it parsed.
 pub fn reload() -> (PathBuf, bool) {
@@ -424,6 +425,7 @@ pub fn reload() -> (PathBuf, bool) {
     (path, ok)
 }
 
+#[allow(dead_code)] // 保留：录制指纹，未接线
 /// Serialise the current live values, for recording what a video was rendered with.
 pub fn fingerprint() -> String {
     serde_json::to_string(&*params()).unwrap_or_else(|_| "{}".to_string())

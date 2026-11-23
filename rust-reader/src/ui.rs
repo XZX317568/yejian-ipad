@@ -3062,7 +3062,6 @@ impl ReaderApp {
         } else {
             layout.books
         };
-        let palette = crate::design::palette(self.dark);
         let stage_color = if self.dark {
             Color32::from_rgb(40, 43, 39)
         } else {
