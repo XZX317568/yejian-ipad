@@ -3892,7 +3892,7 @@ fn library_thumbnails(
         } else if wide {
             pos2(cover.right() + 72., cover.top() + cover.height() * 0.15)
         } else {
-            pos2(area.left() + 24., cover.bottom() + 30.)
+            pos2(area.left() + 24., cover.bottom() + 16.)
         } - vec2(0., 8. * (1. - detail_alpha));
         let body = if wide {
             Rect::from_min_size(
@@ -3900,12 +3900,23 @@ fn library_thumbnails(
                 vec2(392., (area.bottom() - 24. - details_start.y).max(160.)),
             )
         } else {
-            Rect::from_min_max(details_start, area.max - vec2(24., 12.))
+            Rect::from_min_max(details_start, area.max - vec2(24., 6.))
         };
         let column_alpha = detail_alpha * exit_alpha;
-        // 同系列的已下载章节：≥2 章渲染 Apple Books 分组章节卡（S3）；
-        // 本地单卷书退化为进度/卷宗概览卡。
-        let mut siblings = self.chapters_for(id);
+        // 同系列已下载章节：≥2 章渲染 Apple Books 分组章节卡（S3），本地单卷
+        // 书退化为进度/卷宗概览卡；章节名取链接元数据，过滤同 chapters_for。
+        let mut siblings: Vec<(Book, String)> = self
+            .chapters
+            .iter()
+            .filter(|link| self.same_series(id, &link.book_id))
+            .filter_map(|link| {
+                self.books
+                    .iter()
+                    .find(|b| b.id == link.book_id)
+                    .cloned()
+                    .map(|b| (b, link.metadata.chapter_title.clone()))
+            })
+            .collect();
         let mut app = self;
         ui.scope_builder(UiBuilder::new().max_rect(body), |ui| {
             ScrollArea::vertical()
@@ -4001,7 +4012,7 @@ fn library_thumbnails(
 /// 详情页文字列：hero（书名/元信息/进度徽章）→ 操作区 → 内联分组卡；
 /// 全程在 ScrollArea 里，保持扫边 alpha 契约与静止帧逐字节稳定（close-p1==close-pre）。
 fn detail_column(ui: &mut Ui, app: &mut ReaderApp, book: &Book, id: &str, title: &str, text: &str,
-                 ink: Color32, muted: Color32, siblings: &mut Vec<Book>, wide: bool) {
+                 ink: Color32, muted: Color32, siblings: &mut Vec<(Book, String)>, wide: bool) {
     let fs = app.font_scale;
     let dark = app.dark;
     let (t, s, g) = if wide { (36., 15., 8.) } else if ui.available_width() >= 560. { (30., 13., 6.) } else { (24., 13., 6.) };
@@ -4010,7 +4021,7 @@ fn detail_column(ui: &mut Ui, app: &mut ReaderApp, book: &Book, id: &str, title:
         ui.add_space(g);
         ui.add(Label::new(RichText::new(text).size(s * fs).color(muted)).wrap());
         if book.last_read_at.is_some() || book.current_page > 0 {
-            ui.add_space(10.);
+            ui.add_space(8.);
             // 「已读 X / Y 页 · XX%」柔和胶囊徽章。
             let p = crate::design::palette(dark);
             let read = (book.current_page + 1).min(book.page_count);
@@ -4029,29 +4040,42 @@ fn detail_column(ui: &mut Ui, app: &mut ReaderApp, book: &Book, id: &str, title:
         hero(ui);
         ui.add_space(24.);
         app.detail_actions(ui, book, id, 280., 52.);
-    } else {
-        ui.vertical_centered(|ui| {
-            hero(ui);
-            ui.add_space(20.);
-            app.detail_actions(ui, book, id, (252. * fs.sqrt()).min(ui.available_width()), 48.);
-        });
+        ui.add_space(16.);
+        Self::detail_card(ui, app, book, id, siblings);
+        return;
     }
-    ui.add_space(16.);
-    Self::detail_card(ui, app, book, id, siblings);
+    // 单列：hero、按钮、内联卡整体收进居中 ≤560pt 栏宽（原 1040pt 通栏是
+    // 拦截项）。scope_builder 显式钉栏位——vertical_centered 只在自己的
+    // max_rect 内居中，套在 horizontal 余量里会以列右半宽为轴偏右。
+    let avail = ui.available_width();
+    let col_w = avail.min(560.);
+    let left = ui.cursor().left() + ((avail - col_w) / 2.).max(0.);
+    let col = Rect::from_min_max(
+        pos2(left, ui.cursor().top()),
+        pos2(left + col_w, ui.max_rect().bottom()),
+    );
+    ui.scope_builder(UiBuilder::new().max_rect(col), |ui| {
+        ui.vertical_centered(|ui| {
+            ui.set_width(col_w);
+            hero(ui);
+            ui.add_space(10.);
+            app.detail_actions(ui, book, id, (252. * fs.sqrt()).min(col_w), 48.);
+            ui.add_space(8.);
+            Self::detail_card(ui, app, book, id, siblings);
+        });
+    });
 }
 /// 内联分组卡：≥2 章渲染章节列表（正/倒序胶囊 + 前 6 章 + 查看全部）；
-/// 单卷本地书退化为阅读进度与卷宗概览。
-fn detail_card(ui: &mut Ui, app: &mut ReaderApp, book: &Book, id: &str, siblings: &mut Vec<Book>) {
+/// 单卷本地书退化为阅读进度与卷宗概览（栏宽由 detail_column 钉死）。
+fn detail_card(ui: &mut Ui, app: &mut ReaderApp, book: &Book, id: &str, siblings: &mut Vec<(Book, String)>) {
     let p = crate::design::palette(app.dark);
-    // 居中列里卡片别铺满 1050pt：收到 Apple Books 式 640pt 栏宽（列更窄则跟随）。
-    ui.set_max_width(ui.available_width().min(560.));
     crate::design::grouped_card(ui, p, |ui| {
         ui.set_width(ui.available_width());
         if siblings.len() >= 2 {
             if app.detail_desc { siblings.reverse(); }
-            ui.horizontal(|ui| {
-                ui.add(Label::new(RichText::new(format!("章节 · 共 {} 话", siblings.len()))
-                    .size(15. * app.font_scale).strong().color(p.ink)).wrap());
+            let fs = app.font_scale;
+            let title = format!("章节 · 共 {} 话", siblings.len());
+            let pills = |ui: &mut Ui, app: &mut ReaderApp| {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     for (desc, label) in [(true, "最新在前"), (false, "从头开始")] {
                         let r = ui.selectable_label(app.detail_desc == desc, label);
@@ -4059,10 +4083,26 @@ fn detail_card(ui: &mut Ui, app: &mut ReaderApp, book: &Book, id: &str, siblings
                         if r.clicked() { app.detail_desc = desc; }
                     }
                 });
-            });
+            };
+            // 头行放不下时胶囊下移到独立一行（320pt×200% 大字号防挤压）。
+            let pill_font = TextStyle::Body.resolve(ui.style());
+            let pill_w = ["最新在前", "从头开始"].iter()
+                .map(|l| ui.painter().layout_no_wrap((*l).into(), pill_font.clone(), p.ink).size().x + 30.)
+                .sum::<f32>() + 12.;
+            let title_w = ui.painter().layout_no_wrap(title.clone(), FontId::proportional(15. * fs), p.ink).size().x;
+            if title_w + pill_w + 16. > ui.available_width() {
+                ui.add(Label::new(RichText::new(title).size(15. * fs).strong().color(p.ink)).truncate());
+                ui.add_space(4.);
+                pills(ui, app);
+            } else {
+                ui.horizontal(|ui| {
+                    ui.add(Label::new(RichText::new(title).size(15. * fs).strong().color(p.ink)).truncate());
+                    pills(ui, app);
+                });
+            }
             ui.add_space(6.);
-            for (i, entry) in siblings.iter().take(6).enumerate() {
-                Self::detail_chapter_row(ui, app, entry, id, p, i > 0);
+            for (i, (entry, chapter)) in siblings.iter().take(6).enumerate() {
+                Self::detail_chapter_row(ui, app, entry, id, chapter, p, i > 0);
             }
             if siblings.len() > 6 {
                 let y = ui.cursor().top();
@@ -4093,7 +4133,9 @@ fn detail_card(ui: &mut Ui, app: &mut ReaderApp, book: &Book, id: &str, siblings
     });
 }
 /// 内联章节行：当前章琥珀圆点、0.5pt 发丝分割、44pt 热区直达阅读位置。
-fn detail_chapter_row(ui: &mut Ui, app: &mut ReaderApp, entry: &Book, id: &str, p: crate::design::Palette, hairline: bool) {
+/// 章节名扣除右侧页码带后单行截断（…），320pt×200% 大字号也不越界。
+fn detail_chapter_row(ui: &mut Ui, app: &mut ReaderApp, entry: &Book, id: &str, chapter: &str,
+                      p: crate::design::Palette, hairline: bool) {
     if hairline {
         let y = ui.cursor().top();
         ui.painter().line_segment([pos2(ui.min_rect().left(), y), pos2(ui.min_rect().right(), y)], Stroke::new(0.5, p.line));
@@ -4103,12 +4145,23 @@ fn detail_chapter_row(ui: &mut Ui, app: &mut ReaderApp, entry: &Book, id: &str, 
     let current = entry.id == id;
     let pt = ui.painter();
     if current { pt.circle_filled(rect.left_center() + vec2(6., 0.), 3.5, p.accent); }
-    let name = app.chapter(&entry.id).map(|m| m.chapter_title.clone()).unwrap_or_else(|| entry.title.clone());
-    pt.text(rect.left_center() + vec2(if current { 20. } else { 12. }, 0.), Align2::LEFT_CENTER,
-        name, FontId::proportional(14. * app.font_scale), p.ink);
-    if entry.last_read_at.is_some() || entry.current_page > 0 {
-        pt.text(rect.right_center() + vec2(-8., 0.), Align2::RIGHT_CENTER,
-            format!("第 {} / {} 页", (entry.current_page + 1).min(entry.page_count), entry.page_count),
+    let read_badge = (entry.last_read_at.is_some() || entry.current_page > 0)
+        .then(|| format!("第 {} / {} 页", (entry.current_page + 1).min(entry.page_count), entry.page_count));
+    let page_w = read_badge.as_ref()
+        .map(|s| pt.layout_no_wrap(s.clone(), FontId::proportional(12. * app.font_scale), p.muted).size().x + 16.)
+        .unwrap_or(16.);
+    let name_x = rect.left_center() + vec2(if current { 20. } else { 12. }, 0.);
+    let mut job = egui::epaint::text::LayoutJob::single_section(
+        chapter.to_string(),
+        egui::epaint::text::TextFormat::simple(FontId::proportional(14. * app.font_scale), p.ink),
+    );
+    job.wrap.max_width = (rect.right() - page_w - name_x.x).max(24.);
+    job.wrap.max_rows = 1;
+    job.wrap.overflow_character = Some('…');
+    let galley = pt.layout_job(job);
+    pt.galley(pos2(name_x.x, rect.center().y - galley.size().y / 2.), galley, p.ink);
+    if let Some(s) = read_badge {
+        pt.text(rect.right_center() + vec2(-8., 0.), Align2::RIGHT_CENTER, s,
             FontId::proportional(12. * app.font_scale), p.muted);
     }
     app.hitboxes.insert(format!("dchapter-{}", entry.id), rect);
@@ -7059,6 +7112,76 @@ mod tests {
         assert!(app.page_generation > generation);
         assert_eq!(app.page_pending, HashSet::from([("new".into(), 10)]));
     }
+    #[test]
+    fn detail_chapter_card_persists_fold_and_sort_contract() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = Context::default();
+        crate::configure_fonts(&ctx);
+        let mut app = ReaderApp::new(root.path().into(), ctx.clone());
+        app.books = (1..=7).map(|n| book(&format!("c{n}"))).collect();
+        app.replace_links(
+            app.books
+                .iter()
+                .enumerate()
+                .map(|(i, b)| ChapterLink {
+                    book_id: b.id.clone(),
+                    metadata: ChapterMetadata {
+                        source_id: "s".into(),
+                        manga_id: "m".into(),
+                        manga_title: "系列".into(),
+                        chapter_id: format!("ch{i}"),
+                        chapter_title: format!("第 {} 话", i + 1),
+                        chapter_number: Some(i as f64 + 1.),
+                        volume_number: None,
+                    },
+                })
+                .collect(),
+        );
+        app.books[0].current_page = 2;
+        let frame = |app: &mut ReaderApp, w: f32, h: f32| {
+            ctx.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(w, h))),
+                    ..Default::default()
+                },
+                |ui| app.detail_ui(ui, ui.max_rect(), "c1"),
+            )
+            .drop_without_applying_deltas();
+        };
+        frame(&mut app, 820., 1180.);
+        app.hitboxes.clear();
+        frame(&mut app, 820., 1180.);
+        for n in 1..=6 {
+            let rect = app
+                .hitboxes
+                .get(&format!("dchapter-c{n}"))
+                .unwrap_or_else(|| panic!("missing dchapter-c{n}"));
+            assert!(rect.height() >= 40., "dchapter-c{n} too small: {rect:?}");
+        }
+        assert!(!app.hitboxes.contains_key("dchapter-c7"), "7th chapter must fold into the footer");
+        let all = app.hitboxes.get("detail-chapters-all").expect("missing 查看全部 row");
+        assert!(all.height() >= 40., "查看全部 row too small: {all:?}");
+        for hid in ["detail-sort-true", "detail-sort-false", "detail-chapters", "read", "detail-tracking"] {
+            assert!(app.hitboxes.contains_key(hid), "missing hitbox {hid}");
+        }
+        app.detail_desc = true;
+        app.hitboxes.clear();
+        frame(&mut app, 820., 1180.); // 倒序：最上面的行是最后一话
+        let row_top = |app: &ReaderApp, id: &str| app.hitboxes.get(&format!("dchapter-{id}")).map(|r| r.top());
+        assert!(row_top(&app, "c7").is_some_and(|top| top < row_top(&app, "c2").unwrap_or(f32::MAX)),
+            "descending sort did not put the newest chapter first: {:?}", app.hitboxes.keys().collect::<Vec<_>>());
+        assert!(!app.hitboxes.contains_key("dchapter-c1"), "ascending c1 must fold in descending view");
+        app.detail_desc = false;
+        // 320pt×200% 大字号：行热区仍不越屏、仍可点。
+        app.font_scale = 2.;
+        app.hitboxes.clear();
+        frame(&mut app, 320., 1024.);
+        for n in 1..=6 {
+            let rect = app.hitboxes.get(&format!("dchapter-c{n}")).expect("missing row");
+            assert!(rect.left() >= 0. && rect.right() <= 320.5, "row overflows narrow screen: {rect:?}");
+        }
+    }
+
     #[test]
     fn downloaded_chapters_group_by_source_and_keep_fractional_chapter_order() {
         let root = tempfile::tempdir().unwrap();

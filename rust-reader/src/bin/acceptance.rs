@@ -436,10 +436,11 @@ fn collect_images(shape: &Shape, clip: Rect, out: &mut Vec<PaintedImage>) {
     }
 }
 
-fn fixtures(root: &Path) -> Result<Vec<PathBuf>> {
+/// 生成等尺寸 CBZ 夹具。titles 决定书名（去重键），palette_offset 给整套
+/// 调色板移位——同名不同版或不同名同字节都会被 import 按内容 hash 归并。
+fn fixtures(root: &Path, titles: &[&str], palette_offset: u8) -> Result<Vec<PathBuf>> {
     use std::io::Write;
     std::fs::create_dir_all(root)?;
-    let titles = ["山海之间", "深蓝来信", "雨后列车", "小镇回声", "月光旅人"];
     let colors = [
         [52u8, 87, 83],
         [40, 75, 108],
@@ -453,10 +454,10 @@ fn fixtures(root: &Path) -> Result<Vec<PathBuf>> {
         let mut zip = zip::ZipWriter::new(std::fs::File::create(&path)?);
         for page in 0..6 {
             let mut image =
-                image::RgbImage::new(640, if index == 0 && page == 2 { 9000 } else { 960 });
+                image::RgbImage::new(640, if index == 0 && page == 2 && titles.len() == 5 { 9000 } else { 960 });
             for (y, row) in image.enumerate_rows_mut() {
                 for (x, _, pixel) in row {
-                    let base = colors[index];
+                    let base = colors[index % 5].map(|c| c.wrapping_add(palette_offset * 61));
                     let sun = (x as i32 - 380).pow(2) + (y as i32 - 225).pow(2) < 155 * 155;
                     let wave = y as f32 > 400. + (x as f32 / 110.).sin() * 65. + page as f32 * 12.;
                     *pixel = image::Rgb(if sun {
@@ -805,6 +806,93 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
         h.app.screen_name() == "library",
         "design: details did not return"
     );
+
+    // S3 证据：chapter_links 按 book_id 去重——「查看全部」页脚要 ≥7 本入链
+    // 的书：补 4 本夹具副本到 9 册，除焦点书与已读书外 7 本链成一部 7 话作品。
+    // 导入会重置焦点——先记下当前焦点（未读、未链）再导入。
+    let keep_ids = [
+        focus_id.clone(),
+        h.app.shelf_focus_book_id().context("design: lost shelf focus")?,
+    ];
+    let extra = fixtures(
+        &h.output.join("series-fixtures"),
+        &["合集卷一", "合集卷二", "合集卷三", "合集卷四"],
+        1,
+    )?;
+    h.app.import_files(extra[..4].to_vec());
+    h.wait(|app| app.book_count() == 9)?;
+    let library = yejian_core::Library::open(library_root)?;
+    let books = library.list_books("")?;
+    let series: Vec<_> = books
+        .iter()
+        .filter(|book| !keep_ids.contains(&book.id))
+        .take(7)
+        .collect();
+    anyhow::ensure!(series.len() == 7, "design: not enough books left for the series fixture");
+    let series_ids: Vec<String> = series.iter().map(|book| book.id.clone()).collect();
+    let meta = |n: f64| yejian_core::ChapterMetadata {
+        source_id: "design.series".into(),
+        manga_id: "design-series".into(),
+        manga_title: "七话合集".into(),
+        chapter_id: format!("design-ch{n:.0}"),
+        chapter_title: format!("第 {n:.0} 话"),
+        chapter_number: Some(n),
+        volume_number: None,
+    };
+    for (idx, book) in series.iter().enumerate() {
+        library.link_chapter(&book.id, &meta(idx as f64 + 1.))?;
+    }
+    h.app = ReaderApp::new(library_root.to_path_buf(), h.ctx.clone());
+    h.wait(ReaderApp::ready)?;
+    h.frames(40)?;
+    h.wait(ReaderApp::covers_loaded)?;
+    for _ in 0..4 {
+        if h.app
+            .shelf_focus_book_id()
+            .is_some_and(|id| series_ids.contains(&id))
+        {
+            break;
+        }
+        h.click("shelf-next")?;
+        h.frames(12)?;
+    }
+    anyhow::ensure!(
+        h.app
+            .shelf_focus_book_id()
+            .is_some_and(|id| series_ids.contains(&id)),
+        "design: could not focus the series volume"
+    );
+    h.click("open-book")?;
+    h.frames(65)?;
+    anyhow::ensure!(
+        h.app.screen_name() == "detail"
+            && h.app
+                .detail_book_id()
+                .is_some_and(|id| series_ids.iter().any(|s| s == id)),
+        "design: series cover did not open its detail"
+    );
+    anyhow::ensure!(
+        h.app.hitboxes.keys().filter(|k| k.starts_with("dchapter-")).count() >= 2
+            && h.app.hitboxes.contains_key("detail-chapters-all"),
+        "design: inline chapter card is missing its rows or footer: {:?}",
+        h.app.hitboxes.keys().collect::<Vec<_>>()
+    );
+    design_capture(h, "design-detail-chapters", &mut captures)?;
+    h.click("back")?;
+    h.frames(60)?;
+    // 焦点还回未链接的未读书：后续 iPad 段照旧拿到单卷详情。
+    for _ in 0..4 {
+        if h.app.shelf_focus_book_id().as_deref() == Some(keep_ids[1].as_str()) {
+            break;
+        }
+        h.click("shelf-next")?;
+        h.frames(12)?;
+    }
+    anyhow::ensure!(
+        h.app.shelf_focus_book_id().as_deref() == Some(keep_ids[1].as_str()),
+        "design: could not restore focus to the single-volume book"
+    );
+
     // Scrollbar hover fades can start when the cover flight gives control
     // back to the scroll column. They must settle within this bounded tail.
     for _ in 0..30 {
@@ -2288,7 +2376,11 @@ fn main() -> Result<()> {
             }
         }
     }
-    let paths = fixtures(&data.join("fixtures"))?;
+    let paths = fixtures(
+        &data.join("fixtures"),
+        &["山海之间", "深蓝来信", "雨后列车", "小镇回声", "月光旅人"],
+        0,
+    )?;
     let mut h = Harness::new(data.join("library"), output.clone())?;
     // 阶段 0 闸门：先确认纸张真的在弯。没有这条，把曲率参数改坏也能全绿。
     {
