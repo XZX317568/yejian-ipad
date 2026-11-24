@@ -1275,6 +1275,25 @@ impl ReaderApp {
             .map(|m| format!("{} · {}", m.manga_title, m.chapter_title))
             .unwrap_or_else(|| book.title.clone())
     }
+    /// 历史行副标里的相对时间（last_read_at 是 Unix 毫秒）。只读展示，不写库。
+    fn reading_ago(at: i64) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(at);
+        let mins = (now - at).max(0) / 60_000;
+        if mins < 1 {
+            "刚刚".into()
+        } else if mins < 60 {
+            format!("{mins} 分钟前")
+        } else if mins < 60 * 24 {
+            format!("{} 小时前", mins / 60)
+        } else if mins < 60 * 24 * 30 {
+            format!("{} 天前", mins / (60 * 24))
+        } else {
+            format!("{} 个月前", mins / (60 * 24 * 30))
+        }
+    }
     fn selected_books(&self) -> Vec<String> {
         self.books
             .iter()
@@ -5475,10 +5494,18 @@ fn detail_chapter_row(ui: &mut Ui, app: &mut ReaderApp, entry: &Book, id: &str, 
                         title.wrap.max_rows = 1;
                         ui.painter()
                             .galley(text_pos, ui.painter().layout_job(title), palette.ink);
+                        let ago = book
+                            .last_read_at
+                            .map(|at| format!(" · {}", Self::reading_ago(at)))
+                            .unwrap_or_default();
                         self.label(
                             ui.painter(),
                             text_pos + vec2(0., 24. * self.font_scale + 4.),
-                            &format!("第 {} / {} 页", book.current_page + 1, book.page_count),
+                            &format!(
+                                "第 {} / {} 页{ago}",
+                                book.current_page + 1,
+                                book.page_count
+                            ),
                             13.,
                             palette.muted,
                         );
@@ -5543,9 +5570,7 @@ fn detail_chapter_row(ui: &mut Ui, app: &mut ReaderApp, entry: &Book, id: &str, 
                 .id_salt("reader-settings")
                 .show(ui, |ui| {
                     ui.style_mut().wrap_mode = Some(TextWrapMode::Wrap);
-                    Frame::new()
-                        .inner_margin(Margin::symmetric(2, 12))
-                        .show(ui, |ui| {
+                    crate::design::grouped_card(ui, palette, |ui| {
                             ui.set_width(ui.available_width());
                             crate::design::section(ui, "外观");
                             ui.label(RichText::new("主题").color(palette.muted).small());
@@ -5602,11 +5627,8 @@ fn detail_chapter_row(ui: &mut Ui, app: &mut ReaderApp, entry: &Book, id: &str, 
                                 self.setting("reduce-motion", self.reduced.to_string());
                             }
                         });
-                    ui.add_space(10.);
-                    ui.separator();
-                    Frame::new()
-                        .inner_margin(Margin::symmetric(2, 16))
-                        .show(ui, |ui| {
+                    ui.add_space(14.);
+                    crate::design::grouped_card(ui, palette, |ui| {
                             ui.set_width(ui.available_width());
                             crate::design::section(ui, "阅读");
                             let mut mode = if self.vertical {
@@ -5671,11 +5693,8 @@ fn detail_chapter_row(ui: &mut Ui, app: &mut ReaderApp, entry: &Book, id: &str, 
                                 self.setting("private", self.private.to_string());
                             }
                         });
-                    ui.add_space(10.);
-                    ui.separator();
-                    Frame::new()
-                        .inner_margin(Margin::symmetric(2, 16))
-                        .show(ui, |ui| {
+                    ui.add_space(14.);
+                    crate::design::grouped_card(ui, palette, |ui| {
                             ui.set_width(ui.available_width());
                             crate::design::section(ui, "追更");
                             ui.label(
@@ -5708,11 +5727,8 @@ fn detail_chapter_row(ui: &mut Ui, app: &mut ReaderApp, entry: &Book, id: &str, 
                                 self.setting("follow-interval", chosen.to_string());
                             }
                         });
-                    ui.add_space(10.);
-                    ui.separator();
-                    Frame::new()
-                        .inner_margin(Margin::symmetric(2, 16))
-                        .show(ui, |ui| {
+                    ui.add_space(14.);
+                    crate::design::grouped_card(ui, palette, |ui| {
                             ui.set_width(ui.available_width());
                             crate::design::section(ui, "进度跟踪（AniList / Kitsu）");
                             let mut sync = self.trackers.auto_sync();
@@ -5762,11 +5778,8 @@ fn detail_chapter_row(ui: &mut Ui, app: &mut ReaderApp, entry: &Book, id: &str, 
                                 }
                             }
                         });
-                    ui.add_space(10.);
-                    ui.separator();
-                    Frame::new()
-                        .inner_margin(Margin::symmetric(2, 16))
-                        .show(ui, |ui| {
+                    ui.add_space(14.);
+                    crate::design::grouped_card(ui, palette, |ui| {
                             ui.set_width(ui.available_width());
                             crate::design::section(ui, "书库与备份");
                             ui.horizontal_wrapped(|ui| {
@@ -5817,11 +5830,8 @@ fn detail_chapter_row(ui: &mut Ui, app: &mut ReaderApp, entry: &Book, id: &str, 
                                 });
                             }
                         });
-                    ui.add_space(10.);
-                    ui.separator();
-                    Frame::new()
-                        .inner_margin(Margin::symmetric(2, 16))
-                        .show(ui, |ui| {
+                    ui.add_space(14.);
+                    crate::design::grouped_card(ui, palette, |ui| {
                             ui.set_width(ui.available_width());
                             CollapsingHeader::new(RichText::new("设备间同步").strong()).show(
                                 ui,
@@ -6179,8 +6189,12 @@ fn detail_chapter_row(ui: &mut Ui, app: &mut ReaderApp, entry: &Book, id: &str, 
                 .frame(
                     Frame::popup(&ctx.style_of(Theme::Dark))
                         .fill(crate::design::palette(true).surface)
-                        .inner_margin(18)
-                        .corner_radius(16),
+                        .inner_margin(20)
+                        .corner_radius(20)
+                        .stroke(Stroke::new(
+                            1.,
+                            crate::design::palette(true).line.gamma_multiply(0.6),
+                        )),
                 )
                 .show(ctx, |ui| {
                     ui.set_width((ctx.content_rect().width() - 56.).clamp(200., 440.));
@@ -6376,7 +6390,11 @@ fn detail_chapter_row(ui: &mut Ui, app: &mut ReaderApp, entry: &Book, id: &str, 
                                 self.rtl = !self.rtl;
                                 self.save_reader_prefs();
                             }
-                            ui.add_space(10.);
+                            ui.add_space(14.);
+                            ui.label(
+                                RichText::new("画面").color(p.muted).small(),
+                            );
+                            ui.add_space(4.);
                             // Grouped toggle rows with animated pill switches.
                             let toggles = [
                                 ("裁剪白边", "reader-crop", self.crop),
