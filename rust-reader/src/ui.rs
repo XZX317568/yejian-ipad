@@ -2031,10 +2031,15 @@ impl ReaderApp {
         } else {
             palette.soft
         };
-        ui.painter().rect_filled(rect, 10., fill);
+        // 饱满胶囊（短边全圆），主按钮加轻落影浮起（S2b）。
+        let radius = rect.height() / 2.;
+        if primary && !response.is_pointer_button_down_on() {
+            crate::design::soft_shadow(ui.painter(), rect, radius, 0.5, self.dark);
+        }
+        ui.painter().rect_filled(rect, radius, fill);
         if !primary {
             ui.painter()
-                .rect_stroke(rect, 10., Stroke::new(1., palette.line), StrokeKind::Inside);
+                .rect_stroke(rect, radius, Stroke::new(1., palette.line), StrokeKind::Inside);
         }
         let text_color = if primary {
             palette.on_accent
@@ -2079,20 +2084,23 @@ impl ReaderApp {
         );
         let p = ui.painter();
         if !id.starts_with("nav-") && !is_reader {
+            // 圆形/胶囊图标钮：surface 底 + 细描边 + 轻落影（S2b 柔和圆钮）。
+            let chip_radius = visual.height() / 2.;
+            if !(response.is_pointer_button_down_on() || response.hovered()) {
+                crate::design::soft_shadow(p, visual, chip_radius, 0.4, self.dark);
+            }
             p.rect_filled(
                 visual,
-                12.,
+                chip_radius,
                 if response.is_pointer_button_down_on() || response.hovered() {
                     palette.accent_soft
                 } else {
-                    // `soft` sits one step above the shelf stage so the pager
-                    // buttons stay legible in dark mode without a heavy frame.
-                    palette.soft
+                    palette.surface
                 },
             );
             p.rect_stroke(
                 visual,
-                12.,
+                chip_radius,
                 Stroke::new(1., palette.line),
                 StrokeKind::Inside,
             );
@@ -2768,14 +2776,10 @@ impl ReaderApp {
                 pos2(full.right(), full.bottom() + bottom_inset),
             )
         };
-        ui.painter()
-            .rect_filled(rail, 0., palette.surface);
-        if !tablet {
-            ui.painter().line_segment(
-                [rail.left_top(), rail.right_top()],
-                Stroke::new(1., palette.line),
-            );
-        } else {
+        // 毛玻璃浮层：双层柔和落影 + 近不透明暖白 + 顶部微高光细边，
+        // 顶栏/书群可以从栏底微微透出（S2b：translucent_bar 首次挂接）。
+        crate::design::translucent_bar(ui.painter(), rail, palette, self.dark, 0);
+        if tablet {
             ui.painter().line_segment(
                 [rail.right_top(), rail.right_bottom()],
                 Stroke::new(1., palette.line),
@@ -2838,8 +2842,10 @@ impl ReaderApp {
         }
         let pill = Self::nav_pill_rect(&slots, pill_pos);
         self.hitboxes.insert("nav-pill".into(), pill);
-        // 侧栏与底栏激活态统一为同一种几何：同绿、同内边距、同「胶囊」
-        // 圆角（短边全圆），不再一处圆角矩形一处胶囊（P1-4）。
+        // 侧栏与底栏激活态统一为同一种几何：同暖琥珀软底、同内边距、同
+        // 「胶囊」圆角（短边全圆），不再一处圆角矩形一处胶囊（P1-4）；
+        // 药丸加一层极轻的落影，浮在毛玻璃栏面上（S2b）。
+        crate::design::soft_shadow(ui.painter(), pill, pill.height() / 2., 0.35, self.dark);
         ui.painter()
             .rect_filled(pill, pill.height() / 2., palette.accent_soft);
         for (i, (tab, label, kind)) in tabs.into_iter().enumerate() {
@@ -2871,26 +2877,43 @@ impl ReaderApp {
                     Color32::WHITE,
                 );
             }
+            let label_pos = if expanded {
+                pos2(rect.left() + 55., rect.center().y)
+            } else if tablet {
+                rect.center() + vec2(0., 8.)
+            } else {
+                rect.center() + vec2(0., 11.)
+            };
+            let label_color = if tab == self.tab {
+                palette.accent
+            } else {
+                palette.muted
+            };
+            let label_font = FontId::proportional(if expanded { 16. } else { 12. });
+            // 激活标签半粗感：字体没有真粗体时以 0.7pt 偏移重绘一遍。
+            if tab == self.tab {
+                ui.painter().text(
+                    label_pos + vec2(0.7, 0.),
+                    if expanded {
+                        Align2::LEFT_CENTER
+                    } else {
+                        Align2::CENTER_TOP
+                    },
+                    label,
+                    label_font.clone(),
+                    label_color,
+                );
+            }
             ui.painter().text(
-                if expanded {
-                    pos2(rect.left() + 55., rect.center().y)
-                } else if tablet {
-                    rect.center() + vec2(0., 8.)
-                } else {
-                    rect.center() + vec2(0., 11.)
-                },
+                label_pos,
                 if expanded {
                     Align2::LEFT_CENTER
                 } else {
                     Align2::CENTER_TOP
                 },
                 label,
-                FontId::proportional(if expanded { 16. } else { 12. }),
-                if tab == self.tab {
-                    palette.accent
-                } else {
-                    palette.muted
-                },
+                label_font,
+                label_color,
             );
             let text_clicked = ui
                 .interact(
@@ -3124,16 +3147,9 @@ impl ReaderApp {
         // 宽屏：把底部展签让出来，让扇形在"上方可用区域"里垂直居中，
         // 避免书全都压在屏幕底部（2026-11-23 用 analyze-layout.ps1 量出来的问题）。
         let shelf_area = self.shelf_paint_area(area);
-        // P2-3：舞台底色比纸面深约 4%，弱光下边界也能读出来。
-        let stage_color = if self.dark {
-            Color32::from_rgb(35, 38, 34)
-        } else {
-            Color32::from_rgb(226, 224, 213)
-        };
-        // 窄档舞台与宽档同语义：满幅直边纸面带，不再画 22pt 圆角卡片（P1-2）。
-        if !layout.side_by_side {
-            ui.painter().rect_filled(layout.stage, 0., stage_color);
-        }
+        // S2b：窄档不再垫大灰黄舞台色块——立体书群带各自接触阴影，
+        // 直接立在统一的暖白纸面上；分屏不再出现割裂的色带（旧
+        // stage_color 226,224,213/35,38,34 硬编码已移除）。
         // 右侧栏与竖分隔线已下线：书架占满，信息改到底部展签。
         let volumes =
             shelf::geometry_wide(shelf_area, books.len(), self.motion.focus, entrance, layout.wide);
@@ -3190,14 +3206,8 @@ impl ReaderApp {
         // The row is an endless shelf, so spines must dissolve into the page
         // instead of ending on a hard clip line.
         {
-            // P2-3：渐隐带溶解到"舞台实际所在的那层底色"——窄档舞台已填色
-            // 用舞台色，宽档舞台不填色则溶进纸面，不然左右两条 30pt 米色带
-            // 会像描边一样突兀（分屏档右缘硬边同理）。
-            let background = if layout.side_by_side {
-                self.colors().0
-            } else {
-                stage_color
-            };
+            // 舞台色块下线后，左右渐隐带统一溶解进纸面底色（S2b）。
+            let background = self.colors().0;
             let clear =
                 Color32::from_rgba_unmultiplied(background.r(), background.g(), background.b(), 0);
             let fade = 30.;
@@ -3321,7 +3331,8 @@ impl ReaderApp {
             ink,
         );
         let palette = crate::design::palette(self.dark);
-        let mut progress_y = info.y + title.size().y + 10.;
+        // 标题与副标题（章节/进度）间留白加大，字重层级更舒展（S2b）。
+        let mut progress_y = info.y + title.size().y + 12.;
         // A quiet metadata pill rides under the title on wide layouts.
         // 展签太矮时先让位：iPad-11 横屏 pill 会顶掉分隔线与按钮的空档。
         if layout.side_by_side
@@ -3372,9 +3383,10 @@ impl ReaderApp {
         let progress = ui.painter().layout_job(progress);
         // Keep the action with the title and progress when the column scrolls.
         // 展签式布局：按钮必须留在舞台内，不允许被挤到屏幕外。
-        // +30 而不是 +18：给下方 3pt 分隔线留 12pt 空档，线始终锚在文本与按钮之间。
-        let action_y = (progress_y + progress.size().y + 30.)
-            .min(layout.info.bottom() - 56.)
+        // +34：进度与按钮行之间多留呼吸位，同时给下方 3pt 分隔线留 12pt 空档。
+        // 底夹 -58 保证 52pt 按钮底缘距展签底 ≥6pt。
+        let action_y = (progress_y + progress.size().y + 34.)
+            .min(layout.info.bottom() - 58.)
             .max(layout.info.top() + 40.);
         let target_fraction = if has_progress {
             (book.current_page + 1) as f32 / book.page_count.max(1) as f32
@@ -3441,7 +3453,7 @@ impl ReaderApp {
             .clamp(inner_left, (inner_right - group_w).max(inner_left));
         let open_rect = Rect::from_min_size(
             pos2(group_left + action_width + 12., action_y),
-            vec2(detail_width, 50.),
+            vec2(detail_width, 52.),
         );
         if self.selected.is_empty() && self.button(ui, "open-book", open_rect, "详情", false) {
             if let Some(volume) = volumes
@@ -3453,7 +3465,7 @@ impl ReaderApp {
         }
         let action = Rect::from_min_size(
             pos2(group_left, action_y),
-            vec2(action_width, 50.),
+            vec2(action_width, 52.),
         );
         if self.selected.is_empty()
             && self.button(

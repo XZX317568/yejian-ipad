@@ -16,17 +16,26 @@ pub(crate) struct Palette {
 
 /// Light accent triplets for the A/B/C judgement variants.
 /// YEJIAN_ACCENT_VARIANT = A (amber, default) | B (spine brown) | C (ink).
+/// Parsed once and cached: palette() is called for every surface each frame,
+/// so a per-call env read + String allocation was pure waste (L-S1-10).
 fn accent_variant() -> (u8, u8, u8, u8, u8, u8, u8, u8, u8) {
-    match std::env::var("YEJIAN_ACCENT_VARIANT")
-        .unwrap_or_else(|_| "A".into())
-        .trim()
-        .to_ascii_uppercase()
-        .as_str()
-    {
-        "B" => (168, 93, 40, 244, 231, 218, 255, 253, 249),
-        "C" => (44, 38, 33, 235, 230, 222, 255, 253, 249),
-        _ => (200, 125, 47, 247, 234, 217, 255, 253, 249),
-    }
+    static VARIANT: std::sync::OnceLock<(u8, u8, u8, u8, u8, u8, u8, u8, u8)> =
+        std::sync::OnceLock::new();
+    *VARIANT.get_or_init(|| {
+        match std::env::var("YEJIAN_ACCENT_VARIANT")
+            .unwrap_or_else(|_| "A".into())
+            .trim()
+            .to_ascii_uppercase()
+            .as_str()
+        {
+            "B" => (168, 93, 40, 244, 231, 218, 255, 253, 249),
+            "C" => (44, 38, 33, 235, 230, 222, 255, 253, 249),
+            // Variant A deepened to #B0621A: warm amber-brown keeps the
+            // Apple Books glow and lifts on_accent white text past WCAG AA
+            // (>=4.6:1, previously ~3.2:1 at 200,125,47 — L-S1-07).
+            _ => (176, 98, 26, 247, 234, 217, 255, 253, 249),
+        }
+    })
 }
 
 pub(crate) fn palette(dark: bool) -> Palette {
@@ -146,22 +155,23 @@ pub(crate) fn theme_choice(
         pos2(rect.right() - 12., rect.top() + 59.),
     );
     let preview_dark = kind == "dark";
+    // Warm-charcoal night / warm paper — the old green-tinged swatches are gone.
     let bg = if preview_dark {
-        Color32::from_rgb(32, 38, 34)
+        Color32::from_rgb(32, 29, 26)
     } else {
-        Color32::from_rgb(244, 242, 234)
+        Color32::from_rgb(244, 240, 231)
     };
     ui.painter().rect_filled(preview, 5., bg);
     if kind == "system" {
         ui.painter().rect_filled(
             Rect::from_min_max(pos2(preview.center().x, preview.top()), preview.max),
             5.,
-            Color32::from_rgb(32, 38, 34),
+            Color32::from_rgb(32, 29, 26),
         );
     }
     let book = Rect::from_min_size(preview.min + vec2(8., 7.), vec2(22., 34.));
     ui.painter()
-        .rect_filled(book, 2., Color32::from_rgb(135, 151, 123));
+        .rect_filled(book, 2., Color32::from_rgb(196, 142, 78));
     for (offset, fraction) in [(12., 0.60), (21., 0.42), (31., 0.50)] {
         ui.painter().line_segment(
             [
