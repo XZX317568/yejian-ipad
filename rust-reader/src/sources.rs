@@ -4700,6 +4700,69 @@ impl Sources {
         let palette = design::palette(dark);
         ui.vertical(|ui| {
             ui.set_min_width(ui.available_width());
+            // Measure first, then commit to one row or two: a title that only
+            // half-fits was leaving a lone glyph orphaned at the row edge.
+            let (name, site) = {
+                let source = self
+                    .installed
+                    .iter()
+                    .find(|source| source.manifest.id == self.selected_source);
+                let name = source
+                    .map(|s| s.manifest.name.clone())
+                    .unwrap_or_default();
+                let site = source
+                    .and_then(|s| s.manifest.primary_url().map(str::to_string))
+                    .filter(|_| cfg!(target_os = "ios"));
+                (name, site)
+            };
+            let has_settings =
+                !self.selected_source.is_empty() && !self.current_settings().is_empty();
+            let button_font = TextStyle::Button.resolve(ui.style());
+            let galley = |ui: &Ui, text: String, font: FontId| {
+                ui.painter().layout_no_wrap(text, font, palette.ink).size().x
+            };
+            let action_width = |ui: &Ui, text: &str| {
+                (galley(ui, text.to_string(), button_font.clone())
+                    + ui.spacing().button_padding.x * 2.)
+                    .max(44.)
+            };
+            let gap = ui.spacing().item_spacing.x;
+            let mut need = action_width(ui, "‹ 我的书源")
+                + gap
+                + galley(ui, name.clone(), TextStyle::Heading.resolve(ui.style()));
+            for (present, text) in [(has_settings, "书源设置"), (site.is_some(), "网页验证")] {
+                if present {
+                    need += gap + action_width(ui, text);
+                }
+            }
+            // One emphasis per screen: when the name no longer shares the row it
+            // wraps as its own block instead of leaving a stray glyph behind.
+            let stacked = need > ui.available_width();
+            let title_row = |ui: &mut Ui| {
+                ui.add(
+                    Label::new(RichText::new(name.clone()).heading().strong().color(palette.ink))
+                        .wrap(),
+                );
+            };
+            let action_row = |ui: &mut Ui, this: &mut Self| {
+                if has_settings
+                    && ui
+                        .add(quiet_action("书源设置"))
+                        .on_hover_text("打开此书源的账号与参数设置")
+                        .clicked()
+                {
+                    this.settings_open = true;
+                }
+                if let Some(site) = &site {
+                    if ui
+                        .add(quiet_action("网页验证"))
+                        .on_hover_text("在浏览器里通过书源的人机验证")
+                        .clicked()
+                    {
+                        this.open_web(site, None);
+                    }
+                }
+            };
             ui.horizontal_wrapped(|ui| {
                 if ui
                     .add(quiet_action("‹ 我的书源"))
@@ -4708,39 +4771,14 @@ impl Sources {
                 {
                     self.select_source("");
                 }
-                let name = self
-                    .installed
-                    .iter()
-                    .find(|source| source.manifest.id == self.selected_source)
-                    .map(|source| source.manifest.name.as_str())
-                    .unwrap_or("");
-                ui.add(
-                    Label::new(RichText::new(name).heading().strong().color(palette.ink)).wrap(),
-                );
-                if !self.selected_source.is_empty()
-                    && !self.current_settings().is_empty()
-                    && ui
-                        .add(quiet_action("书源设置"))
-                        .on_hover_text("打开此书源的账号与参数设置")
-                        .clicked()
-                {
-                    self.settings_open = true;
+                if !stacked {
+                    title_row(ui);
                 }
-                let site = self
-                    .installed
-                    .iter()
-                    .find(|source| source.manifest.id == self.selected_source)
-                    .and_then(|source| source.manifest.primary_url().map(str::to_string));
-                if let Some(site) = site.filter(|_| cfg!(target_os = "ios")) {
-                    if ui
-                        .add(quiet_action("网页验证"))
-                        .on_hover_text("在浏览器里通过书源的人机验证")
-                        .clicked()
-                    {
-                        self.open_web(&site, None);
-                    }
-                }
+                action_row(ui, self);
             });
+            if stacked {
+                title_row(ui);
+            }
             if self.selected_source.is_empty() {
                 return;
             }
