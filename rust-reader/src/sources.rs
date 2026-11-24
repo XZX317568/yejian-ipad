@@ -79,6 +79,7 @@ fn source_item(
     metadata: &str,
     initial: bool,
     enabled: bool,
+    separator: bool,
 ) -> bool {
     let palette = design::palette(ui.visuals().dark_mode);
     let width = ui.available_width();
@@ -91,13 +92,17 @@ fn source_item(
         text_width,
     );
     title_job.wrap.max_rows = 2;
+    title_job.wrap.overflow_character = Some('…');
     let title_galley = ui.painter().layout_job(title_job);
-    let metadata_galley = ui.painter().layout(
+    let mut metadata_job = egui::text::LayoutJob::simple(
         metadata.to_owned(),
         TextStyle::Small.resolve(ui.style()),
         palette.muted,
         text_width,
     );
+    metadata_job.wrap.max_rows = 1;
+    metadata_job.wrap.overflow_character = Some('…');
+    let metadata_galley = ui.painter().layout_job(metadata_job);
     let text_height = title_galley.size().y
         + if metadata.is_empty() {
             0.
@@ -155,13 +160,15 @@ fn source_item(
         [c + vec2(2., 0.), c + vec2(-3., 5.)],
         Stroke::new(1.5, palette.muted),
     );
-    painter.line_segment(
-        [
-            pos2(rect.left() + leading, rect.bottom()),
-            pos2(rect.right(), rect.bottom()),
-        ],
-        Stroke::new(1., palette.line),
-    );
+    if separator {
+        painter.line_segment(
+            [
+                pos2(rect.left() + leading, rect.bottom()),
+                pos2(rect.right(), rect.bottom()),
+            ],
+            Stroke::new(1., palette.line),
+        );
+    }
     enabled && response.clicked()
 }
 #[derive(Clone)]
@@ -416,19 +423,80 @@ fn paint_cover(
             );
         }
         None => {
-            painter.rect_filled(rect, 8., palette.accent_soft);
-            if let Some(initial) = title.chars().next() {
-                painter.text(
-                    rect.center(),
-                    Align2::CENTER_CENTER,
-                    initial.to_string(),
-                    font,
-                    palette.muted,
-                );
-            }
+            paint_cover_placeholder(painter, rect, title, font, palette);
         }
     }
     painter.rect_stroke(rect, 8., Stroke::new(1., palette.line), StrokeKind::Inside);
+}
+
+/// Paper-toned placeholder for covers without art: a warm accent_soft leaf
+/// with a darker spine strip, a groove + ridge highlight pair like the shelf
+/// volumes, and the title printed on the cover (wrapped, …-truncated) so a
+/// no-image sample still reads as a book instead of a flat grey tile.
+fn paint_cover_placeholder(
+    painter: &Painter,
+    rect: Rect,
+    title: &str,
+    font: FontId,
+    palette: &crate::design::Palette,
+) {
+    painter.rect_filled(rect, 8., palette.accent_soft);
+    let spine_w = (rect.width() * 0.12).clamp(8., 16.);
+    let spine = Rect::from_min_max(
+        rect.min,
+        pos2(rect.left() + spine_w, rect.bottom()),
+    );
+    // Inset the strip so it does not bleed past the rounded corner arc.
+    let spine_inner = Rect::from_min_max(
+        spine.min + vec2(0., 8.),
+        spine.max - vec2(0., 8.),
+    );
+    painter.rect_filled(spine_inner, 1., palette.accent.linear_multiply(0.45));
+    let groove_x = rect.left() + spine_w;
+    painter.line_segment(
+        [
+            pos2(groove_x, spine_inner.top()),
+            pos2(groove_x, spine_inner.bottom()),
+        ],
+        Stroke::new(1., palette.ink.linear_multiply(0.16)),
+    );
+    painter.line_segment(
+        [
+            pos2(groove_x + 1., spine_inner.top()),
+            pos2(groove_x + 1., spine_inner.bottom()),
+        ],
+        Stroke::new(1., Color32::WHITE.linear_multiply(0.4)),
+    );
+    if title.trim().is_empty() {
+        return;
+    }
+    let body = Rect::from_min_max(
+        pos2(groove_x + 8., rect.top() + 8.),
+        rect.max - vec2(8., 8.),
+    );
+    let mut job = egui::text::LayoutJob::simple(
+        title.to_owned(),
+        font,
+        palette.ink,
+        body.width().max(1.),
+    );
+    job.halign = Align::Center;
+    job.wrap.max_rows = 3;
+    // Single-token titles (CJK names without spaces) only get the ellipsis
+    // once the wrapper is allowed to break inside the word.
+    job.wrap.break_anywhere = true;
+    job.wrap.overflow_character = Some('…');
+    let galley = painter.layout_job(job);
+    // A centered `halign` lays the galley out around x=0 (its `rect` is
+    // roughly [-w/2, w/2]), so anchor at body.center - galley.rect.center
+    // instead of subtracting half the galley size.
+    let origin = pos2(
+        body.center().x - galley.rect.center().x,
+        body.center().y - galley.rect.center().y,
+    );
+    painter
+        .with_clip_rect(body.intersect(rect))
+        .galley(origin, galley, palette.ink);
 }
 /// One finished chapter ready for `Command::ImportChapter`.
 
@@ -3126,7 +3194,7 @@ impl Sources {
             let snapshot = follow.snapshot.clone();
             let top = ui.cursor().top();
             let left = ui.cursor().left();
-            if source_item(ui, ("follow", index), &follow.title, &detail, true, true) {
+            if source_item(ui, ("follow", index), &follow.title, &detail, true, true, true) {
                 open = Some(index);
             }
             let bottom = ui.min_rect().bottom();
@@ -5139,45 +5207,52 @@ impl Sources {
     }
 
     fn installed_ui(&mut self, ui: &mut Ui) {
+        let palette = design::palette(ui.visuals().dark_mode);
         design::section(ui, "我的书源");
-        for source in self.installed.clone() {
-            let languages = source
-                .manifest
-                .languages
-                .iter()
-                .map(|lang| language_label(lang))
-                .collect::<Vec<_>>()
-                .join(" / ");
-            let metadata = if languages.is_empty() {
-                format!("v{}", source.manifest.version)
-            } else {
-                format!("{languages} · v{}", source.manifest.version)
-            };
-            if source_item(
-                ui,
-                ("installed", &source.manifest.id),
-                &source.manifest.name,
-                &metadata,
-                true,
-                true,
-            ) {
-                self.select_source(&source.manifest.id);
+        let installed = self.installed.clone();
+        let last = installed.len().saturating_sub(1);
+        design::grouped_card(ui, palette, |ui| {
+            ui.set_width(ui.available_width());
+            for (index, source) in installed.iter().enumerate() {
+                let languages = source
+                    .manifest
+                    .languages
+                    .iter()
+                    .map(|lang| language_label(lang))
+                    .collect::<Vec<_>>()
+                    .join(" / ");
+                let metadata = if languages.is_empty() {
+                    format!("v{}", source.manifest.version)
+                } else {
+                    format!("{languages} · v{}", source.manifest.version)
+                };
+                if source_item(
+                    ui,
+                    ("installed", &source.manifest.id),
+                    &source.manifest.name,
+                    &metadata,
+                    true,
+                    true,
+                    index != last,
+                ) {
+                    self.select_source(&source.manifest.id);
+                }
             }
-        }
+        });
     }
 
     fn repository_entry_ui(&mut self, ui: &mut Ui) {
         let palette = design::palette(ui.visuals().dark_mode);
-        ui.vertical(|ui| {
-            ui.set_min_width(ui.available_width());
-            design::section(
-                ui,
-                if self.installed.is_empty() {
-                    "添加你的第一个书源"
-                } else {
-                    "发现更多书源"
-                },
-            );
+        design::section(
+            ui,
+            if self.installed.is_empty() {
+                "添加你的第一个书源"
+            } else {
+                "发现更多书源"
+            },
+        );
+        design::grouped_card(ui, palette, |ui| {
+            ui.set_width(ui.available_width());
             if self.installed.is_empty() {
                 ui.add(
                     Label::new(
@@ -5190,7 +5265,8 @@ impl Sources {
             if ui
                 .add_enabled(
                     !self.busy,
-                    design::primary("社区源", ui.visuals().dark_mode),
+                    design::primary("社区源", ui.visuals().dark_mode)
+                        .min_size(vec2(ui.available_width(), 48.)),
                 )
                 .clicked()
             {
@@ -5205,6 +5281,7 @@ impl Sources {
                         .hint_text("粘贴书源仓库地址")
                         .desired_width(ui.available_width()),
                 );
+                ui.add_space(4.);
                 if ui
                     .add_enabled(!self.busy, bordered_action("读取", ui.visuals().dark_mode))
                     .clicked()
@@ -5215,8 +5292,14 @@ impl Sources {
         });
     }
 
-    fn repository_source_ui(&mut self, ui: &mut Ui, source: &RepositorySource) {
+    fn repository_source_ui(
+        &mut self,
+        ui: &mut Ui,
+        source: &RepositorySource,
+        separator: bool,
+    ) {
         let palette = design::palette(ui.visuals().dark_mode);
+        let dark = ui.visuals().dark_mode;
         let existing = self.installed.iter().find(|s| s.manifest.id == source.id);
         let installed = existing.is_some_and(|s| s.manifest.version >= source.version);
         let label = if installed {
@@ -5226,24 +5309,24 @@ impl Sources {
         } else {
             "安装"
         };
-        let metadata = source
+        let languages = source
             .languages
             .iter()
             .map(|lang| language_label(lang))
             .collect::<Vec<_>>()
             .join(" / ");
+        let metadata = if languages.is_empty() {
+            format!("v{}", source.version)
+        } else {
+            format!("{languages} · v{}", source.version)
+        };
         let title = |ui: &mut Ui| {
             ui.add(Label::new(RichText::new(&source.name).strong()).wrap());
             if !metadata.is_empty() {
                 ui.add(Label::new(RichText::new(&metadata).small().color(palette.muted)).wrap());
             }
         };
-        let action = || {
-            Button::new(RichText::new(label).color(palette.accent))
-                .frame_when_inactive(false)
-                .min_size(vec2(44., 44.))
-                .wrap()
-        };
+        let action = || bordered_action(label, dark);
         ui.add_space(4.);
         let scale = (ui.text_style_height(&TextStyle::Body) / 20.).max(1.);
         let clicked = if ui.available_width() < 300. * scale {
@@ -5268,7 +5351,22 @@ impl Sources {
             self.submit(Task::Install(source.clone()));
         }
         ui.add_space(4.);
-        ui.separator();
+        if separator {
+            ui.separator();
+        }
+    }
+
+    /// One grouped card of installable rows; the last row drops its hairline
+    /// so the list reads as a single inset group like the installed card.
+    fn repository_group(&mut self, ui: &mut Ui, sources: &[&RepositorySource]) {
+        let palette = design::palette(ui.visuals().dark_mode);
+        let last = sources.len().saturating_sub(1);
+        design::grouped_card(ui, palette, |ui| {
+            ui.set_width(ui.available_width());
+            for (index, source) in sources.iter().enumerate() {
+                self.repository_source_ui(ui, source, index != last);
+            }
+        });
     }
 
     fn repository_ui(&mut self, ui: &mut Ui) {
@@ -5330,6 +5428,12 @@ impl Sources {
             if sources.is_empty() {
                 ui.add(Label::new("没有匹配的书源").wrap());
             } else if ui.available_width() >= 760. * scale {
+                // Two columns keep the original round-robin order; each column
+                // is its own grouped card so borders never double up.
+                let mut columns: [Vec<&RepositorySource>; 2] = [Vec::new(), Vec::new()];
+                for (index, source) in sources.iter().enumerate() {
+                    columns[index % 2].push(*source);
+                }
                 let item_gap = ui.spacing().item_spacing.x;
                 ui.scope(|ui| {
                     ui.spacing_mut().item_spacing.x = 32.;
@@ -5337,15 +5441,15 @@ impl Sources {
                         for column in uis.iter_mut() {
                             column.spacing_mut().item_spacing.x = item_gap;
                         }
-                        for (index, source) in sources.iter().enumerate() {
-                            self.repository_source_ui(&mut uis[index % 2], source);
+                        for (index, column) in columns.iter().enumerate() {
+                            if !column.is_empty() {
+                                self.repository_group(&mut uis[index], column);
+                            }
                         }
                     });
                 });
             } else {
-                for source in sources {
-                    self.repository_source_ui(ui, source);
-                }
+                self.repository_group(ui, &sources);
             }
         }
     }
@@ -8966,5 +9070,4 @@ mod tests {
         assert_eq!(sources.query, "");
         assert!(matches!(sources.failed.as_ref(), Some(Task::Search { query, .. }) if query.is_empty()));
         assert_eq!(sources.request_id, 1, "an empty query is still a real search");
-    }
-}
+    }}
