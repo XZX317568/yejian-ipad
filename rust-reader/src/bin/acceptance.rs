@@ -1095,7 +1095,7 @@ fn filters_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
     // Cancelling a changed draft preserves the submitted filter.
     h.click_text("筛选（1）")?;
     h.frames(3)?;
-    h.click_text("恋爱")?;
+    click_text_scrolled(h, "恋爱")?;
     h.click_text("取消")?;
     h.frames(3)?;
     anyhow::ensure!(
@@ -1130,11 +1130,11 @@ fn filters_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
     h.click_text("重置")?;
     h.frames(2)?;
     // Default 热血 is removed by cycling include -> exclude -> neutral.
-    h.click_text("✓ 热血")?;
+    click_text_scrolled(h, "✓ 热血")?;
     h.frames(2)?;
-    h.click_text("− 热血")?;
+    click_text_scrolled(h, "− 热血")?;
     h.frames(2)?;
-    h.click_text("治愈")?;
+    click_text_scrolled(h, "治愈")?;
     h.click_text("应用筛选")?;
     h.wait(|app| app.source_browser_report()["results"][0] == "筛选:含治愈")?;
     h.frames(3)?;
@@ -1246,6 +1246,18 @@ fn filters_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
 /// 用 band 下缘——即边界是 staircase，逐 band 右跳 slant/bands。
 /// 两个采样行落在封面卡艺术区（y∈[335,775]），避开圆角顶/底与标题行；
 /// 标题行（y≈825）只断言未揭示侧=底色（R2：文字 alpha≈0 的穿帮锚点）。
+/// Detail cover card on iPad portrait (ui::detail_cover_rect): rows are
+/// derived from the card so both the mid-frame capture and the check itself
+/// follow layout retunes. Returns (left, top, width, height).
+fn detail_card_rect(w: f32, hgt: f32) -> (f32, f32, f32, f32) {
+    let card_w = (hgt * 0.25).clamp(250., 320.);
+    let card_h = card_w * 166. / 118.;
+    let block = card_h + 220.;
+    let card_top = 24. + 84. + (hgt - 84. - 24. - block).max(0.) * 0.40;
+    let card_left = w / 2. - card_w / 2.;
+    (card_left, card_top, card_w, card_h)
+}
+
 fn spread_mid_check(h: &Harness, p: f32) -> Result<()> {
     let area_top = 24.;
     let w = h.size[0] as f32;
@@ -1257,13 +1269,7 @@ fn spread_mid_check(h: &Harness, p: f32) -> Result<()> {
         dx < 0.,
         "spread_mid_check assumes dir=+1 (dx={dx}) — generalize before flipping spread.dir"
     );
-    // Detail cover card on iPad portrait (ui::detail_cover_rect): rows are
-    // derived from the card so the check follows layout retunes.
-    let card_w = (hgt * 0.25).clamp(250., 320.);
-    let card_h = card_w * 166. / 118.;
-    let block = card_h + 220.;
-    let card_top = area_top + 84. + (hgt - 84. - 24. - block).max(0.) * 0.40;
-    let card_left = w / 2. - card_w / 2.;
+    let (card_left, card_top, card_w, card_h) = detail_card_rect(w, hgt);
     // The visible copy is the shifted incoming plane: art rect is the card
     // translated by (dx, dy).
     let art_left = card_left + dx;
@@ -1435,22 +1441,35 @@ fn ipad_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
         h.frames(10)?;
         h.click("open-book")?;
         if name == "portrait" {
-            // 摊开中点帧（spec §7 像素断言）：首个 eased p>=0.5 的帧。
+            // 摊开中点帧（spec §7 像素断言）：斜扫前缘扫到卡艺横向中心的帧。
+            // r2=B 参数下 p 轴已平移（start .35 / shift_x 40），裸 p>=0.5 时
+            // 前缘已越过卡片右缘，故以卡艺几何定位中点而非固定进度阈值。
             // 斜扫期间 flight mesh 隐藏，未揭示区 = 纸底色。
+            let w = size[0] as f32;
+            let hgt = size[1] as f32 - 24. - 20.;
+            let slant = yejian::motion_spread_slant(w);
+            let bands = 8f32.max((slant / 8.).ceil());
+            let (card_left, card_top, card_w, card_h) = detail_card_rect(w, hgt);
+            let mid_y = card_top + card_h * 0.5;
             let mut mid = false;
             let mut mid_p = 0f32;
             for i in 1..=45usize {
                 let p = yejian::motion_spread_progress(
                     (i as f64 * h.dt / yejian::motion_open_seconds()).min(1.) as f32,
                 );
-                let capture = !mid && p >= 0.5;
+                // incoming 平面位移随 p 收敛，卡艺中心跟着 dx 左移。
+                let (dx, dy) = yejian::motion_spread_offset(p);
+                let edge = yejian::motion_spread_edge(w, slant, p);
+                let frac = ((mid_y + dy - 24.) / hgt).clamp(0., 1.);
+                let front = edge - slant * (frac * bands).ceil() / bands;
+                let capture = !mid && front >= card_left + card_w * 0.5 + dx;
                 if capture {
                     mid = true;
                     mid_p = p;
                 }
                 h.frame(vec![], capture.then_some("spread-mid"))?;
             }
-            anyhow::ensure!(mid, "spread sweep never reached p=0.5");
+            anyhow::ensure!(mid, "spread sweep never crossed the card centre");
             h.frames(20)?;
             spread_mid_check(h, mid_p)?;
         } else {
