@@ -6,6 +6,8 @@
 
 ## 阶段计划（外部评审后修订：先基建，再动形变）
 
+> **当前阶段（2026-11-24 起）**：UI 重构 S0–S6（Apple Books 暖白原生风 × 实体书脊融合，深耕 Rust egui/wgpu），详见 `工程清单.md`；下方阶段 0–5 为已完成历史。
+
 - ✅ **阶段 0 · 调参基建**
   - ✅ **参数外置**：`rust-reader/src/params.rs` + `rust-reader/params.json`（`YEJIAN_PARAMS` 可覆盖路径，含 `paper` / `snap` / `weight` / `ease` 四组）。**证据**：同一份已编译产物，改 `paper.base` 17→0 后 `motion/frame-045/060/075.png` 三帧 SHA256 全部不同，且无需重新编译。日志 `.tools/loop-baseline/stage0-params-live.log`
   - ✅ **录制管线**：`tools/record.ps1`（多变体 → 各自 mp4 → `hstack` 并排 `compare.mp4`）。ffmpeg 已验证可用：160 帧 → `artifacts/rust/stage0/body.mp4`（30fps，2.7s @60fps）
@@ -18,7 +20,6 @@
   - ⚠️ 第一版录制**看不见飞行段**：`h.frame()` 每帧固定推进 1/60s，而飞行只 0.72s ⇒ 只有 ~43 帧，剩下全是静止的详情页。已加 `Harness.dt`，录制时开放段按 1/240 推进（4 倍慢动作）。
   - 裁决素材（2026-11-23 三次重录=P1-6立体化后，310 帧全链）：r2/r3/r4 各有 compare.mp4 与 {A,B,C}/variant-*.mp4；摊开段书保持立体 morph（非平面卡片）
 - **2026-11-23 裁决结果：r2=r3=r4=B（纸感全套）**——常量已落进 params.rs：spread slant_pct .46→.30 / start .45→.35 / shift_x 24→40；flip turn_ms 180→240 / commit_vx 500→350 / depth 22→34 / band .35→.50 / edge_shade .10→.16；close exit_ms 320→420 / under_alpha .5→.3 / travel 580→680。完整 acceptance EXIT=0 不回归
-  - **2026-11-23 裁决结果：r2=r3=r4=B（纸感全套）**。常量已落进 params.rs（B 值替换默认值）：spread slant_pct .46→.30 / start .45→.35 / shift_x 24→40；flip turn_ms 180→240 / commit_vx 500→350 / depth 22→34 / band .35→.50 / edge_shade .10→.16；close exit_ms 320→420 / under_alpha .5→.3 / travel 580→680。完整 acceptance EXIT=0 不回归
   - 裁决素材：`artifacts/rust/record/r1/compare.mp4`（三宫格 8s）与 `contact.png`（3 行 × 4 关键时刻拼图，`tools/contact-sheet.ps1` 生成）
   - ✅ **裁决：A**（2026-11-23，用户在 `preview/` 里用 A/B/C 三个启动器亲手试过后选定）→ 阶段 1 完成
 - ✅ **阶段 2 · 摊开**：核心链路已入库（`0f43700`，斜扫 clip 揭示 + spread 参数组）；三变体已录 `artifacts/rust/record/r2/compare.mp4`；preview 已加 试-r2-A/B/C 启动器 → **2026-11-23 用户裁决：B（翻页感纸面）**
@@ -77,7 +78,7 @@
 | 用途 | 怎么用 |
 |---|---|
 | 本地离屏 (Windows) | `cd rust-reader` → `$env:YEJIAN_IPAD_ONLY='1'; cargo run --locked -j 1 --features acceptance --bin acceptance -- ..\\artifacts\\rust\\<目录>`，8 档 iPad 矩阵约 45 秒（增量） |
-| 云 macOS | `devin ssh 90712f860a83471a97ad0584fbeac1e5 '<cmd>'` —— **不消耗模型额度**；有 Xcode 26.6 + 6 台 iPad 模拟器；磁盘仅 17GB 空闲 |
+| 云 macOS | `devin ssh 90712f860a83471a97ad0584fbeac1e5 '<cmd>'` —— **不消耗模型额度**；有 Xcode 26.6 + 6 台 iPad 模拟器。**会话已于 2026-11-24 ended**（r5 真机 check 后 SSH `Session has ended`，raw log 未取回）；不再把「17GB 可用」当现状 |
 | 代码同步 | 推 `work/*` 分支到 `XZX317568/yejian-ipad`（PUBLIC），云端 `git clone` |
 | 外部顾问 | Gemini Neon（驱动桌面端，截图读回）／SWE-2 子代理（免费，262K 窗口） |
 | 每轮收尾 | `tools/loop-check.ps1`（环境闸门 + 锁 + git + 测试 + STATE 证据核对；`-Full` 加跑离屏验收）。**每轮必须 LOOP-CHECK PASS 才能报完成** |
@@ -88,15 +89,27 @@
 | 轮 | 变体 A / B / C | 选中 | 时间 |
 |---|---|---|---|
 | 阶段 1 · 抽出 | A 基线 / B 更拔 / C 更克制 | **A**（用户亲眼试玩后选） | 2026-11-23 01:10 |
+| 阶段 2 · 摊开 | A / B / C 三变体（compare.mp4 + variant-*.mp4） | **B**（翻页感纸面） | 2026-11-23 |
+| 阶段 3 · 翻页 | A / B / C 三变体（compare.mp4 + variant-*.mp4） | **B**（纸感） | 2026-11-23 |
+| 阶段 4 · 合上 | A / B / C 三变体（compare.mp4 + variant-*.mp4） | **B**（书感） | 2026-11-23 |
 
 ## 阻塞 / 待核实
 
 - `web_search` 401（key 无效）→ 改用浏览器检索
-- 云 macOS 磁盘 17GB，长构建前要清
+- 云 macOS 会话已 ended（2026-11-24）；旧「磁盘 17GB，长构建前要清」不再是当前环境事实，需要时重开会话再核
 - 子代理仅 `devin/swe-2` 可用（`deepseek-flash` 在配置里但被会话拒绝）
 
 ## 已验证事实（一行一条，附证据路径）
 
+- 2026-11-24 **真实界面评审页（侧栏）**：`preview/design-20261123/review-app.html`（12 张 Air 5 真机/验收截图：书架/详情竖横 + 阅读/历史/书源/设置/筛选/书源浏览/社区/分屏，图片内嵌，**不是 A/B/C 设计稿**）；点「标注」→点画面落点→写改法→自动写 `app-review-notes.json`，服务端 `/api/app-notes`；ego 机检 `.tools/design-20261124/app-review-v2-check.json` **12/12 true**（525 紧凑/1440 两栏/保存/重置/切屏；http 与 file:// 双上下文都能 POST 落盘），截图 `.tools/design-20261124/review-app-v2-525.png`；交互原型热点（书架→详情→阅读→翻页→底栏）机检 `.tools/design-20261124/app-interactive-check.json` **12/12 true**，交互截图 `.tools/design-20261124/review-app-interact-mode-525.png`；原生窗口无法嵌进侧栏（实测失焦即最小化、会抢鼠标），侧栏用交互原型；**visualApproved=false，待用户确认要看哪些真实界面**。
+- 2026-11-24 **侧栏评审页升级为真交互（v2，按宽度布局 + 三档缩放）**：`preview/design-20261123/review-app.html` 3,019,242 B，SHA256 `3C405CCDA5F900FCFF25D84A2859A39E53F5B231CF08278AAC4F9C8C3F1550AC`；由 `review-app.tpl.html`（9,229 B，SHA256 `50331670EBE9A4E20B1097D0CB37A1FF04DD68AAF315859ED9100D62184DB12D`）+ 生成脚本产出，**两次重建逐字节一致**（副本沙箱重建，证据 `.tools/design-20261124/verify2-reproducibility.json`）；交互逻辑独立成 `review-app-interact.js`（30,292 B，SHA256 `600873EB67CC3FC17D75514E9D79AF1E74454FDF25C7DF14B785FA41BCE9A65E`）。能力：单屏按容器宽度渲染（525 视口实测 481×692，比例 1.4387），三档缩放 适应宽度 / 100%(820px) / 200%(1640px)，任何档位 `document.scrollWidth == 视口宽`，200% 在容器内横竖滚；坐标换算回 820×1180 逻辑坐标（200% 平移到右下角点按 → 99.9%/99.9%；未平移点可视内容右边缘 → 29.8%）；纵向滚动 / 阅读页横向拖拽翻页 / 长按标注三者互不误触发，**CDP 触摸三项补测通过**；工具条删除歧义开关，改为常显提示。**独立证伪第二轮 PASS**（判据 10 条全 PASS；实现者自测只作参考、不作验收结论）：证据 `.tools/design-20261124/verify2-recon-525.json`、`verify2-525-interactions.json`、`verify2-1440.json`、`verify2-reproducibility.json`、`verify2-525-fit.png`、`verify2-525-100.png`、`verify2-525-200.png`、`verify2-525-interactions.png`、`verify2-1440-fit.png`。**入口**：`preview/评审-侧边栏.cmd` 已升 `?v=5`，**旧侧栏标签页必须刷新一次**；说明见 `preview/说明.md`。**未通过/未做**：`visualApproved=false`；用户尚未试新版（`app-review-notes.json` 143 B / SHA256 `3E160E19961B755A8E39A84F5DEAEE128786F6F7F05A4FA77B8F2348ECA844F7`，`notes: []`，无 `last` 脏字段，证伪者核过开始/结束一致，快照 `.tools/design-20261124/verify2-notes-before.json`）；fit 档 13px 设计字实测约 7.6px（实现者自报 9.4px，口径矛盾未核实）；工具条覆盖画面顶部 44px（fit 高 692 的 6.4%），是否接受待产品裁决；200% 下桌面鼠标不能拖拽平移（触摸/滚动条可用）；阅读页 3 页为同一张截图重复 + 页码 HUD（本轮未复测，沿用上一轮证伪结论）；刷新后回书架，只恢复标注不恢复上次屏（本轮未复测，沿用上一轮结论）；真实 iPad/Safari 触屏未测。
+- 2026-11-24 **设计评审页 v1（静态工具，visualApproved=false）**：`preview/design-20261123/review.html`（340px 侧栏 + 820×1180 画布；标注模式点画面落点，app.js 经 postMessage 回传命中元素；localStorage + 导出/导入/复制 JSON）；ego-browser 机检 `.tools/design-20261124/review-check.json` **24/24 true**（1440×900 与 1024×768；草稿 50/49.9；命中 `.intro`；切屏隐藏/清单保留/回跳/删除/回归 A/B/C 全过；截图 `.tools/design-20261124/review-page.png`，仅布局自检不作视觉结论）；**待用户试用记 1 条**；侧栏模式（2026-11-24 追加）：`serve.mjs` 本地服务 + `评审-侧边栏.cmd`，右侧栏「浏览器面板」打开 `http://127.0.0.1:8765/review.html`，标注后自动写 `review-notes.json`（无需导出），侧栏 525×1125 机检 `.tools/design-20261124/sidebar-check.json` **11/11 true**，`05-review-check.json` 回归 **24/24 true**；独立证伪 `.tools/design-20261124/verifier-report.json` **84/84 true**（05 重跑 24/24、07 54/54、08 6/6，0 失败）；P3 已知：已有 pin 的 44px 框会截走附近点击、坏 localStorage 静默忽略、Ctrl+Enter 无落点无反馈；本轮未动 Rust、未跑完整 acceptance。
+- 2026-11-24 **QuickJS 运行器 + Air 5 完整验收（4.2 / 3.0）**：workspace `cargo test --locked --workspace -j 1 -- --test-threads=1` → **266 tests + 1 doctest = 267 passed / 0 failed / 3 ignored**（`.tools/quickjs-20261124/workspace-air5-final-r2.log`；根全链 job `pwsh-91b0bc2c2f3b4c9d` exit 0，日志本身无 exit 行）。默认**完整** acceptance（所有 YEJIAN_* 已清）EXIT0 → `artifacts/rust/quickjs-air5-20261124-full`，日志 `acceptance-air5-full-r2.log`（含 open-book→detail 竖/横断言、PASS 行、`acceptance-result.txt: PASS`；4 张 Air 5 截图实测 820×1180 / 1180×820）。`YEJIAN_IPAD_ONLY` 补充 10 profiles EXIT0（`acceptance-air5-ipad-supplement-r2.log`，输出 `...-ipad`）**不能当 full 替代**。机器可读：`.tools/quickjs-20261124/{acceptance,verification}.json`（手工 summary，非 bin 自动 JSON）。
+- 2026-11-24 **拷贝漫画实时（QuickJS 后，源 v24）**：更新時間 50 / 熱門 50 / 全新上架 60 均 has_next=true，筛选 50；搜索「海贼王」12 → 详情 → 403 章 → 13 页 → 首图 HTTP 200 549062B（`copymanga-air5-final-r2.log`，JSON 原样在 `verification.json`）。title 仍全 null，但 `chapter_label_unavailable_count=0`：显示名走 title→有限话号→有限卷号→key 兜底；纯卷 105 个且卷号 distinct 1..105（**旧审查「同名卷」推断错**）。新下载与旧 Failed/Queued 从详情重新加入 + fresh snapshot 统一显示、保留进度；已 Done + CBZ 原名不改、未迁移用户数据。
+- 2026-11-24 **iOS 目标检查（不是 App/真机测试）**：模拟器 `cargo check` 取 `check-ios-r2.log:76` 第一条 **SIM_EXIT=0**（同日志第二条 device 段不用）。真机目标证据 = 工具 job `pwsh-0bc804fd9d234034`：`cargo check --locked -p yejian-sources -j1 --target aarch64-apple-ios`，SDKROOT=iPhoneOS26.5.sdk，**DEVICE_CHECK_EXIT=0**（job completed / exit 0，耗时 25.2s）。raw log `/Users/devin/captures/quickjs-20261124/check-device-real-r5.log` **未取回**（随后 SSH `Session has ended`），故 `.tools/quickjs-20261124/ios-device-check-receipt.json` 是工具输出转录、不含编译器日志正文；范围仅 yejian-sources crate check，**无新 IPA / App 链接 / 部署 / 真机运行**。
+- 2026-11-24 **设计比较页（2.2）**：`preview/design-20261123/compare.html` 已建三列微缩（A/B/C 各 820×1180）+ 四屏切换 + 每列全尺寸入口；`compare-review.json` **21/21 checks true**，`dom-review.json` 12 屏 DOM **10/10 true** 且切换交互 pass；**visualApproved=false**、截图工具两次失败后已停止，Windows 字体≠iPad，A/C 书脊 3D 投影命中最小 40.7px 有风险 → 不得声称触点全 ≥44 或视觉通过；A/B/C 待用户裁决。
+- 2026-11-23 **原生输入收口（4.3）+设计初稿验证轮（2.2）**：本地 `cargo test --locked --workspace -j1 -- --test-threads=1` EXIT0，248 passed / 0 failed / 3 ignored + doctest 1 passed（`.tools/input-20261123/final-tests-recovered.log`）；完整 acceptance `cargo run --locked -j1 --features acceptance --bin acceptance -- ../artifacts/rust/input-20261123-final` EXIT0（`.tools/input-20261123/final-acceptance-recovered.log`，产物 `artifacts/rust/input-20261123-final/`）；Mac Rust(aarch64-apple-ios-sim) 与 Xcode build-for-testing 成功（`rust-remote.log` / `xcode-remote.log`）；模拟器输入实测 iPad Air 11″ M4 (820×1180) 持久目录 `/Users/devin/captures/input-20261123-2312`：**2/2 passed 0 skip**（`.tools/input-20261123/final/{summary.json,input-tests.log,pinyin-candidate.png,verification.json}`）。test06 真实逐键拼音 `h`→`a`→`i`→候选条出现「海」→键盘 Search 提交→重开弹窗回填；test05 覆盖 取消×2、Unicode「海贼王」直输、弹窗内 Search 提交。**未覆盖**：真实书源网络端到端与真机；修的是书源搜索原生 UITextField（fixture），非全局 IME。设计预览浏览器侧已确认 C 筛选仅海贼王、翻页更新文本与页码、A/B/C 切换生效，但截图接口超时、三方向未做最终视觉通过
+- 2026-11-23 用户重申：禁止 AI 自设 goal / 自封完成，只记录事实与证据
 - 2026-11-23 **Air 5 尺寸模拟器体检（工程清单 1.3）**：云 Mac iPad Air 11-inch (M4) 模拟器 DDB1A224（820×1180，同 Air 5），代码 7ae8705；竖 10 + 横 4 画面就绪、IPadRotationTests 4/4、verify-ipad-snapshots PASS（capture 脚本在 XCTest 后被手动中断，relocated-library.json 按脚本同逻辑手工补生成后再核验）。截图 `artifacts/体检-20261123-sim/`。**拷贝漫画 v24（同日更正）**：WASM 导入 js::context_create/context_eval，引擎 host_js.rs 全为桩；但书源源码只在 HTML 列表/筛选页用 `JsContext.eval("JSON.stringify(...)")`。本机网络临时 e2e 探针（examples/tmp_copymanga_e2e.rs，用后已删）实测：搜「海贼王」12 条 → 详情 OK → 403 话 → 13 页、首图 HTTP 200 549062B；「全新上架」60 条；「更新時間」「熱門」报 web verification required。早先「搜索必失败」系 source_probe 只测空关键词+筛选导致的误判。章节 title 全为 None 待查。**中文输入推断**：winit 0.30.13 iOS WinitView 仅实现 UIKeyInput（insertText/deleteBackward），无 UITextInput marked text → 拼音选字大概率不可用，待真机核实
 - 2026-11-23 **最新 IPA（工程清单 0.2）**：Actions run 45126414677（ipad.yml，ref work/ipad-polish-sync @7ae8705，代码同 6273962）成功 7m42s → `artifacts/rust/ipad-20261123-run45126414677/Yejian-iPad/Yejian-0.1.1-7-ipad-unsigned.ipa`（28,826,778 字节，SHA256 e536cc24…fcefc3）；Info.plist 实查 app.yejian.reader.rust / 0.1.1 / build 7——**与 11-20 的 build 7 同号**，新旧只能靠画面区分。云 Mac `devin ssh` 本次报未登录，改走 Actions
 - 2026-11-22 参数外置生效且无需重编译：`paper.base` 17→0 后 frame-045/060/075 哈希全变，日志 `.tools/loop-baseline/stage0-params-live.log`
