@@ -92,6 +92,14 @@
 | 阶段 2 · 摊开 | A / B / C 三变体（compare.mp4 + variant-*.mp4） | **B**（翻页感纸面） | 2026-11-23 |
 | 阶段 3 · 翻页 | A / B / C 三变体（compare.mp4 + variant-*.mp4） | **B**（纸感） | 2026-11-23 |
 | 阶段 4 · 合上 | A / B / C 三变体（compare.mp4 + variant-*.mp4） | **B**（书感） | 2026-11-23 |
+| S6 · 暖白强调色 | A 琥珀(170,94,24) / B 书脊棕(168,93,40) / C 墨黑(44,38,33)（.tools/verify-ui-v2-final/rec/compare.mp4） | **待视觉裁决** | — |
+
+## S6 终验快照（2026-11-25，候选 49e4ca4，verify-s6/-r2 独立验收）
+
+- 单测 268/0/3 EXIT=0 + 六路（full/design/daily/filters/ipad/seam-2×）EXIT=0；回执 .tools/verify-ui-v2-final/logs/（cmd+exit+log+JSON），二进制 SHA256 CA42474504EE8C1C302B6815BA684960DAD00C46F867673CBBB4E6C392932C4E
+- 2× 专项 rendered_ppp=2.0、三帧 join leak=[0,0]；A/B/C 各 310 帧@1024×1366 端到端（书架→摊开→翻页→合书），compare.mp4 3072×1366/10.33s；变体像素逐字节核对属实 —— 全部 Windows 离屏 wgpu（RTX 5060），非真机
+- 十二屏审阅页 preview/ui-v2-review/（index.html + data.js 12 场景 + compare.mp4）；task-44 实际打开复验：12 屏/键盘/播放/暂停/seek PASS，但 ①meta 渲染 src 致整页横溢（scrollWidth≈2.7Mpx）②「打开原图」about:blank —— 两项发布缺陷未签（task-47 未通过）
+- 汇总：reports/2026-11-25-ui-apple-books.md（部分达成 6/7）；遗留 13 条见 .scratch/ui-apple-books/leftovers.md
 
 ## 阻塞 / 待核实
 
