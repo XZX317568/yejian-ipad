@@ -5494,21 +5494,59 @@ fn detail_chapter_row(ui: &mut Ui, app: &mut ReaderApp, entry: &Book, id: &str, 
                         title.wrap.max_rows = 1;
                         ui.painter()
                             .galley(text_pos, ui.painter().layout_job(title), palette.ink);
-                        let ago = book
-                            .last_read_at
-                            .map(|at| format!(" · {}", Self::reading_ago(at)))
-                            .unwrap_or_default();
-                        self.label(
-                            ui.painter(),
+                        // 副标/相对时间都收进卡内带（L-S5c-r2）：320pt×200% 下
+                        // Painter::text 无宽度约束，「第 x / y 页 · 刚刚」曾
+                        // 溢出卡右缘 18pt。改用限宽 LayoutJob（…省略）+ clip；
+                        // 相对时间改挂卡片底角，不与「继续」按钮同一行。
+                        let card_inner = rect.shrink2(vec2(14., 8.));
+                        let clip = ui.painter().with_clip_rect(card_inner);
+                        let button_left = rect.right() - 104. - 12.;
+                        let sub_width = if narrow {
+                            // 窄档按钮在底行右下，副标在左上不同行——限到
+                            // 卡内整宽即可，否则会误按按钮左缘截到「第 …」。
+                            card_inner.right() - text_pos.x
+                        } else {
+                            // 宽档按钮与副标同行右侧，必须让位。
+                            (button_left - text_pos.x).max(60.)
+                        };
+                        let mut sub = egui::text::LayoutJob::simple(
+                            format!("第 {} / {} 页", book.current_page + 1, book.page_count),
+                            FontId::proportional(13. * self.font_scale),
+                            palette.muted,
+                            sub_width,
+                        );
+                        sub.wrap.max_rows = 1;
+                        sub.wrap.overflow_character = Some('…');
+                        clip.galley(
                             text_pos + vec2(0., 24. * self.font_scale + 4.),
-                            &format!(
-                                "第 {} / {} 页{ago}",
-                                book.current_page + 1,
-                                book.page_count
-                            ),
-                            13.,
+                            clip.layout_job(sub),
                             palette.muted,
                         );
+                        if let Some(at) = book.last_read_at {
+                            let (ago_left, ago_right) = if narrow {
+                                (rect.left() + 14., button_left)
+                            } else {
+                                (card_inner.left(), rect.right() - 14.)
+                            };
+                            let mut ago_job = egui::text::LayoutJob::simple(
+                                Self::reading_ago(at),
+                                FontId::proportional(12. * self.font_scale),
+                                palette.muted,
+                                (ago_right - ago_left).max(60.),
+                            );
+                            ago_job.wrap.max_rows = 1;
+                            ago_job.wrap.overflow_character = Some('…');
+                            let ago_galley = clip.layout_job(ago_job);
+                            let ago_pos = if narrow {
+                                pos2(ago_left, rect.bottom() - 10. - ago_galley.size().y)
+                            } else {
+                                pos2(
+                                    ago_right - ago_galley.size().x,
+                                    rect.bottom() - 6. - ago_galley.size().y,
+                                )
+                            };
+                            clip.galley(ago_pos, ago_galley, palette.muted);
+                        }
                         let track = Rect::from_min_size(
                             pos2(text_pos.x, cover.bottom() - 5.),
                             vec2(
