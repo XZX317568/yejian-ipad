@@ -45,6 +45,40 @@ fn quiet_action(label: &str) -> Button<'_> {
 fn bordered_action(label: &str, dark: bool) -> Button<'_> {
     design::secondary(label, dark).wrap()
 }
+/// Mutually-exclusive modes (listings, chapter order) sit on a soft track so
+/// they read as one segmented control instead of a row of loose links. Each
+/// segment keeps a 44pt hit area; the chosen one is filled and selected.
+fn segmented<R>(
+    ui: &mut Ui,
+    palette: &crate::design::Palette,
+    add: impl FnOnce(&mut Ui) -> R,
+) -> R {
+    Frame::new()
+        .fill(palette.soft)
+        .corner_radius(12.)
+        .inner_margin(egui::Margin::same(4))
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 4.;
+            add(ui)
+        })
+        .inner
+}
+fn segment<'a>(label: &'a str, palette: &crate::design::Palette, selected: bool) -> Button<'a> {
+    let text = if selected {
+        RichText::new(label).strong().color(palette.ink)
+    } else {
+        RichText::new(label).color(palette.muted)
+    };
+    Button::new(text)
+        .selected(selected)
+        .frame_when_inactive(selected)
+        .fill(if selected {
+            palette.surface
+        } else {
+            Color32::TRANSPARENT
+        })
+        .min_size(vec2(44., 44.))
+}
 fn disclosure(ui: &mut Ui, label: &str, default_open: bool, body: impl FnOnce(&mut Ui)) {
     let mut state = collapsing_header::CollapsingState::load_with_default_open(
         ui.ctx(),
@@ -4667,7 +4701,11 @@ impl Sources {
         ui.vertical(|ui| {
             ui.set_min_width(ui.available_width());
             ui.horizontal_wrapped(|ui| {
-                if ui.add(quiet_action("‹ 我的书源")).clicked() {
+                if ui
+                    .add(quiet_action("‹ 我的书源"))
+                    .on_hover_text("返回书源首页")
+                    .clicked()
+                {
                     self.select_source("");
                 }
                 let name = self
@@ -4676,10 +4714,15 @@ impl Sources {
                     .find(|source| source.manifest.id == self.selected_source)
                     .map(|source| source.manifest.name.as_str())
                     .unwrap_or("");
-                ui.add(Label::new(RichText::new(name).strong().color(palette.ink)).wrap());
+                ui.add(
+                    Label::new(RichText::new(name).heading().strong().color(palette.ink)).wrap(),
+                );
                 if !self.selected_source.is_empty()
                     && !self.current_settings().is_empty()
-                    && ui.add(quiet_action("书源设置")).clicked()
+                    && ui
+                        .add(quiet_action("书源设置"))
+                        .on_hover_text("打开此书源的账号与参数设置")
+                        .clicked()
                 {
                     self.settings_open = true;
                 }
@@ -4689,7 +4732,11 @@ impl Sources {
                     .find(|source| source.manifest.id == self.selected_source)
                     .and_then(|source| source.manifest.primary_url().map(str::to_string));
                 if let Some(site) = site.filter(|_| cfg!(target_os = "ios")) {
-                    if ui.add(quiet_action("网页验证")).clicked() {
+                    if ui
+                        .add(quiet_action("网页验证"))
+                        .on_hover_text("在浏览器里通过书源的人机验证")
+                        .clicked()
+                    {
                         self.open_web(&site, None);
                     }
                 }
@@ -4749,7 +4796,10 @@ impl Sources {
                 }
                 if !self.applied_filters.is_empty()
                     && !hidden
-                    && ui.add(bordered_action("清除筛选", dark)).clicked()
+                    && ui
+                        .add(bordered_action("清除筛选", dark))
+                        .on_hover_text("清空全部筛选条件并重新搜索")
+                        .clicked()
                 {
                     self.applied_filters.clear();
                     self.start_search();
@@ -4807,32 +4857,30 @@ impl Sources {
                     }
                 }
             } else {
-                ui.horizontal_wrapped(|ui| {
-                    if ui
-                        .add_enabled(
-                            self.metadata_loaded,
-                            quiet_action("全部 / 搜索")
-                                .selected(self.listing.is_none())
-                                .frame_when_inactive(self.listing.is_none()),
-                        )
-                        .clicked()
-                    {
-                        self.start_search();
-                    }
-                    for listing in self.listings.clone() {
+                let palette = design::palette(dark);
+                segmented(ui, &palette, |ui| {
+                    ui.horizontal_wrapped(|ui| {
                         if ui
-                            .add(
-                                quiet_action(&listing.name)
-                                    .selected(self.listing.as_ref() == Some(&listing.id))
-                                    .frame_when_inactive(
-                                        self.listing.as_ref() == Some(&listing.id),
-                                    ),
+                            .add_enabled(
+                                self.metadata_loaded,
+                                segment("全部 / 搜索", &palette, self.listing.is_none()),
                             )
+                            .on_hover_text("按关键词搜索此书源")
                             .clicked()
                         {
-                            self.start_listing(&listing.id);
+                            self.start_search();
                         }
-                    }
+                        for listing in self.listings.clone() {
+                            let selected = self.listing.as_ref() == Some(&listing.id);
+                            if ui
+                                .add(segment(&listing.name, &palette, selected))
+                                .on_hover_text("浏览这个书源列表")
+                                .clicked()
+                            {
+                                self.start_listing(&listing.id);
+                            }
+                        }
+                    });
                 });
             }
             if self.listing.is_some() && !self.applied_filters.is_empty() {
@@ -5752,9 +5800,28 @@ impl Sources {
                 .desired_width(ui.available_width()),
         );
         ui.horizontal_wrapped(|ui| {
-            ui.selectable_value(&mut self.chapters_newest_first, false, "从头开始");
-            ui.selectable_value(&mut self.chapters_newest_first, true, "最新在前");
-            if !self.chapter_query.is_empty() && ui.add(bordered_action("清除查找", dark)).clicked()
+            segmented(ui, &palette, |ui| {
+                let newest = self.chapters_newest_first;
+                if ui
+                    .add(segment("从头开始", &palette, !newest))
+                    .on_hover_text("章节从第 1 话起正序排列")
+                    .clicked()
+                {
+                    self.chapters_newest_first = false;
+                }
+                if ui
+                    .add(segment("最新在前", &palette, newest))
+                    .on_hover_text("最新更新的章节排在最前")
+                    .clicked()
+                {
+                    self.chapters_newest_first = true;
+                }
+            });
+            if !self.chapter_query.is_empty()
+                && ui
+                    .add(bordered_action("清除查找", dark))
+                    .on_hover_text("清空章节查找，显示全部章节")
+                    .clicked()
             {
                 self.chapter_query.clear();
             }
@@ -5832,6 +5899,7 @@ impl Sources {
                 left_w,
             );
             name_job.wrap.max_rows = 2;
+            name_job.wrap.overflow_character = Some('…');
             let name_galley = painter.layout_job(name_job);
             let sub_galley = sub.as_ref().map(|text| {
                 let mut job = egui::text::LayoutJob::simple(
@@ -5841,17 +5909,21 @@ impl Sources {
                     left_w,
                 );
                 job.wrap.max_rows = 1;
+                job.wrap.overflow_character = Some('…');
                 painter.layout_job(job)
             });
             let state_galleys: Vec<Arc<Galley>> = lines
                 .iter()
                 .map(|line| {
-                    painter.layout_job(egui::text::LayoutJob::simple(
+                    let mut job = egui::text::LayoutJob::simple(
                         line.clone(),
                         small.clone(),
                         palette.muted,
                         state_w,
-                    ))
+                    );
+                    job.wrap.max_rows = 1;
+                    job.wrap.overflow_character = Some('…');
+                    painter.layout_job(job)
                 })
                 .collect();
             let text_h = name_galley.size().y
@@ -6076,6 +6148,7 @@ impl Sources {
                     cell_w,
                 );
                 title_job.wrap.max_rows = 2;
+                title_job.wrap.overflow_character = Some('…');
                 let title_galley = painter.layout_job(title_job);
                 painter.galley(
                     pos2(cell.left(), cover_rect.bottom() + 6.),
@@ -6101,6 +6174,7 @@ impl Sources {
                     cell_w,
                 );
                 meta_job.wrap.max_rows = 1;
+                meta_job.wrap.overflow_character = Some('…');
                 let meta_galley = painter.layout_job(meta_job);
                 painter.galley(
                     pos2(cell.left(), cover_rect.bottom() + 6. + body_h * 2. + 2.),
