@@ -661,13 +661,19 @@ mod tests {
         let request = server.join().unwrap();
         assert_eq!(response.status_code, 200);
         // No source cookies ride along; the tracker reply's Set-Cookie does
-        // not land in the shared jar either.
+        // not land in the shared jar either. Cookie matching ignores ports
+        // (RFC 6265), so a sibling test's loopback cookie can legitimately
+        // show up here -- assert on the tracker name, not an empty jar.
         assert!(!request.to_ascii_lowercase().contains("cookie:"), "{request}");
         use reqwest::cookie::CookieStore;
         let jar = JAR.0.read().unwrap();
+        let header = jar
+            .cookies(&format!("http://{addr}/api").parse().unwrap())
+            .map(|value| value.to_str().unwrap_or_default().to_string())
+            .unwrap_or_default();
         assert!(
-            jar.cookies(&format!("http://{addr}/api").parse().unwrap())
-                .is_none()
+            !header.split(';').any(|part| part.trim().starts_with("tracker=")),
+            "{header}"
         );
     }
 }

@@ -6766,10 +6766,27 @@ fn library_thumbnails(
         let index = (self.motion.focus.round() as i32).rem_euclid(books.len() as i32) as usize;
         books.get(index).map(|book| book.id.clone())
     }
+    /// 焦点书标题。验收用它核对详情页标题，不再靠"第一行大字"猜。
+    pub fn shelf_focus_book_title(&self) -> Option<String> {
+        let books = self.visible_books();
+        if books.is_empty() {
+            return None;
+        }
+        let index = (self.motion.focus.round() as i32).rem_euclid(books.len() as i32) as usize;
+        books.get(index).map(|book| book.title.clone())
+    }
 
     pub fn current_book_id(&self) -> Option<&str> {
         match &self.screen {
             Screen::Reader(id) => Some(id),
+            _ => None,
+        }
+    }
+    /// 详情页当前书 id。验收用它核对「点哪本封面开哪本详情」——
+    /// current_book_id 只覆盖 Reader，不能用于 Detail 屏幕。
+    pub fn detail_book_id(&self) -> Option<&str> {
+        match &self.screen {
+            Screen::Detail(id) => Some(id),
             _ => None,
         }
     }

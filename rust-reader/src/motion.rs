@@ -572,14 +572,16 @@ mod tests {
         assert!(!slide.tick(0.23));
         assert_eq!(slide.current_offset(1.), 0.);
 
-        // Tap-slide: outgoing page reported, offset eases to zero in 0.18s.
+        // Tap-slide: outgoing page reported, offset eases to zero in turn_ms
+        // (r3=B ruling: 0.24s; drive the end time off the live parameter).
+        let turn_s = params().flip.turn_ms.max(0.) as f64 / 1000.;
         slide.page = 4;
         slide.animate_turn(3, 400., 1., false);
         assert!(slide.active(1.));
         assert_eq!(slide.outgoing(1.).map(|o| o.0), Some(3));
         assert_eq!(slide.current_offset(1.), 400.);
         assert!(slide.current_offset(1.09).abs() < 400.);
-        assert!(!slide.tick(1.19));
+        assert!(!slide.tick(1. + turn_s + 0.01));
         assert!(slide.outgoing(1.2).is_none());
         assert_eq!(slide.current_offset(1.2), 0.);
 
@@ -599,14 +601,15 @@ mod tests {
 
     #[test]
     fn page_slide_settles_to_zero_offset_and_no_outgoing() {
-        // A committed turn: once the 0.18s slide elapses the offset is
-        // exactly 0 and no outgoing page remains.
+        // A committed turn: once the turn_ms slide elapses (r3=B: 0.24s)
+        // the offset is exactly 0 and no outgoing page remains.
+        let turn_s = params().flip.turn_ms.max(0.) as f64 / 1000.;
         let mut slide = PageSlide::default();
         slide.page = 1;
         slide.animate_turn(0, -600., 10., false);
         assert!(slide.outgoing(10.05).is_some());
         assert_ne!(slide.current_offset(10.05), 0.);
-        assert!(!slide.tick(10.19));
+        assert!(!slide.tick(10. + turn_s + 0.01));
         assert_eq!(slide.current_offset(10.19), 0.);
         assert!(slide.outgoing(10.19).is_none());
         assert!(!slide.active(10.19));
@@ -744,17 +747,20 @@ mod tests {
             prev = e;
         }
         // Slant never exceeds the cap or the width fraction, whichever wins.
-        assert_eq!(spread_slant(391.30435), 180.);
-        assert!(spread_slant(391.30435 - 0.01) < 180.);
+        // r2=B ruling: slant_pct .46→.30, so the cap kicks in at w=600
+        // (180/.30) and spread_slant(200) = 200*0.30 = 60.
+        assert_eq!(spread_slant(600.), 180.);
+        assert!(spread_slant(600. - 0.01) < 180.);
         assert_eq!(spread_slant(1000.), 180.);
-        assert!(spread_slant(200.) - 92. < 0.001);
+        assert!(spread_slant(200.) - 60. < 0.001);
     }
 
     #[test]
     fn spread_offset_and_easing_match_reference() {
-        // archive_motion.dart:323 — incoming translate (-24*dir, +12) * (1-p).
+        // archive_motion.dart:323 — incoming translate (-shift_x*dir, +shift_y) * (1-p);
+        // r2=B ruling moved shift_x 24→40 (翻页感纸面).
         let (x0, y0) = spread_offset(0.);
-        assert!((x0 + 24.).abs() < 1e-4 && (y0 - 12.).abs() < 1e-4);
+        assert!((x0 + 40.).abs() < 1e-4 && (y0 - 12.).abs() < 1e-4);
         let (x1, y1) = spread_offset(1.);
         assert_eq!((x1, y1), (0., 0.));
         // Cubic(.18,.72,.18,1) at t=0.5 measures ~0.9372 on the 18-step

@@ -532,6 +532,32 @@ fn scroll_page(h: &mut Harness, delta: f32) -> Result<()> {
     Ok(())
 }
 
+/// Clicks a label that may sit below the filter sheet's fold. `click_text`
+/// only sees painted (unclipped) text, so long sheets need a few wheel ticks
+/// before the target scrolls into view.
+fn click_text_scrolled(h: &mut Harness, label: &str) -> Result<()> {
+    for _ in 0..6 {
+        if h.texts.iter().any(|(text, _)| text == label) {
+            return h.click_text(label);
+        }
+        h.frame(
+            vec![
+                Event::PointerMoved(pos2(600., 500.)),
+                Event::MouseWheel {
+                    unit: MouseWheelUnit::Point,
+                    delta: vec2(0., -240.),
+                    source: MouseWheelSource::Wheel,
+                    modifiers: Modifiers::NONE,
+                    phase: TouchPhase::Move,
+                },
+            ],
+            None,
+        )?;
+        h.frames(2)?;
+    }
+    h.click_text(label)
+}
+
 fn design_touch(h: &Harness, id: &str, label: Option<&str>) -> Result<()> {
     let rect = *h
         .app
@@ -691,25 +717,28 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
         .app
         .shelf_focus_book_id()
         .context("design: shelf focus book id is missing")?;
+    // 焦点书标题直接取自数据层：旧"第一条高 >20 的文本"会命中「书架」标题。
     let focus_title = h
-        .painted_text
-        .iter()
-        .filter(|text| text.bounds.height() > 20.)
-        .map(|text| text.text.clone())
-        .next()
-        .context("design: selected title above the shelf is missing")?;
+        .app
+        .shelf_focus_book_title()
+        .context("design: shelf focus book title is missing")?;
     h.click("shelf-center")?;
-    h.frames(40)?;
+    // 60 帧（1s）：覆盖 motion::OPEN 0.72s 飞行 + detail_text_alpha 0.92
+    // 淡入——B 参数下 40 帧时文字列仍 0 透明度，按钮被 set_opacity 禁用。
+    h.frames(60)?;
+    // 点封面进的是 Detail 屏幕：current_book_id 只认 Reader，身份核对
+    // 走 detail_book_id + screen_name（84ce320 起此断言即恒假，本轮暴露）。
     anyhow::ensure!(
-        h.app.current_book_id() == Some(focus_id.as_str()),
-        "design: tapping the focused cover opened a different book (wanted {focus_id}, got {:?})",
-        h.app.current_book_id()
+        h.app.screen_name() == "detail" && h.app.detail_book_id() == Some(focus_id.as_str()),
+        "design: tapping the focused cover opened a different book (wanted {focus_id}, got {} {:?})",
+        h.app.screen_name(),
+        h.app.detail_book_id()
     );
     anyhow::ensure!(
         h.painted_text.iter().any(|text| text.text == focus_title),
         "design: detail page does not show the focused title {focus_title}"
     );
-    h.click("shelf-read")?;
+    h.read_from_beginning()?;
     h.wait(ReaderApp::page_loaded)?;
     anyhow::ensure!(
         h.app.current_book_id() == Some(focus_id.as_str()),
@@ -718,6 +747,9 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
     h.frame(vec![], None)?;
     h.click("reader-back")?;
     h.frames(5)?;
+    // reader-back 回到进入点（Detail），再退一次才回书架。
+    h.click("back")?;
+    h.frames(60)?;
     h.click("shelf-next")?;
     h.frames(40)?;
     h.wait(ReaderApp::covers_loaded)?;
@@ -865,7 +897,7 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
         anyhow::ensure!(design_label_visible(h, label), "design: {label} is clipped");
     }
     design_capture(h, "design-filters", &mut captures)?;
-    h.click_text("冒险")?;
+    click_text_scrolled(h, "冒险")?;
     h.click_text("应用筛选")?;
     h.wait(|app| app.source_browser_report()["results"][0] == "筛选:冒险题材")?;
     h.frames(5)?;
@@ -1051,7 +1083,7 @@ fn filters_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
     h.click_text("筛选与排序")?;
     h.frames(4)?;
     h.frame(vec![], Some("source-filters-landscape"))?;
-    h.click_text("冒险")?;
+    click_text_scrolled(h, "冒险")?;
     h.click_text("应用筛选")?;
     h.wait(|app| {
         app.source_browser_report()["results"]
