@@ -24,6 +24,10 @@ struct Harness {
     texts: Vec<(String, Rect)>,
     painted_text: Vec<PaintedText>,
     painted_images: Vec<PaintedImage>,
+    /// 请求的原生像素倍率（注入 RawInput.viewport）；<=1 走默认 1×。
+    ppp: f32,
+    /// 上一帧 egui 实际输出的 pixels_per_point，用来断言真实 2×。
+    rendered_ppp: f32,
 }
 struct PaintedText {
     text: String,
@@ -64,11 +68,13 @@ impl Harness {
             texts: Vec::new(),
             painted_text: Vec::new(),
             painted_images: Vec::new(),
+            ppp: 1.,
+            rendered_ppp: 1.,
         })
     }
     fn frame(&mut self, events: Vec<Event>, name: Option<&str>) -> Result<()> {
         self.now += self.dt;
-        let input = RawInput {
+        let mut input = RawInput {
             screen_rect: Some(Rect::from_min_size(
                 Pos2::ZERO,
                 vec2(self.size[0] as f32, self.size[1] as f32),
@@ -77,7 +83,15 @@ impl Harness {
             events,
             ..Default::default()
         };
+        if self.ppp > 1. {
+            input
+                .viewports
+                .entry(input.viewport_id)
+                .or_default()
+                .native_pixels_per_point = Some(self.ppp);
+        }
         let mut output = self.ctx.run_ui(input, |ui| self.app.draw(ui));
+        self.rendered_ppp = output.pixels_per_point;
         self.texts.clear();
         self.painted_text.clear();
         self.painted_images.clear();
@@ -101,16 +115,20 @@ impl Harness {
                     .update_texture(&self.device, &self.queue, *id, delta);
             }
         }
+        let phys = [
+            (self.size[0] as f32 * output.pixels_per_point).round() as u32,
+            (self.size[1] as f32 * output.pixels_per_point).round() as u32,
+        ];
         let jobs = self.ctx.tessellate(output.shapes, output.pixels_per_point);
         let descriptor = ScreenDescriptor {
-            size_in_pixels: self.size,
+            size_in_pixels: phys,
             pixels_per_point: output.pixels_per_point,
         };
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("yejian-acceptance"),
             size: wgpu::Extent3d {
-                width: self.size[0],
-                height: self.size[1],
+                width: phys[0],
+                height: phys[1],
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -149,11 +167,11 @@ impl Harness {
             self.renderer
                 .render(&mut pass.forget_lifetime(), &jobs, &descriptor);
         }
-        let stride = (self.size[0] * 4).div_ceil(256) * 256;
+        let stride = (phys[0] * 4).div_ceil(256) * 256;
         let buffer = name.map(|_| {
             self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("capture"),
-                size: (stride * self.size[1]) as u64,
+                size: (stride * phys[1]) as u64,
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             })
@@ -175,8 +193,8 @@ impl Harness {
                     },
                 },
                 wgpu::Extent3d {
-                    width: self.size[0],
-                    height: self.size[1],
+                    width: phys[0],
+                    height: phys[1],
                     depth_or_array_layers: 1,
                 },
             );
@@ -191,15 +209,15 @@ impl Harness {
             self.device.poll(wgpu::PollType::wait_indefinitely())?;
             rx.recv()??;
             let mapped = buffer.slice(..).get_mapped_range()?;
-            let mut pixels = Vec::with_capacity((self.size[0] * self.size[1] * 4) as usize);
+            let mut pixels = Vec::with_capacity((phys[0] * phys[1] * 4) as usize);
             for row in mapped.chunks(stride as usize) {
-                pixels.extend_from_slice(&row[..self.size[0] as usize * 4]);
+                pixels.extend_from_slice(&row[..phys[0] as usize * 4]);
             }
             image::save_buffer(
                 self.output.join(format!("{name}.png")),
                 &pixels,
-                self.size[0],
-                self.size[1],
+                phys[0],
+                phys[1],
                 image::ColorType::Rgba8,
             )?;
         }
@@ -484,6 +502,139 @@ fn fixtures(root: &Path, titles: &[&str], palette_offset: u8) -> Result<Vec<Path
         paths.push(path);
     }
     Ok(paths)
+}
+
+/// 原生 2× 下阅读器 tile 拼接取证：双色长页跨 2048px 瓦片缝，页内墨线远
+/// 离接缝供自检「画内线 ≠ 拼缝线」；夹具只写本路隔离数据目录。
+fn seam_fixture(path: &Path) -> Result<PathBuf> {
+    use std::io::Write;
+    std::fs::create_dir_all(path.parent().context("dir")?)?;
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(path)?);
+    let mut img = image::RgbImage::new(640, 3000);
+    for (y, row) in img.enumerate_rows_mut() {
+        for (_, _, p) in row {
+            let ink = (1995..1999).contains(&y) || (2068..2074).contains(&y);
+            *p = image::Rgb(if ink { [218, 216, 204] } else if y < 2048 { [182, 95, 74] } else { [104, 88, 121] });
+        }
+    }
+    let mut png = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut png, image::ImageFormat::Png)?;
+    zip.start_file("001.png", zip::write::SimpleFileOptions::default())?;
+    zip.write_all(&png.into_inner())?;
+    zip.finish()?;
+    Ok(path.to_path_buf())
+}
+/// 逐物理行扫 tile 相接处：记录吸附前逻辑边界与吸附后相接物理坐标，
+/// 断言连接处不露画布底色/白底；墨线自检行不得被误报成缝。
+fn seam_check(h: &Harness, name: &str, presnap: Rect) -> Result<serde_json::Value> {
+    const A: [u8; 3] = [182, 95, 74];
+    const B: [u8; 3] = [104, 88, 121];
+    const INK: [u8; 3] = [218, 216, 204];
+    let ppp = h.rendered_ppp;
+    let shot = image::open(h.output.join(format!("{name}.png")))?.to_rgba8();
+    let (w, px) = (shot.width() as usize, shot.into_raw());
+    let at = |x: usize, y: usize| { let i = (y * w + x) * 4; [px[i], px[i + 1], px[i + 2]] };
+    let near = |p: [u8; 3], c: [u8; 3], t: i32| p.iter().zip(c.iter()).all(|(a, b)| (*a as i32 - *b as i32).abs() <= t);
+    let mut tiles: Vec<Rect> = h.painted_images.iter().map(|i| i.bounds)
+        .filter(|r| presnap.expand(0.6).contains_rect(*r) && r.height() > 30.).collect();
+    tiles.sort_by(|a, b| a.top().partial_cmp(&b.top()).unwrap());
+    tiles.dedup_by(|a, b| a == b);
+    anyhow::ensure!(tiles.len() >= 2, "{name}: expected tiled page, got {tiles:?}");
+    let (x0, x1) = ((presnap.left() * ppp + 8.).round() as usize, (presnap.right() * ppp - 8.).round() as usize);
+    let cols = x1 - x0;
+    let fr = |v: f32| (v * ppp).fract().abs();
+    let mut joins = Vec::new();
+    for (i, t) in tiles.iter().enumerate().skip(1) {
+        let edge = t.top();
+        let adj = tiles[i - 1].bottom() - edge;
+        anyhow::ensure!(adj.abs() < 0.25, "{name}: tiles not adjacent ({adj:.4}pt) {tiles:?}");
+        let row = (edge * ppp).round() as usize;
+        let mut leak = (0usize, 0usize);
+        for row in row.saturating_sub(1)..=row + 1 {
+            for x in x0..x1 {
+                let p = at(x, row);
+                if near(p, [26, 24, 21], 10) || p.iter().all(|&c| c >= 235) { leak.0 += 1; }
+                else if !near(p, A, 40) && !near(p, B, 40) { leak.1 += 1; }
+            }
+        }
+        anyhow::ensure!(leak.0 == 0 && leak.1 * 4 <= cols * 3,
+            "{name}: tile join leaks canvas/blend at {edge:.2}pt row {row}px: {leak:?}");
+        let mid = (x0 + x1) / 2;
+        anyhow::ensure!(near(at(mid, row - 2), A, 40) && near(at(mid, row + 2), B, 40),
+            "{name}: join row {row} not A->B: {:?}/{:?}", at(mid, row - 2), at(mid, row + 2));
+        joins.push(serde_json::json!({"edge_pt": edge, "edge_px": edge * ppp, "adj_gap_pt": adj, "row_px": row, "leak": leak}));
+    }
+    let ink = [1997., 2071.].iter().filter(|sy| {
+        let i = ((*sy / 2048.) as usize).min(tiles.len() - 1);
+        let (base, span) = (i as f32 * 2048., (3000. - i as f32 * 2048.).min(2048.));
+        let r = ((tiles[i].top() + (*sy - base) / span * tiles[i].height()) * ppp).round() as usize;
+        (x0..x1).filter(|&x| near(at(x, r), INK, 40)).count() * 2 > cols
+    }).count();
+    Ok(serde_json::json!({"png": format!("{name}.png"), "presnap_pt": [presnap.left(), presnap.top(), presnap.right(), presnap.bottom()],
+        "presnap_px_frac": [fr(presnap.left()), fr(presnap.top()), fr(presnap.right()), fr(presnap.bottom())],
+        "tiles_px": tiles.iter().map(|t| [t.left() * ppp, t.top() * ppp, t.right() * ppp, t.bottom() * ppp]).collect::<Vec<_>>(),
+        "cols_px": [x0, x1], "joins": joins, "ink_lines_found": ink}))
+}
+/// 真实 2×（native ppp 注入）下阅读器分片拼接实渲取证；只走真实绘制入口。
+fn seam_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
+    h.ppp = 2.;
+    h.size = [821, 1181]; // 奇数宽 → 页矩形吸附后边缘落在 .5 物理像素上
+    h.app.import_files(vec![seam_fixture(&library_root.join("seam-fixture").join("接缝量规.cbz"))?]);
+    h.wait(|a| a.book_count() == 6)?;
+    h.wait(ReaderApp::covers_loaded)?;
+    for _ in 0..6 {
+        if h.app.shelf_focus_book_title().as_deref() == Some("接缝量规") { break; }
+        h.click("shelf-next")?;
+        h.frames(30)?;
+    }
+    anyhow::ensure!(h.app.shelf_focus_book_title().as_deref() == Some("接缝量规"), "seam: fixture not focused");
+    h.click("open-book")?;
+    h.wait(|a| a.screen_name() == "detail")?;
+    h.frames(70)?;
+    h.click("read")?;
+    h.wait(ReaderApp::page_loaded)?;
+    for _ in 0..90 {
+        if !h.app.frame_is_animating { break; }
+        h.frames(1)?;
+    }
+    h.frame(vec![], Some("seam2x-paged"))?;
+    anyhow::ensure!(h.rendered_ppp == 2., "seam: ppp requested 2, rendered {}", h.rendered_ppp);
+    let rect = *h.app.hitboxes.get("reader-image").context("seam: no reader-image")?;
+    let paged = seam_check(h, "seam2x-paged", rect)?;
+    h.click("reader-settings")?;
+    h.frames(5)?;
+    h.click("reader-mode-vertical")?;
+    h.frames(5)?;
+    h.click("reader-options-close")?;
+    h.frames(6)?;
+    h.wait(ReaderApp::page_loaded)?;
+    let strip = |h: &Harness| h.app.hitboxes
+        .get(&format!("vertical-page-{}", h.app.current_page()))
+        .copied().context("seam: no vertical page");
+    let mut vertical = Vec::new();
+    for take in 0..2 {
+        if take > 0 {
+            let c = pos2(h.size[0] as f32 / 2., h.size[1] as f32 / 2.);
+            h.drag(c, c - vec2(0., 333.))?;
+        }
+        for _ in 0..8 {
+            let rect = strip(h)?;
+            let seam_y = rect.top() + rect.height() * 2048. / 3000.;
+            if (160. ..h.size[1] as f32 - 240.).contains(&seam_y) { break; }
+            let c = pos2(h.size[0] as f32 / 2., h.size[1] as f32 / 2.);
+            h.drag(c, c + vec2(0., if seam_y > 940. { -560. } else { 560. }))?;
+            h.frames(30)?;
+        }
+        let name = format!("seam2x-vertical-{take}");
+        h.frame(vec![], Some(&name))?;
+        vertical.push(seam_check(h, &name, strip(h)?)?);
+    }
+    std::fs::write(h.output.join("seam2x.json"), serde_json::to_vec_pretty(&serde_json::json!({
+        "requested_ppp": 2., "rendered_ppp": h.rendered_ppp, "logical_size_pt": h.size,
+        "physical_buffer_px": [h.size[0] as f32 * 2., h.size[1] as f32 * 2.],
+        "paged": paged, "vertical": vertical }))?)?;
+    println!("PASS: reader tile joins pixel-tight at native 2x (seam2x.json)");
+    Ok(())
 }
 
 fn design_safe_rect(h: &Harness) -> Rect {
@@ -2492,6 +2643,9 @@ fn main() -> Result<()> {
     }
     if std::env::var_os("YEJIAN_RECORD_ONLY").is_some() {
         return record_pass(&mut h);
+    }
+    if std::env::var_os("YEJIAN_SEAM_ONLY").is_some() {
+        return seam_pass(&mut h, &data.join("library"));
     }
     h.frame(vec![], Some("phone-shelf"))?;
     anyhow::ensure!(h.app.rendered_book_nodes < 45);
