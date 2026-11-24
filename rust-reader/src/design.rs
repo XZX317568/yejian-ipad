@@ -14,30 +14,46 @@ pub(crate) struct Palette {
     pub on_accent: Color32,
 }
 
+/// Light accent triplets for the A/B/C judgement variants.
+/// YEJIAN_ACCENT_VARIANT = A (amber, default) | B (spine brown) | C (ink).
+fn accent_variant() -> (u8, u8, u8, u8, u8, u8, u8, u8, u8) {
+    match std::env::var("YEJIAN_ACCENT_VARIANT")
+        .unwrap_or_else(|_| "A".into())
+        .trim()
+        .to_ascii_uppercase()
+        .as_str()
+    {
+        "B" => (168, 93, 40, 244, 231, 218, 255, 253, 249),
+        "C" => (44, 38, 33, 235, 230, 222, 255, 253, 249),
+        _ => (200, 125, 47, 247, 234, 217, 255, 253, 249),
+    }
+}
+
 pub(crate) fn palette(dark: bool) -> Palette {
     if dark {
         Palette {
-            paper: Color32::from_rgb(24, 29, 28),
-            surface: Color32::from_rgb(32, 39, 37),
-            soft: Color32::from_rgb(39, 47, 44),
-            ink: Color32::from_rgb(233, 235, 226),
-            muted: Color32::from_rgb(161, 174, 165),
-            line: Color32::from_rgb(54, 65, 59),
-            accent: Color32::from_rgb(155, 201, 177),
-            accent_soft: Color32::from_rgb(43, 65, 54),
-            on_accent: Color32::from_rgb(23, 47, 37),
+            paper: Color32::from_rgb(20, 19, 18),
+            surface: Color32::from_rgb(31, 29, 27),
+            soft: Color32::from_rgb(42, 39, 36),
+            ink: Color32::from_rgb(245, 242, 235),
+            muted: Color32::from_rgb(163, 158, 147),
+            line: Color32::from_rgb(51, 47, 43),
+            accent: Color32::from_rgb(224, 155, 79),
+            accent_soft: Color32::from_rgb(59, 46, 30),
+            on_accent: Color32::from_rgb(24, 19, 13),
         }
     } else {
+        let (ar, ag, ab, sr, sg, sb, on_r, on_g, on_b) = accent_variant();
         Palette {
-            paper: Color32::from_rgb(250, 249, 246),
-            surface: Color32::from_rgb(255, 255, 252),
-            soft: Color32::from_rgb(240, 239, 234),
-            ink: Color32::from_rgb(35, 43, 38),
-            muted: Color32::from_rgb(105, 117, 108),
-            line: Color32::from_rgb(222, 225, 214),
-            accent: Color32::from_rgb(45, 91, 71),
-            accent_soft: Color32::from_rgb(228, 236, 224),
-            on_accent: Color32::from_rgb(255, 254, 246),
+            paper: Color32::from_rgb(250, 247, 242),
+            surface: Color32::from_rgb(255, 255, 255),
+            soft: Color32::from_rgb(242, 237, 228),
+            ink: Color32::from_rgb(28, 25, 23),
+            muted: Color32::from_rgb(120, 113, 108),
+            line: Color32::from_rgb(231, 226, 216),
+            accent: Color32::from_rgb(ar, ag, ab),
+            accent_soft: Color32::from_rgb(sr, sg, sb),
+            on_accent: Color32::from_rgb(on_r, on_g, on_b),
         }
     }
 }
@@ -56,12 +72,12 @@ pub(crate) fn visuals(dark: bool) -> Visuals {
     v.extreme_bg_color = p.surface;
     v.faint_bg_color = p.soft;
     v.window_stroke = Stroke::new(1., p.line);
-    v.window_corner_radius = CornerRadius::same(20);
+    v.window_corner_radius = CornerRadius::same(16);
     v.menu_corner_radius = CornerRadius::same(12);
     v.selection.bg_fill = p.accent_soft;
     v.selection.stroke = Stroke::new(1., p.accent);
     v.hyperlink_color = p.accent;
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1., p.line);
+    v.widgets.noninteractive.bg_stroke = Stroke::new(0.75, p.line);
     v.widgets.noninteractive.fg_stroke = Stroke::new(1., p.ink);
     for widget in [
         &mut v.widgets.inactive,
@@ -71,9 +87,9 @@ pub(crate) fn visuals(dark: bool) -> Visuals {
     ] {
         widget.bg_fill = p.surface;
         widget.weak_bg_fill = Color32::TRANSPARENT;
-        widget.bg_stroke = Stroke::new(1., p.line);
+        widget.bg_stroke = Stroke::new(0.75, p.line);
         widget.fg_stroke = Stroke::new(1.5, p.ink);
-        widget.corner_radius = CornerRadius::same(10);
+        widget.corner_radius = CornerRadius::same(11);
         widget.expansion = 0.;
     }
     v.widgets.hovered.bg_fill = p.accent_soft;
@@ -284,8 +300,8 @@ pub(crate) fn secondary<'a>(label: &'a str, dark: bool) -> Button<'a> {
     let p = palette(dark);
     Button::new(RichText::new(label).color(p.ink))
         .fill(p.soft)
-        .stroke(Stroke::new(1., p.line))
-        .corner_radius(10)
+        .stroke(Stroke::new(0.75, p.line))
+        .corner_radius(11)
         .min_size(vec2(44., 44.))
         .wrap()
 }
@@ -636,4 +652,87 @@ pub(crate) fn draw_icon(p: &Painter, center: Pos2, kind: &str, color: Color32, a
         }
         _ => {}
     }
+}
+
+/// 统一字阶角色：Apple Books 原生排版基准（点），乘 font_scale 缩放。
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+pub(crate) enum TypeRole {
+    LargeTitle,
+    Title,
+    Headline,
+    Body,
+    Subhead,
+    Caption,
+}
+
+/// 字阶尺寸。LargeTitle 在大字号上温和阻尼（>1.35 后缓升），
+/// 避免 200% 动态字级把标题顶出安全区（硬上限 42pt）。
+#[allow(dead_code)]
+pub(crate) fn type_size(font_scale: f32, role: TypeRole) -> f32 {
+    let base = match role {
+        TypeRole::LargeTitle => 30.,
+        TypeRole::Title => 24.,
+        TypeRole::Headline => 20.,
+        TypeRole::Body => 17.,
+        TypeRole::Subhead => 14.,
+        TypeRole::Caption => 12.,
+    };
+    if matches!(role, TypeRole::LargeTitle) && font_scale > 1.35 {
+        return (30. * (1.35 + (font_scale - 1.35) * 0.4)).min(42.);
+    }
+    base * font_scale
+}
+
+/// 原生毛玻璃质感浮层：接触影 + 环境影 + 半透明底 + 顶部微高光。
+/// 供导航栏、阅读器工具条等浮层统一复用（S2/S4 挂接点）。
+#[allow(dead_code)]
+pub(crate) fn translucent_bar(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    p: Palette,
+    dark: bool,
+    radius: u8,
+) {
+    // 双层柔和阴影：近身接触影 + 较大环境影。
+    soft_shadow(painter, rect, radius as f32, 0.7, dark);
+    soft_shadow(
+        painter,
+        rect.shrink(2.),
+        radius as f32,
+        0.4,
+        dark,
+    );
+    let fill = if dark {
+        p.surface.linear_multiply(224. / 255.)
+    } else {
+        p.surface.linear_multiply(232. / 255.)
+    };
+    painter.rect_filled(rect, radius as f32, fill);
+    // 1px 顶部/内缘微高光描边，模拟毛玻璃板的分层边缘。
+    painter.rect_stroke(
+        rect.shrink(0.5),
+        radius as f32,
+        Stroke::new(1., p.ink.linear_multiply(if dark { 0.06 } else { 0.10 })),
+        StrokeKind::Inside,
+    );
+    painter.line_segment(
+        [rect.left_top() + vec2(radius as f32, 0.5), rect.right_top() + vec2(-(radius as f32), 0.5)],
+        Stroke::new(1., Color32::WHITE.linear_multiply(if dark { 0.05 } else { 0.45 })),
+    );
+}
+
+/// iOS 设置页式分组卡片：14pt 圆角、surface 底、1px line 细描边、16pt 内边距。
+#[allow(dead_code)]
+pub(crate) fn grouped_card<R>(
+    ui: &mut egui::Ui,
+    p: Palette,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<R> {
+    Frame::new()
+        .fill(p.surface)
+        .corner_radius(14)
+        .inner_margin(16)
+        .stroke(Stroke::new(1., p.line))
+        .show(ui, add_contents)
 }
