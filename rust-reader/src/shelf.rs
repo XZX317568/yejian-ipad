@@ -497,15 +497,17 @@ pub fn paint_floor(p: &Painter, volumes: &[Volume], dark: bool) {
     }
 }
 
-/// 单本书的接触阴影 + 环境投影（paint_floor 的循环体；详情页立体封面
-/// 复用同一条阴影链路）。
+/// 单本书的接触阴影 + 小范围环境投影（paint_floor 的循环体；详情页立体
+/// 封面复用同一条阴影链路）。Apple Books × 实体书脊自然落桌阴影：
+/// 双层羽化暗色网格，无高光棱线、无长斜尾——旧版 (255,252,240) lit 条与
+/// vec2(-10,10) tail 在斜轴测下糊成亮白斜楔花屏（S2a 根因，2026-11-24）。
 pub fn paint_floor_one(p: &Painter, volume: &Volume, dark: bool) {
+    // 暖炭黑（不是纸底灰——旧暖灰在亮部斜拼处显白）。
     let ink = if dark {
-        Color32::from_rgb(254, 253, 248)
+        Color32::from_rgb(4, 3, 2)
     } else {
-        Color32::from_rgb(138, 128, 107)
+        Color32::from_rgb(32, 26, 20)
     };
-    let fade_dir = vec2(-1., 1.).normalized();
     {
         let volume = volume;
         let lift = volume.lift;
@@ -515,91 +517,82 @@ pub fn paint_floor_one(p: &Painter, volume: &Volume, dark: bool) {
         // 与 paint_body 同款的景深衰减：每退一槽阴影也淡 13%。
         let dim = 1. - 0.13 * volume.distance.abs().min(3.);
         let alpha = volume.opacity * volume.fade * dim;
-        let origin = volume.floor + vec2(-4., 5.) * lift * volume.scale;
+        // 阴影锚到书的**真实底缘**（front/face 底边），随 pull/lift 跟书走：
+        // 抽出抬升时阴影贴着底缘淡出——旧实现锚在未抬升的槽位 floor，
+        // 焦点书抬高 ~0.6·height 后阴影悬浮成脱节的白亮斜块（花屏根因之二）。
+        let base0 = volume.front.point(0., 1.);
         let front = volume.front.horizontal;
         let depth = volume.face.horizontal;
-        // 三层重量感阴影（全部屏幕空间、沿 fade_dir 投影）：
-        // ①接触阴影：书底正下方 2–4pt 的最暗窄带——书"压"在搁板上；
-        // ②环境投影：再向外 24–36pt 的柔和漫反射投影，lift 越高越散；
-        // ③搁板线：书底边缘下 1–2px 细线，书脊侧暗线、封面侧高光。
-        // 接触阴影并进同一个 mesh（不是独立 Shape，更不是 ellipse——独立椭圆
-        // 在斜轴测下会渲染成一排圆点，2026-11-23 实测已回退）。
-        let band = if focus > 1. { 3.5 } else { 3.0 }; // ① 2–4pt
-        let spread = 26. + 8. * lift; // ② 26–34pt，抽出时扩大
-        let tail = vec2(-10., 10.) * volume.scale * (1. + 0.55 * lift);
-        let contact = (0.34 - 0.10 * lift) * alpha * focus; // ①最暗
-        let ambient = (0.12 - 0.065 * lift) * alpha * focus.min(1.1); // ②淡
-        let p0 = origin;
-        let p1 = origin + front;
-        let p2 = origin + front + depth;
-        let p3 = origin + depth;
-        let p4 = origin + depth + tail;
-        let p5 = origin + tail;
-        // 四条等距环：贴地前缘 → 接触阴影外缘 → 环境中段 → 环境外缘。
-        let ring = |d: f32| [p0 + fade_dir * d, p1 + fade_dir * d, p2 + fade_dir * d];
-        let r1 = ring(band);
-        let r2 = ring(band + spread * 0.45);
-        let r3 = ring(band + spread);
+        // 书底足迹平行四边形：p0 书脊底角 → p1 → p2 封面底角 → p3 后角。
+        let pts = [base0, base0 + front, base0 + front + depth, base0 + depth];
+        // 每条边的屏幕空间外法线（绕边顺时针 90°，y 朝下的坐标系里指向纸面）。
+        // 阴影严格沿足迹外法线膨胀——竖直下落会把上收的封面斜边画成脱节斜楔。
+        let center = (pts[0] + pts[2].to_vec2()).to_vec2() * 0.5;
+        let center = pos2(center.x, center.y);
+        let edge_normal = |a: Pos2, b: Pos2| {
+            let d = b - a;
+            let n = vec2(d.y, -d.x);
+            if n.length() < 0.01 {
+                vec2(0., 1.)
+            } else {
+                let n = n.normalized();
+                // 法线朝外判定：背离足迹中心的一侧。
+                if (a + n - center).length_sq() > (a - center).length_sq() { n } else { -n }
+            }
+        };
+        let n01 = edge_normal(pts[0], pts[1]);
+        let n12 = edge_normal(pts[1], pts[2]);
+        let n23 = edge_normal(pts[2], pts[3]);
+        let n30 = edge_normal(pts[3], pts[0]);
+        // 顶点外法线 = 两邻边法线之和归一（角部斜向均匀膨胀）。
+        let corner_n = |m: Vec2, n: Vec2| {
+            let s = m + n;
+            if s.length() < 0.01 { n } else { s.normalized() }
+        };
+        let corner = [corner_n(n30, n01), corner_n(n01, n12), corner_n(n12, n23), corner_n(n23, n30)];
+        // 双层阴影（全部屏幕空间）：
+        // ①接触影：贴书底缘 2–3.5pt·scale 的最实窄带，随 lift 变薄变淡；
+        // ②环境影：再向外 ≤6–8pt·scale 的极低透明羽化渐隐。
+        // 两圈顶点同 mesh——足迹几何退化（morph 中）时环宽收缩不炸形。
+        let scale = volume.scale;
+        let band = (if focus > 1. { 3.4 } else { 2.9 } - 0.9 * lift).max(1.4) * scale;
+        let spread = (6.0 + 2.0 * lift) * scale;
+        let contact = (0.30 - 0.16 * lift).max(0.08) * alpha * focus; // ①最实
+        let ambient = (0.085 - 0.04 * lift).max(0.03) * alpha * focus.min(1.1); // ②极淡
+        // 内圈：贴底四点，书脊侧略深、封面侧略浅。
+        let inner_a = [contact * 1.25, contact, contact * 0.9, contact * 0.55]
+            .map(|a| a.min(0.4));
         let mut mesh = Mesh::default();
-        // row 0：贴地前缘，最深（接触阴影内缘）
-        for pos in [p0, p1, p2] {
-            mesh.colored_vertex(pos, ink.gamma_multiply(contact));
+        for (pos, a) in pts.iter().zip(inner_a) {
+            mesh.colored_vertex(*pos, ink.gamma_multiply(a));
         }
-        // row 1：接触阴影外缘——3pt 内从最深陡降到略高于环境值
-        for pos in r1 {
-            mesh.colored_vertex(pos, ink.gamma_multiply(ambient * 1.25));
+        // 中圈（接触影外缘）：带内陡降到略高于环境值。
+        for (i, pos) in pts.iter().enumerate() {
+            mesh.colored_vertex(*pos + corner[i] * band, ink.gamma_multiply(ambient * 1.15));
         }
-        // row 2：环境投影中段
-        for pos in r2 {
-            mesh.colored_vertex(pos, ink.gamma_multiply(ambient * 0.4));
-        }
-        // row 3：环境投影外缘 → 完全透明
-        for pos in r3 {
-            mesh.colored_vertex(pos, Color32::TRANSPARENT);
-        }
-        // 侧翼与书底后方：从环境外缘扇回 p3(书底后角)+tail(两侧余韵)，
-        // 沿用原 (-1,1) 方向的环境梯度淡出。
-        let far = [r3[0], r3[1], r3[2], p3, p4, p5];
-        let bounds = Rect::from_points(&far);
-        let half = bounds.size() * vec2(-1., 1.) * 0.5;
-        for &pos in &far[3..] {
-            let factor = ((pos - (bounds.center() - half)).dot(half)
-                / (2. * half.length_sq()))
-            .clamp(0., 1.);
+        // 外圈（环境影外缘 → 全透明）。
+        for (i, pos) in pts.iter().enumerate() {
             mesh.colored_vertex(
-                pos,
-                ink.gamma_multiply(ambient).lerp_to_gamma(Color32::TRANSPARENT, factor),
+                *pos + corner[i] * (band + spread),
+                Color32::TRANSPARENT,
             );
         }
-        // 三环条带：p→r1（接触）→r2→r3（环境），每条两个四边形
-        for (a, b) in [(0u32, 3u32), (3, 6), (6, 9)] {
-            for i in 0..2u32 {
-                mesh.add_triangle(a + i, a + i + 1, b + i + 1);
-                mesh.add_triangle(a + i, b + i + 1, b + i);
+        // 三环条带：0-3 底缘 → 4-7 中圈 → 8-11 外圈，每环四个四边形。
+        for (a, b) in [(0u32, 4u32), (4, 8)] {
+            for i in 0..4u32 {
+                let j = (i + 1) % 4;
+                mesh.add_triangle(a + i, a + j, b + j);
+                mesh.add_triangle(a + i, b + j, b + i);
             }
         }
-        // 侧翼扇形：r3[0] 为根，扫过 r3[1]r3[2]p3p4p5（顶点 10–14）
-        for i in 10..14u32 {
-            mesh.add_triangle(9, i, i + 1);
-        }
         p.add(Shape::mesh(mesh));
-        // ③搁板线：沿书底前缘向 fade_dir 偏 1.2px 画在搁板面上（书体后绘会
-        // 压住贴边的一半，留一道细缝）。暗侧（书脊底）暗线、亮侧（封面底，
-        // 光从右上掠入）搁板高光。
-        let line_off = fade_dir * 1.2;
-        let line_alpha = (0.30 - 0.10 * lift) * alpha * focus;
+        // ③搁板基准线：极淡暖色发丝线沿书底前缘，只暗示落桌接触——
+        // 不画封面侧亮白反光棱（旧 lit 条即花屏斜楔之一）。
+        let line_off = corner[0] * 1.0;
+        let line_alpha = (0.24 - 0.10 * lift).max(0.06) * alpha * focus;
         p.line_segment(
-            [p0 + line_off, p1 + line_off],
-            Stroke::new(1.4, ink.gamma_multiply(line_alpha)),
-        );
-        let lit = if dark {
-            Color32::from_gray(120)
-        } else {
-            Color32::from_rgb(255, 252, 240)
-        };
-        p.line_segment(
-            [p1 + line_off, p2 + line_off],
-            Stroke::new(1.0, lit.gamma_multiply((0.55 - 0.20 * lift) * alpha * focus)),
+            [pts[0] + line_off, pts[2] + corner[2] * 1.0],
+            Stroke::new(1.0, ink.gamma_multiply(line_alpha)),
         );
     }
 }
