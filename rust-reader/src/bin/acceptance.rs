@@ -872,12 +872,56 @@ fn design_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
         "design: series cover did not open its detail"
     );
     anyhow::ensure!(
-        h.app.hitboxes.keys().filter(|k| k.starts_with("dchapter-")).count() >= 2
+        h.app.hitboxes.keys().filter(|k| k.starts_with("dchapter-")).count() == 6
             && h.app.hitboxes.contains_key("detail-chapters-all"),
         "design: inline chapter card is missing its rows or footer: {:?}",
         h.app.hitboxes.keys().collect::<Vec<_>>()
     );
     design_capture(h, "design-detail-chapters", &mut captures)?;
+    // task-24 补证：834pt 横屏下卡片头/尾必有一端出屏（内容 ≈373pt > 可用窗），
+    // 切到 1024×1366 竖幅把整卡收进首屏——前 6 话与「查看全部」同屏完整可读。
+    // 若仍差一点则小步滚动补齐；拍完回到 1194×834 再走原 back 链路。
+    h.size = [1024, 1366];
+    h.frames(12)?;
+    let wanted = |h: &Harness| {
+        let fully = |name: &str| {
+            h.painted_text.iter().any(|t| {
+                t.text == name
+                    && design_safe_rect(h).expand(0.5).contains_rect(t.bounds)
+                    && t.clip.expand(0.5).contains_rect(t.bounds)
+            })
+        };
+        fully("查看全部 7 话")
+            && fully("章节 · 共 7 话")
+            && (1..=6).all(|n| fully(&format!("第 {n} 话")))
+    };
+    // 滚轮指针必须落在正文滚动区（cover.bottom() 以下），否则事件落空。
+    for _ in 0..8 {
+        if wanted(h) {
+            break;
+        }
+        h.frame(
+            vec![
+                Event::PointerMoved(pos2(600., 1150.)),
+                Event::MouseWheel {
+                    unit: MouseWheelUnit::Point,
+                    delta: vec2(0., -80.),
+                    source: MouseWheelSource::Wheel,
+                    modifiers: Modifiers::NONE,
+                    phase: TouchPhase::Move,
+                },
+            ],
+            None,
+        )?;
+        h.frames(4)?;
+    }
+    anyhow::ensure!(
+        wanted(h),
+        "design: cannot fit all 7 chapter rows plus the footer on one canvas"
+    );
+    design_capture(h, "design-detail-chapters-full", &mut captures)?;
+    h.size = [1194, 834];
+    h.frames(12)?;
     h.click("back")?;
     h.frames(60)?;
     // 焦点还回未链接的未读书：后续 iPad 段照旧拿到单卷详情。
