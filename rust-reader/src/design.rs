@@ -30,10 +30,10 @@ fn accent_variant() -> (u8, u8, u8, u8, u8, u8, u8, u8, u8) {
         {
             "B" => (168, 93, 40, 244, 231, 218, 255, 253, 249),
             "C" => (44, 38, 33, 235, 230, 222, 255, 253, 249),
-            // Variant A deepened to #B0621A: warm amber-brown keeps the
-            // Apple Books glow and lifts on_accent white text past WCAG AA
-            // (>=4.6:1, previously ~3.2:1 at 200,125,47 — L-S1-07).
-            _ => (176, 98, 26, 247, 234, 217, 255, 253, 249),
+            // Variant A #AA5E18: amber stays warm, on_accent white is
+            // 4.81:1 (L-S2b-01) and accent text on the lightened
+            // accent_soft capsule is >=4.5:1 (L-S2b-02).
+            _ => (170, 94, 24, 251, 246, 240, 255, 253, 249),
         }
     })
 }
@@ -58,7 +58,9 @@ pub(crate) fn palette(dark: bool) -> Palette {
             surface: Color32::from_rgb(255, 255, 255),
             soft: Color32::from_rgb(242, 237, 228),
             ink: Color32::from_rgb(28, 25, 23),
-            muted: Color32::from_rgb(120, 113, 108),
+            // Deepened so inactive labels on the translucent_bar blend
+            // reach >=4.8:1 against a white backdrop (L-S2b-02).
+            muted: Color32::from_rgb(108, 101, 96),
             line: Color32::from_rgb(231, 226, 216),
             accent: Color32::from_rgb(ar, ag, ab),
             accent_soft: Color32::from_rgb(sr, sg, sb),
@@ -696,7 +698,6 @@ pub(crate) fn type_size(font_scale: f32, role: TypeRole) -> f32 {
 
 /// 原生毛玻璃质感浮层：接触影 + 环境影 + 半透明底 + 顶部微高光。
 /// 供导航栏、阅读器工具条等浮层统一复用（S2/S4 挂接点）。
-#[allow(dead_code)]
 pub(crate) fn translucent_bar(
     painter: &egui::Painter,
     rect: egui::Rect,
@@ -733,7 +734,6 @@ pub(crate) fn translucent_bar(
 }
 
 /// iOS 设置页式分组卡片：14pt 圆角、surface 底、1px line 细描边、16pt 内边距。
-#[allow(dead_code)]
 pub(crate) fn grouped_card<R>(
     ui: &mut egui::Ui,
     p: Palette,
