@@ -1,4 +1,5 @@
 .tools/
+.scratch/
 artifacts/
 **/.dart_tool/
 **/build/
@@ -19,4 +20,6 @@ rust-reader/data/
 **/target*/
 .tmp-sim/
 NUL
+preview/design-20261123/review-notes.json
+preview/design-20261123/app-review-notes.json
 **/Dtmpcheck.json

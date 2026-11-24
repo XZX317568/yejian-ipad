@@ -958,7 +958,7 @@ mod tests {
 
     fn js_module() -> Vec<u8> {
         let source = r#"(module
-            (import "js" "context_eval" (func $eval (param i32 i32 i32) (result i32)))
+            (import "js" "context_eval_async" (func $eval (param i32 i32 i32) (result i32)))
             (memory (export "memory") 1)
             (func (export "get_search_manga_list")
                 (param i32 i32 i32) (result i32)
@@ -1056,7 +1056,7 @@ mod tests {
     }
 
     #[test]
-    fn js_only_source_reports_web_verification_instead_of_empty_results() {
+    fn unsupported_async_js_reports_web_verification_instead_of_empty_results() {
         let mut interpreter = AidokuInterpreter::create(
             &js_module(),
             "test.source".into(),

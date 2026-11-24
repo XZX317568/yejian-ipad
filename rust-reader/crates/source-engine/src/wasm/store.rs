@@ -9,6 +9,7 @@ use parking_lot::Mutex;
 use scraper::Html;
 
 use super::host_net::NetRequestState;
+use super::js_runtime::JsRuntime;
 
 /// A parsed HTML document. Uses `Arc<Mutex<..>>` (not `Rc<RefCell<..>>`) even
 /// though it's only ever touched from one thread at a time, because the
@@ -40,10 +41,15 @@ pub(crate) enum StoredValue {
     HtmlNodeList(Vec<HtmlNode>),
     CanvasContext(RgbaImage),
     Image(RgbaImage),
-    JsContext,
+    /// A live QuickJS runtime+context created by `js.context_create`.
+    JsContext(Box<JsRuntime>),
     WebviewContext,
-    JsPlaceholder,
 }
+
+/// Max simultaneously live `js.context_create` contexts. Each [`JsRuntime`]
+/// may allocate up to 32MiB, so 4 caps JS heap at ~128MiB per interpreter.
+/// `remove`/`clear` below drop the `JsRuntime` and free the slot.
+pub(crate) const MAX_JS_CONTEXTS: usize = 4;
 
 /// Mirrors `GlobalStore` in Dart: a simple incrementing-id map of host-owned
 /// objects referenced by the WASM module via opaque `i32` descriptors.
@@ -66,6 +72,15 @@ impl GlobalStore {
         self.storage.insert(desc, value);
         self.next += 1;
         desc
+    }
+
+    /// Count of live `StoredValue::JsContext` entries, checked by
+    /// `js.context_create` against [`MAX_JS_CONTEXTS`].
+    pub fn js_context_count(&self) -> usize {
+        self.storage
+            .values()
+            .filter(|v| matches!(v, StoredValue::JsContext(_)))
+            .count()
     }
 
     pub fn get(&self, desc: i32) -> Option<&StoredValue> {

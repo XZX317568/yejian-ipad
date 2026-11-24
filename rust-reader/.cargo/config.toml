@@ -1,3 +1,13 @@
 [build]
 jobs = 1
 
+# iOS bindgen/clang triple override (task-27), scoped to QuickJS only.
+# rquickjs-sys passes the raw Rust triple to libclang; for the simulator that is
+# `--target=arm64-apple-ios-sim`, where clang reads "sim" as the OS version.
+# bindgen 0.72 appends BINDGEN_EXTRA_CLANG_ARGS_<TARGET> after the crate's own
+# --target, so clang's last --target wins and the simulator triple is valid.
+# 15.0 matches IPHONEOS_DEPLOYMENT_TARGET in the Xcode project; force=false
+# keeps a developer's exported value. Device (aarch64-apple-ios) needs none.
+# Rust target is unchanged: only the clang triple for generated bindings moves.
+[env]
+BINDGEN_EXTRA_CLANG_ARGS_aarch64_apple_ios_sim = { value = "--target=arm64-apple-ios15.0-simulator", force = false }

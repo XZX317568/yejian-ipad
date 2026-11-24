@@ -1297,11 +1297,13 @@ fn ipad_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
     use yejian_platform::{Insets, set_insets_override};
     // iPad window sizes in points (one harness pixel per point), plus the
     // narrow Split View widths and a no-inset control.
-    let profiles: [([u32; 2], i32, i32, &str); 8] = [
+    let profiles: [([u32; 2], i32, i32, &str); 10] = [
         ([1024, 1366], 24, 20, "ipad-pro-129-portrait"),
         ([1366, 1024], 24, 20, "ipad-pro-129-landscape"),
         ([834, 1194], 24, 20, "ipad-11-portrait"),
         ([1194, 834], 24, 20, "ipad-11-landscape"),
+        ([820, 1180], 24, 20, "ipad-air5-portrait"),
+        ([1180, 820], 24, 20, "ipad-air5-landscape"),
         ([744, 1133], 24, 20, "ipad-mini-portrait"),
         ([507, 1024], 24, 20, "ipad-split-half"),
         ([320, 1024], 24, 20, "ipad-split-third"),
@@ -1546,7 +1548,7 @@ fn ipad_pass(h: &mut Harness, library_root: &Path) -> Result<()> {
     library.set_setting("font-scale", "1")?;
     set_insets_override(None);
     println!(
-        "PASS: iPad profiles rendered with real UI at 1024x1366, 1366x1024, 1194x834, 744x1133, 507x1024 and 320x1024"
+        "PASS: iPad profiles rendered with real UI at 1024x1366, 1366x1024, 1194x834, 820x1180, 1180x820, 744x1133, 507x1024 and 320x1024"
     );
     Ok(())
 }
@@ -2457,10 +2459,43 @@ fn main() -> Result<()> {
         (1366, 1024, "ipad-landscape-shelf"),
         (1024, 1366, "ipad-portrait-shelf"),
         (507, 1024, "ipad-split-shelf"),
+        (820, 1180, "ipad-air5-portrait-shelf"),
+        (1180, 820, "ipad-air5-landscape-shelf"),
     ] {
         h.size = [width, height];
         h.frames(6)?;
         h.frame(vec![], Some(name))?;
+        if name.starts_with("ipad-air5") {
+            let screen = Rect::from_min_size(Pos2::ZERO, vec2(width as f32, height as f32));
+            let open = *h
+                .app
+                .hitboxes
+                .get("open-book")
+                .with_context(|| format!("{name}: open-book action is missing"))?;
+            anyhow::ensure!(
+                screen.contains_rect(open),
+                "{name}: open-book action is outside the {width}x{height} window"
+            );
+            h.click("open-book")?;
+            h.frames(65)?;
+            anyhow::ensure!(
+                h.app.screen_name() == "detail",
+                "{name}: open-book did not reach the detail screen"
+            );
+            let read = *h
+                .app
+                .hitboxes
+                .get("read")
+                .with_context(|| format!("{name}: detail read action is missing"))?;
+            anyhow::ensure!(
+                screen.contains_rect(read),
+                "{name}: primary reader action leaves the {width}x{height} window"
+            );
+            let detail = name.replace("-shelf", "-detail");
+            h.frame(vec![], Some(detail.as_str()))?;
+            h.click("back")?;
+            h.frames(90)?;
+        }
     }
     h.size = [1366, 1024];
     h.frames(6)?;

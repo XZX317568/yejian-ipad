@@ -23,6 +23,7 @@ pub(crate) mod host_js;
 pub(crate) mod host_net;
 pub(crate) mod host_std;
 pub(crate) mod interpreter;
+pub(crate) mod js_runtime;
 pub(crate) mod memory;
 pub(crate) mod models;
 pub(crate) mod postcard;

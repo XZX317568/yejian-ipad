@@ -233,12 +233,19 @@ fn chapter_name(chapter: &Chapter) -> String {
         .title
         .clone()
         .filter(|title| !title.trim().is_empty())
-        .unwrap_or_else(|| {
+        .or_else(|| {
             chapter
                 .chapter_number
+                .filter(|number| number.is_finite())
                 .map(|number| format!("第 {number} 话"))
-                .unwrap_or_else(|| chapter.key.clone())
         })
+        .or_else(|| {
+            chapter
+                .volume_number
+                .filter(|number| number.is_finite())
+                .map(|number| format!("第 {number} 卷"))
+        })
+        .unwrap_or_else(|| chapter.key.clone())
 }
 /// Use one comparable volume group for chapters without explicit volumes,
 
@@ -533,12 +540,7 @@ struct DownloadTask {
 }
 impl DownloadTask {
     fn from_chapter(source: &str, manga: &Manga, chapter: &Chapter) -> Self {
-        let chapter_title = chapter.title.clone().unwrap_or_else(|| {
-            chapter
-                .chapter_number
-                .map(|n| format!("第 {n} 话"))
-                .unwrap_or_else(|| chapter.key.clone())
-        });
+        let chapter_title = chapter_name(chapter);
         Self {
             id: identity_id(source, &manga.key, &chapter.key),
             source_id: source.to_string(),
@@ -1459,14 +1461,17 @@ fn enqueue_task(tasks: &mut Vec<DownloadTask>, task: DownloadTask) -> EnqueueOut
             existing.error = None;
             existing.cbz = None;
         }
-        // Re-adding from the manga detail page carries freshly saved complete
-
-        // objects. Replace the references so a task whose snapshot file was
-
-        // lost or corrupted can be retried without losing its cached pages.
-
-        existing.manga_snapshot = task.manga_snapshot;
-        existing.chapter_snapshot = task.chapter_snapshot;
+        // A fresh chapter snapshot means `from_chapter` built this incoming
+        // task, so refresh the display metadata too: old queue rows whose
+        // title fell back to the UUID key become readable again. Minimal
+        // retries without a snapshot keep the stored name/progress/caches.
+        if task.chapter_snapshot.is_some() {
+            existing.manga_snapshot = task.manga_snapshot;
+            existing.chapter_snapshot = task.chapter_snapshot;
+            existing.chapter_title = task.chapter_title;
+            existing.chapter_number = task.chapter_number;
+            existing.volume_number = task.volume_number;
+        }
         if existing.status == DownloadStatus::Failed {
             existing.status = DownloadStatus::Queued;
             existing.error = None;
@@ -1614,6 +1619,9 @@ pub struct Sources {
 
     /// or the system-browser + paste dialog on desktop.
     web_session: Option<WebSession>,
+    /// In-flight iOS native search prompt: (request id, source). Not persisted;
+    /// a source change drops it so A→B→A cannot reuse text typed for A.
+    pending_native_search: Option<(i64, String)>,
     login_user: String,
     login_pass: String,
     /// Cookies from verification/login pages by URL, in `web-cookies.json`.
@@ -2028,6 +2036,9 @@ impl Sources {
             "filter_editor":self.filter_editor.is_some(),"busy":self.busy,
             "results":self.results.entries.iter().map(|manga|manga.title.as_str()).collect::<Vec<_>>(),
             "applied":self.applied_filters,
+            "query":self.query,
+            "native_search_rect":self.hitboxes.get("source-native-search")
+                .map(|rect|[rect.left(),rect.top(),rect.right(),rect.bottom()]),
         })
     }
 
@@ -2607,6 +2618,7 @@ impl Sources {
             stale_engines,
             challenge: None,
             web_session: None,
+            pending_native_search: None,
             login_user: String::new(),
             login_pass: String::new(),
             web_cookies,
@@ -3605,6 +3617,7 @@ impl Sources {
             return;
         }
         self.pending_open = None;
+        self.pending_native_search = None;
         if !self.selected_source.is_empty() {
             self.sessions.insert(
                 self.selected_source.clone(),
@@ -3668,6 +3681,43 @@ impl Sources {
             page: 1,
             filters,
         });
+    }
+    fn open_native_search(&mut self) {
+        if self.pending_native_search.is_some() {
+            self.status = "搜索输入框已打开".into();
+            return;
+        }
+        if !self.metadata_loaded {
+            return;
+        }
+        match yejian_platform::open_text_input(&self.query) {
+            Ok(request_id) => {
+                self.pending_native_search = Some((request_id, self.selected_source.clone()));
+            }
+            Err(error) => self.status = format!("无法打开搜索输入框：{error}"),
+        }
+    }
+    fn finish_native_text_input(&mut self, result: yejian_platform::TextInputResult) {
+        let Some((request_id, source)) = self.pending_native_search.clone() else {
+            return;
+        };
+        if result.request_id != request_id {
+            return;
+        }
+        self.pending_native_search = None;
+        let Some(text) = result.text else {
+            self.status = "已取消输入".into();
+            return;
+        };
+        if source != self.selected_source || !self.metadata_loaded {
+            return;
+        }
+        self.query = text;
+        self.start_search();
+    }
+    fn fail_native_text_input(&mut self, error: yejian_platform::PlatformError) {
+        self.pending_native_search = None;
+        self.status = format!("搜索输入读取失败：{error}");
     }
     fn filters_hidden(&self) -> bool {
         !self.query.trim().is_empty()
@@ -4298,6 +4348,11 @@ impl Sources {
                 }
             }
         }
+        match yejian_platform::poll_text_input() {
+            Ok(Some(result)) => self.finish_native_text_input(result),
+            Ok(None) => {}
+            Err(error) => self.fail_native_text_input(error),
+        }
         while let Ok(event) = self.dl_rx.try_recv() {
             self.handle_download_event(event);
         }
@@ -4575,12 +4630,28 @@ impl Sources {
                 return;
             }
             ui.add_space(2.);
-            let input = ui.add(
-                TextEdit::singleline(&mut self.query)
-                    .hint_text("在此书源搜索漫画")
-                    .desired_width(ui.available_width()),
-            );
-            let enter = input.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
+            let enter = if cfg!(target_os = "ios") {
+                let label = if self.query.trim().is_empty() { "搜索漫画…".to_string() }
+                            else { format!("搜索：{}", self.query) };
+                let response = ui.add_enabled(
+                    self.metadata_loaded && self.pending_native_search.is_none(),
+                    bordered_action(&label, dark),
+                );
+                // XCTest taps the real button by its reported frame instead of
+                // guessing where egui placed the label.
+                self.hitboxes.insert("source-native-search".into(), response.rect);
+                if response.clicked() {
+                    self.open_native_search();
+                }
+                false
+            } else {
+                let input = ui.add(
+                    TextEdit::singleline(&mut self.query)
+                        .hint_text("在此书源搜索漫画")
+                        .desired_width(ui.available_width()),
+                );
+                input.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter))
+            };
             ui.horizontal_wrapped(|ui| {
                 if ui
                     .add_enabled(
@@ -6534,6 +6605,7 @@ mod tests {
             stale_engines: Default::default(),
             challenge: None,
             web_session: None,
+            pending_native_search: None,
             login_user: String::new(),
             login_pass: String::new(),
             web_cookies: Default::default(),
@@ -7061,6 +7133,63 @@ mod tests {
     }
 
     #[test]
+    fn chapter_labels_prefer_title_then_chapter_then_volume() {
+        let label = |key: &str, title: Option<&str>, number: Option<f32>, volume: Option<f32>| {
+            chapter_name(&Chapter {
+                key: key.into(),
+                title: title.map(str::to_string),
+                chapter_number: number,
+                volume_number: volume,
+                ..Default::default()
+            })
+        };
+        assert_eq!(label("k", Some("单行本 1"), Some(2.), Some(3.)), "单行本 1");
+        assert_eq!(label("k", Some("   "), Some(2.5), Some(1.)), "第 2.5 话");
+        assert_eq!(label("k", None, Some(0.), Some(1.)), "第 0 话");
+        assert_eq!(label("k", None, Some(2.5), None), "第 2.5 话");
+        assert_eq!(label("k", None, None, Some(1.)), "第 1 卷");
+        assert_eq!(label("k", None, Some(3.), Some(2.)), "第 3 话");
+        assert_eq!(label("k", None, Some(f32::NAN), Some(1.)), "第 1 卷");
+        assert_eq!(
+            label("k", None, Some(f32::INFINITY), Some(f32::NEG_INFINITY)),
+            "k"
+        );
+    }
+
+    #[test]
+    fn download_task_reuses_chapter_name_and_keeps_the_original_snapshot() {
+        let book = manga("test.source", "m8");
+        for (key, title, number, volume) in [
+            ("volume-only", None, None, Some(1.)),
+            ("blank", Some("   "), Some(2.5), Some(1.)),
+            ("number-first", None, Some(3.), Some(2.)),
+        ] {
+            let chapter = Chapter {
+                key: key.into(),
+                title: title.map(str::to_string),
+                chapter_number: number,
+                volume_number: volume,
+                ..Default::default()
+            };
+            let expected = chapter_name(&chapter);
+            let task = DownloadTask::from_chapter("test.source", &book, &chapter);
+            assert_eq!(
+                (
+                    task.chapter_title.as_str(),
+                    task.metadata().chapter_title.as_str(),
+                    task.chapter_id.as_str()
+                ),
+                (expected.as_str(), expected.as_str(), key),
+                "{key}"
+            );
+            assert_eq!(task.volume_number, volume.map(f64::from), "{key}");
+            let bytes = chapter.to_postcard_bytes();
+            let snapshot = task.chapter_snapshot.as_deref();
+            assert_eq!(snapshot, Some(bytes.as_slice()), "{key}");
+        }
+    }
+
+    #[test]
     fn restored_chapters_are_readable_without_a_download_queue_and_hidden_links_are_removed() {
         let root = tempfile::tempdir().unwrap();
         let mut sources = test_sources(root.path());
@@ -7553,8 +7682,78 @@ mod tests {
             enqueue_task(&mut tasks, task("source.a", "m", "c")),
             EnqueueOutcome::AlreadyDownloaded
         ));
+        let renamed = DownloadTask::from_chapter(
+            "source.a",
+            &manga("source.a", "m"),
+            &Chapter {
+                key: "c".into(),
+                title: Some("新标题".into()),
+                chapter_number: Some(9.),
+                volume_number: Some(2.),
+                ..Default::default()
+            },
+        );
+        assert!(matches!(
+            enqueue_task(&mut tasks, renamed),
+            EnqueueOutcome::AlreadyDownloaded
+        ));
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].status, DownloadStatus::Done);
+        assert_eq!(tasks[0].chapter_title, "c");
+        assert_eq!(tasks[0].chapter_number, None);
+        assert_eq!(tasks[0].volume_number, None);
+    }
+
+    #[test]
+    fn reenqueue_refreshes_uuid_title_only_from_a_full_chapter_snapshot() {
+        let mut tasks = Vec::new();
+        let mut stale = task("source.a", "m", "c");
+        let id = stale.id.clone();
+        stale.chapter_title = "9f1c-stale-uuid".into();
+        stale.status = DownloadStatus::Failed;
+        stale.error = Some("旧失败".into());
+        stale.read_page = Some(3);
+        stale.read_at = Some(1_700_000_000);
+        stale.pages_done = 2;
+        stale.pages_total = 5;
+        stale.pages_signature = Some("sig".into());
+        tasks.push(stale);
+        let fresh = DownloadTask::from_chapter(
+            "source.a",
+            &manga("source.a", "m"),
+            &Chapter {
+                key: "c".into(),
+                volume_number: Some(1.),
+                ..Default::default()
+            },
+        );
+        assert!(matches!(
+            enqueue_task(&mut tasks, fresh),
+            EnqueueOutcome::Duplicate
+        ));
+        let refreshed = &tasks[0];
+        assert_eq!(refreshed.id, id);
+        assert_eq!(refreshed.status, DownloadStatus::Queued);
+        assert_eq!(refreshed.error, None);
+        assert_eq!(refreshed.chapter_title, "第 1 卷");
+        assert_eq!(refreshed.chapter_number, None);
+        assert_eq!(refreshed.volume_number, Some(1.0));
+        assert_eq!(refreshed.read_page, Some(3));
+        assert_eq!(refreshed.read_at, Some(1_700_000_000));
+        assert_eq!(refreshed.pages_done, 2);
+        assert_eq!(refreshed.pages_total, 5);
+        assert_eq!(refreshed.pages_signature.as_deref(), Some("sig"));
+        assert_eq!(refreshed.chapter_for().unwrap().volume_number, Some(1.0));
+        let mut minimal = task("source.a", "m", "c");
+        minimal.chapter_title = "极简重试标题".into();
+        minimal.chapter_snapshot = None;
+        assert!(matches!(
+            enqueue_task(&mut tasks, minimal),
+            EnqueueOutcome::Duplicate
+        ));
+        assert_eq!(tasks[0].chapter_title, "第 1 卷");
+        assert!(tasks[0].chapter_snapshot.is_some());
+        assert_eq!(tasks[0].pages_signature.as_deref(), Some("sig"));
     }
 
     #[test]
@@ -8713,5 +8912,59 @@ mod tests {
             cover_key("source.a", "https://img.example/c.jpg"),
             cover_key(&sources.follows[0].source_id, &url.unwrap()),
         );
+    }
+    fn finish_native_search(sources: &mut Sources, request_id: i64, text: Option<&str>) {
+        sources.finish_native_text_input(yejian_platform::TextInputResult { request_id, text: text.map(str::to_owned) });
+    }
+    #[test]
+    fn native_search_stale_duplicate_cancel_foreign_and_a_b_a_never_double_submit() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sources = test_sources(root.path());
+        sources.selected_source = "source.a".into(); sources.metadata_loaded = true; sources.query = "旧关键词".into();
+        sources.pending_native_search = Some((7, "source.a".into()));
+        finish_native_search(&mut sources, 6, Some("别的"));
+        assert_eq!(sources.query, "旧关键词", "another request id is stale");
+        assert!(sources.pending_native_search.is_some(), "stale reply keeps waiting");
+        finish_native_search(&mut sources, 7, Some("海贼王"));
+        assert_eq!(sources.query, "海贼王");
+        assert!(sources.pending_native_search.is_none());
+        assert!(matches!(sources.failed.as_ref(),
+            Some(Task::Search { query, page: 1, .. }) if query == "海贼王"));
+        assert_eq!(sources.request_id, 1, "exactly one search was submitted");
+        finish_native_search(&mut sources, 7, Some("重复回包"));
+        assert_eq!(sources.query, "海贼王", "a duplicate reply must not resubmit");
+        assert_eq!(sources.request_id, 1);
+        sources.pending_native_search = Some((8, "source.a".into()));
+        finish_native_search(&mut sources, 8, None);
+        assert_eq!(sources.query, "海贼王", "cancel keeps the query");
+        assert!(sources.pending_native_search.is_none());
+        assert_eq!(sources.request_id, 1, "cancel starts no search");
+        sources.pending_native_search = Some((4, "source.b".into()));
+        finish_native_search(&mut sources, 4, Some("新关键词"));
+        assert_eq!(sources.query, "海贼王", "another source cannot commit");
+        assert!(sources.pending_native_search.is_none());
+        sources.pending_native_search = Some((9, "source.a".into()));
+        sources.select_source("source.b");
+        assert!(sources.pending_native_search.is_none());
+        sources.select_source("source.a");
+        assert_eq!(sources.query, "海贼王", "A's own session text is restored");
+        finish_native_search(&mut sources, 9, Some("海贼王"));
+        assert_eq!(sources.query, "海贼王", "old prompt cannot overwrite it");
+    }
+    #[test]
+    fn native_search_protocol_error_clears_pending_and_empty_text_still_searches() {
+        let root = tempfile::tempdir().unwrap();
+        let mut sources = test_sources(root.path());
+        sources.selected_source = "source.a".into(); sources.metadata_loaded = true;
+        sources.pending_native_search = Some((5, "source.a".into()));
+        sources.fail_native_text_input(yejian_platform::PlatformError::Protocol("bad requestId".into()));
+        assert!(sources.pending_native_search.is_none(), "a protocol error must restore the button");
+        assert!(sources.status.contains("搜索输入读取失败"));
+        assert_eq!(sources.request_id, 0, "a protocol error starts no search");
+        sources.pending_native_search = Some((6, "source.a".into()));
+        finish_native_search(&mut sources, 6, Some(""));
+        assert_eq!(sources.query, "");
+        assert!(matches!(sources.failed.as_ref(), Some(Task::Search { query, .. }) if query.is_empty()));
+        assert_eq!(sources.request_id, 1, "an empty query is still a real search");
     }
 }

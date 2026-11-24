@@ -449,6 +449,14 @@ pub struct WebResult {
     pub cookies: Option<Vec<(String, String)>>,
 }
 
+/// Result of a finished native search prompt (iOS `UITextField`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextInputResult {
+    pub request_id: i64,
+    /// `None` when the user canceled without submitting.
+    pub text: Option<String>,
+}
+
 /// True when the shell can show an in-app web page (Android WebView dialog,
 /// iOS WKWebView). Desktop platforms have no in-app browser; the UI must
 /// fall back to [`open_external_url`] plus a paste-cookies dialog.
@@ -545,6 +553,42 @@ pub fn poll_web() -> Result<Option<WebResult>> {
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 pub fn poll_web() -> Result<Option<WebResult>> {
     Ok(None)
+}
+
+/// Present one native `UITextField` prompt, prefilled with `initial`.
+#[cfg(target_os = "ios")]
+pub fn open_text_input(initial: &str) -> Result<i64> { ios::open_text_input(initial) }
+#[cfg(not(target_os = "ios"))]
+pub fn open_text_input(initial: &str) -> Result<i64> {
+    let _ = initial;
+    Err(PlatformError::Unsupported("native text input prompt"))
+}
+#[cfg(target_os = "ios")]
+pub fn poll_text_input() -> Result<Option<TextInputResult>> { ios::poll_text_input() }
+#[cfg(not(target_os = "ios"))]
+pub fn poll_text_input() -> Result<Option<TextInputResult>> { Ok(None) }
+
+/// Parse the strict JSON contract from `yejian_ios_poll_text_input()`. A
+/// malformed reply is an error so the caller can clear its pending prompt.
+#[cfg(any(target_os = "ios", test))]
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn parse_text_input_json(json: &str) -> Result<TextInputResult> {
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|error| PlatformError::Protocol(format!("invalid text input JSON: {error}")))?;
+    let object = value.as_object()
+        .ok_or_else(|| PlatformError::Protocol("text input payload is not an object".into()))?;
+    if let Some(key) = object.keys().find(|k| !matches!(k.as_str(), "requestId" | "text")) {
+        return Err(PlatformError::Protocol(format!("unknown text input field `{key}`")));
+    }
+    let request_id = object.get("requestId").and_then(serde_json::Value::as_i64)
+        .filter(|id| *id > 0)
+        .ok_or_else(|| PlatformError::Protocol("`requestId` must be a positive integer".into()))?;
+    let text = match object.get("text") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(text)) => Some(text.clone()),
+        Some(_) => return Err(PlatformError::Protocol("`text` must be a string or null".into())),
+    };
+    Ok(TextInputResult { request_id, text })
 }
 
 #[cfg_attr(not(any(target_os = "ios", target_os = "android")), allow(dead_code))]
@@ -719,5 +763,22 @@ mod web_tests {
         assert_eq!(done.cookies, Some(vec![("cf_clearance".into(), "x".into())]));
         let cancelled = super::parse_web_json(r#"{"url":"https://a.test"}"#).unwrap();
         assert_eq!(cancelled.cookies, None);
+    }
+
+    #[test]
+    fn text_input_json_requires_a_positive_request_id_and_strict_text() {
+        let done = super::parse_text_input_json(r#"{"requestId":7,"text":"海贼王"}"#).unwrap();
+        assert_eq!((done.request_id, done.text.as_deref()), (7, Some("海贼王")));
+        for cancel in [r#"{"requestId":8}"#, r#"{"requestId":9,"text":null}"#] {
+            assert_eq!(super::parse_text_input_json(cancel).unwrap().text, None);
+        }
+        let bad = [
+            "", "{}", "[]", r#"{"requestId":0}"#, r#"{"requestId":-1}"#,
+            r#"{"requestId":"7"}"#, r#"{"requestId":7.5}"#, r#"{"requestId":7,"text":3}"#,
+            r#"{"requestId":7,"text":false}"#, r#"{"requestId":7,"extra":1}"#,
+        ];
+        for payload in bad {
+            assert!(super::parse_text_input_json(payload).is_err(), "accepted {payload}");
+        }
     }
 }

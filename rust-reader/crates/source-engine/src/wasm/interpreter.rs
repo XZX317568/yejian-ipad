@@ -32,7 +32,9 @@ pub(crate) struct HostState {
     pub print_handler: Option<Arc<dyn Fn(String) + Send + Sync>>,
     pub partial_result_handler: Option<Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
     pub request_handler: RequestHandler,
-    /// Set by any `js` import that would evaluate code or drive a web view.
+    /// Set only by *unsupported* JS/WebView calls (`context_eval_async` and
+    /// every `webview_*`); synchronous `context_eval`/`context_get` run on
+    /// QuickJS and leave this unset even when the JS itself fails.
     pub js_requested: bool,
     /// Set when a failing HTTP response carries a known anti-bot marker.
     pub challenge_suspected: bool,

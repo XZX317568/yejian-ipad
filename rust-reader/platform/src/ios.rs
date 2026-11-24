@@ -26,6 +26,8 @@ extern "C" {
     fn yejian_ios_set_waker(callback: extern "C" fn());
     fn yejian_ios_open_web(url: *const c_char, user_agent: *const c_char) -> i64;
     fn yejian_ios_poll_web() -> *mut c_char;
+    fn yejian_ios_open_text_input(initial: *const c_char) -> i64;
+    fn yejian_ios_poll_text_input() -> *mut c_char;
     fn yejian_ios_open_external_url(url: *const c_char) -> i64;
 }
 
@@ -143,6 +145,22 @@ pub(crate) fn poll_web() -> Result<Option<crate::WebResult>> {
     match take_string(unsafe { yejian_ios_poll_web() }) {
         Some(text) if !text.is_empty() => crate::parse_web_json(&text).map(Some),
         _ => Ok(None),
+    }
+}
+
+pub(crate) fn open_text_input(initial: &str) -> Result<i64> {
+    let text = CString::new(initial).map_err(|_| PlatformError::Io("search text contains a NUL byte".into()))?;
+    match unsafe { yejian_ios_open_text_input(text.as_ptr()) } {
+        id if id > 0 => Ok(id),
+        _ => Err(PlatformError::Picker("no view controller is available to present the search field".into())),
+    }
+}
+
+pub(crate) fn poll_text_input() -> Result<Option<crate::TextInputResult>> {
+    // Empty JSON is malformed, not absent: let the caller clear its prompt.
+    match take_string(unsafe { yejian_ios_poll_text_input() }) {
+        Some(json) => crate::parse_text_input_json(&json).map(Some),
+        None => Ok(None),
     }
 }
 

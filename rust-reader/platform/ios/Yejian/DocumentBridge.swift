@@ -650,6 +650,101 @@ extension YejianDocumentBridge {
     }
 }
 
+private let textInputLock = NSLock()
+private var textInputResults: [String] = []
+private var nextTextInputId: Int64 = 1
+private var activeTextInputPrompt: YejianTextInputPrompt?
+private final class YejianTextInputPrompt: NSObject, UITextFieldDelegate {
+    let requestId: Int64; let controller: UIAlertController
+    private let finish: (String) -> Void; private var searchAction: UIAlertAction?; private var sent = false
+    /// Set only after the present completion handler ran. UIKit asserts when
+    /// a .alert presentation controller's delegate is touched, so dismissal
+    /// without an action reply is detected by polling this flag plus the
+    /// controller's presentation state instead.
+    var presentationCompleted = false
+    init(requestId: Int64, initial: String, finish: @escaping (String) -> Void) {
+        self.requestId = requestId; self.finish = finish
+        controller = UIAlertController(title: "搜索漫画", message: "选字完成后点搜索", preferredStyle: .alert)
+        super.init()
+        controller.view.accessibilityIdentifier = "yejian.source.search.alert"
+        controller.addTextField { field in
+            field.text = initial
+            field.placeholder = "关键词"
+            field.clearButtonMode = .whileEditing; field.returnKeyType = .search
+            field.autocorrectionType = .no; field.accessibilityIdentifier = "yejian.source.search.field"
+            field.delegate = self; field.addTarget(self, action: #selector(self.refresh), for: .editingChanged)
+        }
+        let search = UIAlertAction(title: "搜索", style: .default) { [weak self] _ in self?.submit() }
+        searchAction = search
+        controller.addAction(UIAlertAction(title: "取消", style: .cancel) { [weak self] _ in self?.send(nil) })
+        controller.addAction(search)
+        controller.preferredAction = search
+        refresh()
+    }
+    private var field: UITextField? { controller.textFields?.first }
+    @objc private func refresh() { searchAction?.isEnabled = field?.markedTextRange == nil }
+    func textFieldDidChangeSelection(_ textField: UITextField) { refresh() }
+    func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+        guard textField.markedTextRange == nil else { return false }
+        submit()
+        return true
+    }
+    private func submit() {
+        guard let field, field.markedTextRange == nil, !sent else { return }
+        send(field.text ?? "")
+        controller.dismiss(animated: true)
+    }
+    func recoverFromFailedPresentation() { send(nil) }
+    /// The alert vanished after a fully completed presentation without any
+    /// action reply. Alerts have no legal delegate hook for this, so
+    /// `pollTextInput` reports it as a cancel.
+    func reportVanished() { send(nil) }
+    private func send(_ text: String?) {
+        guard !sent else { return }
+        sent = true
+        var payload: [String: Any] = ["requestId": requestId]
+        if let text { payload["text"] = text }
+        let data = (try? JSONSerialization.data(withJSONObject: payload)) ?? Data()
+        finish(String(data: data, encoding: .utf8) ?? "")
+    }
+}
+extension YejianDocumentBridge {
+    func openTextInput(initial: String) -> Int64 {
+        guard prepared else { return -1 }
+        return onMain {
+            guard activeTextInputPrompt == nil, let presenter = self.topViewController(),
+                  presenter.view.window != nil, !presenter.isBeingPresented,
+                  !presenter.isBeingDismissed, !(presenter is UIAlertController) else { return -1 }
+            let requestId = nextTextInputId
+            nextTextInputId += 1
+            let prompt = YejianTextInputPrompt(requestId: requestId, initial: initial) { json in
+                textInputLock.lock(); textInputResults.append(json); textInputLock.unlock()
+                activeTextInputPrompt = nil; self.wake()
+            }
+            activeTextInputPrompt = prompt
+            presenter.present(prompt.controller, animated: true) {
+                guard activeTextInputPrompt === prompt else { return }
+                if prompt.controller.presentingViewController == nil { prompt.recoverFromFailedPresentation() }
+                else { prompt.presentationCompleted = true }
+            }
+            return requestId
+        }
+    }
+    func pollTextInput() -> String? {
+        // The lock guards the queue only; the disappearance check and the
+        // resulting send/wake run outside it on the main thread.
+        onMain {
+            guard let prompt = activeTextInputPrompt, prompt.presentationCompleted,
+                  !prompt.controller.isBeingDismissed,
+                  prompt.controller.presentingViewController == nil,
+                  prompt.controller.viewIfLoaded?.window == nil else { return }
+            prompt.reportVanished()
+        }
+        textInputLock.lock(); defer { textInputLock.unlock() }
+        return textInputResults.isEmpty ? nil : textInputResults.removeFirst()
+    }
+}
+
 // MARK: - Rust ABI
 
 #if DEBUG
@@ -723,6 +818,18 @@ public func yejian_ios_open_web(
 @_cdecl("yejian_ios_poll_web")
 public func yejian_ios_poll_web() -> UnsafeMutablePointer<CChar>? {
     guard let json = YejianDocumentBridge.shared.pollWeb() else { return nil }
+    return duplicate(json)
+}
+
+@_cdecl("yejian_ios_open_text_input")
+public func yejian_ios_open_text_input(_ initial: UnsafePointer<CChar>?) -> Int64 {
+    guard let initial else { return -1 }
+    return YejianDocumentBridge.shared.openTextInput(initial: String(cString: initial))
+}
+
+@_cdecl("yejian_ios_poll_text_input")
+public func yejian_ios_poll_text_input() -> UnsafeMutablePointer<CChar>? {
+    guard let json = YejianDocumentBridge.shared.pollTextInput() else { return nil }
     return duplicate(json)
 }
 
