@@ -228,6 +228,8 @@ pub struct ReaderApp {
     chapters: Vec<ChapterLink>,
     chapter_indices: HashMap<String, usize>,
     chapter_dialog: Option<String>,
+    /// 详情页内联章节卡的排序偏好：false=正序（从头），true=倒序（最新）。
+    detail_desc: bool,
     ready: bool,
     startup_error: Option<String>,
     query: String,
@@ -362,6 +364,7 @@ impl ReaderApp {
             chapters: Vec::new(),
             chapter_indices: HashMap::new(),
             chapter_dialog: None,
+            detail_desc: false,
             ready: false,
             startup_error: None,
             query: String::new(),
@@ -3863,49 +3866,27 @@ fn library_thumbnails(
         } else {
             format!("{} · {} 页", book.author, book.page_count)
         };
+        let wide = Self::detail_wide(area);
         let details_start = if Self::detail_side_by_side(area) {
             pos2(area.center().x, area.top() + 68.)
-        } else if Self::detail_wide(area) {
+        } else if wide {
             pos2(cover.right() + 72., cover.top() + cover.height() * 0.15)
         } else {
-            pos2(area.left() + 24., cover.bottom() + 44.)
+            pos2(area.left() + 24., cover.bottom() + 30.)
         } - vec2(0., 8. * (1. - detail_alpha));
-        if Self::detail_wide(area) {
-            let body = Rect::from_min_size(
+        let body = if wide {
+            Rect::from_min_size(
                 details_start,
-                vec2(360., (area.bottom() - 24. - details_start.y).max(160.)),
-            );
-            let column_alpha = detail_alpha * exit_alpha;
-            ui.scope_builder(UiBuilder::new().max_rect(body), |ui| {
-                ScrollArea::vertical()
-                    .id_salt(("detail-body", id))
-                    .show(ui, |ui| {
-                        if column_alpha < 0.999 {
-                            ui.set_opacity(column_alpha);
-                        }
-                        ui.add(
-                            Label::new(
-                                RichText::new(title)
-                                    .font(crate::typography::display(36. * self.font_scale))
-                                    .color(ink),
-                            )
-                            .wrap(),
-                        );
-                        ui.add_space(8.);
-                        ui.add(
-                            Label::new(
-                                RichText::new(text).size(15. * self.font_scale).color(muted),
-                            )
-                            .wrap(),
-                        );
-                        ui.add_space(28.);
-                        self.detail_actions(ui, &book, id, 280., 52.);
-                    });
-            });
-            return;
-        }
-        let body = Rect::from_min_max(details_start, area.max - vec2(24., 12.));
+                vec2(392., (area.bottom() - 24. - details_start.y).max(160.)),
+            )
+        } else {
+            Rect::from_min_max(details_start, area.max - vec2(24., 12.))
+        };
         let column_alpha = detail_alpha * exit_alpha;
+        // 同系列的已下载章节：≥2 章渲染 Apple Books 分组章节卡（S3）；
+        // 本地单卷书退化为进度/卷宗概览卡。
+        let mut siblings = self.chapters_for(id);
+        let mut app = self;
         ui.scope_builder(UiBuilder::new().max_rect(body), |ui| {
             ScrollArea::vertical()
                 .id_salt(("detail-body", id))
@@ -3913,38 +3894,13 @@ fn library_thumbnails(
                     if column_alpha < 0.999 {
                         ui.set_opacity(column_alpha);
                     }
-                    ui.vertical_centered(|ui| {
-                        let title_size = if area.width() >= 700. { 30. } else { 24. };
-                        ui.add(
-                            Label::new(
-                                RichText::new(title)
-                                    .font(crate::typography::display(title_size * self.font_scale))
-                                    .color(ink),
-                            )
-                            .wrap(),
-                        );
-                        ui.add_space(6.);
-                        ui.add(
-                            Label::new(
-                                RichText::new(text).size(13. * self.font_scale).color(muted),
-                            )
-                            .wrap(),
-                        );
-                        ui.add_space(18.);
-                        let width = (218. * self.font_scale.sqrt()).min(ui.available_width());
-                        self.detail_actions(ui, &book, id, width, 48.);
-                    });
+                    Self::detail_column(ui, &mut app, &book, id, &title, &text, ink, muted, &mut siblings, wide);
                 });
         });
     }
-    fn detail_actions(
-        &mut self,
-        ui: &mut Ui,
-        book: &yejian_core::Book,
-        id: &str,
-        width: f32,
-        primary_height: f32,
-    ) {
+    /// Apple Books 工具条：次按钮按文字量取宽、≥44pt、自动折行的紧凑胶囊。
+    /// 主按钮 read 仍是唯一视觉焦点（accent 胶囊 + 轻落影）。
+    fn detail_actions(&mut self, ui: &mut Ui, book: &Book, id: &str, width: f32, primary_height: f32) {
         let can_restart = book.current_page > 0 || book.page_fraction > 0.;
         let width = width.min(ui.available_width());
         let (rect, _) = ui.allocate_exact_size(vec2(width, primary_height), Sense::hover());
@@ -3957,38 +3913,192 @@ fn library_thumbnails(
             self.flight = None;
             self.open_reader(book);
         }
+        let mut row: Vec<(&str, String)> = Vec::new();
         if can_restart {
-            let (rect, _) = ui.allocate_exact_size(vec2(width, 46.), Sense::hover());
-            if self.button(ui, "read-start", rect, "从第一页开始", false) {
-                let mut first = book.clone();
-                first.current_page = 0;
-                first.page_fraction = 0.;
-                self.flight = None;
-                self.open_reader(&first);
-            }
+            row.push(("read-start", "从第一页开始".into()));
         }
         if self.chapter(id).is_some() {
-            let (rect, _) = ui.allocate_exact_size(vec2(width, 46.), Sense::hover());
-            if self.button(ui, "detail-chapters", rect, "已下载章节", false) {
-                self.chapter_dialog = Some(id.to_string());
-            }
+            row.push(("detail-chapters", "章节目录".into()));
         }
         let key = if let Some(chapter) = self.chapter(id) {
-            crate::trackers::binding_key(
-                Some((&chapter.source_id, &chapter.manga_id)),
-                None,
-            )
+            crate::trackers::binding_key(Some((&chapter.source_id, &chapter.manga_id)), None)
         } else {
             crate::trackers::binding_key(None, Some(id))
         };
         if !key.is_empty() {
-            let (rect, _) = ui.allocate_exact_size(vec2(width, 46.), Sense::hover());
-            if self.button(ui, "detail-tracking", rect, "进度跟踪", false) {
-                self.track_panel = Some(key);
-                self.track_query.clear();
+            row.push(("detail-tracking", "进度跟踪".into()));
+        }
+        if row.is_empty() {
+            return;
+        }
+        ui.add_space(10.);
+        let font = FontId::proportional(15. * self.font_scale);
+        let gap = 8.;
+        let widths: Vec<f32> = row
+            .iter()
+            .map(|(_, label)| (ui.painter().layout_no_wrap(label.clone(), font.clone(), Color32::WHITE).size().x + 36.).clamp(76., width.max(76.)))
+            .collect();
+        let total = widths.iter().sum::<f32>() + gap * (widths.len() - 1) as f32;
+        let click = |app: &mut Self, hid: &str, book: &Book, id: &str, key: &str| {
+            match hid {
+                "read-start" => {
+                    let mut first = book.clone();
+                    first.current_page = 0;
+                    first.page_fraction = 0.;
+                    app.flight = None;
+                    app.open_reader(&first);
+                }
+                "detail-chapters" => app.chapter_dialog = Some(id.to_string()),
+                _ => {
+                    app.track_panel = Some(key.to_string());
+                    app.track_query.clear();
+                }
             }
+        };
+        if total <= ui.available_width() {
+            // 一行放得下：整块手动居中（horizontal_wrapped 会左漂）。
+            ui.horizontal(|ui| {
+                ui.add_space(((ui.available_width() - total) / 2.).max(0.));
+                for ((hid, label), w) in row.iter().zip(&widths) {
+                    let (rect, _) = ui.allocate_exact_size(vec2(*w, 44.), Sense::hover());
+                    if self.button(ui, hid, rect, label, false) {
+                        click(self, hid, book, id, &key);
+                    }
+                    ui.add_space(gap);
+                }
+            });
+            return;
+        }
+        // 200% 大字号等超宽场景：每个次按钮竖排居中，热区仍 ≥44pt。
+        for ((hid, label), w) in row.iter().zip(&widths) {
+            let (rect, _) = ui.allocate_exact_size(vec2(*w, 44.), Sense::hover());
+            if self.button(ui, hid, rect, label, false) {
+                click(self, hid, book, id, &key);
+            }
+            ui.add_space(gap);
         }
     }
+/// 详情页文字列：hero（书名/元信息/进度徽章）→ 操作区 → 内联分组卡；
+/// 全程在 ScrollArea 里，保持扫边 alpha 契约与静止帧逐字节稳定（close-p1==close-pre）。
+fn detail_column(ui: &mut Ui, app: &mut ReaderApp, book: &Book, id: &str, title: &str, text: &str,
+                 ink: Color32, muted: Color32, siblings: &mut Vec<Book>, wide: bool) {
+    let fs = app.font_scale;
+    let dark = app.dark;
+    let (t, s, g) = if wide { (36., 15., 8.) } else if ui.available_width() >= 560. { (30., 13., 6.) } else { (24., 13., 6.) };
+    let hero = |ui: &mut Ui| {
+        ui.add(Label::new(RichText::new(title).font(crate::typography::display(t * fs)).color(ink)).wrap());
+        ui.add_space(g);
+        ui.add(Label::new(RichText::new(text).size(s * fs).color(muted)).wrap());
+        if book.last_read_at.is_some() || book.current_page > 0 {
+            ui.add_space(10.);
+            // 「已读 X / Y 页 · XX%」柔和胶囊徽章。
+            let p = crate::design::palette(dark);
+            let read = (book.current_page + 1).min(book.page_count);
+            let pct = if book.page_count > 0 { ((book.current_page as f32 + book.page_fraction.clamp(0., 1.)) / book.page_count as f32 * 100.).round() as u32 } else { 0 };
+            let label = format!("已读 {read} / {} 页 · {pct}%", book.page_count);
+            let font = FontId::proportional(12.5 * fs);
+            let size = ui.painter().layout_no_wrap(label.clone(), font.clone(), p.ink).size();
+            let (rect, _) = ui.allocate_exact_size(size + vec2(26., 14.), Sense::hover());
+            let pt = ui.painter();
+            pt.rect_filled(rect, rect.height() / 2., p.soft);
+            pt.circle_filled(rect.left_center() + vec2(15., 0.), 3., p.accent);
+            pt.text(rect.left_center() + vec2(24., 0.), Align2::LEFT_CENTER, label, font, p.muted);
+        }
+    };
+    if wide {
+        hero(ui);
+        ui.add_space(24.);
+        app.detail_actions(ui, book, id, 280., 52.);
+    } else {
+        ui.vertical_centered(|ui| {
+            hero(ui);
+            ui.add_space(20.);
+            app.detail_actions(ui, book, id, (252. * fs.sqrt()).min(ui.available_width()), 48.);
+        });
+    }
+    ui.add_space(16.);
+    Self::detail_card(ui, app, book, id, siblings);
+}
+/// 内联分组卡：≥2 章渲染章节列表（正/倒序胶囊 + 前 6 章 + 查看全部）；
+/// 单卷本地书退化为阅读进度与卷宗概览。
+fn detail_card(ui: &mut Ui, app: &mut ReaderApp, book: &Book, id: &str, siblings: &mut Vec<Book>) {
+    let p = crate::design::palette(app.dark);
+    // 居中列里卡片别铺满 1050pt：收到 Apple Books 式 640pt 栏宽（列更窄则跟随）。
+    ui.set_max_width(ui.available_width().min(560.));
+    crate::design::grouped_card(ui, p, |ui| {
+        ui.set_width(ui.available_width());
+        if siblings.len() >= 2 {
+            if app.detail_desc { siblings.reverse(); }
+            ui.horizontal(|ui| {
+                ui.add(Label::new(RichText::new(format!("章节 · 共 {} 话", siblings.len()))
+                    .size(15. * app.font_scale).strong().color(p.ink)).wrap());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    for (desc, label) in [(true, "最新在前"), (false, "从头开始")] {
+                        let r = ui.selectable_label(app.detail_desc == desc, label);
+                        app.hitboxes.insert(format!("detail-sort-{desc}"), r.rect);
+                        if r.clicked() { app.detail_desc = desc; }
+                    }
+                });
+            });
+            ui.add_space(6.);
+            for (i, entry) in siblings.iter().take(6).enumerate() {
+                Self::detail_chapter_row(ui, app, entry, id, p, i > 0);
+            }
+            if siblings.len() > 6 {
+                let y = ui.cursor().top();
+                ui.painter().line_segment([pos2(ui.min_rect().left(), y), pos2(ui.min_rect().right(), y)], Stroke::new(0.5, p.line));
+                let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 44.), Sense::click());
+                app.hitboxes.insert("detail-chapters-all".into(), rect);
+                ui.painter().text(rect.center(), Align2::CENTER_CENTER, format!("查看全部 {} 话", siblings.len()),
+                    FontId::proportional(14. * app.font_scale), p.accent);
+                if resp.clicked() { app.chapter_dialog = Some(id.to_string()); }
+            }
+            return;
+        }
+        ui.add(Label::new(RichText::new("阅读进度 · 卷宗").size(15. * app.font_scale).strong().color(p.ink)).wrap());
+        ui.add_space(10.);
+        let track = Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), 6.));
+        ui.advance_cursor_after_rect(track);
+        ui.painter().rect_filled(track, 3., p.soft);
+        let frac = if book.page_count > 0 { ((book.current_page as f32 + book.page_fraction.clamp(0., 1.)) / book.page_count as f32).clamp(0., 1.) } else { 0. };
+        if frac > 0.01 {
+            ui.painter().rect_filled(Rect::from_min_size(track.min, vec2((track.width() * frac).max(6.), 6.)), 3., p.accent);
+        }
+        ui.add_space(10.);
+        let ext = book.archive_path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_uppercase()).unwrap_or_else(|| "CBZ".into());
+        ui.label(RichText::new(format!("已读 {} / {} 页 · {}% · {ext} · {}",
+            (book.current_page + 1).min(book.page_count), book.page_count, (frac * 100.).round() as u32,
+            if book.category.is_empty() { "未分类" } else { book.category.as_str() }))
+            .size(13. * app.font_scale).color(p.muted));
+    });
+}
+/// 内联章节行：当前章琥珀圆点、0.5pt 发丝分割、44pt 热区直达阅读位置。
+fn detail_chapter_row(ui: &mut Ui, app: &mut ReaderApp, entry: &Book, id: &str, p: crate::design::Palette, hairline: bool) {
+    if hairline {
+        let y = ui.cursor().top();
+        ui.painter().line_segment([pos2(ui.min_rect().left(), y), pos2(ui.min_rect().right(), y)], Stroke::new(0.5, p.line));
+    }
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 44.), Sense::click());
+    if resp.hovered() { ui.painter().rect_filled(rect, 6., p.soft.gamma_multiply(0.55)); }
+    let current = entry.id == id;
+    let pt = ui.painter();
+    if current { pt.circle_filled(rect.left_center() + vec2(6., 0.), 3.5, p.accent); }
+    let name = app.chapter(&entry.id).map(|m| m.chapter_title.clone()).unwrap_or_else(|| entry.title.clone());
+    pt.text(rect.left_center() + vec2(if current { 20. } else { 12. }, 0.), Align2::LEFT_CENTER,
+        name, FontId::proportional(14. * app.font_scale), p.ink);
+    if entry.last_read_at.is_some() || entry.current_page > 0 {
+        pt.text(rect.right_center() + vec2(-8., 0.), Align2::RIGHT_CENTER,
+            format!("第 {} / {} 页", (entry.current_page + 1).min(entry.page_count), entry.page_count),
+            FontId::proportional(12. * app.font_scale), p.muted);
+    }
+    app.hitboxes.insert(format!("dchapter-{}", entry.id), rect);
+    if resp.clicked() {
+        app.flight = None;
+        app.open_reader(entry);
+    }
+}
+
+
     fn reader_input_blocked(&self) -> bool {
         self.reader_options
             || self.chapter_dialog.is_some()
