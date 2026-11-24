@@ -38,6 +38,22 @@ struct Flight {
     origin_lane: i32,
     clip: Rect,
 }
+/// Reader canvas: warm charcoal, keeps close-mid dark samples under 90.
+const READER_CANVAS: Color32 = Color32::from_rgb(26, 24, 21);
+/// Snap page rect to the pixel grid: shared tile/spread edges coincide (S4).
+fn snap_page_rect(painter: &Painter, r: Rect) -> Rect {
+    let ppp = painter.ctx().pixels_per_point();
+    let s = |v: f32| (v * ppp).round() / ppp;
+    Rect::from_min_max(pos2(s(r.left()), s(r.top())), pos2(s(r.right()), s(r.bottom())))
+}
+fn page_label(book: &Book, page: usize, private: bool) -> String {
+    format!("{} / {}{}", page + 1, book.page_count, if private { " · 私密阅读" } else { "" })
+}
+struct ReaderChrome { // chrome rects shared by live controls and ghosts
+    top: Rect, dock: Rect, back: Rect, settings: Rect, chapters: Rect, title_clip: Rect,
+    prev: Rect, next: Rect, badge: Rect, slider: Rect, }
+
+
 struct PageTexture {
     tiles: Vec<TextureHandle>,
     size: Vec2,
@@ -64,6 +80,7 @@ impl PageTexture {
         } else {
             Rect::from_min_max(Pos2::ZERO, pos2(1., 1.))
         };
+        let rect = snap_page_rect(painter, rect);
         let mut top = 0.;
         for tile in &self.tiles {
             let tile_height = tile.size()[1] as f32 / self.size.y;
@@ -110,6 +127,7 @@ impl PageTexture {
             Rect::from_min_max(Pos2::ZERO, pos2(1., 1.))
         };
         let f = crate::params::params().flip.clone();
+        let rect = snap_page_rect(painter, rect);
         let mut top = 0.;
         for tile in &self.tiles {
             let tile_height = tile.size()[1] as f32 / self.size.y;
@@ -2108,7 +2126,9 @@ impl ReaderApp {
                 StrokeKind::Inside,
             );
         }
-        crate::design::draw_icon(p, visual.center(), kind, color, active);
+        if !is_reader {
+            crate::design::draw_icon(p, visual.center(), kind, color, active);
+        }
         response.clicked()
     }
     fn shelf_area(&self, area: Rect) -> Rect {
@@ -4134,6 +4154,38 @@ fn detail_chapter_row(ui: &mut Ui, app: &mut ReaderApp, entry: &Book, id: &str, 
             self.setting("reading-mode", mode.into());
         }
     }
+    /// Chrome rects (bar + capsule <=680pt); shifts = show-hide slide.
+    fn reader_chrome(&self, painter: &Painter, area: Rect, book: &Book, id: &str, top_shift: f32, bottom_shift: f32) -> ReaderChrome {
+        let top = Rect::from_min_max(area.min + vec2(12., 10. + top_shift), pos2(area.right() - 12., area.top() + 66. + top_shift));
+        let dock = Rect::from_center_size(pos2(area.center().x, area.bottom() - 42. + bottom_shift), vec2((area.width() - 24.).min(680.), 60.));
+        let back = Rect::from_min_size(top.min + vec2(6., 6.), vec2(44., 44.));
+        let settings = Rect::from_min_size(pos2(top.right() - 50., top.top() + 6.), vec2(44., 44.));
+        let chapters = Rect::from_min_size(pos2(settings.left() - 48., top.top() + 6.), vec2(44., 44.));
+        let title_r = (if self.chapter(id).is_some() { chapters.left() } else { settings.left() }) - 8.;
+        let title_clip = Rect::from_min_max(pos2(back.right() + 8., top.top()), pos2(title_r, top.bottom()));
+        let prev = Rect::from_min_size(dock.min + vec2(8., 8.), vec2(44., 44.));
+        let next = Rect::from_min_size(pos2(dock.right() - 52., dock.top() + 8.), vec2(44., 44.));
+        let galley = painter.layout_no_wrap(page_label(book, self.page, self.private), FontId::monospace(12.), Color32::WHITE);
+        let badge_x = (prev.right() + 22. + galley.size().x / 2.).max(dock.left() + 96.);
+        let badge = Rect::from_center_size(pos2(badge_x, dock.center().y), vec2(galley.size().x + 32., 34.));
+        let slider = Rect::from_min_max(pos2((badge.right() + 8.).min(next.left() - 88.), dock.top() + 8.), pos2(next.left() - 8., dock.bottom() - 8.));
+        ReaderChrome { top, dock, back, settings, chapters, title_clip, prev, next, badge, slider }
+    }
+    /// Static chrome for live frame and ghosts (icon() skips glyphs live).
+    fn paint_reader_chrome(&self, painter: &Painter, c: &ReaderChrome, book: &Book, id: &str) {
+        let p = crate::design::palette(true);
+        crate::design::translucent_bar(painter, c.top, p, true, 16);
+        crate::design::translucent_bar(painter, c.dock, p, true, 30);
+        let icon = Color32::from_gray(232);
+        crate::design::draw_icon(painter, c.back.center(), "back", icon, false);
+        if self.chapter(id).is_some() { crate::design::draw_icon(painter, c.chapters.center(), "chapters", icon, false); }
+        crate::design::draw_icon(painter, c.settings.center(), "settings", icon, false);
+        painter.with_clip_rect(c.title_clip).text(pos2(c.title_clip.left(), c.top.center().y), Align2::LEFT_CENTER, self.reading_title(book), FontId::proportional(15.), p.ink);
+        crate::design::draw_icon(painter, c.prev.center(), "prev", icon, false);
+        crate::design::draw_icon(painter, c.next.center(), "next", icon, false);
+        painter.rect_filled(c.badge, 17., p.soft);
+        painter.text(c.badge.center(), Align2::CENTER_CENTER, page_label(book, self.page, self.private), FontId::monospace(12.), p.ink);
+    }
     fn reader_tap(&mut self, id: &str, relative: f32, step: i32, now: f64, viewport_w: f32) {
         if self.vertical || self.zoom > 1. || (0.27..=0.73).contains(&relative) {
             let current = self
@@ -4241,57 +4293,20 @@ fn detail_chapter_row(ui: &mut Ui, app: &mut ReaderApp, entry: &Book, id: &str, 
         // The peel ridge rides the retreating edge (1-p) and never drops
         // below the live drag/turn phase, mirroring the entry's max().
         let phase = (1. - p).max((slide_x.abs() / page_viewport.width().max(1.)).clamp(0., 1.));
-        let title = self.reading_title(&book);
-        let has_chapter = self.chapter(&id).is_some();
-        let page_label = format!(
-            "{} / {}{}", self.page + 1, book.page_count,
-            if self.private { " · 私密阅读" } else { "" });
-        let palette = crate::design::palette(true);
         for band in shelf::spread_clip(area, p, dir) {
             let clipped = ui.painter().with_clip_rect(band);
-            clipped.rect_filled(band, 0., Color32::from_rgb(18, 20, 22));
+            clipped.rect_filled(band, 0., READER_CANVAS);
             let pages_painter = clipped.with_clip_rect(page_viewport);
             for (page, target, mirror) in &queue {
                 if let Some(tex) = self.pages.get(&(id.clone(), *page)) {
                     tex.paint_flip(&pages_painter, target.translate(shift), crop, phase, *mirror);
                 }
             }
-            if chrome_t <= 0.001 {
-                continue;
-            }
-            // Static ghost of the reader chrome (icons + labels, no slider /
-            // hover state) fading out ahead of the bands.
-            let mut ghost = clipped.clone();
+            if chrome_t <= 0.001 { continue; }
+            let mut ghost = clipped.clone(); // chrome ghost, fading out
             ghost.multiply_opacity(chrome_t);
-            let top_shift = -56. * (1. - chrome_t);
-            let bottom_shift = 68. * (1. - chrome_t);
-            let top_bar = Rect::from_min_max(
-                area.min + vec2(0., top_shift),
-                pos2(area.right(), area.top() + 56. + top_shift),
-            );
-            let bottom_bar = Rect::from_min_max(
-                pos2(area.left(), area.bottom() - 68. + bottom_shift),
-                pos2(area.right(), area.bottom() + bottom_shift),
-            );
-            let bar_fill = palette.surface.gamma_multiply(chrome_t);
-            let hairline = Stroke::new(1., Color32::from_white_alpha((30. * chrome_t) as u8));
-            ghost.rect_filled(top_bar, 0., bar_fill);
-            ghost.line_segment([top_bar.left_bottom(), top_bar.right_bottom()], hairline);
-            ghost.rect_filled(bottom_bar, 0., bar_fill);
-            ghost.line_segment([bottom_bar.left_top(), bottom_bar.right_top()], hairline);
-            let icon = Color32::from_gray(232);
-            let di = crate::design::draw_icon;
-            di(&ghost, pos2(area.left() + 30., area.top() + 30. + top_shift), "back", icon, false);
-            if has_chapter {
-                di(&ghost, pos2(area.right() - 82., area.top() + 30. + top_shift), "chapters", icon, false);
-            }
-            di(&ghost, pos2(area.right() - 30., area.top() + 30. + top_shift), "settings", icon, false);
-            ghost.text(area.min + vec2(56., 20. + top_shift), Align2::LEFT_TOP,
-                       title.clone(), FontId::proportional(15.), palette.ink);
-            di(&ghost, pos2(area.left() + 32., bottom_bar.top() + 34.), "prev", icon, false);
-            di(&ghost, pos2(area.right() - 32., bottom_bar.top() + 34.), "next", icon, false);
-            ghost.text(pos2(area.center().x, bottom_bar.top() + 2.), Align2::CENTER_TOP,
-                       page_label.clone(), FontId::monospace(12.), palette.muted);
+            let chrome = self.reader_chrome(&ghost, area, &book, &id, -76. * (1. - chrome_t), 72. * (1. - chrome_t));
+            self.paint_reader_chrome(&ghost, &chrome, &book, &id);
         }
     }
     /// Under-screen content stays hidden until the band coverage drops
@@ -4312,8 +4327,7 @@ fn detail_chapter_row(ui: &mut Ui, app: &mut ReaderApp, entry: &Book, id: &str, 
             return;
         };
         let ctx = ui.ctx().clone();
-        ui.painter()
-            .rect_filled(area, 0., Color32::from_rgb(18, 20, 22));
+        ui.painter().rect_filled(area, 0., READER_CANVAS);
         self.ask_page(id, self.page);
         let step: i32 = if self.spread && !self.vertical && area.width() > 700. {
             if self.spread_offset && self.page == 0 {
@@ -5001,31 +5015,15 @@ fn detail_chapter_row(ui: &mut Ui, app: &mut ReaderApp, entry: &Book, id: &str, 
         }
         if chrome_t > 0.001 {
             let palette = crate::design::palette(true);
-            let (ink, muted) = (palette.ink, palette.muted);
             ui.style_mut().visuals = crate::design::visuals(true);
-            let bar_fill = palette.surface.gamma_multiply(chrome_t);
-            let hairline = Stroke::new(1., Color32::from_white_alpha((30. * chrome_t) as u8));
-            let top_shift = -56. * (1. - chrome_t);
-            let bottom_shift = 68. * (1. - chrome_t);
-            let top_bar = Rect::from_min_max(
-                area.min + vec2(0., top_shift),
-                pos2(area.right(), area.top() + 56. + top_shift),
-            );
-            let bottom_bar = Rect::from_min_max(
-                pos2(area.left(), area.bottom() - 68. + bottom_shift),
-                pos2(area.right(), area.bottom() + bottom_shift),
-            );
-            ui.painter().rect_filled(top_bar, 0., bar_fill);
-            ui.painter()
-                .line_segment([top_bar.left_bottom(), top_bar.right_bottom()], hairline);
-            ui.painter().rect_filled(bottom_bar, 0., bar_fill);
-            ui.painter()
-                .line_segment([bottom_bar.left_top(), bottom_bar.right_top()], hairline);
+            let chrome = self.reader_chrome(ui.painter(), area, &book, id, -76. * (1. - chrome_t), 72. * (1. - chrome_t));
             if self.controls {
-                if self.icon(
+                self.paint_reader_chrome(ui.painter(), &chrome, &book, id);
+                // back() defers: it flips is_reader mid-paint (chip glyphs).
+                let go_back = self.icon(
                     ui,
                     "reader-back",
-                    Rect::from_min_size(area.min + vec2(8., 8. + top_shift), vec2(44., 44.)),
+                    chrome.back,
                     "back",
                     match (&self.reader_return, self.tab) {
                         (Screen::Library, Tab::History) => "返回阅读足迹",
@@ -5033,98 +5031,24 @@ fn detail_chapter_row(ui: &mut Ui, app: &mut ReaderApp, entry: &Book, id: &str, 
                         (Screen::Library, _) => "返回书架",
                         _ => "返回详情",
                     },
-                ) {
-                    self.back(now, area);
-                }
-                ui.painter()
-                    .with_clip_rect(Rect::from_min_max(
-                        area.min + vec2(56., top_shift),
-                        pos2(
-                            area.right()
-                                - if self.chapter(id).is_some() {
-                                    110.
-                                } else {
-                                    58.
-                                },
-                            area.top() + 56. + top_shift,
-                        ),
-                    ))
-                    .text(
-                        area.min + vec2(56., 20. + top_shift),
-                        Align2::LEFT_TOP,
-                        self.reading_title(&book),
-                        FontId::proportional(15.),
-                        ink,
-                    );
+                );
                 if self.chapter(id).is_some()
-                    && self.icon(
-                        ui,
-                        "reader-chapters",
-                        Rect::from_min_size(
-                            pos2(area.right() - 104., area.top() + 8. + top_shift),
-                            vec2(44., 44.),
-                        ),
-                        "chapters",
-                        "已下载章节",
-                    )
-                {
+                    && self.icon(ui, "reader-chapters", chrome.chapters, "chapters", "已下载章节") {
                     self.chapter_dialog = Some(id.to_string());
                 }
-                if self.icon(
-                    ui,
-                    "reader-settings",
-                    Rect::from_min_size(
-                        pos2(area.right() - 52., area.top() + 8. + top_shift),
-                        vec2(44., 44.),
-                    ),
-                    "settings",
-                    "阅读设置",
-                ) {
+                if self.icon(ui, "reader-settings", chrome.settings, "settings", "阅读设置") {
                     self.reader_options = true;
                     self.vertical_reader.stop();
                     self.pending_reader_tap = None;
                 }
-                if self.icon(
-                    ui,
-                    "reader-prev",
-                    Rect::from_min_size(
-                        pos2(area.left() + 10., bottom_bar.top() + 12.),
-                        vec2(44., 44.),
-                    ),
-                    "prev",
-                    "上一页",
-                ) {
+                if self.icon(ui, "reader-prev", chrome.prev, "prev", "上一页") {
                     self.next_page(id, -step, now, page_viewport.width());
                 }
-                if self.icon(
-                    ui,
-                    "reader-next",
-                    Rect::from_min_size(
-                        pos2(area.right() - 54., bottom_bar.top() + 12.),
-                        vec2(44., 44.),
-                    ),
-                    "next",
-                    "下一页",
-                ) {
+                if self.icon(ui, "reader-next", chrome.next, "next", "下一页") {
                     self.next_page(id, step, now, page_viewport.width());
                 }
-                ui.painter().text(
-                    pos2(area.center().x, bottom_bar.top() + 2.),
-                    Align2::CENTER_TOP,
-                    format!(
-                        "{} / {}{}",
-                        self.page + 1,
-                        book.page_count,
-                        if self.private { " · 私密阅读" } else { "" }
-                    ),
-                    FontId::monospace(12.),
-                    muted,
-                );
                 let mut page_f32 = self.page as f32 + 1.;
-                let slider_rect = Rect::from_min_size(
-                    pos2(area.left() + 62., bottom_bar.top() + 18.),
-                    vec2((area.width() - 124.).max(80.), 44.),
-                );
+                let slider_rect = chrome.slider;
                 let out = ui
                     .scope_builder(UiBuilder::new().max_rect(slider_rect), |ui| {
                         crate::design::slider(
@@ -5153,14 +5077,14 @@ fn detail_chapter_row(ui: &mut Ui, app: &mut ReaderApp, entry: &Book, id: &str, 
                     let text =
                         format!("第 {} / {} 页", page_f32.round() as usize, book.page_count);
                     let galley =
-                        ui.painter().layout_no_wrap(text, FontId::proportional(13.), ink);
+                        ui.painter().layout_no_wrap(text, FontId::proportional(13.), palette.ink);
                     let bubble_size = vec2(galley.size().x + 26., galley.size().y + 14.);
                     let thumb_x = out.thumb_x.clamp(
                         area.left() + bubble_size.x / 2. + 6.,
                         area.right() - bubble_size.x / 2. - 6.,
                     );
                     let bubble = Rect::from_center_size(
-                        pos2(thumb_x, bottom_bar.top() - 24.),
+                        pos2(thumb_x, chrome.dock.top() - 22.),
                         bubble_size,
                     );
                     crate::design::soft_shadow(ui.painter(), bubble, bubble_size.y / 2., 1.4, true);
@@ -5173,65 +5097,13 @@ fn detail_chapter_row(ui: &mut Ui, app: &mut ReaderApp, entry: &Book, id: &str, 
                         StrokeKind::Inside,
                     );
                     ui.painter()
-                        .galley(bubble.center() - galley.size() / 2., galley, ink);
+                        .galley(bubble.center() - galley.size() / 2., galley, palette.ink);
                 }
+                if go_back { self.back(now, area); }
             } else {
-                // A fading ghost keeps the outgoing chrome sliding away;
-                // nothing here is interactive any more.
-                let mut ghost = ui.painter().clone();
+                let mut ghost = ui.painter().clone(); // fading chrome ghost
                 ghost.multiply_opacity(chrome_t);
-                let icon_color = Color32::from_gray(232);
-                crate::design::draw_icon(
-                    &ghost,
-                    pos2(area.left() + 30., area.top() + 30. + top_shift),
-                    "back",
-                    icon_color,
-                    false,
-                );
-                if self.chapter(id).is_some() {
-                    crate::design::draw_icon(
-                        &ghost,
-                        pos2(area.right() - 82., area.top() + 30. + top_shift),
-                        "chapters",
-                        icon_color,
-                        false,
-                    );
-                }
-                crate::design::draw_icon(
-                    &ghost,
-                    pos2(area.right() - 30., area.top() + 30. + top_shift),
-                    "settings",
-                    icon_color,
-                    false,
-                );
-                ghost.text(
-                    area.min + vec2(56., 20. + top_shift),
-                    Align2::LEFT_TOP,
-                    self.reading_title(&book),
-                    FontId::proportional(15.),
-                    ink,
-                );
-                crate::design::draw_icon(
-                    &ghost,
-                    pos2(area.left() + 32., bottom_bar.top() + 34.),
-                    "prev",
-                    icon_color,
-                    false,
-                );
-                crate::design::draw_icon(
-                    &ghost,
-                    pos2(area.right() - 32., bottom_bar.top() + 34.),
-                    "next",
-                    icon_color,
-                    false,
-                );
-                ghost.text(
-                    pos2(area.center().x, bottom_bar.top() + 2.),
-                    Align2::CENTER_TOP,
-                    format!("{} / {}", self.page + 1, book.page_count),
-                    FontId::monospace(12.),
-                    muted,
-                );
+                self.paint_reader_chrome(&ghost, &chrome, &book, id);
             }
         }
     }
