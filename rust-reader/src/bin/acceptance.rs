@@ -553,7 +553,12 @@ fn seam_check(h: &Harness, name: &str, presnap: Rect) -> Result<serde_json::Valu
         for row in row.saturating_sub(1)..=row + 1 {
             for x in x0..x1 {
                 let p = at(x, row);
-                if near(p, [26, 24, 21], 10) || p.iter().all(|&c| c >= 235) { leak.0 += 1; }
+                if near(p, [0, 0, 0], 10)
+                    || near(p, [26, 24, 21], 10)
+                    || p.iter().all(|&c| c >= 235)
+                {
+                    leak.0 += 1;
+                }
                 else if !near(p, A, 40) && !near(p, B, 40) { leak.1 += 1; }
             }
         }

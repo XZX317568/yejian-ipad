@@ -41,15 +41,15 @@ fn accent_variant() -> (u8, u8, u8, u8, u8, u8, u8, u8, u8) {
 pub(crate) fn palette(dark: bool) -> Palette {
     if dark {
         Palette {
-            paper: Color32::from_rgb(20, 19, 18),
-            surface: Color32::from_rgb(31, 29, 27),
-            soft: Color32::from_rgb(42, 39, 36),
-            ink: Color32::from_rgb(245, 242, 235),
-            muted: Color32::from_rgb(163, 158, 147),
-            line: Color32::from_rgb(51, 47, 43),
-            accent: Color32::from_rgb(224, 155, 79),
-            accent_soft: Color32::from_rgb(59, 46, 30),
-            on_accent: Color32::from_rgb(24, 19, 13),
+            paper: Color32::BLACK,
+            surface: Color32::from_rgb(13, 12, 11),
+            soft: Color32::from_rgb(22, 20, 18),
+            ink: Color32::from_rgb(242, 237, 230),
+            muted: Color32::from_rgb(158, 150, 140),
+            line: Color32::from_rgb(42, 38, 34),
+            accent: Color32::from_rgb(226, 146, 88),
+            accent_soft: Color32::from_rgb(46, 33, 21),
+            on_accent: Color32::from_rgb(20, 14, 8),
         }
     } else {
         let (ar, ag, ab, sr, sg, sb, on_r, on_g, on_b) = accent_variant();
@@ -159,7 +159,7 @@ pub(crate) fn theme_choice(
     let preview_dark = kind == "dark";
     // Warm-charcoal night / warm paper — the old green-tinged swatches are gone.
     let bg = if preview_dark {
-        Color32::from_rgb(32, 29, 26)
+        Color32::from_rgb(13, 12, 11)
     } else {
         Color32::from_rgb(244, 240, 231)
     };
@@ -168,7 +168,7 @@ pub(crate) fn theme_choice(
         ui.painter().rect_filled(
             Rect::from_min_max(pos2(preview.center().x, preview.top()), preview.max),
             5.,
-            Color32::from_rgb(32, 29, 26),
+            Color32::from_rgb(13, 12, 11),
         );
     }
     let book = Rect::from_min_size(preview.min + vec2(8., 7.), vec2(22., 34.));
@@ -661,6 +661,28 @@ pub(crate) fn draw_icon(p: &Painter, center: Pos2, kind: &str, color: Color32, a
                 vec![c + vec2(-5.6, 0.6), c + vec2(-1.6, 4.4), c + vec2(6., -4.2)],
                 Stroke::new(2., color),
             ));
+        }
+        "bookmark" => {
+            let points = vec![
+                pos2(c.x - 5., c.y - 7.),
+                pos2(c.x + 5., c.y - 7.),
+                pos2(c.x + 5., c.y + 7.),
+                pos2(c.x, c.y + 2.),
+                pos2(c.x - 5., c.y + 7.),
+            ];
+            if active {
+                let mut mesh = Mesh::default();
+                for &point in &points {
+                    mesh.colored_vertex(point, tint);
+                }
+                mesh.add_triangle(0, 1, 3);
+                mesh.add_triangle(0, 3, 4);
+                mesh.add_triangle(1, 2, 3);
+                p.add(Shape::mesh(mesh));
+            }
+            let mut outline = points.clone();
+            outline.push(points[0]);
+            p.add(Shape::line(outline, stroke));
         }
         _ => {}
     }

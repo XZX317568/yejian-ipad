@@ -38,8 +38,6 @@ struct Flight {
     origin_lane: i32,
     clip: Rect,
 }
-/// Reader canvas: warm charcoal, keeps close-mid dark samples under 90.
-const READER_CANVAS: Color32 = Color32::from_rgb(26, 24, 21);
 /// Snap page rect to the pixel grid: shared tile/spread edges coincide (S4).
 fn snap_page_rect(painter: &Painter, r: Rect) -> Rect {
     let ppp = painter.ctx().pixels_per_point();
@@ -334,6 +332,13 @@ pub struct ReaderApp {
     fit_width: bool,
     brightness: f32,
     spread_offset: bool,
+    reader_bg: crate::reader_prefs::ReaderBg,
+    warm_tint: bool,
+    gutter_style: crate::reader_prefs::GutterStyle,
+    tap_preset: crate::reader_prefs::TapPreset,
+    show_corner_hud: bool,
+    page_anim: crate::reader_prefs::PageAnim,
+    bookmarks: Vec<usize>,
     reader_globals: crate::reader_prefs::ReaderPrefs,
     reader_prefs: HashMap<String, crate::reader_prefs::ReaderPrefs>,
     dark: bool,
@@ -366,6 +371,7 @@ impl ReaderApp {
     pub fn new(root: PathBuf, ctx: Context) -> Self {
         let backup_path = root.join("backup.yejian.zip").to_string_lossy().to_string();
         let reader_prefs = crate::reader_prefs::load(&root).unwrap_or_default();
+        let reader_defaults = crate::reader_prefs::ReaderPrefs::default();
         Self {
             worker: Worker::start(root.clone(), ctx.clone()),
             sync: crate::sync::ProgressSync::new(root.clone(), ctx.clone()),
@@ -453,7 +459,14 @@ impl ReaderApp {
             fit_width: false,
             brightness: 1.,
             spread_offset: false,
-            reader_globals: crate::reader_prefs::ReaderPrefs::default(),
+            reader_bg: reader_defaults.bg,
+            warm_tint: reader_defaults.warm_tint,
+            gutter_style: reader_defaults.gutter,
+            tap_preset: reader_defaults.tap_preset,
+            show_corner_hud: reader_defaults.show_corner_hud,
+            page_anim: reader_defaults.page_anim,
+            bookmarks: reader_defaults.bookmarks.clone(),
+            reader_globals: reader_defaults,
             reader_prefs,
             dark: false,
             reduced: false,
@@ -1730,6 +1743,17 @@ impl ReaderApp {
         self.fit_width = prefs.fit_width;
         self.brightness = prefs.brightness;
         self.spread_offset = prefs.spread_offset;
+        self.reader_bg = prefs.bg;
+        self.warm_tint = prefs.warm_tint;
+        self.gutter_style = prefs.gutter;
+        self.tap_preset = prefs.tap_preset;
+        self.show_corner_hud = prefs.show_corner_hud;
+        self.page_anim = prefs.page_anim;
+        self.bookmarks = prefs.bookmarks;
+    }
+    fn reader_canvas_color(&self) -> Color32 {
+        let [r, g, b] = self.reader_bg.rgb();
+        Color32::from_rgb(r, g, b)
     }
     fn current_prefs(&self) -> crate::reader_prefs::ReaderPrefs {
         crate::reader_prefs::ReaderPrefs {
@@ -1745,6 +1769,13 @@ impl ReaderApp {
             fit_width: self.fit_width,
             brightness: self.brightness,
             spread_offset: self.spread_offset,
+            bg: self.reader_bg,
+            warm_tint: self.warm_tint,
+            gutter: self.gutter_style,
+            tap_preset: self.tap_preset,
+            show_corner_hud: self.show_corner_hud,
+            page_anim: self.page_anim,
+            bookmarks: self.bookmarks.clone(),
         }
     }
     /// Changes made inside the reader always land on the current work.
@@ -4365,9 +4396,10 @@ fn detail_chapter_row(ui: &mut Ui, app: &mut ReaderApp, entry: &Book, id: &str, 
         // The peel ridge rides the retreating edge (1-p) and never drops
         // below the live drag/turn phase, mirroring the entry's max().
         let phase = (1. - p).max((slide_x.abs() / page_viewport.width().max(1.)).clamp(0., 1.));
+        let canvas = self.reader_canvas_color();
         for band in shelf::spread_clip(area, p, dir) {
             let clipped = ui.painter().with_clip_rect(band);
-            clipped.rect_filled(band, 0., READER_CANVAS);
+            clipped.rect_filled(band, 0., canvas);
             let pages_painter = clipped.with_clip_rect(page_viewport);
             for (page, target, mirror) in &queue {
                 if let Some(tex) = self.pages.get(&(id.clone(), *page)) {
@@ -4399,7 +4431,7 @@ fn detail_chapter_row(ui: &mut Ui, app: &mut ReaderApp, entry: &Book, id: &str, 
             return;
         };
         let ctx = ui.ctx().clone();
-        ui.painter().rect_filled(area, 0., READER_CANVAS);
+        ui.painter().rect_filled(area, 0., self.reader_canvas_color());
         self.ask_page(id, self.page);
         let step: i32 = if self.spread && !self.vertical && area.width() > 700. {
             if self.spread_offset && self.page == 0 {

@@ -17,6 +17,57 @@ pub enum Mode {
     Vertical,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReaderBg {
+    #[default]
+    Oled,
+    Charcoal,
+    Gray,
+    Paper,
+}
+impl ReaderBg {
+    pub fn rgb(self) -> [u8; 3] {
+        match self {
+            Self::Oled => [0, 0, 0],
+            Self::Charcoal => [22, 20, 18],
+            Self::Gray => [36, 38, 41],
+            Self::Paper => [234, 227, 213],
+        }
+    }
+    #[allow(dead_code)]
+    pub fn is_light_canvas(self) -> bool {
+        matches!(self, Self::Paper)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GutterStyle {
+    #[default]
+    Book,
+    None,
+    Gap,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TapPreset {
+    #[default]
+    Split,
+    Edges,
+    Off,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PageAnim {
+    #[default]
+    Curl,
+    Slide,
+    None,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ReaderPrefs {
     pub mode: Mode,
@@ -29,9 +80,26 @@ pub struct ReaderPrefs {
     pub brightness: f32,
     #[serde(default)]
     pub spread_offset: bool,
+    #[serde(default)]
+    pub bg: ReaderBg,
+    #[serde(default)]
+    pub warm_tint: bool,
+    #[serde(default)]
+    pub gutter: GutterStyle,
+    #[serde(default)]
+    pub tap_preset: TapPreset,
+    #[serde(default = "yes")]
+    pub show_corner_hud: bool,
+    #[serde(default)]
+    pub page_anim: PageAnim,
+    #[serde(default)]
+    pub bookmarks: Vec<usize>,
 }
 fn one() -> f32 {
     1.
+}
+fn yes() -> bool {
+    true
 }
 impl Default for ReaderPrefs {
     fn default() -> Self {
@@ -42,6 +110,13 @@ impl Default for ReaderPrefs {
             fit_width: false,
             brightness: 1.,
             spread_offset: false,
+            bg: ReaderBg::Oled,
+            warm_tint: false,
+            gutter: GutterStyle::Book,
+            tap_preset: TapPreset::Split,
+            show_corner_hud: true,
+            page_anim: PageAnim::Curl,
+            bookmarks: Vec::new(),
         }
     }
 }
@@ -51,6 +126,22 @@ impl ReaderPrefs {
             self.brightness.clamp(0.3, 1.)
         } else {
             1.
+        }
+    }
+    #[allow(dead_code)]
+    pub fn is_bookmarked(&self, page: usize) -> bool {
+        self.bookmarks.contains(&page)
+    }
+    #[allow(dead_code)]
+    pub fn toggle_bookmark(&mut self, page: usize) -> bool {
+        if self.bookmarks.contains(&page) {
+            self.bookmarks.retain(|&saved| saved != page);
+            false
+        } else {
+            self.bookmarks.push(page);
+            self.bookmarks.sort_unstable();
+            self.bookmarks.dedup();
+            true
         }
     }
 }
@@ -126,6 +217,7 @@ mod tests {
                 fit_width: false,
                 brightness: 0.5,
                 spread_offset: true,
+                ..ReaderPrefs::default()
             },
         );
         save(dir.path(), &prefs).unwrap();
@@ -152,5 +244,45 @@ mod tests {
         assert_eq!(loaded["k"].mode, Mode::Spread);
         assert_eq!(loaded["k"].brightness(), 1.);
         assert!(!loaded["k"].crop);
+    }
+
+    #[test]
+    fn old_json_loads_new_v4_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(FILE), br#"{"prefs":{"k":{"mode":"spread","rtl":true}}}"#)
+            .unwrap();
+        let loaded = load(dir.path()).unwrap();
+        let prefs = &loaded["k"];
+        assert_eq!(prefs.bg, ReaderBg::Oled);
+        assert_eq!(prefs.gutter, GutterStyle::Book);
+        assert_eq!(prefs.tap_preset, TapPreset::Split);
+        assert!(prefs.show_corner_hud);
+        assert_eq!(prefs.page_anim, PageAnim::Curl);
+        assert!(!prefs.warm_tint);
+        assert!(prefs.bookmarks.is_empty());
+    }
+
+    #[test]
+    fn bookmark_toggle_sorts_dedups_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut prefs = ReaderPrefs {
+            bookmarks: vec![4, 1, 4],
+            ..ReaderPrefs::default()
+        };
+        assert!(prefs.is_bookmarked(4));
+        assert!(prefs.toggle_bookmark(2));
+        assert_eq!(prefs.bookmarks, vec![1, 2, 4]);
+        assert!(!prefs.toggle_bookmark(2));
+        assert_eq!(prefs.bookmarks, vec![1, 4]);
+        assert!(prefs.toggle_bookmark(3));
+        assert_eq!(prefs.bookmarks, vec![1, 3, 4]);
+
+        let mut stored = HashMap::new();
+        stored.insert("k".into(), prefs);
+        save(dir.path(), &stored).unwrap();
+        let loaded = load(dir.path()).unwrap();
+        assert_eq!(loaded["k"].bookmarks, vec![1, 3, 4]);
+        assert!(loaded["k"].is_bookmarked(3));
+        assert!(!loaded["k"].is_bookmarked(2));
     }
 }
