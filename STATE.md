@@ -98,8 +98,9 @@
 
 - 单测 268/0/3 EXIT=0 + 六路（full/design/daily/filters/ipad/seam-2×）EXIT=0；回执 .tools/verify-ui-v2-final/logs/（cmd+exit+log+JSON），二进制 SHA256 CA42474504EE8C1C302B6815BA684960DAD00C46F867673CBBB4E6C392932C4E
 - 2× 专项 rendered_ppp=2.0、三帧 join leak=[0,0]；A/B/C 各 310 帧@1024×1366 端到端（书架→摊开→翻页→合书），compare.mp4 3072×1366/10.33s；变体像素逐字节核对属实 —— 全部 Windows 离屏 wgpu（RTX 5060），非真机
-- 十二屏审阅页 preview/ui-v2-review/（index.html + data.js 12 场景 + compare.mp4）；task-44 实际打开复验：12 屏/键盘/播放/暂停/seek PASS，但 ①meta 渲染 src 致整页横溢（scrollWidth≈2.7Mpx）②「打开原图」about:blank —— 两项发布缺陷未签（task-47 未通过）
-- 汇总：reports/2026-11-25-ui-apple-books.md（部分达成 6/7）；遗留 13 条见 .scratch/ui-apple-books/leftovers.md
+- 十二屏审阅页 preview/ui-v2-review/（index.html + data.js 12 场景 + compare.mp4）；入口 `file:///D:/Documents/aidoku/preview/ui-v2-review/index.html`（双击即开，无服务器）。task-44 **当时**实际打开复验：12 屏/键盘/播放/暂停/seek PASS，但 ①meta 渲染 src 致整页横溢（scrollWidth≈2.7Mpx）②「打开原图」about:blank —— 两项发布缺陷当时未签（**历史快照**，e10c58a 6/7 即基于此）
+- task-46 修复两项缺陷（index.html 7,025 B，SHA256 5449656D…B119），task-47 独立复验 **PASS**：526 与 1440 两档 12/12 屏 documentElement.scrollWidth == clientWidth（请求 525 实测 526，+1px）；「打开原图」真实点击 820×1180 与 O 键 1366×1024 均 1:1 非空白、关闭回原场景；键盘/切图/页内播放 t=1.231、暂停 t=2.035、seek 8s 全过；证据 .tools/verify-ui-v2-offline/width/{summary.json,525-sweep.json,1440-sweep.json,525-interactions.json,width-*.png}、worklog-review-width.md
+- 汇总：reports/2026-11-25-ui-apple-books.md（技术交付 **7/7**；用户视觉签收未回 → 项目不可标 done；e10c58a 的「部分达成 6/7」为历史快照）；遗留 13 条见 .scratch/ui-apple-books/leftovers.md
 
 ## 阻塞 / 待核实
 
