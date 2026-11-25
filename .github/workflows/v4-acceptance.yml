@@ -20,6 +20,9 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
+      - name: 保持测试夹具 LF 换行
+        run: git config --global core.autocrlf false
+
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
