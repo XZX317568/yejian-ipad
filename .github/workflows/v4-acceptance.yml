@@ -1,0 +1,82 @@
+name: V4 Acceptance CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["work/v4-*"]
+    paths:
+      - "rust-reader/**"
+      - ".github/workflows/v4-acceptance.yml"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: "0"
+  RUSTUP_TOOLCHAIN: "1.97.0"
+
+jobs:
+  test-and-acceptance-windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: 准备 Rust 工具链
+        run: rustup toolchain install "$env:RUSTUP_TOOLCHAIN" --profile minimal
+
+      - name: 缓存 Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-reader/target
+          key: ${{ runner.os }}-cargo-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('rust-reader/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ env.RUSTUP_TOOLCHAIN }}-
+
+      - name: 全量单元测试
+        working-directory: rust-reader
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path ..\ci-acceptance | Out-Null
+          cargo test --locked --workspace -j 1 -- --test-threads=1 2>&1 | Tee-Object -FilePath ..\ci-acceptance\test.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: 完整离屏 GPU 验收 (Full + Design + iPad)
+        working-directory: rust-reader
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path ..\ci-acceptance\full, ..\ci-acceptance\design, ..\ci-acceptance\ipad | Out-Null
+          cargo run --locked -j 1 --features acceptance --bin acceptance -- ..\ci-acceptance\full 2>&1 | Tee-Object -FilePath ..\ci-acceptance\full.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:YEJIAN_DESIGN_ONLY = '1'
+          cargo run --locked -j 1 --features acceptance --bin acceptance -- ..\ci-acceptance\design 2>&1 | Tee-Object -FilePath ..\ci-acceptance\design.log
+          $ec = $LASTEXITCODE
+          Remove-Item Env:YEJIAN_DESIGN_ONLY
+          if ($ec -ne 0) { exit $ec }
+          $env:YEJIAN_IPAD_ONLY = '1'
+          cargo run --locked -j 1 --features acceptance --bin acceptance -- ..\ci-acceptance\ipad 2>&1 | Tee-Object -FilePath ..\ci-acceptance\ipad.log
+          $ec = $LASTEXITCODE
+          Remove-Item Env:YEJIAN_IPAD_ONLY
+          if ($ec -ne 0) { exit $ec }
+
+      - name: 上传验收截图与报告
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: yejian-windows-acceptance
+          path: |
+            ci-acceptance/*.log
+            ci-acceptance/full/*.png
+            ci-acceptance/full/*.txt
+            ci-acceptance/full/*.json
+            ci-acceptance/design/*.png
+            ci-acceptance/design/*.json
+            ci-acceptance/ipad/*.png
+            ci-acceptance/ipad/*.json
+          if-no-files-found: warn
+          retention-days: 3
