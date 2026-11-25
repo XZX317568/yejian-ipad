@@ -92,7 +92,7 @@
 | 阶段 2 · 摊开 | A / B / C 三变体（compare.mp4 + variant-*.mp4） | **B**（翻页感纸面） | 2026-11-23 |
 | 阶段 3 · 翻页 | A / B / C 三变体（compare.mp4 + variant-*.mp4） | **B**（纸感） | 2026-11-23 |
 | 阶段 4 · 合上 | A / B / C 三变体（compare.mp4 + variant-*.mp4） | **B**（书感） | 2026-11-23 |
-| S6 · 暖白强调色 | A 琥珀(170,94,24) / B 书脊棕(168,93,40) / C 墨黑(44,38,33)（.tools/verify-ui-v2-final/rec/compare.mp4） | **待视觉裁决** | — |
+| S6 · 暖白强调色 | A 琥珀(170,94,24) / B 书脊棕(168,93,40) / C 墨黑(44,38,33)（.tools/verify-ui-v2-final/rec/compare.mp4） | **A**（琥珀，浅色 #AA5E18；与 `design.rs:36` 默认分支及录像 frame-000 CTA 像素一致） | 2026-11-25 12:14:13 +08:00（Asia/Shanghai，**系统记录收到裁决的时间**，非客户端发送时间/毫秒） |
 
 ## S6 终验快照（2026-11-25，候选 49e4ca4，verify-s6/-r2 独立验收）
 
@@ -100,7 +100,7 @@
 - 2× 专项 rendered_ppp=2.0、三帧 join leak=[0,0]；A/B/C 各 310 帧@1024×1366 端到端（书架→摊开→翻页→合书），compare.mp4 3072×1366/10.33s；变体像素逐字节核对属实 —— 全部 Windows 离屏 wgpu（RTX 5060），非真机
 - 十二屏审阅页 preview/ui-v2-review/（index.html + data.js 12 场景 + compare.mp4）；入口 `file:///D:/Documents/aidoku/preview/ui-v2-review/index.html`（双击即开，无服务器）。task-44 **当时**实际打开复验：12 屏/键盘/播放/暂停/seek PASS，但 ①meta 渲染 src 致整页横溢（scrollWidth≈2.7Mpx）②「打开原图」about:blank —— 两项发布缺陷当时未签（**历史快照**，e10c58a 6/7 即基于此）
 - task-46 修复两项缺陷（index.html 7,025 B，SHA256 5449656D…B119），task-47 独立复验 **PASS**：526 与 1440 两档 12/12 屏 documentElement.scrollWidth == clientWidth（请求 525 实测 526，+1px）；「打开原图」真实点击 820×1180 与 O 键 1366×1024 均 1:1 非空白、关闭回原场景；键盘/切图/页内播放 t=1.231、暂停 t=2.035、seek 8s 全过；证据 .tools/verify-ui-v2-offline/width/{summary.json,525-sweep.json,1440-sweep.json,525-interactions.json,width-*.png}、worklog-review-width.md
-- 汇总：reports/2026-11-25-ui-apple-books.md（技术交付 **7/7**；用户视觉签收未回 → 项目不可标 done；e10c58a 的「部分达成 6/7」为历史快照）；遗留 13 条见 .scratch/ui-apple-books/leftovers.md
+- 汇总：reports/2026-11-25-ui-apple-books.md（技术交付 **7/7**；用户已于 2026-11-25 12:14:13 +08:00 选定强调色 **A 琥珀 #AA5E18**；e10c58a 的「部分达成 6/7」为历史快照；iPad 真机未测、弯曲翻页相位逐像素证伪未做仍为未验证边界，选色不等于真机验收）；遗留 13 条见 .scratch/ui-apple-books/leftovers.md
 
 ## 阻塞 / 待核实
 
